@@ -73,6 +73,7 @@ pub struct BrainLogEntry {
 
 /// History of brain suggestions (ring buffer, last N).
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct BrainHistory {
     entries: std::collections::VecDeque<BrainLogEntry>,
     max_entries: usize,
@@ -80,6 +81,7 @@ pub struct BrainHistory {
     pub total_agreed: u64,
 }
 
+#[allow(dead_code)]
 impl BrainHistory {
     pub fn new(max_entries: usize) -> Self {
         Self {
