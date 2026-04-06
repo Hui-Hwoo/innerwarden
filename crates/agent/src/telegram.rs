@@ -3198,6 +3198,7 @@ pub struct PipelineDigestStats {
 }
 
 /// Format an enriched daily digest with pipeline grouping stats.
+#[allow(clippy::too_many_arguments)]
 pub fn format_daily_digest_enriched(
     incidents_today: u32,
     blocks_today: u32,

@@ -375,9 +375,7 @@ pub(crate) fn is_immediate_threat(incident: &Incident) -> bool {
 /// Returns `true` when this detector name represents an immediate threat.
 /// Used for both incidents and group summaries.
 pub(crate) fn is_immediate_threat_detector(detector: &str) -> bool {
-    IMMEDIATE_THREAT_DETECTORS
-        .iter()
-        .any(|d| detector == *d)
+    IMMEDIATE_THREAT_DETECTORS.contains(&detector)
 }
 
 /// Returns `true` when a group summary warrants an immediate Telegram
@@ -420,10 +418,11 @@ pub(crate) fn should_suppress_for_environment(
     // Cloud VPS: suppress timing-based detectors up to High severity.
     // On cloud/VM, hypervisor jitter makes timing analysis unreliable.
     // Only Critical timing anomalies go through (indicating persistent pattern).
-    if profile.is_cloud() && CLOUD_SUPPRESSED_DETECTORS.iter().any(|d| detector.contains(d)) {
-        if !matches!(incident.severity, Severity::Critical) {
-            return true;
-        }
+    if profile.is_cloud()
+        && CLOUD_SUPPRESSED_DETECTORS.iter().any(|d| detector.contains(d))
+        && !matches!(incident.severity, Severity::Critical)
+    {
+        return true;
     }
 
     false
