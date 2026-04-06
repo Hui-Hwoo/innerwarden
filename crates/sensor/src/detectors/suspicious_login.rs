@@ -85,7 +85,10 @@ impl SuspiciousLoginDetector {
 
         // Track login hours for this IP (for off-hours detection)
         let hour = now.hour();
-        self.ip_login_hours.entry(ip.clone()).or_default().insert(hour);
+        self.ip_login_hours
+            .entry(ip.clone())
+            .or_default()
+            .insert(hour);
 
         // Check for off-hours login (22:00-06:00 UTC)
         let is_off_hours = !(6..22).contains(&hour);
@@ -137,9 +140,15 @@ impl SuspiciousLoginDetector {
         self.alerted.insert(ip.clone(), now);
 
         let title = match reason {
-            "brute_force_success" => format!("SSH login from attacking IP {ip} after {prior_failures} failed attempts"),
-            "failed_then_success" => format!("SSH login from {ip} after {prior_failures} failed attempts"),
-            "first_time_privileged" => format!("First-time SSH login to privileged account {user} from {ip}"),
+            "brute_force_success" => {
+                format!("SSH login from attacking IP {ip} after {prior_failures} failed attempts")
+            }
+            "failed_then_success" => {
+                format!("SSH login from {ip} after {prior_failures} failed attempts")
+            }
+            "first_time_privileged" => {
+                format!("First-time SSH login to privileged account {user} from {ip}")
+            }
             "off_hours_new_ip" => format!("Off-hours SSH login from new IP {ip} as {user}"),
             _ => format!("Suspicious SSH login from {ip} as {user}"),
         };
@@ -161,11 +170,7 @@ impl SuspiciousLoginDetector {
         Some(Incident {
             ts: now,
             host: self.host.clone(),
-            incident_id: format!(
-                "suspicious_login:{}:{}",
-                ip,
-                now.format("%Y-%m-%dT%H:%MZ")
-            ),
+            incident_id: format!("suspicious_login:{}:{}", ip, now.format("%Y-%m-%dT%H:%MZ")),
             severity,
             title,
             summary,
@@ -185,12 +190,20 @@ impl SuspiciousLoginDetector {
                 format!("Verify if {user} login from {ip} was authorized"),
                 format!("Check commands run by {user} after login"),
                 "Review /var/log/auth.log for the full session".to_string(),
-                if is_privileged { "Consider suspending sudo access until verified".to_string() } else { "Monitor for privilege escalation".to_string() },
+                if is_privileged {
+                    "Consider suspending sudo access until verified".to_string()
+                } else {
+                    "Monitor for privilege escalation".to_string()
+                },
             ],
             tags: vec![
                 "auth".to_string(),
                 "ssh".to_string(),
-                if reason.contains("brute") { "compromise".to_string() } else { "suspicious".to_string() },
+                if reason.contains("brute") {
+                    "compromise".to_string()
+                } else {
+                    "suspicious".to_string()
+                },
             ],
             entities: vec![EntityRef::ip(&ip), EntityRef::user(user)],
         })

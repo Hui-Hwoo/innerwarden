@@ -108,7 +108,12 @@ impl BrainHistory {
     }
 
     pub fn mark_feedback(&mut self, incident_id: &str, correct: bool) -> bool {
-        if let Some(entry) = self.entries.iter_mut().rev().find(|e| e.incident_id == incident_id) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.incident_id == incident_id)
+        {
             entry.feedback = Some(correct);
             true
         } else {
@@ -117,16 +122,24 @@ impl BrainHistory {
     }
 
     pub fn agreement_rate(&self) -> f32 {
-        if self.total_suggestions == 0 { return 0.0; }
+        if self.total_suggestions == 0 {
+            return 0.0;
+        }
         self.total_agreed as f32 / self.total_suggestions as f32
     }
 
     pub fn fp_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.feedback == Some(false)).count()
+        self.entries
+            .iter()
+            .filter(|e| e.feedback == Some(false))
+            .count()
     }
 
     pub fn tp_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.feedback == Some(true)).count()
+        self.entries
+            .iter()
+            .filter(|e| e.feedback == Some(true))
+            .count()
     }
 
     pub fn unreviewed_count(&self) -> usize {
@@ -136,17 +149,38 @@ impl BrainHistory {
 
 /// Action names matching the gym's defender action space.
 const ACTION_NAMES: [&str; 30] = [
-    "observe", "block_ip", "kill_process", "suspend_user",
-    "deploy_honeypot", "capture_forensics", "isolate_network",
-    "alert", "restore_file", "escalate",
+    "observe",
+    "block_ip",
+    "kill_process",
+    "suspend_user",
+    "deploy_honeypot",
+    "capture_forensics",
+    "isolate_network",
+    "alert",
+    "restore_file",
+    "escalate",
     // Stances (10-19 in gym, mapped to 20-29 here)
-    "enable_waf", "enable_ssh_rate_limit", "enable_tls_inspection",
-    "enable_outbound_monitor", "push_cloudflare_edge", "enable_correlation",
-    "enable_abuseipdb_gate", "tighten_ssh", "enable_xdp", "enable_kernel_monitor",
+    "enable_waf",
+    "enable_ssh_rate_limit",
+    "enable_tls_inspection",
+    "enable_outbound_monitor",
+    "push_cloudflare_edge",
+    "enable_correlation",
+    "enable_abuseipdb_gate",
+    "tighten_ssh",
+    "enable_xdp",
+    "enable_kernel_monitor",
     // Reserved
-    "reserved_20", "reserved_21", "reserved_22", "reserved_23",
-    "reserved_24", "reserved_25", "reserved_26", "reserved_27",
-    "reserved_28", "reserved_29",
+    "reserved_20",
+    "reserved_21",
+    "reserved_22",
+    "reserved_23",
+    "reserved_24",
+    "reserved_25",
+    "reserved_26",
+    "reserved_27",
+    "reserved_28",
+    "reserved_29",
 ];
 
 impl DefenderBrain {
@@ -163,7 +197,11 @@ impl DefenderBrain {
     /// Load from embedded binary (always available, compiled into the agent).
     pub fn load(_path: &str) -> Self {
         if let Some(brain) = Self::from_iwd1(MODEL_BYTES) {
-            info!(params = brain.param_count(), size_kb = MODEL_BYTES.len() / 1024, "defender brain loaded (embedded, AlphaZero V4)");
+            info!(
+                params = brain.param_count(),
+                size_kb = MODEL_BYTES.len() / 1024,
+                "defender brain loaded (embedded, AlphaZero V4)"
+            );
             return brain;
         }
         warn!("defender brain: embedded model failed to parse — running without neural decisions");
@@ -180,7 +218,12 @@ impl DefenderBrain {
         let policy_head = Self::parse_layers(v.get("policy_head")?)?;
         let value_head = Self::parse_layers(v.get("value_head")?)?;
 
-        Some(Self { trunk, policy_head, value_head, loaded: true })
+        Some(Self {
+            trunk,
+            policy_head,
+            value_head,
+            loaded: true,
+        })
     }
 
     #[allow(dead_code)]
@@ -191,13 +234,19 @@ impl DefenderBrain {
             let weights_val = layer_val.get("weights")?.as_array()?;
             let biases_val = layer_val.get("biases")?.as_array()?;
 
-            let weights: Vec<Vec<f32>> = weights_val.iter().map(|row| {
-                row.as_array().unwrap_or(&vec![]).iter()
-                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-                    .collect()
-            }).collect();
+            let weights: Vec<Vec<f32>> = weights_val
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                        .collect()
+                })
+                .collect();
 
-            let biases: Vec<f32> = biases_val.iter()
+            let biases: Vec<f32> = biases_val
+                .iter()
                 .map(|v| v.as_f64().unwrap_or(0.0) as f32)
                 .collect();
 
@@ -215,10 +264,17 @@ impl DefenderBrain {
         // Format: "IWD1" + num_sections(u32) + for each section: num_layers(u32) + layers
         // Each layer: rows(u32) + cols(u32) + weights(rows*cols*f32) + biases(rows*f32)
         let mut offset = 4;
-        let num_sections = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
+        let num_sections = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
         offset += 4;
 
-        if num_sections != 3 { return None; } // trunk, policy, value
+        if num_sections != 3 {
+            return None;
+        } // trunk, policy, value
 
         let mut sections = Vec::new();
         for _ in 0..3 {
@@ -236,23 +292,49 @@ impl DefenderBrain {
     }
 
     fn read_section(data: &[u8], mut offset: usize) -> Option<(Vec<Layer>, usize)> {
-        if offset + 4 > data.len() { return None; }
-        let num_layers = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
+        if offset + 4 > data.len() {
+            return None;
+        }
+        let num_layers = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
         offset += 4;
 
         let mut layers = Vec::new();
         for _ in 0..num_layers {
-            if offset + 8 > data.len() { return None; }
-            let rows = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-            let cols = u32::from_le_bytes([data[offset+4], data[offset+5], data[offset+6], data[offset+7]]) as usize;
+            if offset + 8 > data.len() {
+                return None;
+            }
+            let rows = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            let cols = u32::from_le_bytes([
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]) as usize;
             offset += 8;
 
             let mut weights = Vec::with_capacity(rows);
             for _ in 0..rows {
                 let mut row = Vec::with_capacity(cols);
                 for _ in 0..cols {
-                    if offset + 4 > data.len() { return None; }
-                    let val = f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+                    if offset + 4 > data.len() {
+                        return None;
+                    }
+                    let val = f32::from_le_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]);
                     row.push(val);
                     offset += 4;
                 }
@@ -261,8 +343,15 @@ impl DefenderBrain {
 
             let mut biases = Vec::with_capacity(rows);
             for _ in 0..rows {
-                if offset + 4 > data.len() { return None; }
-                let val = f32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+                if offset + 4 > data.len() {
+                    return None;
+                }
+                let val = f32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
                 biases.push(val);
                 offset += 4;
             }
@@ -280,9 +369,10 @@ impl DefenderBrain {
     /// Total parameters.
     pub fn param_count(&self) -> usize {
         let count = |layers: &[Layer]| -> usize {
-            layers.iter().map(|l| {
-                l.weights.iter().map(|r| r.len()).sum::<usize>() + l.biases.len()
-            }).sum()
+            layers
+                .iter()
+                .map(|l| l.weights.iter().map(|r| r.len()).sum::<usize>() + l.biases.len())
+                .sum()
         };
         count(&self.trunk) + count(&self.policy_head) + count(&self.value_head)
     }
@@ -303,7 +393,9 @@ impl DefenderBrain {
     /// [18] blocked
     /// [19-71] reserved
     pub fn suggest(&self, features: &[f32; 72]) -> Option<BrainSuggestion> {
-        if !self.loaded { return None; }
+        if !self.loaded {
+            return None;
+        }
 
         // Trunk forward (ReLU)
         let mut x = features.to_vec();
@@ -334,15 +426,20 @@ impl DefenderBrain {
         let value = vx.first().copied().unwrap_or(0.0).tanh();
 
         // Find best action
-        let best_action = policy.iter().enumerate()
+        let best_action = policy
+            .iter()
+            .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .unwrap_or(0);
 
         // Top 3
-        let mut indexed: Vec<(usize, f32)> = policy.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+        let mut indexed: Vec<(usize, f32)> =
+            policy.iter().enumerate().map(|(i, &p)| (i, p)).collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_actions: Vec<(usize, &str, f32)> = indexed.iter().take(3)
+        let top_actions: Vec<(usize, &str, f32)> = indexed
+            .iter()
+            .take(3)
             .map(|&(i, p)| (i, ACTION_NAMES.get(i).copied().unwrap_or("unknown"), p))
             .collect();
 
@@ -358,17 +455,25 @@ impl DefenderBrain {
 
 /// ReLU forward pass.
 fn forward_relu(layer: &Layer, input: &[f32]) -> Vec<f32> {
-    layer.weights.iter().zip(&layer.biases).map(|(w, &b)| {
-        let sum: f32 = w.iter().zip(input).map(|(&wi, &xi)| wi * xi).sum::<f32>() + b;
-        sum.max(0.0)
-    }).collect()
+    layer
+        .weights
+        .iter()
+        .zip(&layer.biases)
+        .map(|(w, &b)| {
+            let sum: f32 = w.iter().zip(input).map(|(&wi, &xi)| wi * xi).sum::<f32>() + b;
+            sum.max(0.0)
+        })
+        .collect()
 }
 
 /// Linear forward pass (no activation).
 fn forward_linear(layer: &Layer, input: &[f32]) -> Vec<f32> {
-    layer.weights.iter().zip(&layer.biases).map(|(w, &b)| {
-        w.iter().zip(input).map(|(&wi, &xi)| wi * xi).sum::<f32>() + b
-    }).collect()
+    layer
+        .weights
+        .iter()
+        .zip(&layer.biases)
+        .map(|(w, &b)| w.iter().zip(input).map(|(&wi, &xi)| wi * xi).sum::<f32>() + b)
+        .collect()
 }
 
 /// Softmax.

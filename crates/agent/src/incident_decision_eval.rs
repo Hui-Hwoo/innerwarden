@@ -60,10 +60,10 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
                 let ba = suggestion.action_name;
                 let aa = &ai_action_str;
                 (ba == "block_ip" && aa.contains("BlockIp"))
-                || (ba == "kill_process" && aa.contains("KillProcess"))
-                || (ba == "observe" && (aa.contains("Ignore") || aa.contains("Monitor")))
-                || (ba == "alert" && aa.contains("Monitor"))
-                || (ba == "escalate" && aa.contains("Escalate"))
+                    || (ba == "kill_process" && aa.contains("KillProcess"))
+                    || (ba == "observe" && (aa.contains("Ignore") || aa.contains("Monitor")))
+                    || (ba == "alert" && aa.contains("Monitor"))
+                    || (ba == "escalate" && aa.contains("Escalate"))
             };
 
             info!(
@@ -103,7 +103,10 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
                 if entries.len() > 500 {
                     entries.drain(0..entries.len() - 500);
                 }
-                if let Err(e) = std::fs::write(&log_path, serde_json::to_string(&entries).unwrap_or_default()) {
+                if let Err(e) = std::fs::write(
+                    &log_path,
+                    serde_json::to_string(&entries).unwrap_or_default(),
+                ) {
                     warn!("failed to write brain-log.json: {e}");
                 }
             }
@@ -125,12 +128,18 @@ fn build_brain_features(
     let mut f = [0.0f32; 72];
 
     // Extract IP from incident entities or incident_id
-    let ip = incident.entities.iter()
+    let ip = incident
+        .entities
+        .iter()
         .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
         .map(|e| e.value.as_str())
         .or_else(|| {
             let parts: Vec<&str> = incident.incident_id.split(':').collect();
-            if parts.len() >= 2 && parts[1].contains('.') { Some(parts[1]) } else { None }
+            if parts.len() >= 2 && parts[1].contains('.') {
+                Some(parts[1])
+            } else {
+                None
+            }
         });
 
     let det = incident.incident_id.split(':').next().unwrap_or("");
@@ -156,7 +165,11 @@ fn build_brain_features(
         }
 
         // [8] is this IP already blocked?
-        f[8] = if state.blocklist.contains(ip_str) { 1.0 } else { 0.0 };
+        f[8] = if state.blocklist.contains(ip_str) {
+            1.0
+        } else {
+            0.0
+        };
 
         // [9] IP reputation from local cache
         if let Some(rep) = state.ip_reputations.get(ip_str) {
@@ -164,8 +177,10 @@ fn build_brain_features(
         }
 
         // [10] is internal/private IP?
-        let is_internal = ip_str.starts_with("10.") || ip_str.starts_with("192.168.")
-            || ip_str.starts_with("172.") || ip_str.starts_with("127.");
+        let is_internal = ip_str.starts_with("10.")
+            || ip_str.starts_with("192.168.")
+            || ip_str.starts_with("172.")
+            || ip_str.starts_with("127.");
         f[10] = if is_internal { 1.0 } else { 0.0 };
     }
 
@@ -181,10 +196,22 @@ fn build_brain_features(
     f[17] = if det == "web_shell" { 1.0 } else { 0.0 };
 
     // [18-23] more detector flags
-    f[18] = if det == "data_exfil_ebpf" || det == "data_exfil_cmd" { 1.0 } else { 0.0 };
+    f[18] = if det == "data_exfil_ebpf" || det == "data_exfil_cmd" {
+        1.0
+    } else {
+        0.0
+    };
     f[19] = if det == "c2_callback" { 1.0 } else { 0.0 };
-    f[20] = if det == "dns_tunneling" || det == "dns_tunneling_ebpf" { 1.0 } else { 0.0 };
-    f[21] = if det == "credential_stuffing" || det == "distributed_ssh" { 1.0 } else { 0.0 };
+    f[20] = if det == "dns_tunneling" || det == "dns_tunneling_ebpf" {
+        1.0
+    } else {
+        0.0
+    };
+    f[21] = if det == "credential_stuffing" || det == "distributed_ssh" {
+        1.0
+    } else {
+        0.0
+    };
     f[22] = if det == "rootkit" { 1.0 } else { 0.0 };
     f[23] = if det == "neural_anomaly" { 1.0 } else { 0.0 };
 
@@ -192,14 +219,24 @@ fn build_brain_features(
     f[24] = if state.baseline.is_mature() { 1.0 } else { 0.0 };
 
     // [25] baseline anomaly recently?
-    f[25] = if state.last_baseline_anomaly_ts.is_some_and(|ts| {
-        (chrono::Utc::now() - ts).num_seconds() < 300
-    }) { 1.0 } else { 0.0 };
+    f[25] = if state
+        .last_baseline_anomaly_ts
+        .is_some_and(|ts| (chrono::Utc::now() - ts).num_seconds() < 300)
+    {
+        1.0
+    } else {
+        0.0
+    };
 
     // [26] autoencoder anomaly recently?
-    f[26] = if state.last_autoencoder_anomaly_ts.is_some_and(|ts| {
-        (chrono::Utc::now() - ts).num_seconds() < 300
-    }) { 1.0 } else { 0.0 };
+    f[26] = if state
+        .last_autoencoder_anomaly_ts
+        .is_some_and(|ts| (chrono::Utc::now() - ts).num_seconds() < 300)
+    {
+        1.0
+    } else {
+        0.0
+    };
 
     // [27] total blocked IPs (how active is the defense?)
     f[27] = (state.blocklist.len() as f32 / 50.0).min(1.0);
@@ -210,10 +247,21 @@ fn build_brain_features(
     // [29] is this a known FP pattern? (neural_anomaly with low maturity)
     f[29] = if det == "neural_anomaly" {
         if let Some(evidence) = incident.evidence.get(0) {
-            let maturity = evidence.get("maturity").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            if maturity < 0.5 { 1.0 } else { 0.0 } // low maturity = likely FP
-        } else { 0.0 }
-    } else { 0.0 };
+            let maturity = evidence
+                .get("maturity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            if maturity < 0.5 {
+                1.0
+            } else {
+                0.0
+            } // low maturity = likely FP
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
 
     f
 }
