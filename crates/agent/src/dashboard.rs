@@ -2122,6 +2122,22 @@ fn safe_read_data_file(data_dir: &Path, filename: &str) -> Option<String> {
     }
 }
 
+/// Write a file safely inside data_dir (prevents path traversal).
+fn safe_write_data_file(data_dir: &Path, filename: &str, contents: &str) -> bool {
+    // Only allow simple filenames (no slashes, no ..)
+    if filename.contains('/') || filename.contains("..") {
+        return false;
+    }
+    let Some(base) = data_dir.canonicalize().ok() else {
+        return false;
+    };
+    let target = base.join(filename);
+    if !target.starts_with(&base) {
+        return false;
+    }
+    std::fs::write(target, contents).is_ok()
+}
+
 // ── Attacker Intelligence & Monthly Reports ────────────────────────
 
 /// `GET /api/attacker-profiles` - list attacker profiles sorted by risk.
@@ -2364,19 +2380,11 @@ async fn api_brain_feedback(
         }
     }
     if found {
-        // Validate path stays within data_dir before writing
-        let data_root = state
-            .data_dir
-            .canonicalize()
-            .unwrap_or_else(|_| state.data_dir.clone());
-        let write_path = data_root.join("brain-log.json");
-        if write_path.starts_with(&data_root) {
-            std::fs::write(
-                &write_path,
-                serde_json::to_string_pretty(&entries).unwrap_or_default(),
-            )
-            .ok();
-        }
+        safe_write_data_file(
+            &state.data_dir,
+            "brain-log.json",
+            &serde_json::to_string_pretty(&entries).unwrap_or_default(),
+        );
     }
 
     Json(serde_json::json!({
