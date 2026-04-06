@@ -8723,10 +8723,42 @@ const INDEX_HTML: &str = r##"<!doctype html>
       ]);
       status.textContent = 'Updated ' + new Date().toLocaleTimeString();
       content.innerHTML = renderStatus(s, col.collectors || []);
+      loadDeepSecurity();
     } catch(e) {
       status.textContent = 'error';
       content.innerHTML = '<div class="empty" style="padding:40px;color:var(--danger)">Failed: ' + esc(String(e.message)) + '</div>';
     }
+  }
+
+  async function loadDeepSecurity() {
+    try {
+      const ds = await loadJson('/api/deep-security');
+      const fw = document.querySelector('#ds-firmware .deep-value');
+      const hv = document.querySelector('#ds-hypervisor .deep-value');
+      const kc = document.querySelector('#ds-killchain .deep-value');
+      const dn = document.querySelector('#ds-dna .deep-value');
+      if (fw) {
+        if (ds.firmware_trust_score != null) {
+          const pct = (ds.firmware_trust_score*100).toFixed(0);
+          fw.innerHTML = '<span style="color:' + (pct >= 85 ? 'var(--ok)' : pct >= 50 ? 'var(--warn)' : 'var(--danger)') + '">' + pct + '% trust</span>';
+        } else { fw.innerHTML = '<span style="color:var(--ok)">Active</span>'; }
+      }
+      if (hv) {
+        const env = ds.hypervisor_environment || 'Detecting…';
+        const col = env.includes('BareMetal') ? 'var(--ok)' : env.includes('Virtual') ? 'var(--accent)' : 'var(--muted)';
+        hv.innerHTML = '<span style="color:' + col + '">' + env.replace(/[{}"]/g,'').replace(/hypervisor:\\s*/,'').trim() + '</span>';
+      }
+      if (kc) {
+        kc.innerHTML = '<span style="color:var(--text)">' + ds.killchain_pids_tracked + ' tracked</span>' +
+          (ds.killchain_full_matches > 0 ? ' · <span style="color:var(--danger)">' + ds.killchain_full_matches + ' detected</span>' : '') +
+          (ds.killchain_pre_chains > 0 ? ' · <span style="color:var(--warn)">' + ds.killchain_pre_chains + ' pre-chain</span>' : '');
+      }
+      if (dn) {
+        dn.innerHTML = '<span style="color:var(--text)">' + ds.dna_fingerprints + ' fingerprints</span>' +
+          (ds.dna_anomaly_alerts > 0 ? ' · <span style="color:var(--warn)">' + ds.dna_anomaly_alerts + ' anomalies</span>' : '') +
+          ' · <span style="color:var(--muted)">' + ds.dna_attack_chains + ' chains</span>';
+      }
+    } catch(e) { console.warn('deep-security:', e); }
   }
 
   function renderStatus(s, collectors) {
@@ -8791,40 +8823,6 @@ const INDEX_HTML: &str = r##"<!doctype html>
       '<div class="deep-card" id="ds-killchain"><div class="deep-icon">⛓️</div><div class="deep-label">Kill Chain</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
       '<div class="deep-card" id="ds-dna"><div class="deep-icon">🧬</div><div class="deep-label">Threat DNA</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
       '</div></div>';
-
-    // Fetch deep security data async (non-blocking)
-    html += `<script>
-    (async function() {
-      try {
-        const ds = await (await fetch('/api/deep-security',{cache:'no-store'})).json();
-        const fw = document.querySelector('#ds-firmware .deep-value');
-        const hv = document.querySelector('#ds-hypervisor .deep-value');
-        const kc = document.querySelector('#ds-killchain .deep-value');
-        const dn = document.querySelector('#ds-dna .deep-value');
-        if (fw) {
-          if (ds.firmware_trust_score != null) {
-            const pct = (ds.firmware_trust_score*100).toFixed(0);
-            fw.innerHTML = '<span style="color:' + (pct >= 85 ? 'var(--ok)' : pct >= 50 ? 'var(--warn)' : 'var(--danger)') + '">' + pct + '% trust</span>';
-          } else { fw.innerHTML = '<span style="color:var(--ok)">Active</span>'; }
-        }
-        if (hv) {
-          const env = ds.hypervisor_environment || 'Detecting…';
-          const col = env.includes('BareMetal') ? 'var(--ok)' : env.includes('Virtual') ? 'var(--accent)' : 'var(--muted)';
-          hv.innerHTML = '<span style="color:' + col + '">' + env.replace(/.*\\(/, '').replace(/[{}"]/g,'').split(',')[0] + '</span>';
-        }
-        if (kc) {
-          kc.innerHTML = '<span style="color:var(--text)">' + ds.killchain_pids_tracked + ' tracked</span>' +
-            (ds.killchain_full_matches > 0 ? ' · <span style="color:var(--danger)">' + ds.killchain_full_matches + ' detected</span>' : '') +
-            (ds.killchain_pre_chains > 0 ? ' · <span style="color:var(--warn)">' + ds.killchain_pre_chains + ' pre-chain</span>' : '');
-        }
-        if (dn) {
-          dn.innerHTML = '<span style="color:var(--text)">' + ds.dna_fingerprints + ' fingerprints</span>' +
-            (ds.dna_anomaly_alerts > 0 ? ' · <span style="color:var(--warn)">' + ds.dna_anomaly_alerts + ' anomalies</span>' : '') +
-            ' · <span style="color:var(--muted)">' + ds.dna_attack_chains + ' chains</span>';
-        }
-      } catch(e) { console.warn('deep-security:', e); }
-    })();
-    </script>`;
 
     // ── Section 2: Active Integrations grid ───────────────────────────────
     const card = (icon, name, on, desc, badgeLabel, kind, costNote, enableCmd) => {
