@@ -1566,7 +1566,7 @@ mod tests {
     #[test]
     fn engine_starts_empty() {
         let engine = CorrelationEngine::new();
-        assert_eq!(engine.rule_count(), 35);
+        assert_eq!(engine.rule_count(), 40);
         assert_eq!(engine.pending_count(), 0);
     }
 
