@@ -88,7 +88,7 @@ impl SuspiciousLoginDetector {
         self.ip_login_hours.entry(ip.clone()).or_default().insert(hour);
 
         // Check for off-hours login (22:00-06:00 UTC)
-        let is_off_hours = hour >= 22 || hour < 6;
+        let is_off_hours = !(6..22).contains(&hour);
 
         // Check for privileged user
         let is_privileged = matches!(user, "root" | "admin" | "ubuntu" | "deploy" | "ansible");
