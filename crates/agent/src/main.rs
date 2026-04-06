@@ -319,6 +319,14 @@ struct AgentState {
     last_narrative_at: Option<std::time::Instant>,
     /// Date for which we last sent the daily Telegram digest (avoids re-sending).
     last_daily_summary_telegram: Option<chrono::NaiveDate>,
+    /// Telegram daily budget: how many immediate notifications sent today.
+    /// Resets when the date changes.
+    telegram_daily_sent: u32,
+    /// Date the daily budget counter applies to.
+    telegram_budget_date: Option<chrono::NaiveDate>,
+    /// Incidents deferred from Telegram (not immediate threats) — accumulated
+    /// per-detector for the daily digest breakdown.
+    telegram_deferred: std::collections::HashMap<String, u32>,
     /// Telegram client for T.1 notifications and T.2 approvals (None when disabled).
     telegram_client: Option<Arc<telegram::TelegramClient>>,
     /// Pending T.2 operator confirmations keyed by incident_id.
@@ -887,6 +895,9 @@ async fn main() -> Result<()> {
         },
         last_narrative_at: load_last_narrative_instant(&cli.data_dir),
         last_daily_summary_telegram: None,
+        telegram_daily_sent: 0,
+        telegram_budget_date: None,
+        telegram_deferred: HashMap::new(),
         telegram_client,
         pending_confirmations: HashMap::new(),
         approval_rx: None, // set below in continuous mode
@@ -1233,6 +1244,7 @@ async fn main() -> Result<()> {
                             let tg_summaries: Vec<String> = summaries
                                 .iter()
                                 .filter(|s| notification_pipeline::should_notify_summary(s, tg_level))
+                                .filter(|s| notification_pipeline::is_immediate_threat_summary(s))
                                 .map(|s| s.format_html())
                                 .collect();
                             if !tg_summaries.is_empty() {
@@ -1578,6 +1590,7 @@ async fn main() -> Result<()> {
                             let tg_summaries: Vec<String> = summaries
                                 .iter()
                                 .filter(|s| notification_pipeline::should_notify_summary(s, tg_level))
+                                .filter(|s| notification_pipeline::is_immediate_threat_summary(s))
                                 .map(|s| s.format_html())
                                 .collect();
                             if !tg_summaries.is_empty() {
@@ -2789,6 +2802,9 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(data_dir).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
@@ -3041,6 +3057,9 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
@@ -3188,6 +3207,9 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
@@ -3310,6 +3332,9 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
@@ -3444,6 +3469,9 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
@@ -3555,6 +3583,9 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,
@@ -3678,6 +3709,9 @@ mod tests {
             decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
             last_narrative_at: None,
             last_daily_summary_telegram: None,
+            telegram_daily_sent: 0,
+            telegram_budget_date: None,
+            telegram_deferred: HashMap::new(),
             telegram_client: None,
             pending_confirmations: HashMap::new(),
             approval_rx: None,

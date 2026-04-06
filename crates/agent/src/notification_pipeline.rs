@@ -72,14 +72,38 @@ pub(crate) struct GroupSummary {
 impl GroupSummary {
     /// Format as HTML for Telegram/Slack.
     pub fn format_html(&self) -> String {
-        let status = if self.auto_resolved {
-            " [auto-resolved]"
+        let sev_emoji = match self.severity_max {
+            Severity::Critical => "\u{1f534}", // 🔴
+            Severity::High => "\u{1f7e0}",     // 🟠
+            Severity::Medium => "\u{1f7e1}",   // 🟡
+            _ => "\u{1f7e2}",                  // 🟢
+        };
+        let label = match self.detector.as_str() {
+            "ssh_bruteforce" => "login attempts",
+            "credential_stuffing" => "credential attacks",
+            "port_scan" => "port scans",
+            "packet_flood" => "traffic floods",
+            "discovery_burst" => "recon scans",
+            "reverse_shell" => "reverse shell attempts",
+            "data_exfil" | "data_exfil_cmd" | "data_exfil_ebpf" => "data theft attempts",
+            "suspicious_execution" => "suspicious executions",
+            "web_scan" => "web scans",
+            "rootkit" => "kernel anomalies",
+            _ => &self.detector,
+        };
+        let resolved = if self.auto_resolved {
+            " \u{2014} auto-resolved"
         } else {
             ""
         };
+        let entity_str = if self.entity_value == "unknown" || self.entity_value == "timing" {
+            String::new()
+        } else {
+            format!(" from <code>{}</code>", self.entity_value)
+        };
         format!(
-            "📊 <b>{}</b>: {} incidents from {} <code>{}</code> ({:?}){status}",
-            self.detector, self.count, entity_type_label(&self.entity_type), self.entity_value, self.severity_max,
+            "{sev_emoji} <b>{}</b> {label}{entity_str}{resolved}",
+            self.count,
         )
     }
 }
@@ -298,6 +322,71 @@ fn filter_by_level(level: ChannelFilterLevel, severity: &Severity, auto_resolved
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Immediate-threat classification (Telegram gate)
+// ---------------------------------------------------------------------------
+
+/// Detectors that represent a real, active threat requiring the operator's
+/// immediate attention.  Everything else is informational / auto-handled and
+/// belongs in the daily digest — not an individual Telegram notification.
+const IMMEDIATE_THREAT_DETECTORS: &[&str] = &[
+    "reverse_shell",
+    "data_exfil",
+    "data_exfil_cmd",
+    "data_exfil_ebpf",
+    "ransomware",
+    "privesc",
+    "lateral_movement",
+    "container_escape",
+    "web_shell",
+    "process_injection",
+    "fileless",
+    "c2_callback",
+    "credential_harvest",
+    "ssh_key_injection",
+    "kernel_module_load",
+    "log_tampering",
+    "dns_tunneling",
+    "dns_tunneling_ebpf",
+    "crontab_persistence",
+    "systemd_persistence",
+];
+
+/// Returns `true` when this incident represents an active threat that warrants
+/// an immediate Telegram notification.  Critical severity always qualifies
+/// regardless of detector.
+pub(crate) fn is_immediate_threat(incident: &Incident) -> bool {
+    // Critical is always immediate — no exceptions.
+    if matches!(incident.severity, Severity::Critical) {
+        return true;
+    }
+
+    let detector = incident
+        .incident_id
+        .split(':')
+        .next()
+        .unwrap_or("unknown");
+
+    is_immediate_threat_detector(detector)
+}
+
+/// Returns `true` when this detector name represents an immediate threat.
+/// Used for both incidents and group summaries.
+pub(crate) fn is_immediate_threat_detector(detector: &str) -> bool {
+    IMMEDIATE_THREAT_DETECTORS
+        .iter()
+        .any(|d| detector == *d)
+}
+
+/// Returns `true` when a group summary warrants an immediate Telegram
+/// notification.  Non-threat detectors go to daily digest only.
+pub(crate) fn is_immediate_threat_summary(summary: &GroupSummary) -> bool {
+    if matches!(summary.severity_max, Severity::Critical) {
+        return true;
+    }
+    is_immediate_threat_detector(&summary.detector)
 }
 
 // ---------------------------------------------------------------------------
@@ -842,5 +931,72 @@ mod tests {
         assert!(filter_by_level(cfg.notification_level, &Severity::Low, false));
         assert!(filter_by_level(cfg.notification_level, &Severity::High, false));
         assert!(filter_by_level(cfg.notification_level, &Severity::Critical, false));
+    }
+
+    // -- Immediate threat classification tests --
+
+    #[test]
+    fn reverse_shell_is_immediate_threat() {
+        let inc = make_incident("reverse_shell", "1.2.3.4", Severity::High);
+        assert!(is_immediate_threat(&inc));
+    }
+
+    #[test]
+    fn data_exfil_is_immediate_threat() {
+        let inc = make_incident("data_exfil", "1.2.3.4", Severity::High);
+        assert!(is_immediate_threat(&inc));
+        let inc2 = make_incident("data_exfil_ebpf", "1.2.3.4", Severity::High);
+        assert!(is_immediate_threat(&inc2));
+    }
+
+    #[test]
+    fn ransomware_is_immediate_threat() {
+        let inc = make_incident("ransomware", "1.2.3.4", Severity::High);
+        assert!(is_immediate_threat(&inc));
+    }
+
+    #[test]
+    fn ssh_bruteforce_is_not_immediate_threat() {
+        let inc = make_incident("ssh_bruteforce", "1.2.3.4", Severity::High);
+        assert!(!is_immediate_threat(&inc));
+    }
+
+    #[test]
+    fn discovery_burst_is_not_immediate_threat() {
+        let inc = make_incident("discovery_burst", "1.2.3.4", Severity::Medium);
+        assert!(!is_immediate_threat(&inc));
+    }
+
+    #[test]
+    fn suspicious_execution_is_not_immediate_threat() {
+        let inc = make_incident("suspicious_execution", "unknown", Severity::Low);
+        assert!(!is_immediate_threat(&inc));
+    }
+
+    #[test]
+    fn packet_flood_is_not_immediate_threat() {
+        let inc = make_incident("packet_flood", "10.0.0.1", Severity::High);
+        assert!(!is_immediate_threat(&inc));
+    }
+
+    #[test]
+    fn critical_severity_always_immediate() {
+        // Even a "noisy" detector becomes immediate at Critical severity.
+        let inc = make_incident("ssh_bruteforce", "1.2.3.4", Severity::Critical);
+        assert!(is_immediate_threat(&inc));
+    }
+
+    #[test]
+    fn port_scan_is_not_immediate_threat() {
+        let inc = make_incident("port_scan", "5.6.7.8", Severity::Medium);
+        assert!(!is_immediate_threat(&inc));
+    }
+
+    #[test]
+    fn persistence_detectors_are_immediate() {
+        let inc1 = make_incident("crontab_persistence", "unknown", Severity::High);
+        assert!(is_immediate_threat(&inc1));
+        let inc2 = make_incident("systemd_persistence", "unknown", Severity::High);
+        assert!(is_immediate_threat(&inc2));
     }
 }

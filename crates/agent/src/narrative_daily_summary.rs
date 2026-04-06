@@ -96,6 +96,10 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                                 .map(|(d, c)| (d.as_str(), *c))
                                 .unwrap_or(("none", 0));
                             let pipeline_stats = state.grouping_engine.drain_digest_stats();
+                            // Drain deferred incidents for digest breakdown.
+                            let mut deferred: Vec<(String, u32)> =
+                                state.telegram_deferred.drain().collect();
+                            deferred.sort_by(|a, b| b.1.cmp(&a.1));
                             let text = telegram::format_daily_digest_enriched(
                                 incidents_today,
                                 blocks_today,
@@ -108,6 +112,7 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                                     suppressed_count: pipeline_stats.suppressed_count,
                                     auto_resolved_groups: pipeline_stats.auto_resolved_groups,
                                     needs_review_groups: pipeline_stats.needs_review_groups,
+                                    deferred,
                                 },
                             );
                             match tg.send_text_message(&text).await {

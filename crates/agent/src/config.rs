@@ -923,6 +923,12 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub daily_summary_hour: Option<u8>,
 
+    /// Maximum Telegram notifications per day (default: 10).
+    /// Only immediate threats count against the budget. Critical severity
+    /// always breaks the budget. Everything else goes to the daily digest.
+    #[serde(default = "default_telegram_daily_budget")]
+    pub daily_budget: u32,
+
     /// Dev mode: adds a "Check FP" button to every notification.
     /// When pressed, logs the incident to a false-positive review file
     /// for later analysis. Useful for tuning detectors.
@@ -1014,6 +1020,7 @@ impl Default for TelegramConfig {
             dashboard_url: String::new(),
             approval_ttl_secs: default_telegram_approval_ttl_secs(),
             daily_summary_hour: None,
+            daily_budget: default_telegram_daily_budget(),
             dev_mode: false,
             user_profile: default_user_profile(),
             bot: TelegramBotConfig::default(),
@@ -1594,6 +1601,10 @@ fn default_crowdsec_max_per_sync() -> usize {
 
 fn default_telegram_approval_ttl_secs() -> u64 {
     600
+}
+
+fn default_telegram_daily_budget() -> u32 {
+    10
 }
 
 fn default_user_profile() -> String {
