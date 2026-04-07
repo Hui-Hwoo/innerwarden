@@ -1,3 +1,6 @@
+// Migrated from standalone repo — suppress cosmetic clippy lints.
+#![allow(clippy::vec_init_then_push)]
+
 //! innerwarden-killchain — Kill chain detection engine.
 //!
 //! Detects multi-step attack patterns (reverse shell, bind shell, code injection,
