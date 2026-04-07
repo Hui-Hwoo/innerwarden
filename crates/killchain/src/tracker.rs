@@ -468,6 +468,7 @@ fn missing_flag_names(current_flags: u32, pattern_mask: u32) -> Vec<&'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
     use serde_json::json;
 
     fn ts() -> String {
