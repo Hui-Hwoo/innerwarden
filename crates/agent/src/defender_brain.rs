@@ -69,6 +69,8 @@ pub struct BrainLogEntry {
     pub agreed: bool,
     /// Operator feedback: None = unreviewed, true = correct, false = FP.
     pub feedback: Option<bool>,
+    /// The 72-dim feature vector used for this decision (for offline training).
+    pub features: Vec<f32>,
 }
 
 /// History of brain suggestions (ring buffer, last N).

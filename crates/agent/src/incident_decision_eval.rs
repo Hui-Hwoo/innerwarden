@@ -113,6 +113,7 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
                 ai_confidence: decision.confidence,
                 agreed: brain_agrees,
                 feedback: None,
+                features: features.to_vec(),
             };
 
             // Persist to file for dashboard access
@@ -123,9 +124,9 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
                 .unwrap_or_default();
             if let Ok(v) = serde_json::to_value(&log_entry) {
                 entries.push(v);
-                // Keep last 500 entries
-                if entries.len() > 500 {
-                    entries.drain(0..entries.len() - 500);
+                // Keep last 10000 entries (includes features for training)
+                if entries.len() > 10000 {
+                    entries.drain(0..entries.len() - 10000);
                 }
                 if let Err(e) = std::fs::write(
                     &log_path,
