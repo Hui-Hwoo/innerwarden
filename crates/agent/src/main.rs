@@ -84,6 +84,7 @@ mod reader;
 mod redis_reader;
 mod report;
 mod scoring;
+mod shield_inline;
 mod skills;
 mod slack;
 mod state_store;
@@ -436,6 +437,8 @@ struct AgentState {
     last_killchain_cleanup: std::time::Instant,
     /// Threat DNA engine — behavioral fingerprinting, anomaly detection, attack chain tracking.
     dna_state: dna_inline::DnaState,
+    /// DDoS Shield engine — rate limiting, SYN tracking, escalation, XDP blocking.
+    shield_state: Option<shield_inline::ShieldState>,
     /// Shared deep security snapshot for dashboard API.
     deep_security_snapshot:
         Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
@@ -1055,6 +1058,15 @@ async fn main() -> Result<()> {
             cfg.dna.anomaly_threshold,
             cfg.dna.session_timeout_secs,
         ),
+        shield_state: if cfg.shield.enabled {
+            Some(shield_inline::ShieldState::new(
+                &cli.data_dir.join("shield"),
+                &cfg.shield.bpf_path,
+                cfg.shield.dry_run,
+            ))
+        } else {
+            None
+        },
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
         operator_ips: std::collections::HashMap::new(),
@@ -2860,6 +2872,13 @@ async fn process_narrative_tick(
         }
     }
 
+    // Feed events through DDoS shield (rate limiting, SYN tracking, escalation).
+    if let Some(ref mut shield) = state.shield_state {
+        let (_drops, shield_incidents) = shield_inline::process_events(shield, &events_entries);
+        shield_inline::write_incidents(data_dir, &shield_incidents);
+        shield_inline::notify_telegram(&state.telegram_client, &shield_incidents);
+    }
+
     narrative_anomaly::process_anomalies(data_dir, &today, &events_entries, state);
 
     narrative_incident_ingest::ingest_new_incidents(data_dir, &today, state)?;
@@ -3099,6 +3118,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3373,6 +3393,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3542,6 +3563,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3686,6 +3708,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3842,6 +3865,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3975,6 +3999,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -4120,6 +4145,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
