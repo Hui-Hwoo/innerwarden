@@ -111,10 +111,12 @@ fn measure_privileged_instruction(iterations: usize) -> Vec<u64> {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             // CPUID causes a mandatory VM exit.
+            // rbx is reserved by LLVM — save/restore manually around CPUID.
             std::arch::asm!(
+                "push rbx",
                 "cpuid",
+                "pop rbx",
                 inout("eax") 0x40000000u32 => _,
-                out("ebx") _,
                 out("ecx") _,
                 out("edx") _,
                 options(nostack),
