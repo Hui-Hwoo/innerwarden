@@ -3,7 +3,7 @@
 //! pre-chain warnings and full-match incidents.
 
 use std::collections::HashMap;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
