@@ -1711,30 +1711,48 @@ async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResp
         .collect();
     let reputation_map = load_ip_reputation_map(&state.data_dir);
 
-    // Public feed: filter out system daemon privesc (legitimate setuid) and
-    // Inner Warden's own operations. These are noise, not attacks.
+    // Public feed: only show real external attacks (with attacker IP).
+    // Filter out internal detections, system noise, and advisory-only detectors.
     let is_internal = |inc: &Incident| -> bool {
+        let det = inc.incident_id.split(':').next().unwrap_or("");
+        // Advisory-only detectors (observe, never block)
+        if matches!(
+            det,
+            "neural_anomaly" | "host_drift" | "network_sniffing" | "discovery_burst"
+        ) {
+            return true;
+        }
+        // No external IP = internal noise
+        if !inc
+            .entities
+            .iter()
+            .any(|e| e.r#type == EntityType::Ip)
+        {
+            return true;
+        }
         let t = inc.title.to_lowercase();
         // Inner Warden processes doing setuid for skills
-        t.contains("(en-agent)") || t.contains("(n-shield)")
-            || t.contains("(en-sensor)") || t.contains("innerwarden")
-        // System daemons that legitimately do setuid
-            || t.contains("(timesyncd)") // systemd-timesyncd
-            || t.contains("(systemd")   // any systemd process
-            || t.contains("(networkd)")  // systemd-networkd
-            || t.contains("(resolved)")  // systemd-resolved
-            || t.contains("(sshd)")     // sshd privilege separation
-            || t.contains("(cron)")     // cron running as root
-            || t.contains("(polkitd)")  // polkit auth
-            || t.contains("(dbus-daem") // dbus
-            || t.contains("(login)")    // login process
-            || t.contains("(su)")       // su command
-            || t.contains("(sudo)")     // sudo command
-            || t.contains("(pkexec)")   // polkit exec
-            || t.contains("(fwupdmgr)") // firmware update manager
-            || t.contains("(mandb)")    // man-db cache rebuild
-            || t.contains("(find)")     // find in cron jobs
-            || t.contains("(install)") // install command (package managers)
+        t.contains("(en-agent)")
+            || t.contains("(n-shield)")
+            || t.contains("(en-sensor)")
+            || t.contains("innerwarden")
+            // System daemons that legitimately do setuid
+            || t.contains("(timesyncd)")
+            || t.contains("(systemd")
+            || t.contains("(networkd)")
+            || t.contains("(resolved)")
+            || t.contains("(sshd)")
+            || t.contains("(cron)")
+            || t.contains("(polkitd)")
+            || t.contains("(dbus-daem")
+            || t.contains("(login)")
+            || t.contains("(su)")
+            || t.contains("(sudo)")
+            || t.contains("(pkexec)")
+            || t.contains("(fwupdmgr)")
+            || t.contains("(mandb)")
+            || t.contains("(find)")
+            || t.contains("(install)")
     };
 
     // Filter real attacks only (exclude internal noise) for consistent stats.
