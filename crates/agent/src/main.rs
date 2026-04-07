@@ -440,6 +440,8 @@ struct AgentState {
     deep_security_snapshot: Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
     /// Timestamp of last DNA state persistence.
     last_dna_save: std::time::Instant,
+    /// IPs of active operator SSH sessions (trusted_users). Never blocked.
+    operator_ips: std::collections::HashSet<String>,
     /// Suppressed incident patterns (user-configurable via CLI/dashboard).
     suppressed_incident_ids: std::collections::HashSet<String>,
     /// Threat feed client for external intelligence (None when disabled).
@@ -1051,6 +1053,7 @@ async fn main() -> Result<()> {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
+        operator_ips: std::collections::HashSet::new(),
         suppressed_incident_ids: firmware_tick::load_suppressed_ids(&cli.data_dir),
         threat_feed: None, // initialized below if configured
         last_baseline_anomaly_ts: None,
@@ -1059,6 +1062,24 @@ async fn main() -> Result<()> {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
     };
+
+    // Seed operator IPs from active SSH sessions (who -i).
+    if let Ok(output) = std::process::Command::new("who").arg("-i").output() {
+        let who_out = String::from_utf8_lossy(&output.stdout);
+        for line in who_out.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let (Some(user), Some(ip_raw)) = (parts.first(), parts.last()) {
+                let ip = ip_raw.trim_matches(|c| c == '(' || c == ')');
+                if cfg.allowlist.trusted_users.iter().any(|u| u == *user)
+                    && !ip.is_empty()
+                    && ip != ":"
+                {
+                    state.operator_ips.insert(ip.to_string());
+                    info!(user, ip, "startup: operator session detected");
+                }
+            }
+        }
+    }
 
     // Load attacker intelligence profiles from persistent store
     state.attacker_profiles = attacker_intel::load_from_store(&state.store);
@@ -2711,6 +2732,29 @@ async fn process_narrative_tick(
 
     state.telemetry.observe_events(&events_entries);
 
+    // Track operator IPs: when a trusted user logs in via SSH, whitelist their IP.
+    for ev in &events_entries {
+        if ev.kind == "ssh.login_success"
+            || ev.kind == "auth.login_success"
+            || ev.kind == "auth.session_opened"
+        {
+            if let Some(user) = ev.details.get("user").and_then(|v| v.as_str()) {
+                if cfg.allowlist.trusted_users.iter().any(|u| u == user) {
+                    let ip = ev
+                        .details
+                        .get("ip")
+                        .or_else(|| ev.details.get("src_ip"))
+                        .and_then(|v| v.as_str());
+                    if let Some(ip) = ip {
+                        if state.operator_ips.insert(ip.to_string()) {
+                            info!(user, ip, "operator session detected — IP whitelisted");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Feed new events into the narrative accumulator (incremental, no file re-read)
     state.narrative_acc.reset_for_date(&today);
     state.narrative_acc.ingest_events(&events_entries);
@@ -2999,7 +3043,8 @@ mod tests {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3269,7 +3314,8 @@ mod tests {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3434,7 +3480,8 @@ mod tests {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3574,7 +3621,8 @@ mod tests {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3726,7 +3774,8 @@ mod tests {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3855,7 +3904,8 @@ mod tests {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3996,7 +4046,8 @@ mod tests {
         ),
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: None,
-            suppressed_incident_ids: std::collections::HashSet::new(),
+            operator_ips: std::collections::HashSet::new(),
+        suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
