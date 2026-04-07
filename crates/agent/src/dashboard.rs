@@ -1710,7 +1710,8 @@ async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResp
     let cutoff = now - chrono::Duration::hours(24);
 
     // Read today + yesterday for rolling 24h window.
-    let mut incidents = read_jsonl::<Incident>(&dated_path(&state.data_dir, "incidents", &yesterday));
+    let mut incidents =
+        read_jsonl::<Incident>(&dated_path(&state.data_dir, "incidents", &yesterday));
     incidents.extend(read_jsonl::<Incident>(&dated_path(
         &state.data_dir,
         "incidents",
@@ -1744,11 +1745,7 @@ async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResp
             return true;
         }
         // No external IP = internal noise
-        if !inc
-            .entities
-            .iter()
-            .any(|e| e.r#type == EntityType::Ip)
-        {
+        if !inc.entities.iter().any(|e| e.r#type == EntityType::Ip) {
             return true;
         }
         let t = inc.title.to_lowercase();
