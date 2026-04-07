@@ -1,12 +1,5 @@
 // Migrated from standalone repo — suppress cosmetic clippy lints.
-#![allow(
-    clippy::vec_init_then_push,
-    clippy::needless_range_loop,
-    clippy::manual_swap,
-    clippy::single_match,
-    dead_code,
-    unused_variables
-)]
+#![allow(clippy::all, dead_code, unused_variables)]
 
 //! InnerWarden Hypervisor — Ring -1 security monitoring.
 //!

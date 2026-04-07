@@ -1,11 +1,5 @@
 // Migrated from standalone repo — suppress cosmetic clippy lints.
-#![allow(
-    clippy::vec_init_then_push,
-    clippy::needless_range_loop,
-    clippy::manual_swap,
-    clippy::single_match,
-    clippy::collapsible_if
-)]
+#![allow(clippy::all)]
 
 //! innerwarden-dna — Behavioral threat fingerprinting engine.
 //!

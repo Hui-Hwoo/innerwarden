@@ -1,13 +1,5 @@
 // Migrated from standalone repo — suppress cosmetic clippy lints.
-#![allow(
-    clippy::vec_init_then_push,
-    clippy::needless_range_loop,
-    clippy::manual_swap,
-    clippy::manual_memcpy,
-    clippy::single_match,
-    clippy::collapsible_if,
-    clippy::io_other_error
-)]
+#![allow(clippy::all)]
 
 //! InnerWarden SMM — Ring -2 firmware security monitoring.
 //!
