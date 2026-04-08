@@ -94,6 +94,7 @@ pub struct BrainStats {
     pub today_total: u64,
 }
 
+#[allow(dead_code)]
 impl BrainStats {
     pub fn load(data_dir: &std::path::Path) -> Self {
         let path = data_dir.join("brain-stats.json");
