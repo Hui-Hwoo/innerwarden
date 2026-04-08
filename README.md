@@ -56,14 +56,15 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 <p align="center">
   <a href="https://innerwarden.com/live">
-    <img src="docs/images/live-attack.png" alt="Live threat feed" width="820">
+    <img src="docs/images/innerwarden-demo.gif" alt="InnerWarden dashboard demo — sensors, threats, investigation, attacker intelligence" width="820">
   </a>
-  <br>
-  <sub><a href="https://innerwarden.com/live"><strong>See it responding to real attacks right now</strong></a></sub>
 </p>
-<p align="center">
-  <img src="docs/images/innerwarden-demo.gif" alt="InnerWarden dashboard demo — sensors, threats, investigation, attacker intelligence" width="820">
-</p>
+
+<h3 align="center">
+  <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
+  &nbsp;·&nbsp;
+  <a href="https://vimeo.com/1175992244">3-minute explainer video</a>
+</h3>
 
 https://github.com/user-attachments/assets/b55967a6-a2d0-4158-9007-05e689d5bf0c
 
