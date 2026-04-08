@@ -83,6 +83,7 @@ mod reader;
 #[cfg(feature = "redis-reader")]
 mod redis_reader;
 mod report;
+mod response_lifecycle;
 mod scoring;
 mod shield_inline;
 mod skills;
@@ -391,6 +392,9 @@ struct AgentState {
     /// XDP blocklist entries with timestamps and per-IP TTL for adaptive expiration.
     /// Periodically cleaned: IPs older than their individual TTL are removed.
     xdp_block_times: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)>,
+    /// Unified response lifecycle: tracks all active responses (block IP, container,
+    /// nginx, sudo) with TTL, auto-revert, manual revert, and Prometheus metrics.
+    response_lifecycle: response_lifecycle::ResponseLifecycle,
     /// AbuseIPDB report queue - IPs are held for ABUSEIPDB_REPORT_DELAY_SECS
     /// before reporting, giving time for false-positive correction.
     abuseipdb_report_queue: Vec<(String, String, String, chrono::DateTime<chrono::Utc>)>,
@@ -1034,6 +1038,7 @@ async fn main() -> Result<()> {
         },
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
+        response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
         narrative_incidents_offset: 0,
@@ -1426,6 +1431,27 @@ async fn main() -> Result<()> {
                                 info!(ip, ttl_secs, "XDP adaptive TTL expired - removed from blocklist");
                             }
                             state.xdp_block_times.remove(ip);
+                        }
+                    }
+
+                    // ── Response Lifecycle: unified TTL cleanup ──
+                    // Handles auto-revert for ufw, iptables, nftables (backends that
+                    // didn't have TTL before). XDP/container/nginx/sudo still use
+                    // their existing cleanup above; the lifecycle tracks them for
+                    // dashboard visibility.
+                    {
+                        let reverts = state.response_lifecycle.tick_cleanup();
+                        for revert in &reverts {
+                            response_lifecycle::execute_revert(revert, cfg.responder.dry_run).await;
+                        }
+                        if !reverts.is_empty() {
+                            info!(count = reverts.len(), "response lifecycle: reverted expired responses");
+                        }
+                        // Persist snapshot for dashboard /api/responses endpoint.
+                        let json = state.response_lifecycle.to_json();
+                        let path = cli.data_dir.join("responses.json");
+                        if let Ok(data) = serde_json::to_string(&json) {
+                            let _ = tokio::fs::write(&path, data).await;
                         }
                     }
 
@@ -3099,6 +3125,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3376,6 +3403,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3548,6 +3576,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3695,6 +3724,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3854,6 +3884,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -3990,6 +4021,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,
@@ -4138,6 +4170,7 @@ mod tests {
             mesh: None,
             recent_blocks: std::collections::VecDeque::new(),
             xdp_block_times: HashMap::new(),
+            response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
             abuseipdb_report_queue: Vec::new(),
             narrative_acc: NarrativeAccumulator::default(),
             narrative_incidents_offset: 0,

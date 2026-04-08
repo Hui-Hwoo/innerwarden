@@ -976,6 +976,7 @@ pub async fn serve(
         .route("/api/correlation-chains", get(api_correlation_chains))
         .route("/api/baseline-status", get(api_baseline_status))
         .route("/api/playbook-log", get(api_playbook_log))
+        .route("/api/responses", get(api_responses))
         // Defender Brain (AlphaZero)
         .route("/api/defender-brain/recent", get(api_brain_recent))
         .route("/api/defender-brain/stats", get(api_brain_stats))
@@ -4802,11 +4803,58 @@ async fn api_prometheus_metrics(State(state): State<DashboardState>) -> axum::re
         ));
     }
 
+    // Response lifecycle metrics (from responses.json snapshot).
+    let responses_path = state.data_dir.join("responses.json");
+    if let Ok(data) = std::fs::read_to_string(&responses_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+            out.push_str("# HELP innerwarden_responses_active Currently active response actions\n");
+            out.push_str("# TYPE innerwarden_responses_active gauge\n");
+            if let Some(count) = json["active_count"].as_u64() {
+                out.push_str(&format!("innerwarden_responses_active {count}\n"));
+            }
+            out.push_str("# HELP innerwarden_responses_total Total response actions registered\n");
+            out.push_str("# TYPE innerwarden_responses_total counter\n");
+            if let Some(count) = json["totals"]["registered"].as_u64() {
+                out.push_str(&format!("innerwarden_responses_total {count}\n"));
+            }
+            out.push_str("# HELP innerwarden_responses_expired_total Responses expired by TTL\n");
+            out.push_str("# TYPE innerwarden_responses_expired_total counter\n");
+            if let Some(count) = json["totals"]["expired"].as_u64() {
+                out.push_str(&format!("innerwarden_responses_expired_total {count}\n"));
+            }
+            out.push_str("# HELP innerwarden_responses_reverted_total Responses manually reverted\n");
+            out.push_str("# TYPE innerwarden_responses_reverted_total counter\n");
+            if let Some(count) = json["totals"]["reverted"].as_u64() {
+                out.push_str(&format!("innerwarden_responses_reverted_total {count}\n"));
+            }
+        }
+    }
+
     axum::response::Response::builder()
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
         .body(Body::from(out))
         .unwrap()
         .into_response()
+}
+
+/// GET /api/responses — active and historical response actions with TTL.
+async fn api_responses(State(state): State<DashboardState>) -> axum::response::Response {
+    let responses_path = state.data_dir.join("responses.json");
+    match std::fs::read_to_string(&responses_path) {
+        Ok(data) => axum::response::Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(data))
+            .unwrap()
+            .into_response(),
+        Err(_) => {
+            let empty = serde_json::json!({"active": [], "active_count": 0, "history": [], "totals": {"registered": 0, "expired": 0, "reverted": 0}});
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&empty).unwrap()))
+                .unwrap()
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
