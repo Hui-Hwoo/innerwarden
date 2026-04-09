@@ -5225,6 +5225,34 @@ fn build_pivots_from_graph(
         PivotKind::Detector => NodeType::Incident, // group by detector
     };
 
+    // Identify the host's own IPs to exclude from attacker pivots
+    let host_ips: std::collections::HashSet<String> = graph
+        .nodes_of_type(NodeType::System)
+        .iter()
+        .flat_map(|&id| {
+            // The system node's hostname; also collect IPs marked internal
+            // that have only outgoing Resolved/dns edges (self-generated traffic)
+            std::iter::once(graph.get_node(id).map(|n| n.label()).unwrap_or_default())
+        })
+        .chain(
+            graph.nodes_of_type(NodeType::Ip).iter().filter_map(|&id| {
+                if let Some(crate::knowledge_graph::types::Node::Ip { addr, is_internal: true, .. }) = graph.get_node(id) {
+                    // Internal IPs that only appear as source in DNS/connect (not as attack target)
+                    let incoming_attacks = graph.incoming_edges(id).iter().any(|e| {
+                        matches!(e.relation, Relation::TriggeredBy)
+                    });
+                    if !incoming_attacks {
+                        Some(addr.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }),
+        )
+        .collect();
+
     if group_by == PivotKind::Detector {
         // Group incidents by detector
         let mut by_det: std::collections::HashMap<String, Vec<&Node>> = std::collections::HashMap::new();
@@ -5268,9 +5296,14 @@ fn build_pivots_from_graph(
             }
             if let Some(node) = graph.get_node(edge.to) {
                 if node.node_type() == node_type {
+                    let label = node.label();
+                    // Skip host's own IPs — they're the victim, not the attacker
+                    if node_type == NodeType::Ip && host_ips.contains(&label) {
+                        continue;
+                    }
                     pivot_data
                         .entry(edge.to)
-                        .or_insert_with(|| (node.label(), Vec::new()))
+                        .or_insert_with(|| (label, Vec::new()))
                         .1
                         .push(inc_id);
                 }
