@@ -2709,7 +2709,7 @@ async fn api_overview(
     Query(query): Query<ListQuery>,
 ) -> Json<OverviewResponse> {
     let date = resolve_date(query.date.as_deref());
-    // When sleeping, return minimal data from telemetry only (no JSONL reads)
+    // When sleeping, return minimal data from telemetry only
     if is_dashboard_sleeping(&state.last_activity) {
         return Json(OverviewResponse {
             date: date.clone(),
@@ -2723,7 +2723,56 @@ async fn api_overview(
             latest_telemetry: crate::telemetry::read_latest_snapshot(&state.data_dir, &date),
         });
     }
-    Json(compute_overview(&state.data_dir, &date))
+
+    // Read from knowledge graph (live) instead of JSONL
+    let graph = state.knowledge_graph.read().unwrap();
+    let metrics = graph.metrics();
+
+    // Count decisions from Incident nodes
+    use crate::knowledge_graph::types::{Node, NodeType};
+    let incident_nodes = graph.nodes_of_type(NodeType::Incident);
+    let mut by_detector: BTreeMap<String, usize> = BTreeMap::new();
+    let mut decisions_count = 0usize;
+    let mut ai_confirmed = 0usize;
+    let mut ai_responded = 0usize;
+    let mut ai_ignored = 0usize;
+
+    for &id in &incident_nodes {
+        if let Some(Node::Incident { detector, decision, .. }) = graph.get_node(id) {
+            *by_detector.entry(detector.clone()).or_insert(0) += 1;
+            if let Some(dec) = decision {
+                decisions_count += 1;
+                match dec.as_str() {
+                    "ignore" => ai_ignored += 1,
+                    "monitor" => ai_confirmed += 1,
+                    _ => {
+                        ai_confirmed += 1;
+                        ai_responded += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut top_detectors: Vec<DetectorCount> = by_detector
+        .into_iter()
+        .map(|(detector, count)| DetectorCount { detector, count })
+        .collect();
+    top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
+    top_detectors.truncate(6);
+
+    let telemetry = crate::telemetry::read_latest_snapshot(&state.data_dir, &date);
+    Json(OverviewResponse {
+        date,
+        events_count: metrics.edge_count, // edges ≈ events (each event creates edges)
+        incidents_count: incident_nodes.len(),
+        decisions_count,
+        ai_confirmed,
+        ai_responded,
+        ai_ignored,
+        top_detectors,
+        latest_telemetry: telemetry,
+    })
 }
 
 async fn api_incidents(
@@ -2732,61 +2781,70 @@ async fn api_incidents(
 ) -> Json<IncidentListResponse> {
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
-    let path = dated_path(&state.data_dir, "incidents", &date);
-    let mut incidents = read_jsonl::<innerwarden_core::incident::Incident>(&path);
-    incidents.sort_by(|a, b| b.ts.cmp(&a.ts));
 
-    // Load decisions to cross-reference outcomes
-    let decisions = read_jsonl::<DecisionEntry>(&dated_path(&state.data_dir, "decisions", &date));
-    let decision_map: std::collections::HashMap<String, &DecisionEntry> = decisions
+    // Read from knowledge graph (live)
+    use crate::knowledge_graph::types::{Node, NodeType};
+    let graph = state.knowledge_graph.read().unwrap();
+
+    let mut incident_views: Vec<IncidentView> = graph
+        .nodes_of_type(NodeType::Incident)
         .iter()
-        .map(|d| (d.incident_id.clone(), d))
-        .collect();
+        .filter_map(|&id| {
+            if let Some(Node::Incident {
+                incident_id,
+                detector: _,
+                severity,
+                title,
+                summary,
+                ts,
+                mitre_ids,
+                decision,
+                confidence: _,
+            }) = graph.get_node(id)
+            {
+                // Collect entities from TriggeredBy edges
+                let entities: Vec<String> = graph
+                    .outgoing_edges(id)
+                    .iter()
+                    .filter(|e| e.relation == crate::knowledge_graph::types::Relation::TriggeredBy)
+                    .filter_map(|e| graph.get_node(e.to).map(|n| {
+                        let ntype = format!("{:?}", n.node_type()).to_lowercase();
+                        format!("{}:{}", ntype, n.label())
+                    }))
+                    .collect();
 
-    let total = incidents.len();
-    let items = incidents
-        .into_iter()
-        .take(limit)
-        .map(|inc| {
-            let (outcome, action_taken) = if let Some(d) = decision_map.get(&inc.incident_id) {
-                let outcome = match d.action_type.as_str() {
-                    "block_ip" => "blocked",
-                    "suspend_user_sudo" => "suspended",
-                    "kill_process" => "killed",
-                    "block_container" => "contained",
-                    "monitor" => "monitored",
-                    "honeypot" => "honeypot",
-                    "ignore" => "ignored",
-                    _ => "resolved",
+                let outcome = match decision.as_deref() {
+                    Some("block_ip") => "blocked",
+                    Some("suspend_user_sudo") => "suspended",
+                    Some("kill_process") => "killed",
+                    Some("block_container") => "contained",
+                    Some("monitor") => "monitored",
+                    Some("honeypot") => "honeypot",
+                    Some("ignore") => "ignored",
+                    Some(_) => "resolved",
+                    None => "open",
                 };
-                let source = if d.ai_provider.starts_with("fail2ban") {
-                    format!("fail2ban → {}", d.skill_id.as_deref().unwrap_or(""))
-                } else if d.ai_provider.starts_with("abuseipdb") {
-                    "abuseipdb auto-block".to_string()
-                } else {
-                    d.skill_id.clone().unwrap_or_default()
-                };
-                (outcome.to_string(), Some(source))
+
+                Some(IncidentView {
+                    ts: *ts,
+                    incident_id: incident_id.clone(),
+                    severity: severity.to_lowercase(),
+                    title: title.clone(),
+                    summary: summary.clone(),
+                    entities,
+                    tags: mitre_ids.clone(),
+                    outcome: outcome.to_string(),
+                    action_taken: decision.clone(),
+                })
             } else {
-                ("open".to_string(), None)
-            };
-            IncidentView {
-                ts: inc.ts,
-                incident_id: inc.incident_id,
-                severity: format!("{:?}", inc.severity).to_lowercase(),
-                title: inc.title,
-                summary: inc.summary,
-                entities: inc
-                    .entities
-                    .into_iter()
-                    .map(|e| format!("{:?}:{}", e.r#type, e.value))
-                    .collect(),
-                tags: inc.tags,
-                outcome,
-                action_taken,
+                None
             }
         })
         .collect();
+
+    incident_views.sort_by(|a, b| b.ts.cmp(&a.ts));
+    let total = incident_views.len();
+    let items: Vec<IncidentView> = incident_views.into_iter().take(limit).collect();
 
     Json(IncidentListResponse { date, total, items })
 }
@@ -2827,15 +2885,9 @@ async fn api_entities(
 ) -> Json<EntitiesResponse> {
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
-    let group_by = PivotKind::parse(query.group_by.as_deref());
-    let filters =
-        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    let attackers = if group_by == PivotKind::Ip {
-        build_attackers(&state.data_dir, &date, &filters, limit)
-    } else {
-        Vec::new()
-    };
+    // Build attackers from knowledge graph
+    let attackers = build_attackers_from_graph(&state.knowledge_graph, limit);
     Json(EntitiesResponse { date, attackers })
 }
 
@@ -2846,9 +2898,8 @@ async fn api_pivots(
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let group_by = PivotKind::parse(query.group_by.as_deref());
-    let filters =
-        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
-    let items = build_pivots(&state.data_dir, &date, group_by, &filters, limit);
+
+    let items = build_pivots_from_graph(&state.knowledge_graph, group_by, limit);
     Json(PivotResponse {
         date,
         group_by: group_by.as_str().to_string(),
@@ -5159,6 +5210,152 @@ use std::io::BufRead;
 
 /// Build the attacker list for a given date.
 /// Only IPs that appear in at least one incident are included.
+/// Build pivot items from the knowledge graph (live, no JSONL).
+fn build_pivots_from_graph(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    group_by: PivotKind,
+    limit: usize,
+) -> Vec<PivotItem> {
+    use crate::knowledge_graph::types::*;
+    let graph = kg.read().unwrap();
+
+    let node_type = match group_by {
+        PivotKind::Ip => NodeType::Ip,
+        PivotKind::User => NodeType::User,
+        PivotKind::Detector => NodeType::Incident, // group by detector
+    };
+
+    if group_by == PivotKind::Detector {
+        // Group incidents by detector
+        let mut by_det: std::collections::HashMap<String, Vec<&Node>> = std::collections::HashMap::new();
+        for id in graph.nodes_of_type(NodeType::Incident) {
+            if let Some(node @ Node::Incident { detector, .. }) = graph.get_node(id) {
+                by_det.entry(detector.clone()).or_default().push(node);
+            }
+        }
+        let mut items: Vec<PivotItem> = by_det
+            .into_iter()
+            .map(|(det, nodes)| {
+                let first = nodes.iter().filter_map(|n| if let Node::Incident { ts, .. } = n { Some(*ts) } else { None }).min();
+                let last = nodes.iter().filter_map(|n| if let Node::Incident { ts, .. } = n { Some(*ts) } else { None }).max();
+                let max_sev = nodes.iter().filter_map(|n| if let Node::Incident { severity, .. } = n { Some(severity.as_str()) } else { None })
+                    .max_by_key(|s| severity_rank(s)).unwrap_or("low").to_string();
+                PivotItem {
+                    group_by: "detector".to_string(),
+                    value: det,
+                    first_seen: first.unwrap_or_else(chrono::Utc::now),
+                    last_seen: last.unwrap_or_else(chrono::Utc::now),
+                    max_severity: max_sev,
+                    incident_count: nodes.len(),
+                    event_count: 0,
+                    outcome: "active".to_string(),
+                    detectors: vec![],
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| b.incident_count.cmp(&a.incident_count));
+        items.truncate(limit);
+        return items;
+    }
+
+    // Group by IP or User: find which have TriggeredBy edges from incidents
+    let mut pivot_data: std::collections::HashMap<NodeId, (String, Vec<NodeId>)> = std::collections::HashMap::new();
+
+    for inc_id in graph.nodes_of_type(NodeType::Incident) {
+        for edge in graph.outgoing_edges(inc_id) {
+            if edge.relation != Relation::TriggeredBy {
+                continue;
+            }
+            if let Some(node) = graph.get_node(edge.to) {
+                if node.node_type() == node_type {
+                    pivot_data
+                        .entry(edge.to)
+                        .or_insert_with(|| (node.label(), Vec::new()))
+                        .1
+                        .push(inc_id);
+                }
+            }
+        }
+    }
+
+    let mut items: Vec<PivotItem> = pivot_data
+        .into_iter()
+        .map(|(node_id, (label, inc_ids))| {
+            let edges = graph.all_edges(node_id);
+            let first = edges.first().map(|e| e.ts);
+            let last = edges.last().map(|e| e.ts);
+
+            let mut detectors = std::collections::HashSet::new();
+            let mut max_sev = "low".to_string();
+            let mut outcome = "open".to_string();
+
+            for &iid in &inc_ids {
+                if let Some(Node::Incident { detector, severity, decision, .. }) = graph.get_node(iid) {
+                    detectors.insert(detector.clone());
+                    if severity_rank(severity) > severity_rank(&max_sev) {
+                        max_sev = severity.to_lowercase();
+                    }
+                    if let Some(dec) = decision {
+                        outcome = match dec.as_str() {
+                            "block_ip" => "blocked",
+                            "honeypot" => "honeypot",
+                            "monitor" => "monitoring",
+                            "ignore" => outcome.as_str(), // keep previous non-ignore
+                            _ => "resolved",
+                        }.to_string();
+                    }
+                }
+            }
+
+            PivotItem {
+                group_by: group_by.as_str().to_string(),
+                value: label,
+                first_seen: first.unwrap_or_else(chrono::Utc::now),
+                last_seen: last.unwrap_or_else(chrono::Utc::now),
+                max_severity: max_sev,
+                incident_count: inc_ids.len(),
+                event_count: edges.len(),
+                outcome,
+                detectors: detectors.into_iter().collect(),
+            }
+        })
+        .collect();
+
+    items.sort_by(|a, b| b.incident_count.cmp(&a.incident_count).then(b.last_seen.cmp(&a.last_seen)));
+    items.truncate(limit);
+    items
+}
+
+fn severity_rank(s: &str) -> u8 {
+    match s.to_lowercase().as_str() {
+        "critical" => 5,
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        "info" => 1,
+        _ => 0,
+    }
+}
+
+fn build_attackers_from_graph(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    limit: usize,
+) -> Vec<AttackerSummary> {
+    build_pivots_from_graph(kg, PivotKind::Ip, limit)
+        .into_iter()
+        .map(|p| AttackerSummary {
+            ip: p.value,
+            first_seen: p.first_seen,
+            last_seen: p.last_seen,
+            max_severity: p.max_severity,
+            detectors: p.detectors,
+            outcome: p.outcome,
+            incident_count: p.incident_count,
+            event_count: p.event_count,
+        })
+        .collect()
+}
+
 fn build_attackers(
     data_dir: &Path,
     date: &str,
