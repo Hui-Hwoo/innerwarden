@@ -10882,15 +10882,23 @@ const INDEX_HTML: &str = r##"<!doctype html>
         return;
       }
 
-      // Load Cytoscape.js from CDN if not loaded
+      // Load Cytoscape.js from CDN if not loaded (with offline fallback)
       if (typeof cytoscape === 'undefined') {
-        await new Promise((resolve, reject) => {
-          const s = document.createElement('script');
-          s.src = 'https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js';
-          s.onload = resolve;
-          s.onerror = reject;
-          document.head.appendChild(s);
-        });
+        try {
+          await new Promise((resolve, reject) => {
+            const s = document.createElement('script');
+            s.src = 'https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js';
+            s.onload = resolve;
+            s.onerror = reject;
+            s.timeout = 5000;
+            document.head.appendChild(s);
+            setTimeout(() => reject(new Error('timeout')), 5000);
+          });
+        } catch (e) {
+          container.innerHTML = '<p style="padding:40px;text-align:center;color:var(--dim);">Graph visualization requires internet (Cytoscape.js CDN). Stats are shown above.</p>';
+          if (statusEl) statusEl.textContent = 'Cytoscape.js unavailable (offline)';
+          return;
+        }
       }
 
       if (graphCy) graphCy.destroy();

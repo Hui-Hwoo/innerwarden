@@ -137,8 +137,12 @@ fn detect_lateral_movement(
 
     // Group: Process → set of internal IPs connected on port 22
     let mut ssh_scans: HashMap<NodeId, HashSet<String>> = HashMap::new();
+    let active = graph.active_nodes_since(cutoff);
 
-    for proc_id in graph.nodes_of_type(NodeType::Process) {
+    for &proc_id in &active {
+        if !matches!(graph.get_node(proc_id), Some(Node::Process { .. })) {
+            continue;
+        }
         for edge in graph.outgoing_edges(proc_id) {
             if edge.relation != Relation::ConnectedTo || edge.ts < cutoff {
                 continue;
@@ -287,8 +291,12 @@ fn detect_reverse_shell(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let cutoff = now - Duration::seconds(30);
+    let active = graph.active_nodes_since(cutoff);
 
-    for proc_id in graph.nodes_of_type(NodeType::Process) {
+    for &proc_id in &active {
+        if !matches!(graph.get_node(proc_id), Some(Node::Process { .. })) {
+            continue;
+        }
         let edges = graph.outgoing_edges(proc_id);
 
         // Check for fd redirect (fd 0, 1, or 2)
@@ -371,8 +379,12 @@ fn detect_fileless(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let cutoff = now - Duration::seconds(60);
+    let active = graph.active_nodes_since(cutoff);
 
-    for proc_id in graph.nodes_of_type(NodeType::Process) {
+    for &proc_id in &active {
+        if !matches!(graph.get_node(proc_id), Some(Node::Process { .. })) {
+            continue;
+        }
         let edges = graph.outgoing_edges(proc_id);
 
         let has_memfd = edges
@@ -525,6 +537,7 @@ fn detect_persistence(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let cutoff = now - Duration::seconds(300);
+    let active = graph.active_nodes_since(cutoff);
 
     let persistence_patterns: &[(&str, &str, &str)] = &[
         ("/etc/cron", "crontab_persistence", "T1053.003"),
@@ -534,7 +547,10 @@ fn detect_persistence(
         ("authorized_keys", "ssh_key_injection", "T1098.004"),
     ];
 
-    for proc_id in graph.nodes_of_type(NodeType::Process) {
+    for &proc_id in &active {
+        if !matches!(graph.get_node(proc_id), Some(Node::Process { .. })) {
+            continue;
+        }
         for edge in graph.outgoing_edges(proc_id) {
             if edge.relation != Relation::Wrote || edge.ts < cutoff {
                 continue;
@@ -600,8 +616,12 @@ fn detect_data_exfil(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let cutoff = now - Duration::seconds(60);
+    let active = graph.active_nodes_since(cutoff);
 
-    for proc_id in graph.nodes_of_type(NodeType::Process) {
+    for &proc_id in &active {
+        if !matches!(graph.get_node(proc_id), Some(Node::Process { .. })) {
+            continue;
+        }
         let edges = graph.outgoing_edges(proc_id);
 
         // Check if process read a sensitive file recently

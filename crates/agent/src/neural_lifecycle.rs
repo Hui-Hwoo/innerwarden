@@ -341,6 +341,20 @@ impl AutoencoderNet {
             layers.push(Layer { weights, biases });
         }
 
+        // Validate dimensions: first layer input size must match NUM_FEATURES
+        if let Some(first) = layers.first() {
+            if let Some(row) = first.weights.first() {
+                if row.len() != NUM_FEATURES {
+                    tracing::warn!(
+                        "anomaly: model input size {} != expected {}, discarding stale model",
+                        row.len(),
+                        NUM_FEATURES
+                    );
+                    return None;
+                }
+            }
+        }
+
         Some(Self { layers, lr })
     }
 

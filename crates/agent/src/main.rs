@@ -2970,6 +2970,7 @@ async fn process_narrative_tick(
     // Periodic graph maintenance (cleanup expired + snapshot every 5 min)
     if state.last_graph_snapshot.elapsed().as_secs() >= 300 {
         state.knowledge_graph.cleanup_expired(chrono::Utc::now());
+        state.knowledge_graph.compact_edges();
         state.knowledge_graph.enforce_memory_limit();
         if let Err(e) = state
             .knowledge_graph
@@ -3006,20 +3007,23 @@ async fn process_narrative_tick(
             state.knowledge_graph.ingest_incident(inc);
         }
         if !graph_incidents.is_empty() {
-            // Write graph detector incidents to JSONL for comparison with sensor detectors
-            let incidents_path = data_dir.join(format!("incidents-graph-{today}.jsonl"));
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&incidents_path)
-            {
-                use std::io::Write;
-                for inc in &graph_incidents {
-                    if let Ok(json) = serde_json::to_string(inc) {
-                        let _ = writeln!(f, "{}", json);
+            // Write graph detector incidents to JSONL (spawn_blocking for sync I/O)
+            let incidents_clone = graph_incidents.clone();
+            let write_path = data_dir.join(format!("incidents-graph-{today}.jsonl"));
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&write_path)
+                {
+                    use std::io::Write;
+                    for inc in &incidents_clone {
+                        if let Ok(json) = serde_json::to_string(inc) {
+                            let _ = writeln!(f, "{}", json);
+                        }
                     }
                 }
-            }
+            });
             tracing::info!(
                 count = graph_incidents.len(),
                 "graph detectors fired"

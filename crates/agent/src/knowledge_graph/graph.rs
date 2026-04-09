@@ -32,6 +32,7 @@ pub struct KnowledgeGraph {
     // ── Counters ──
     pub(crate) next_id: NodeId,
     pub(crate) memory_estimate: usize,
+    pub(crate) tombstoned_edges: usize,
     pub max_memory: usize,
     pub created_at: DateTime<Utc>,
 }
@@ -57,6 +58,7 @@ impl KnowledgeGraph {
             threat_intel_nodes: HashSet::new(),
             next_id: 1,
             memory_estimate: 0,
+            tombstoned_edges: 0,
             max_memory: 50 * 1024 * 1024, // 50 MB
             created_at: Utc::now(),
         }
@@ -116,28 +118,77 @@ impl KnowledgeGraph {
             self.deindex_node(id, &node);
             self.threat_intel_nodes.remove(&id);
 
-            // Remove edges connected to this node (mark as tombstone by setting from=to=0)
-            let edge_idxs: Vec<usize> = self
+            // Collect edge indexes to tombstone
+            let mut edge_idxs: Vec<usize> = self
                 .outgoing
                 .remove(&id)
-                .unwrap_or_default()
-                .into_iter()
-                .chain(self.incoming.remove(&id).unwrap_or_default())
-                .collect();
+                .unwrap_or_default();
+            edge_idxs.extend(self.incoming.remove(&id).unwrap_or_default());
+            edge_idxs.sort_unstable();
+            edge_idxs.dedup();
 
-            for idx in edge_idxs {
-                if idx < self.edges.len() {
-                    let edge = &self.edges[idx];
+            for idx in &edge_idxs {
+                if *idx < self.edges.len() {
+                    let edge = &self.edges[*idx];
                     let other = if edge.from == id { edge.to } else { edge.from };
-                    // Remove from the other node's adjacency
                     if let Some(adj) = self.outgoing.get_mut(&other) {
-                        adj.retain(|&i| i != idx);
+                        adj.retain(|&i| i != *idx);
                     }
                     if let Some(adj) = self.incoming.get_mut(&other) {
-                        adj.retain(|&i| i != idx);
+                        adj.retain(|&i| i != *idx);
                     }
                 }
+                self.tombstoned_edges += 1;
             }
+        }
+    }
+
+    /// Compact the edge vec by removing tombstoned entries and rebuilding adjacency.
+    /// Called periodically when tombstone ratio exceeds 20%.
+    pub fn compact_edges(&mut self) {
+        if self.edges.is_empty() || self.tombstoned_edges == 0 {
+            return;
+        }
+        let ratio = self.tombstoned_edges as f32 / self.edges.len() as f32;
+        if ratio < 0.2 {
+            return;
+        }
+
+        // Collect live edges (those still referenced by adjacency lists)
+        let mut live: HashSet<usize> = HashSet::new();
+        for idxs in self.outgoing.values() {
+            for &i in idxs {
+                live.insert(i);
+            }
+        }
+
+        let mut new_edges = Vec::with_capacity(live.len());
+        let mut old_to_new: HashMap<usize, usize> = HashMap::new();
+
+        for (old_idx, edge) in self.edges.iter().enumerate() {
+            if live.contains(&old_idx) {
+                let new_idx = new_edges.len();
+                old_to_new.insert(old_idx, new_idx);
+                new_edges.push(edge.clone());
+            } else {
+                self.memory_estimate = self.memory_estimate.saturating_sub(Self::estimate_edge_size(edge));
+            }
+        }
+
+        // Remap adjacency lists
+        for idxs in self.outgoing.values_mut() {
+            *idxs = idxs.iter().filter_map(|i| old_to_new.get(i).copied()).collect();
+        }
+        for idxs in self.incoming.values_mut() {
+            *idxs = idxs.iter().filter_map(|i| old_to_new.get(i).copied()).collect();
+        }
+
+        let removed = self.edges.len() - new_edges.len();
+        self.edges = new_edges;
+        self.tombstoned_edges = 0;
+
+        if removed > 0 {
+            tracing::debug!(removed, live = self.edges.len(), "knowledge graph: compacted edges");
         }
     }
 
@@ -339,15 +390,19 @@ impl KnowledgeGraph {
             .unwrap_or_default()
     }
 
-    /// All edges (in + out) for a node, sorted by timestamp.
+    /// All edges (in + out) for a node, sorted by timestamp. Deduplicated by index.
     pub fn all_edges(&self, node: NodeId) -> Vec<&Edge> {
-        let mut edges: Vec<&Edge> = self
-            .outgoing_edges(node)
-            .into_iter()
-            .chain(self.incoming_edges(node))
+        let mut seen = HashSet::new();
+        let out = self.outgoing.get(&node).map(|v| v.as_slice()).unwrap_or(&[]);
+        let inc = self.incoming.get(&node).map(|v| v.as_slice()).unwrap_or(&[]);
+
+        let mut edges: Vec<&Edge> = out
+            .iter()
+            .chain(inc.iter())
+            .filter(|&&idx| seen.insert(idx))
+            .filter_map(|&idx| self.edges.get(idx))
             .collect();
         edges.sort_by_key(|e| e.ts);
-        edges.dedup_by(|a, b| std::ptr::eq(*a, *b));
         edges
     }
 
@@ -358,6 +413,20 @@ impl KnowledgeGraph {
             .filter(|(_, n)| n.node_type() == nt)
             .map(|(&id, _)| id)
             .collect()
+    }
+
+    /// Find nodes that have edges newer than `since`. Much faster than scanning all nodes.
+    pub fn active_nodes_since(&self, since: DateTime<Utc>) -> HashSet<NodeId> {
+        let mut active = HashSet::new();
+        // Scan edges from the end (most recent) backwards
+        for edge in self.edges.iter().rev() {
+            if edge.ts < since {
+                break; // Edges are appended chronologically
+            }
+            active.insert(edge.from);
+            active.insert(edge.to);
+        }
+        active
     }
 
     /// BFS neighborhood: subgraph within `depth` hops of `start`.

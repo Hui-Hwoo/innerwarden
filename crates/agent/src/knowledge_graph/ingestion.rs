@@ -309,9 +309,10 @@ impl KnowledgeGraph {
         let proc_id = if let Some(pid) = detail_u32(event, "pid") {
             self.ensure_process(pid, 0, "sudo", 0, event.ts)
         } else {
-            // Create a generic sudo process node
-            let pid = (event.ts.timestamp_millis() & 0xFFFF) as u32 + 60000;
-            self.ensure_process(pid, 0, "sudo", 0, event.ts)
+            // No PID available (log-sourced event). Use next_id as synthetic PID
+            // to avoid collisions with real PIDs (real PIDs are < 32768 on most Linux).
+            let synthetic_pid = self.next_id as u32 + 100_000;
+            self.ensure_process(synthetic_pid, 0, "sudo", 0, event.ts)
         };
 
         let user_id = self.ensure_user(&run_as);
@@ -479,9 +480,15 @@ impl KnowledgeGraph {
     }
 
     fn ingest_network_snapshot(&mut self, event: &Event) {
-        // Bulk connections from snapshot
+        // Bulk connections from snapshot (capped to prevent edge explosion)
+        const MAX_SNAPSHOT_EDGES: usize = 200;
+        let mut snapshot_count = 0;
+
         if let Some(connections) = event.details.get("connections").and_then(|v| v.as_array()) {
             for conn in connections {
+                if snapshot_count >= MAX_SNAPSHOT_EDGES {
+                    break;
+                }
                 let pid = conn.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let dst_ip = conn.get("dst_ip").and_then(|v| v.as_str());
                 let port = conn.get("port").and_then(|v| v.as_u64()).map(|v| v as u16);
@@ -498,12 +505,16 @@ impl KnowledgeGraph {
                         edge = edge.with_prop("state", serde_json::Value::from(s));
                     }
                     self.add_edge(edge);
+                    snapshot_count += 1;
                 }
             }
         }
 
         if let Some(listening) = event.details.get("listening_ports").and_then(|v| v.as_array()) {
             for entry in listening {
+                if snapshot_count >= MAX_SNAPSHOT_EDGES {
+                    break;
+                }
                 let pid = entry.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let port_num = entry.get("port").and_then(|v| v.as_u64()).map(|v| v as u16);
                 let proto = entry.get("proto").and_then(|v| v.as_str()).unwrap_or("tcp");
@@ -512,6 +523,7 @@ impl KnowledgeGraph {
                     let proc_id = self.ensure_process(pid, 0, "", 0, event.ts);
                     let port_id = self.ensure_port(port_num, proto);
                     self.add_edge(Edge::new(proc_id, port_id, Relation::SnapshotListensOn, event.ts));
+                    snapshot_count += 1;
                 }
             }
         }
