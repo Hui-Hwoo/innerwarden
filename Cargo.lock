@@ -1852,6 +1852,7 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-bash",
+ "ureq",
 ]
 
 [[package]]

@@ -125,3 +125,5 @@ pub mod yara_scan;
 pub mod data_encoding;
 pub mod dns_c2;
 pub mod sandbox_evasion;
+pub mod datasets;
+pub mod threat_intel;

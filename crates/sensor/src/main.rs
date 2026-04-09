@@ -136,6 +136,7 @@ struct DetectorSet {
     dns_c2: Option<detectors::dns_c2::DnsC2Detector>,
     data_encoding: Option<detectors::data_encoding::DataEncodingDetector>,
     sandbox_evasion: Option<detectors::sandbox_evasion::SandboxEvasionDetector>,
+    threat_intel: Option<detectors::threat_intel::ThreatIntelDetector>,
 }
 
 #[derive(Default)]
@@ -700,7 +701,22 @@ async fn main() -> Result<()> {
             info!("sandbox_evasion detector enabled (T1497 VM/sandbox evasion checks)");
             detectors::sandbox_evasion::SandboxEvasionDetector::new(&cfg.agent.host_id, 3, 60)
         }),
+        threat_intel: Some({
+            info!("threat_intel detector enabled (O(1) dataset matching)");
+            detectors::threat_intel::ThreatIntelDetector::new(&cfg.agent.host_id, 600)
+        }),
     };
+
+    // Load threat intelligence datasets (IPs, domains, JA3, hashes, URLs).
+    // Downloads public feeds on first run, reloads from disk every 60 min.
+    let datasets_dir = data_dir.join("datasets");
+    let mut threat_datasets = detectors::datasets::Datasets::load(&datasets_dir, 3600);
+    if !threat_datasets.is_loaded() {
+        info!("downloading threat intelligence feeds for the first time...");
+        let (ok, total) = detectors::datasets::update_all_feeds(&datasets_dir);
+        info!(feeds_updated = ok, total_entries = total, "initial feed download complete");
+        threat_datasets.reload();
+    }
 
     // Spawn auth_log collector
     if cfg.collectors.auth_log.enabled {
@@ -1150,6 +1166,9 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Periodic dataset reload (every hour)
+        threat_datasets.maybe_reload();
+
         process_event(
             ev,
             &mut writer,
@@ -1157,6 +1176,7 @@ async fn main() -> Result<()> {
             &mut stats,
             &mut syslog_writer,
             &mut dedup_cache,
+            &threat_datasets,
         );
 
         // Also flush every 50 events as a safety net
@@ -1259,6 +1279,7 @@ fn process_event(
     stats: &mut WriteStats,
     syslog: &mut Option<sinks::syslog_cef::SyslogCefWriter>,
     dedup_cache: &mut HashMap<u32, (chrono::DateTime<chrono::Utc>, u8)>,
+    threat_datasets: &detectors::datasets::Datasets,
 ) {
     use innerwarden_core::event::Severity;
 
@@ -1691,6 +1712,13 @@ fn process_event(
 
     if let Some(ref mut det) = detectors.sandbox_evasion {
         if let Some(incident) = det.process(&ev) {
+            write_incident(writer, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // Threat intelligence dataset matching (O(1) per lookup).
+    if let Some(ref mut det) = detectors.threat_intel {
+        if let Some(incident) = det.process(&ev, threat_datasets) {
             write_incident(writer, stats, incident, syslog, dedup_cache);
         }
     }
