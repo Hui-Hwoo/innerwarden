@@ -984,6 +984,7 @@ pub async fn serve(
         .route("/api/baseline-status", get(api_baseline_status))
         .route("/api/graph/stats", get(api_graph_stats))
         .route("/api/graph/view", get(api_graph_view))
+        .route("/api/graph/neighborhood", get(api_graph_neighborhood))
         .route("/api/playbook-log", get(api_playbook_log))
         .route("/api/responses", get(api_responses))
         .route("/api/mitre/navigator", get(api_mitre_navigator))
@@ -2444,6 +2445,89 @@ async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json:
         .collect();
 
     Json(serde_json::json!({
+        "nodes": cy_nodes,
+        "edges": cy_edges,
+    }))
+}
+
+/// `GET /api/graph/neighborhood?type=ip&value=1.2.3.4&depth=2` — subgraph around a node.
+async fn api_graph_neighborhood(
+    State(state): State<DashboardState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    use crate::knowledge_graph::{graph::KnowledgeGraph, types::*};
+
+    let subject_type = params.get("type").map(|s| s.as_str()).unwrap_or("ip");
+    let subject_value = match params.get("value") {
+        Some(v) => v.clone(),
+        None => return Json(serde_json::json!({"nodes": [], "edges": []})),
+    };
+    let depth: usize = params
+        .get("depth")
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(2)
+        .min(4);
+
+    // Load graph from snapshot
+    let graph = KnowledgeGraph::load_snapshot(&state.data_dir.join("graph-snapshot.json"));
+    if graph.node_count() == 0 {
+        return Json(serde_json::json!({"nodes": [], "edges": []}));
+    }
+
+    // Find center node
+    let center = match subject_type {
+        "ip" => graph.find_by_ip(&subject_value),
+        "user" => graph.find_by_user(&subject_value),
+        "path" | "file" => graph.find_by_path(&subject_value),
+        "container" => graph.find_by_container(&subject_value),
+        "domain" => graph.find_by_domain(&subject_value),
+        "incident" => graph.find_by_incident(&subject_value),
+        _ => graph.find_by_ip(&subject_value),
+    };
+
+    let center_id = match center {
+        Some(id) => id,
+        None => return Json(serde_json::json!({"nodes": [], "edges": []})),
+    };
+
+    let sub = graph.neighborhood(center_id, depth);
+
+    let cy_nodes: Vec<serde_json::Value> = sub
+        .nodes
+        .iter()
+        .map(|(id, n)| {
+            serde_json::json!({
+                "data": {
+                    "id": format!("n{}", id),
+                    "label": n.label(),
+                    "type": format!("{:?}", n.node_type()),
+                    "sensitive": n.is_sensitive_file(),
+                    "center": *id == center_id,
+                }
+            })
+        })
+        .collect();
+
+    let cy_edges: Vec<serde_json::Value> = sub
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_snapshot())
+        .map(|(i, e)| {
+            serde_json::json!({
+                "data": {
+                    "id": format!("ne{}", i),
+                    "source": format!("n{}", e.from),
+                    "target": format!("n{}", e.to),
+                    "relation": format!("{:?}", e.relation),
+                    "ts": e.ts.to_rfc3339(),
+                }
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "center": format!("n{}", center_id),
         "nodes": cy_nodes,
         "edges": cy_edges,
     }))
@@ -10510,6 +10594,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
             '<div style="font-size:0.8rem;color:var(--text);line-height:1.5">' + narrative + '</div></div>';
         })()}
         <div class="guided-grid">
+          <section class="guided-card" style="grid-column:1/-1">
+            <div class="guided-title">Attack Graph <span style="font-weight:400;font-size:0.65rem;color:var(--dim)">(neighborhood depth=2)</span></div>
+            <div id="journeyGraphContainer" style="height:280px;background:var(--bg);border-radius:8px;border:1px solid var(--border);margin-top:6px;"></div>
+          </section>
+        </div>
+        <div class="guided-grid">
           <section class="guided-card">
             <div class="guided-title">Investigation Summary</div>
             ${summaryGrid}
@@ -10563,8 +10653,94 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
       html += '</div>';
       document.getElementById('journeyContent').innerHTML = html;
+
+      // Load mini-graph for this subject
+      loadJourneyGraph(subjectType, subjectValue);
     } catch (e) {
       document.getElementById('journeyContent').innerHTML = '<div class="err">Failed to load journey: ' + esc(e.message) + '</div>';
+    }
+  }
+
+  async function loadJourneyGraph(subjectType, subjectValue) {
+    const container = document.getElementById('journeyGraphContainer');
+    if (!container) return;
+
+    // Map journey subject type to graph node type
+    const typeMap = { ip: 'ip', user: 'user', container: 'container', path: 'file', file: 'file' };
+    const gType = typeMap[subjectType] || subjectType;
+
+    try {
+      // Ensure Cytoscape.js is loaded
+      if (typeof cytoscape === 'undefined') {
+        try {
+          await new Promise((resolve, reject) => {
+            const s = document.createElement('script');
+            s.src = 'https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js';
+            s.onload = resolve;
+            s.onerror = reject;
+            document.head.appendChild(s);
+            setTimeout(() => reject(new Error('timeout')), 5000);
+          });
+        } catch (e) {
+          container.innerHTML = '<p style="padding:20px;text-align:center;color:var(--dim);font-size:0.75rem">Graph requires internet (Cytoscape.js)</p>';
+          return;
+        }
+      }
+
+      const data = await loadJson('/api/graph/neighborhood?type=' + encodeURIComponent(gType) + '&value=' + encodeURIComponent(subjectValue) + '&depth=2');
+
+      if (!data.nodes || data.nodes.length === 0) {
+        container.innerHTML = '<p style="padding:20px;text-align:center;color:var(--dim);font-size:0.75rem">No graph data for this entity yet</p>';
+        return;
+      }
+
+      const cy = cytoscape({
+        container: container,
+        elements: { nodes: data.nodes, edges: data.edges },
+        style: [
+          { selector: 'node', style: {
+            'label': 'data(label)',
+            'background-color': function(ele) { return NODE_COLORS[ele.data('type')] || '#6b7280'; },
+            'color': '#e8eef5',
+            'text-valign': 'bottom',
+            'text-margin-y': 3,
+            'font-size': '9px',
+            'width': function(ele) { return Math.max(12, Math.min(35, 8 + ele.degree() * 2)); },
+            'height': function(ele) { return Math.max(12, Math.min(35, 8 + ele.degree() * 2)); },
+            'border-width': function(ele) { return ele.data('center') ? 3 : 1; },
+            'border-color': function(ele) { return ele.data('center') ? '#00d9ff' : '#333'; },
+          }},
+          { selector: 'edge', style: {
+            'width': 1,
+            'line-color': '#444',
+            'target-arrow-color': '#555',
+            'target-arrow-shape': 'triangle',
+            'curve-style': 'bezier',
+            'label': 'data(relation)',
+            'font-size': '7px',
+            'color': '#555',
+            'text-rotation': 'autorotate',
+            'text-margin-y': -6,
+          }},
+        ],
+        layout: { name: 'cose', animate: false, nodeRepulsion: 6000, idealEdgeLength: 60, padding: 15 },
+        minZoom: 0.3, maxZoom: 4,
+        userPanningEnabled: true,
+        userZoomingEnabled: true,
+      });
+
+      // Click on a node: navigate to its journey if it's an IP or user
+      cy.on('tap', 'node', function(evt) {
+        const d = evt.target.data();
+        if (d.type === 'Ip') {
+          loadJourney('ip', d.label);
+        } else if (d.type === 'User') {
+          loadJourney('user', d.label);
+        }
+      });
+
+    } catch (e) {
+      container.innerHTML = '<p style="padding:20px;text-align:center;color:var(--dim);font-size:0.75rem">Graph: ' + esc(e.message) + '</p>';
     }
   }
 
