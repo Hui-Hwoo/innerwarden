@@ -3007,7 +3007,7 @@ async fn process_narrative_tick(
     }
 
     // Periodic graph maintenance (cleanup expired + snapshot every 5 min)
-    if state.last_graph_snapshot.elapsed().as_secs() >= 300 {
+    if state.last_graph_snapshot.elapsed().as_secs() >= 60 {
         {
             let mut graph = state.knowledge_graph.write().unwrap();
             graph.cleanup_expired(chrono::Utc::now());
