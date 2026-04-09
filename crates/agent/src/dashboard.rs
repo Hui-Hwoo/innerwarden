@@ -4449,11 +4449,17 @@ async fn api_agent_security_context(
     top.sort_by(|a, b| b.1.cmp(&a.1));
     let top_threats: Vec<String> = top.iter().take(5).map(|(k, _)| k.clone()).collect();
 
-    let threat_level = if high_or_critical >= 5 {
+    // Threat level based on AI-confirmed actions, not raw incident count.
+    // Raw incidents include noise. Only AI decisions that resulted in action matter.
+    let ai_actions = decisions
+        .iter()
+        .filter(|d| d.action_type != "ignore" && d.action_type != "request_confirmation")
+        .count();
+    let threat_level = if ai_actions >= 10 {
         "critical"
-    } else if high_or_critical >= 2 {
+    } else if ai_actions >= 5 {
         "high"
-    } else if total_incidents >= 5 {
+    } else if ai_actions >= 1 {
         "medium"
     } else {
         "low"
@@ -8165,34 +8171,30 @@ const INDEX_HTML: &str = r##"<!doctype html>
     const sub = document.getElementById('heroSub');
     if (!hero || !icon || !title || !sub) return;
 
-    const totalThreats = (incidents || []).length;
-    const resolved = (incidents || []).filter(i => i.outcome && i.outcome !== 'open').length;
-    const openThreats = totalThreats - resolved;
+    // Use AI-confirmed threats, not raw incident count.
+    const ov = window._lastOverview || {};
+    const confirmedThreats = ov.ai_confirmed || 0;
+    const responded = ov.ai_responded || 0;
+    const noise = ov.ai_ignored || 0;
+    const rawTotal = (incidents || []).length;
     const blockedCount = (decisions || []).filter(d => ['block_ip','suspend_user_sudo','kill_process','block_container'].includes(d.action_type)).length;
-    const containmentRate = totalThreats > 0 ? Math.round((resolved / totalThreats) * 100) : 100;
 
-    if (openThreats > 0 && openThreats >= totalThreats / 2) {
+    if (confirmedThreats > 5) {
       hero.className = 'status-hero danger';
       icon.textContent = '🛡️';
-      title.textContent = 'Defending - ' + openThreats + ' unresolved';
-      sub.textContent = blockedCount + ' attacks blocked · ' + containmentRate + '% contained · investigating remaining threats';
-    } else if (totalThreats > 0) {
+      title.textContent = 'Active Defense — ' + confirmedThreats + ' threats';
+      sub.textContent = responded + ' contained · ' + blockedCount + ' IPs blocked · ' + noise + ' noise filtered';
+    } else if (confirmedThreats > 0) {
       hero.className = 'status-hero safe';
       icon.textContent = '🛡️';
       title.textContent = 'Server Protected';
-      sub.textContent = totalThreats + ' threats detected · ' + blockedCount + ' blocked · ' + containmentRate + '% contained';
+      sub.textContent = confirmedThreats + ' threats detected · ' + responded + ' contained · ' + noise + ' noise filtered';
     } else {
       hero.className = 'status-hero safe';
       icon.textContent = '✅';
       title.textContent = 'All Clear';
-      sub.textContent = 'No threats detected today · defense active';
+      sub.textContent = 'No confirmed threats · ' + rawTotal + ' events analyzed · defense active';
     }
-
-    // Update KPIs to focus on protection
-    const kpiInc = document.getElementById('kpi-incidents');
-    const kpiDec = document.getElementById('kpi-decisions');
-    if (kpiInc) kpiInc.textContent = blockedCount || '0';
-    if (kpiDec) kpiDec.textContent = containmentRate + '%';
   }
 
   function buildActivityFeed(incidents, decisions) {
@@ -8523,14 +8525,15 @@ const INDEX_HTML: &str = r##"<!doctype html>
     if (!canvas || !CJ) return;
     const label = document.getElementById('threatLabel');
 
-    // Scale based on absolute incident count per day
-    // 0 = safe, 10 = guarded, 50 = elevated, 200+ = critical
-    const ratio = Math.min(incidents / 200, 1);
+    // Scale based on AI-confirmed threats, NOT raw incident count.
+    // Raw incidents include noise (host_drift, etc). Only confirmed threats matter.
+    const threats = window._lastOverview?.ai_confirmed || 0;
+    const ratio = Math.min(threats / 20, 1);
     let level = 'NOMINAL';
     let color = '#4ade80';
-    if (incidents >= 200) { level = 'CRITICAL'; color = '#f43f5e'; }
-    else if (incidents >= 50) { level = 'ELEVATED'; color = '#fbbf24'; }
-    else if (incidents >= 10) { level = 'GUARDED'; color = '#7fe7ff'; }
+    if (threats >= 20) { level = 'CRITICAL'; color = '#f43f5e'; }
+    else if (threats >= 10) { level = 'ELEVATED'; color = '#fbbf24'; }
+    else if (threats >= 3) { level = 'GUARDED'; color = '#7fe7ff'; }
 
     if (label) label.textContent = level;
     if (label) label.style.color = color;
@@ -10568,6 +10571,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
       const items = entityData.items || [];
 
+      window._lastOverview = ov; // Store for threat level gauge
       updateKpi('kpi-events',    ov.events_count);
       updateKpi('kpi-confirmed', ov.ai_confirmed || 0);
       updateKpi('kpi-responded', ov.ai_responded || 0);
@@ -10639,6 +10643,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
       const items = entityData.items || [];
       state.clusters = clusterData.items || [];
 
+      window._lastOverview = ov;
       document.getElementById('kpi-events').textContent    = ov.events_count;
       document.getElementById('kpi-confirmed').textContent = ov.ai_confirmed || 0;
       document.getElementById('kpi-responded').textContent = ov.ai_responded || 0;
