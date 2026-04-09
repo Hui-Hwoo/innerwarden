@@ -1720,35 +1720,82 @@ struct LiveFeedResponse {
 /// `GET /api/live-feed` - last 30 incidents with totals for the day (public).
 async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResponse> {
     let now = chrono::Utc::now();
-    let date = now.format("%Y-%m-%d").to_string();
-    let yesterday = (now - chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
-    let cutoff = now - chrono::Duration::hours(24);
+    let reputation_map = load_ip_reputation_map(&state.data_dir);
 
-    // Read today + yesterday for rolling 24h window.
-    let mut incidents =
-        read_jsonl::<Incident>(&dated_path(&state.data_dir, "incidents", &yesterday));
-    incidents.extend(read_jsonl::<Incident>(&dated_path(
-        &state.data_dir,
-        "incidents",
-        &date,
-    )));
-    incidents.retain(|i| i.ts >= cutoff);
+    // Read incidents from knowledge graph
+    use crate::knowledge_graph::types::{Node, NodeType, Relation};
+    let graph = state.knowledge_graph.read().unwrap();
 
-    let mut decisions =
-        read_jsonl::<DecisionEntry>(&dated_path(&state.data_dir, "decisions", &yesterday));
-    decisions.extend(read_jsonl::<DecisionEntry>(&dated_path(
-        &state.data_dir,
-        "decisions",
-        &date,
-    )));
-    decisions.retain(|d| d.ts >= cutoff);
+    // Build incidents from graph Incident nodes
+    let mut incidents: Vec<Incident> = Vec::new();
+    let mut decisions: Vec<DecisionEntry> = Vec::new();
+
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident {
+            incident_id, severity, title, summary, ts, mitre_ids,
+            decision, confidence, decision_reason, decision_target, auto_executed, detector, ..
+        }) = graph.get_node(id) {
+            // Collect entities from TriggeredBy edges
+            let entities: Vec<innerwarden_core::entities::EntityRef> = graph
+                .outgoing_edges(id)
+                .iter()
+                .filter(|e| e.relation == Relation::TriggeredBy)
+                .filter_map(|e| {
+                    match graph.get_node(e.to) {
+                        Some(Node::Ip { addr, .. }) => Some(innerwarden_core::entities::EntityRef::ip(addr)),
+                        Some(Node::User { name, .. }) => Some(innerwarden_core::entities::EntityRef::user(name)),
+                        _ => None,
+                    }
+                })
+                .collect();
+
+            let sev = match severity.to_lowercase().as_str() {
+                "critical" => innerwarden_core::event::Severity::Critical,
+                "high" => innerwarden_core::event::Severity::High,
+                "medium" => innerwarden_core::event::Severity::Medium,
+                "low" => innerwarden_core::event::Severity::Low,
+                _ => innerwarden_core::event::Severity::Info,
+            };
+
+            incidents.push(Incident {
+                ts: *ts,
+                host: String::new(),
+                incident_id: incident_id.clone(),
+                severity: sev,
+                title: title.clone(),
+                summary: summary.clone(),
+                evidence: serde_json::json!({}),
+                recommended_checks: vec![],
+                tags: mitre_ids.clone(),
+                entities,
+            });
+
+            if let Some(action) = decision {
+                decisions.push(DecisionEntry {
+                    ts: *ts,
+                    incident_id: incident_id.clone(),
+                    host: String::new(),
+                    ai_provider: String::new(),
+                    action_type: action.clone(),
+                    target_ip: decision_target.clone(),
+                    target_user: None,
+                    skill_id: None,
+                    confidence: confidence.unwrap_or(0.0),
+                    auto_executed: *auto_executed,
+                    dry_run: false,
+                    reason: decision_reason.clone().unwrap_or_default(),
+                    execution_result: if *auto_executed { "ok".into() } else { "skipped".into() },
+                    estimated_threat: String::new(),
+                    prev_hash: None,
+                });
+            }
+        }
+    }
+
     let decision_map: HashMap<String, &DecisionEntry> = decisions
         .iter()
         .map(|d| (d.incident_id.clone(), d))
         .collect();
-    let reputation_map = load_ip_reputation_map(&state.data_dir);
 
     // Public feed: only show real external attacks (with attacker IP).
     // Filter out internal detections, system noise, and advisory-only detectors.
@@ -2938,9 +2985,85 @@ async fn api_clusters(
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let window_seconds = query.window_seconds.unwrap_or(300).clamp(30, 3600);
-    let filters =
-        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
-    let items = build_cluster_items(&state.data_dir, &date, &filters, limit, window_seconds);
+
+    // Build clusters from graph Incident nodes
+    use crate::knowledge_graph::types::{Node, NodeType, Relation};
+    let graph = state.knowledge_graph.read().unwrap();
+
+    let mut incidents_by_ip: std::collections::HashMap<String, Vec<(chrono::DateTime<Utc>, String, String)>> =
+        std::collections::HashMap::new();
+
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident { incident_id, detector, ts, .. }) = graph.get_node(id) {
+            // Find associated IP via TriggeredBy edge
+            for edge in graph.outgoing_edges(id) {
+                if edge.relation == Relation::TriggeredBy {
+                    if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                        incidents_by_ip
+                            .entry(addr.clone())
+                            .or_default()
+                            .push((*ts, incident_id.clone(), detector.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    let window = chrono::Duration::seconds(window_seconds as i64);
+    let mut items: Vec<ClusterItem> = Vec::new();
+
+    for (ip, mut incs) in incidents_by_ip {
+        if incs.len() < 2 { continue; }
+        incs.sort_by_key(|(ts, _, _)| *ts);
+
+        // Group into temporal clusters
+        let mut cluster_start = incs[0].0;
+        let mut cluster_incs = vec![incs[0].clone()];
+
+        for i in 1..incs.len() {
+            if incs[i].0 - cluster_incs.last().unwrap().0 <= window {
+                cluster_incs.push(incs[i].clone());
+            } else {
+                if cluster_incs.len() >= 2 {
+                    let dets: Vec<String> = cluster_incs.iter().map(|(_, _, d)| d.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+                    let ids: Vec<String> = cluster_incs.iter().map(|(_, id, _)| id.clone()).collect();
+                    items.push(ClusterItem {
+                        cluster_id: format!("cluster-{:03}", items.len() + 1),
+                        pivot: format!("ip:{}", ip),
+                        pivot_type: "ip".to_string(),
+                        pivot_value: ip.clone(),
+                        start_ts: cluster_start,
+                        end_ts: cluster_incs.last().unwrap().0,
+                        incident_count: cluster_incs.len(),
+                        detector_kinds: dets,
+                        incident_ids: ids,
+                    });
+                }
+                cluster_start = incs[i].0;
+                cluster_incs = vec![incs[i].clone()];
+            }
+        }
+        // Flush last cluster
+        if cluster_incs.len() >= 2 {
+            let dets: Vec<String> = cluster_incs.iter().map(|(_, _, d)| d.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+            let ids: Vec<String> = cluster_incs.iter().map(|(_, id, _)| id.clone()).collect();
+            items.push(ClusterItem {
+                cluster_id: format!("cluster-{:03}", items.len() + 1),
+                pivot: format!("ip:{}", ip),
+                pivot_type: "ip".to_string(),
+                pivot_value: ip.clone(),
+                start_ts: cluster_start,
+                end_ts: cluster_incs.last().unwrap().0,
+                incident_count: cluster_incs.len(),
+                detector_kinds: dets,
+                incident_ids: ids,
+            });
+        }
+    }
+
+    items.sort_by(|a, b| b.incident_count.cmp(&a.incident_count));
+    items.truncate(limit);
+
     Json(ClusterResponse {
         date,
         total: items.len(),
@@ -3578,151 +3701,60 @@ async fn api_sensors(State(state): State<DashboardState>) -> Json<serde_json::Va
 }
 
 async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
+    use crate::knowledge_graph::types::*;
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let safe_today = today
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '-')
-        .collect::<String>();
-    // Validate date format to prevent path traversal (CodeQL CWE-22)
-    if safe_today.len() != 10 || safe_today.chars().nth(4).is_none_or(|c| c != '-') {
-        return serde_json::json!({ "error": "invalid date" });
-    }
-    // Resolve data_dir to canonical form first, then construct paths from it (CWE-22).
-    let Ok(canonical_data) = state.data_dir.canonicalize() else {
-        return serde_json::json!({ "error": "invalid data directory" });
-    };
-    let events_path = canonical_data.join(format!("events-{safe_today}.jsonl"));
-    let incidents_path = canonical_data.join(format!("incidents-{safe_today}.jsonl"));
-    // Verify constructed paths stay inside canonical data dir (CWE-22)
-    if !events_path.starts_with(&canonical_data) || !incidents_path.starts_with(&canonical_data) {
-        return serde_json::json!({ "error": "path traversal blocked" });
-    }
 
-    // Sample events file across its full length for timeline coverage.
-    // Read 20 chunks of 64KB evenly spaced across the file → ~2000 events sampled.
-    let mut source_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut kind_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let graph = state.knowledge_graph.read().unwrap();
+    let metrics = graph.metrics();
+
+    // Count edges by relation type (approximates event kind distribution)
+    let mut relation_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut timeline: std::collections::BTreeMap<String, std::collections::HashMap<String, usize>> =
         std::collections::BTreeMap::new();
-    let mut total_events = 0usize;
 
-    if let Some(samples) = tokio::task::spawn_blocking({
-        let path = events_path.clone();
-        move || -> Option<Vec<String>> {
-            let file = std::fs::File::open(&path).ok()?;
-            let len = file.metadata().ok()?.len();
-            if len == 0 {
-                return Some(vec![]);
-            }
+    for edge in graph.edges_slice() {
+        if edge.is_snapshot() { continue; }
+        let rel = format!("{:?}", edge.relation);
+        *relation_counts.entry(rel.clone()).or_insert(0) += 1;
 
-            let chunk_size: u64 = 64 * 1024;
-            let num_samples: u64 = 20;
-            let step = if len > chunk_size * num_samples {
-                len / num_samples
-            } else {
-                0
-            };
-            let mut chunks = Vec::new();
-
-            for i in 0..num_samples {
-                let offset = if step > 0 { i * step } else { 0 };
-                let mut reader = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
-                std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(offset)).ok()?;
-                let mut limited = vec![0u8; chunk_size as usize];
-                let n = std::io::Read::read(&mut reader, &mut limited).ok()?;
-                chunks.push(String::from_utf8_lossy(&limited[..n]).to_string());
-                if step == 0 {
-                    break;
-                } // file smaller than total sample size
-            }
-            Some(chunks)
+        let ts = edge.ts.format("%H:%M").to_string();
+        if ts.len() >= 5 {
+            let hour = &ts[0..2];
+            let min: usize = ts[3..5].parse().unwrap_or(0);
+            let bucket = format!("{}:{:02}", hour, (min / 5) * 5);
+            *timeline.entry(bucket).or_default().entry(rel).or_insert(0) += 1;
         }
-    })
-    .await
-    .unwrap_or(None)
-    {
-        // Also count total lines from file size estimate (avg ~530 bytes/line)
-        if let Ok(meta) = std::fs::metadata(&events_path) {
-            total_events = (meta.len() / 530) as usize;
-        }
+    }
 
-        for chunk in &samples {
-            for line in chunk.lines() {
-                if line.is_empty() || !line.starts_with('{') {
-                    continue;
-                }
-                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
-                    let source = ev["source"].as_str().unwrap_or("unknown").to_string();
-                    let kind = ev["kind"].as_str().unwrap_or("unknown").to_string();
-                    *source_counts.entry(source.clone()).or_insert(0) += 1;
-                    *kind_counts.entry(kind).or_insert(0) += 1;
+    // Source counts: approximate from node types
+    let mut source_counts: Vec<(String, usize)> = vec![
+        ("ebpf".to_string(), graph.nodes_of_type(NodeType::Process).len()),
+        ("network".to_string(), graph.nodes_of_type(NodeType::Ip).len()),
+        ("dns".to_string(), graph.nodes_of_type(NodeType::Domain).len()),
+        ("filesystem".to_string(), graph.nodes_of_type(NodeType::File).len()),
+        ("auth".to_string(), graph.nodes_of_type(NodeType::User).len()),
+    ];
+    source_counts.sort_by(|a, b| b.1.cmp(&a.1));
 
-                    if let Some(ts) = ev["ts"].as_str() {
-                        if ts.len() >= 16 {
-                            let hour = &ts[11..13];
-                            let min: usize = ts[14..16].parse().unwrap_or(0);
-                            let bucket = format!("{hour}:{:02}", (min / 5) * 5);
-                            *timeline
-                                .entry(bucket)
-                                .or_default()
-                                .entry(source)
-                                .or_insert(0) += 1;
-                        }
-                    }
-                }
+    // Detector counts from Incident nodes
+    let mut detector_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut detector_timeline: std::collections::BTreeMap<String, std::collections::HashMap<String, usize>> =
+        std::collections::BTreeMap::new();
+
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident { detector, ts, .. }) = graph.get_node(id) {
+            *detector_counts.entry(detector.clone()).or_insert(0) += 1;
+            let ts_str = ts.format("%H:%M").to_string();
+            if ts_str.len() >= 5 {
+                let hour = &ts_str[0..2];
+                let min: usize = ts_str[3..5].parse().unwrap_or(0);
+                let bucket = format!("{}:{:02}", hour, (min / 5) * 5);
+                *detector_timeline.entry(bucket).or_default().entry(detector.clone()).or_insert(0) += 1;
             }
         }
     }
 
-    // Read incidents for detector activity
-    let mut detector_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut detector_timeline: std::collections::BTreeMap<
-        String,
-        std::collections::HashMap<String, usize>,
-    > = std::collections::BTreeMap::new();
-    let mut total_incidents = 0usize;
-
-    if let Some(content) = tokio::task::spawn_blocking({
-        let path = incidents_path.clone();
-        move || -> Option<String> { std::fs::read_to_string(&path).ok() }
-    })
-    .await
-    .unwrap_or(None)
-    {
-        for line in content.lines() {
-            if line.is_empty() || !line.starts_with('{') {
-                continue;
-            }
-            if let Ok(inc) = serde_json::from_str::<serde_json::Value>(line) {
-                total_incidents += 1;
-                let id = inc["incident_id"].as_str().unwrap_or("unknown");
-                let detector = id.split(':').next().unwrap_or("unknown").to_string();
-                *detector_counts.entry(detector.clone()).or_insert(0) += 1;
-
-                if let Some(ts) = inc["ts"].as_str() {
-                    if ts.len() >= 16 {
-                        let hour = &ts[11..13];
-                        let min: usize = ts[14..16].parse().unwrap_or(0);
-                        let bucket = format!("{hour}:{:02}", (min / 5) * 5);
-                        *detector_timeline
-                            .entry(bucket)
-                            .or_default()
-                            .entry(detector)
-                            .or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort source_counts by count descending
-    let mut sources: Vec<_> = source_counts.into_iter().collect();
-    sources.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let mut kinds: Vec<_> = kind_counts.into_iter().collect();
+    let mut kinds: Vec<_> = relation_counts.into_iter().collect();
     kinds.sort_by(|a, b| b.1.cmp(&a.1));
     kinds.truncate(15);
 
@@ -3731,9 +3763,9 @@ async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
 
     serde_json::json!({
         "date": today,
-        "total_events": total_events,
-        "total_incidents": total_incidents,
-        "sources": sources.iter().map(|(s, c)| serde_json::json!({"name": s, "count": c})).collect::<Vec<_>>(),
+        "total_events": metrics.edge_count,
+        "total_incidents": metrics.incident_nodes,
+        "sources": source_counts.iter().map(|(s, c)| serde_json::json!({"name": s, "count": c})).collect::<Vec<_>>(),
         "top_kinds": kinds.iter().map(|(k, c)| serde_json::json!({"name": k, "count": c})).collect::<Vec<_>>(),
         "detectors": detectors.iter().map(|(d, c)| serde_json::json!({"name": d, "count": c})).collect::<Vec<_>>(),
         "event_timeline": timeline,
