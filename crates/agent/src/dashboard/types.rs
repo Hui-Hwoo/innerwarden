@@ -137,6 +137,14 @@ pub(crate) struct OverviewResponse {
     pub(super) ai_responded: usize,
     /// Incidents where AI decided to ignore (false positive or low risk).
     pub(super) ai_ignored: usize,
+    /// Incidents with no decision yet — need human attention.
+    pub(super) unresolved_count: usize,
+    /// Incidents safely resolved (blocked, killed, contained, monitored, honeypot).
+    pub(super) safely_resolved: usize,
+    /// Breakdown by severity level: {"critical": N, "high": N, ...}
+    pub(super) severity_breakdown: std::collections::HashMap<String, usize>,
+    /// Incidents from allowlisted IPs/users (can be hidden in dashboard).
+    pub(super) allowlisted_count: usize,
     pub(super) top_detectors: Vec<DetectorCount>,
     pub(super) latest_telemetry: Option<TelemetrySnapshot>,
 }
@@ -166,6 +174,8 @@ pub(crate) struct IncidentView {
     pub(super) ts: chrono::DateTime<Utc>,
     pub(super) incident_id: String,
     pub(super) severity: String,
+    /// Effective severity after considering outcome: blocked critical → medium, ignored → info.
+    pub(super) effective_severity: String,
     pub(super) title: String,
     pub(super) summary: String,
     pub(super) entities: Vec<String>,
@@ -175,6 +185,11 @@ pub(crate) struct IncidentView {
     /// What action was taken (e.g. "block-ip-ufw", "fail2ban:sshd")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) action_taken: Option<String>,
+    /// AI decision confidence (0.0 - 1.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) confidence: Option<f32>,
+    /// True if the source entity is in the allowlist.
+    pub(super) is_allowlisted: bool,
 }
 
 #[derive(Debug, Serialize)]

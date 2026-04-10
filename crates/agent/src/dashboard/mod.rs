@@ -348,6 +348,25 @@ pub async fn serve(
     // Dashboard routes - auth required
     let dashboard = Router::new()
         .route("/", get(index))
+        .route("/app.css", get(serve_css))
+        .route("/js/api.js", get(serve_js_api))
+        .route("/js/helpers.js", get(serve_js_helpers))
+        .route("/js/state.js", get(serve_js_state))
+        .route("/js/nav.js", get(serve_js_nav))
+        .route("/js/home.js", get(serve_js_home))
+        .route("/js/threats.js", get(serve_js_threats))
+        .route("/js/journey.js", get(serve_js_journey))
+        .route("/js/sensors.js", get(serve_js_sensors))
+        .route("/js/reports.js", get(serve_js_reports))
+        .route("/js/status.js", get(serve_js_status))
+        .route("/js/compliance.js", get(serve_js_compliance))
+        .route("/js/honeypot.js", get(serve_js_honeypot))
+        .route("/js/intel.js", get(serve_js_intel))
+        .route("/js/graph.js", get(serve_js_graph))
+        .route("/js/monthly.js", get(serve_js_monthly))
+        .route("/js/responses.js", get(serve_js_responses))
+        .route("/js/actions.js", get(serve_js_actions))
+        .route("/js/sse.js", get(serve_js_sse))
         .route("/api/overview", get(api_overview))
         .route("/api/incidents", get(api_incidents))
         .route("/api/decisions", get(api_decisions))
@@ -389,6 +408,10 @@ pub async fn serve(
         .route("/api/graph/stats", get(api_graph_stats))
         .route("/api/graph/view", get(api_graph_view))
         .route("/api/graph/neighborhood", get(api_graph_neighborhood))
+        .route("/api/graph/path", get(api_graph_path))
+        .route("/api/graph/process-tree", get(api_graph_process_tree))
+        .route("/api/graph/timeline", get(api_graph_timeline))
+        .route("/api/graph/threats", get(api_graph_threats))
         .route("/api/playbook-log", get(api_playbook_log))
         .route("/api/responses", get(api_responses))
         .route("/api/mitre/navigator", get(api_mitre_navigator))
@@ -403,6 +426,7 @@ pub async fn serve(
         .route("/api/events/stream", get(api_events_stream))
         // Web Push
         .route("/sw.js", get(service_worker_js))
+        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/push/vapid-key", get(api_push_vapid_key))
         .route(
             "/api/push/subscribe",
@@ -494,6 +518,43 @@ async fn index() -> impl IntoResponse {
     )
 }
 
+async fn serve_css() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        APP_CSS,
+    )
+}
+
+macro_rules! js_handler {
+    ($name:ident, $content:expr) => {
+        async fn $name() -> impl IntoResponse {
+            (
+                [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+                $content,
+            )
+        }
+    };
+}
+
+js_handler!(serve_js_api, JS_API);
+js_handler!(serve_js_helpers, JS_HELPERS);
+js_handler!(serve_js_state, JS_STATE);
+js_handler!(serve_js_nav, JS_NAV);
+js_handler!(serve_js_home, JS_HOME);
+js_handler!(serve_js_threats, JS_THREATS);
+js_handler!(serve_js_journey, JS_JOURNEY);
+js_handler!(serve_js_sensors, JS_SENSORS);
+js_handler!(serve_js_reports, JS_REPORTS);
+js_handler!(serve_js_status, JS_STATUS);
+js_handler!(serve_js_compliance, JS_COMPLIANCE);
+js_handler!(serve_js_honeypot, JS_HONEYPOT);
+js_handler!(serve_js_intel, JS_INTEL);
+js_handler!(serve_js_graph, JS_GRAPH);
+js_handler!(serve_js_monthly, JS_MONTHLY);
+js_handler!(serve_js_responses, JS_RESPONSES);
+js_handler!(serve_js_actions, JS_ACTIONS);
+js_handler!(serve_js_sse, JS_SSE);
+
 
 
 
@@ -521,6 +582,25 @@ async fn index() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 const INDEX_HTML: &str = include_str!("frontend/html/index.html");
+const APP_CSS: &str = include_str!("frontend/css/app.css");
+const JS_API: &str = include_str!("frontend/js/api.js");
+const JS_HELPERS: &str = include_str!("frontend/js/helpers.js");
+const JS_STATE: &str = include_str!("frontend/js/state.js");
+const JS_NAV: &str = include_str!("frontend/js/nav.js");
+const JS_HOME: &str = include_str!("frontend/js/home.js");
+const JS_THREATS: &str = include_str!("frontend/js/threats.js");
+const JS_JOURNEY: &str = include_str!("frontend/js/journey.js");
+const JS_SENSORS: &str = include_str!("frontend/js/sensors.js");
+const JS_REPORTS: &str = include_str!("frontend/js/reports.js");
+const JS_STATUS: &str = include_str!("frontend/js/status.js");
+const JS_COMPLIANCE: &str = include_str!("frontend/js/compliance.js");
+const JS_HONEYPOT: &str = include_str!("frontend/js/honeypot.js");
+const JS_INTEL: &str = include_str!("frontend/js/intel.js");
+const JS_GRAPH: &str = include_str!("frontend/js/graph.js");
+const JS_MONTHLY: &str = include_str!("frontend/js/monthly.js");
+const JS_RESPONSES: &str = include_str!("frontend/js/responses.js");
+const JS_ACTIONS: &str = include_str!("frontend/js/actions.js");
+const JS_SSE: &str = include_str!("frontend/js/sse.js");
 
 
 // ---------------------------------------------------------------------------
@@ -1072,6 +1152,10 @@ mod tests {
                 ai_confirmed: 1,
                 ai_responded: 0,
                 ai_ignored: 0,
+                unresolved_count: 1,
+                safely_resolved: 0,
+                severity_breakdown: std::collections::HashMap::new(),
+                allowlisted_count: 0,
                 top_detectors: vec![],
                 latest_telemetry: None,
             },

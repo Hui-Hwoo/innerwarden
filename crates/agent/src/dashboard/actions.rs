@@ -28,6 +28,8 @@ pub(super) async fn api_action_config(State(state): State<DashboardState>) -> Js
         "ai_model": cfg.ai_model,
         "mode": mode,
         "version": env!("CARGO_PKG_VERSION"),
+        "trusted_ips": cfg.trusted_ips,
+        "trusted_users": cfg.trusted_users,
     }))
 }
 /// GET /api/quickwins - return actionable suggestions based on recent unblocked threats.

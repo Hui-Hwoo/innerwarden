@@ -93,6 +93,10 @@ pub struct DashboardActionConfig {
     pub retention_telemetry_days: usize,
     /// Data retention: reports keep days.
     pub retention_reports_days: usize,
+    /// Allowlisted IPs (trusted, dashboard can filter them out).
+    pub trusted_ips: Vec<String>,
+    /// Allowlisted users.
+    pub trusted_users: Vec<String>,
 }
 
 impl Default for DashboardActionConfig {
@@ -126,6 +130,8 @@ impl Default for DashboardActionConfig {
             retention_decisions_days: 90,
             retention_telemetry_days: 14,
             retention_reports_days: 30,
+            trusted_ips: vec![],
+            trusted_users: vec![],
         }
     }
 }

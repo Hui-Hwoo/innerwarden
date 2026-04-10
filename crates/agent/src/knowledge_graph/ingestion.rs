@@ -195,6 +195,7 @@ impl KnowledgeGraph {
             decision_reason: None,
             decision_target: None,
             auto_executed: false,
+            is_allowlisted: false,
         });
 
         // Create TriggeredBy edges from Incident to each entity
@@ -221,6 +222,19 @@ impl KnowledgeGraph {
                     Relation::TriggeredBy,
                     incident.ts,
                 ));
+            }
+        }
+    }
+
+    /// Mark an incident node as allowlisted.
+    pub fn set_allowlisted(&mut self, incident_id: &str, value: bool) {
+        if let Some(inc_node_id) = self.find_by_incident(incident_id) {
+            if let Some(Node::Incident {
+                is_allowlisted: ref mut al,
+                ..
+            }) = self.get_node_mut(inc_node_id)
+            {
+                *al = value;
             }
         }
     }

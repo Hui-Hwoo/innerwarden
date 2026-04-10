@@ -95,6 +95,8 @@ pub enum Node {
         decision_reason: Option<String>,
         decision_target: Option<String>,
         auto_executed: bool,
+        /// True if the source entity (IP/user) is in the allowlist.
+        is_allowlisted: bool,
     },
     Campaign {
         campaign_id: String,

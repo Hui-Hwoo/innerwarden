@@ -7,6 +7,8 @@ use crate::{ai, allowlist, config, state_store, AgentState};
 pub(crate) enum PreAiFlowDecision {
     Proceed,
     SkipHandled,
+    /// Entity is in allowlist — skip AI but mark in graph.
+    SkipAllowlisted,
     PipelineTestHandled,
 }
 
@@ -96,7 +98,7 @@ pub(crate) fn evaluate_pre_ai_flow(
                 incident_id = %incident.incident_id,
                 "AI gate: skipping (entity is in allowlist)"
             );
-            return PreAiFlowDecision::SkipHandled;
+            return PreAiFlowDecision::SkipAllowlisted;
         }
     }
 

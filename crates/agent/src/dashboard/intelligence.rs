@@ -365,3 +365,124 @@ pub(super) async fn api_campaigns(State(state): State<DashboardState>) -> Json<s
         "campaigns": campaigns,
     }))
 }
+
+// ── Knowledge Graph Phase 2 endpoints ────────────────────────────────
+
+/// `GET /api/graph/path?from=N&to=N&max_depth=10` — shortest path between two nodes.
+pub(super) async fn api_graph_path(
+    State(state): State<DashboardState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let from: u64 = params.get("from").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let to: u64 = params.get("to").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let max_depth: usize = params.get("max_depth").and_then(|v| v.parse().ok()).unwrap_or(10).min(10);
+
+    let graph = state.knowledge_graph.read().unwrap();
+    match graph.path_between(from, to, max_depth) {
+        Some(edges) => {
+            let items: Vec<serde_json::Value> = edges.iter().map(|e| {
+                serde_json::json!({
+                    "from": e.from, "to": e.to,
+                    "relation": format!("{:?}", e.relation),
+                    "ts": e.ts.to_rfc3339(),
+                    "properties": e.properties,
+                })
+            }).collect();
+            Json(serde_json::json!({ "path": items }))
+        }
+        None => Json(serde_json::json!({ "path": [] })),
+    }
+}
+
+/// `GET /api/graph/process-tree?pid=1234` — ancestors + descendants of a process.
+pub(super) async fn api_graph_process_tree(
+    State(state): State<DashboardState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    use crate::knowledge_graph::types::*;
+
+    let pid: u32 = params.get("pid").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let graph = state.knowledge_graph.read().unwrap();
+
+    let ancestors = graph.ancestors(pid);
+    let descendants = graph.descendants(pid);
+    let center = graph.find_by_pid(pid);
+
+    let mut all_ids: Vec<NodeId> = ancestors.iter().chain(descendants.iter()).copied().collect();
+    if let Some(c) = center { all_ids.push(c); }
+    all_ids.sort();
+    all_ids.dedup();
+
+    let keep: std::collections::HashSet<NodeId> = all_ids.iter().copied().collect();
+
+    let cy_nodes: Vec<serde_json::Value> = all_ids.iter().filter_map(|&id| {
+        graph.get_node(id).map(|n| serde_json::json!({
+            "data": {
+                "id": format!("n{}", id),
+                "label": n.label(),
+                "type": format!("{:?}", n.node_type()),
+                "is_center": center == Some(id),
+            }
+        }))
+    }).collect();
+
+    let cy_edges: Vec<serde_json::Value> = graph.edges_slice().iter().enumerate()
+        .filter(|(_, e)| keep.contains(&e.from) && keep.contains(&e.to)
+            && matches!(e.relation, Relation::SpawnedBy))
+        .map(|(i, e)| serde_json::json!({
+            "data": {
+                "id": format!("e{}", i),
+                "source": format!("n{}", e.from),
+                "target": format!("n{}", e.to),
+                "relation": format!("{:?}", e.relation),
+                "ts": e.ts.to_rfc3339(),
+            }
+        }))
+        .collect();
+
+    Json(serde_json::json!({ "nodes": cy_nodes, "edges": cy_edges }))
+}
+
+/// `GET /api/graph/timeline?node_id=N` — chronological edges of a node.
+pub(super) async fn api_graph_timeline(
+    State(state): State<DashboardState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let node_id: u64 = params.get("node_id").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let graph = state.knowledge_graph.read().unwrap();
+
+    let edges = graph.timeline(node_id);
+    let items: Vec<serde_json::Value> = edges.iter().map(|e| {
+        let from_label = graph.get_node(e.from).map(|n| n.label().to_string()).unwrap_or_default();
+        let to_label = graph.get_node(e.to).map(|n| n.label().to_string()).unwrap_or_default();
+        serde_json::json!({
+            "from": e.from, "to": e.to,
+            "from_label": from_label, "to_label": to_label,
+            "relation": format!("{:?}", e.relation),
+            "ts": e.ts.to_rfc3339(),
+            "properties": e.properties,
+        })
+    }).collect();
+
+    Json(serde_json::json!({ "timeline": items }))
+}
+
+/// `GET /api/graph/threats` — all process→IP connections where IP has threat intel datasets.
+pub(super) async fn api_graph_threats(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
+    let graph = state.knowledge_graph.read().unwrap();
+    let hits = graph.threat_intel_hits();
+
+    let items: Vec<serde_json::Value> = hits.iter().map(|(proc_id, ip_id, dataset)| {
+        let proc_label = graph.get_node(*proc_id).map(|n| n.label().to_string()).unwrap_or_default();
+        let ip_label = graph.get_node(*ip_id).map(|n| n.label().to_string()).unwrap_or_default();
+        serde_json::json!({
+            "process_id": proc_id, "process_label": proc_label,
+            "ip_id": ip_id, "ip_label": ip_label,
+            "dataset": dataset,
+        })
+    }).collect();
+
+    Json(serde_json::json!({ "total": items.len(), "hits": items }))
+}
