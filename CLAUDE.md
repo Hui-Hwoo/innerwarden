@@ -37,7 +37,7 @@ make replay-qa    # validacao E2E
 ## Estado (2026-04-04)
 
 - 49 sensor detectors + 27 graph detectors (Phase 3A-C complete), 40 eBPF hooks, 65 MITRE IDs, 43 correlation rules + 10 graph correlation rules
-- Knowledge graph: in-memory directed graph (11 node types, 50 relation types, 60 event kinds mapped). Dashboard tab + AI triage integration + 58-feature autoencoder (10 graph structural features). **Phase 6 complete**: graph is primary read source for dashboard, bot, agent context, reports. ~25 JSONL reads eliminated, 2 redundant writes removed. Snapshot rotation (3 backups) + integrity check + corruption fallback.
+- Knowledge graph: in-memory directed graph (11 node types, 50 relation types, 60 event kinds mapped). Dashboard tab + AI triage integration + 58-feature autoencoder (10 graph structural features). **Phase 6 complete + Phase 7 Gap 2**: graph is primary read source. Daily dated snapshots (`graph-snapshot-YYYY-MM-DD.json`), 7-day retention. decision_cooldown, report, neural_lifecycle migrated from JSONL to graph snapshot reads. ~25 JSONL reads eliminated, 2 redundant writes removed. Snapshot rotation (3 backups) + integrity check + corruption fallback.
 - Server producao: ver config local (nao expor no repo publico)
 - Branches: main = stable, develop = bleeding edge
 - CI: `make check` + `make test` + `make spec-check`
@@ -91,7 +91,7 @@ ADR: `docs/internal/adr/0001-project-taxonomy.md`
 | 005 | Intelligent Notifications | Spec pronto. Grouping + channel filter + env calibration + AI batch triage |
 | 012 | Eliminate JSONL Dependency (Phase 6) | **Concluida**. 6A-6F done. Graph primary for dashboard/bot/reports. Deferred: FP tracking, multi-day snapshots, telemetry (spec 013) |
 | 010 | Detector Migration (Phase 3) | **3A-3C Done**: 27 graph detectors + 10 correlation rules + dedup + config flag. 3D partial (metrics deferred). 29 tests. |
-| 013 | Graph Single Source of Truth (Phase 7) | Spec pronto. 5 gaps from Phase 6: FP tracking, daily snapshots, telemetry, monthly report, event timestamps |
+| 013 | Graph Single Source of Truth (Phase 7) | **Gap 2 DONE**: daily dated snapshots (`graph-snapshot-YYYY-MM-DD.json`), 7-day retention, legacy fallback. decision_cooldown, report, neural_lifecycle migrated to graph reads. Remaining: Gap 1 (FP tracking), Gap 4 (monthly report), Gap 5 (event timestamps). Gap 3 deferred (keep JSONL). |
 
 ## Divida tecnica
 
