@@ -618,22 +618,7 @@ pub(super) fn make_synthetic_incident(
 
 /// Append a single `DecisionEntry` to today's decisions JSONL file.
 pub(super) fn append_decision_entry(data_dir: &Path, entry: &DecisionEntry) -> anyhow::Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let today = chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-    let path = data_dir.join(format!("decisions-{today}.jsonl"));
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
-    let line = serde_json::to_string(entry).context("serialize decision")?;
-    writeln!(f, "{line}").context("write decision")?;
-    f.flush().context("flush decision")
+    crate::decisions::append_chained(data_dir, entry)
 }
 
 /// Inject a synthetic high-severity SSH brute-force incident so the agent's main
