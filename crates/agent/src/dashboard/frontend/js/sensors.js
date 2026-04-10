@@ -97,10 +97,15 @@ async function loadTopAction() {
       el.style.display = 'block';
       el.style.borderColor = 'rgba(58,194,126,0.3)';
       el.style.background = 'rgba(58,194,126,0.04)';
-      el.innerHTML = '<div style="display:flex;align-items:center;gap:10px">' +
+      el.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between">' +
+        '<div style="display:flex;align-items:center;gap:10px">' +
         '<span style="font-size:1.3rem">&#9989;</span>' +
         '<div><div style="font-size:0.85rem;font-weight:700;color:var(--ok)">All Clear</div>' +
-        '<div style="font-size:0.7rem;color:var(--muted)">' + blocks + ' IPs blocked today. No unresolved high-severity incidents.</div></div></div>';
+        '<div style="font-size:0.7rem;color:var(--muted)">' + blocks + ' IPs blocked today. No unresolved high-severity incidents.</div></div></div>' +
+        '<button onclick="this.closest(\'[id]\').style.display=\'none\'" style="' +
+        'padding:4px 8px;border-radius:6px;border:1px solid var(--line);' +
+        'background:transparent;color:var(--muted);font-size:0.75rem;' +
+        'cursor:pointer;line-height:1" title="Dismiss">\u2715</button></div>';
       return;
     }
 
@@ -126,13 +131,18 @@ async function loadTopAction() {
     }
     actionHtml += '</div></div></div>';
 
-    // Action button — takes user to Threats tab
-    actionHtml += '<button onclick="showView(\'investigate\')" style="' +
+    // Action button + dismiss
+    actionHtml += '<div style="display:flex;align-items:center;gap:8px">' +
+      '<button onclick="showView(\'investigate\')" style="' +
       'padding:8px 18px;border-radius:10px;border:1px solid ' + color + ';' +
       'background:transparent;color:' + color + ';font-size:0.75rem;font-weight:700;' +
       'cursor:pointer;white-space:nowrap;transition:background 0.2s' +
       '" onmouseover="this.style.background=\'' + color + '20\'" onmouseout="this.style.background=\'transparent\'">' +
-      'Investigate &#8594;</button></div>';
+      'Investigate &#8594;</button>' +
+      '<button onclick="this.closest(\'[id]\').style.display=\'none\'" style="' +
+      'padding:4px 8px;border-radius:6px;border:1px solid var(--line);' +
+      'background:transparent;color:var(--muted);font-size:0.75rem;' +
+      'cursor:pointer;line-height:1" title="Dismiss">\u2715</button></div></div>';
 
     el.innerHTML = actionHtml;
   } catch(e) { console.warn('loadTopAction:', e); }
