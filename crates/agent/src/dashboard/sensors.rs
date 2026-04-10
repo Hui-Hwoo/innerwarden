@@ -131,31 +131,27 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
         "read_only"
     };
 
-    // Count kill chain incidents from today's incident store
+    // Count kill chain incidents from knowledge graph (Phase 6A: no JSONL reads).
+    // Single pass — avoids u64 underflow from two-pass subtract.
     let mut kc_total_blocked: u64 = 0;
     let mut kc_total_pre_chain: u64 = 0;
     let mut kc_patterns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let inc_path = data_dir.join(&incidents_file);
-    if inc_path.exists() {
-        let incidents = read_jsonl::<innerwarden_core::incident::Incident>(&inc_path);
-        for inc in &incidents {
-            if let Some(evidence) = inc.evidence.as_array() {
-                for ev in evidence {
-                    let kind = ev.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                    if kind.contains("kill_chain") {
-                        let blocked = ev.get("blocked").and_then(|b| b.as_bool()).unwrap_or(false);
-                        if blocked {
-                            kc_total_blocked += 1;
-                        } else {
-                            kc_total_pre_chain += 1;
-                        }
-                        let pattern = ev
-                            .get("pattern")
-                            .and_then(|p| p.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        *kc_patterns.entry(pattern).or_insert(0) += 1;
-                    }
+    {
+        use crate::knowledge_graph::types::{Node, NodeType};
+        let graph = state.knowledge_graph.read().unwrap();
+        for id in graph.nodes_of_type(NodeType::Incident) {
+            if let Some(Node::Incident {
+                detector, decision, ..
+            }) = graph.get_node(id)
+            {
+                if !detector.contains("kill_chain") {
+                    continue;
+                }
+                *kc_patterns.entry(detector.clone()).or_insert(0) += 1;
+                if decision.as_deref() == Some("block_ip") {
+                    kc_total_blocked += 1;
+                } else {
+                    kc_total_pre_chain += 1;
                 }
             }
         }
@@ -218,10 +214,6 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
 /// GET /api/collectors - sensor collector detection (file existence + recency).
 /// Fail-silent: never requires root, never panics.
 pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<serde_json::Value> {
-    let data_dir = &state.data_dir;
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let events_file = data_dir.join(format!("events-{today}.jsonl"));
-
     // Helper: check if a path exists
     let file_exists = |p: &str| std::path::Path::new(p).exists();
 
@@ -243,23 +235,12 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
             .unwrap_or(false)
     };
 
-    // Helper: count events by source in today's events file (last 2000 lines)
-    let count_source = |source: &str| -> u64 {
-        use std::io::{BufRead, BufReader};
-        let f = match std::fs::File::open(&events_file) {
-            Ok(f) => f,
-            Err(_) => return 0,
-        };
-        let needle = format!("\"source\":\"{source}\"");
-        let needle2 = format!("\"source\": \"{source}\"");
-        let mut count = 0u64;
-        for line in BufReader::new(f).lines() {
-            let Ok(l) = line else { break };
-            if l.contains(&needle) || l.contains(&needle2) {
-                count += 1;
-            }
-        }
-        count
+    // Count events by source from knowledge graph (Phase 6A: no JSONL reads)
+    let graph = state.knowledge_graph.read().unwrap();
+    let source_counts = graph.source_counts.clone();
+    drop(graph);
+    let count_source = move |source: &str| -> u64 {
+        source_counts.get(source).copied().unwrap_or(0) as u64
     };
 
     // Recency threshold: active if file modified within last 2 hours

@@ -43,7 +43,7 @@ pub(crate) async fn handle_telegram_bot_command(
                     .format("%Y-%m-%d")
                     .to_string();
                 let decision_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("decisions-{today}.jsonl"))
+                    bot_helpers::graph_count(&state.knowledge_graph, "decisions")
                         as u64;
 
                 // Check for recent critical/high incidents from narrative accumulator
@@ -110,9 +110,9 @@ pub(crate) async fn handle_telegram_bot_command(
                     .format("%Y-%m-%d")
                     .to_string();
                 let incident_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("incidents-{today}.jsonl"));
+                    bot_helpers::graph_count(&state.knowledge_graph, "incidents");
                 let decision_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("decisions-{today}.jsonl"));
+                    bot_helpers::graph_count(&state.knowledge_graph, "decisions");
                 let mode = guardian_mode(cfg);
                 let mode_label = mode.label();
                 let mode_desc = mode.description();
@@ -246,7 +246,7 @@ pub(crate) async fn handle_telegram_bot_command(
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();
-            let text = bot_helpers::read_last_incidents(data_dir, &today, 5);
+            let text = bot_helpers::graph_last_incidents(&state.knowledge_graph, 5);
             tg_reply(state, text);
         }
         return true;
@@ -259,7 +259,7 @@ pub(crate) async fn handle_telegram_bot_command(
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();
-            let text = bot_helpers::read_last_decisions(data_dir, &today, 5);
+            let text = bot_helpers::graph_last_decisions(&state.knowledge_graph, 5);
             tg_reply(state, text);
         }
         return true;
@@ -507,9 +507,9 @@ pub(crate) async fn handle_telegram_bot_command(
                     .format("%Y-%m-%d")
                     .to_string();
                 let incident_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("incidents-{today}.jsonl"));
+                    bot_helpers::graph_count(&state.knowledge_graph, "incidents");
                 let decision_count =
-                    bot_helpers::count_jsonl_lines(data_dir, &format!("decisions-{today}.jsonl"));
+                    bot_helpers::graph_count(&state.knowledge_graph, "decisions");
                 let mode = guardian_mode(cfg);
                 let host = std::env::var("HOSTNAME")
                     .or_else(|_| {
@@ -629,8 +629,8 @@ pub(crate) async fn handle_telegram_bot_command(
                 .format("%Y-%m-%d")
                 .to_string();
             // Inject full system context so the AI knows exactly what's configured
-            let agent_ctx = build_agent_context(cfg, data_dir);
-            let recent_incidents = bot_helpers::read_last_incidents_raw(data_dir, &today, 3);
+            let agent_ctx = build_agent_context(cfg, data_dir, &state.knowledge_graph);
+            let recent_incidents = bot_helpers::graph_last_incidents_raw(&state.knowledge_graph, 3);
             let system_prompt = if recent_incidents.is_empty() {
                 format!("{}\n\n{agent_ctx}", cfg.telegram.bot.personality)
             } else {

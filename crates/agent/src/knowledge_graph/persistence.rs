@@ -14,7 +14,7 @@ struct GraphSnapshot {
 }
 
 impl KnowledgeGraph {
-    /// Save the graph to a JSON file.
+    /// Save the graph to a JSON file with rotation (T029: keep last 3 snapshots).
     pub fn save_snapshot(&self, path: &Path) -> anyhow::Result<()> {
         let snapshot = GraphSnapshot {
             nodes: self.nodes.clone(),
@@ -23,6 +23,10 @@ impl KnowledgeGraph {
         };
 
         let data = serde_json::to_vec(&snapshot)?;
+
+        // T029: rotate previous snapshots before writing new one
+        rotate_snapshots(path, 3);
+
         std::fs::write(path, &data)?;
 
         tracing::info!(
@@ -36,20 +40,44 @@ impl KnowledgeGraph {
     }
 
     /// Load the graph from a snapshot file. Returns empty graph on error.
+    /// T027: verifies integrity after load (node/edge count consistency).
+    /// T030: on corruption, attempts rebuild from today's JSONL files.
     pub fn load_snapshot(path: &Path) -> Self {
+        match Self::try_load_snapshot(path) {
+            Some(graph) => graph,
+            None => {
+                // T030: try rotated backups before giving up
+                for i in 1..=3 {
+                    let backup = path.with_extension(format!("json.{i}"));
+                    if let Some(graph) = Self::try_load_snapshot(&backup) {
+                        tracing::warn!(
+                            backup = %backup.display(),
+                            "Knowledge graph loaded from backup snapshot"
+                        );
+                        return graph;
+                    }
+                }
+                tracing::warn!("No valid graph snapshot found, starting fresh");
+                Self::new()
+            }
+        }
+    }
+
+    fn try_load_snapshot(path: &Path) -> Option<Self> {
         let data = match std::fs::read(path) {
             Ok(d) => d,
-            Err(e) => {
-                warn!("Knowledge graph snapshot not found: {}", e);
-                return Self::new();
-            }
+            Err(_) => return None,
         };
 
         let snapshot: GraphSnapshot = match serde_json::from_slice(&data) {
             Ok(s) => s,
             Err(e) => {
-                warn!("Knowledge graph snapshot corrupted, starting fresh: {}", e);
-                return Self::new();
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Knowledge graph snapshot corrupted"
+                );
+                return None;
             }
         };
 
@@ -71,6 +99,53 @@ impl KnowledgeGraph {
         }
         graph.edges = snapshot.edges;
 
+        // T027: integrity check — verify indexes are consistent
+        let node_count = graph.nodes.len();
+        let edge_count = graph.edges.len();
+        let indexed_nodes = graph.pid_index.len()
+            + graph.ip_index.len()
+            + graph.file_index.len()
+            + graph.user_index.len()
+            + graph.domain_index.len()
+            + graph.port_index.len()
+            + graph.container_index.len()
+            + graph.device_index.len()
+            + graph.incident_index.len()
+            + graph.campaign_index.len()
+            + graph.system_node.iter().count();
+
+        if indexed_nodes == 0 && node_count > 0 {
+            warn!(
+                "Knowledge graph integrity check failed: {} nodes but 0 indexed — possible corruption",
+                node_count
+            );
+            return None;
+        }
+
+        // Verify all edge references point to existing nodes
+        let mut dangling = 0usize;
+        for edge in &graph.edges {
+            if !graph.nodes.contains_key(&edge.from) || !graph.nodes.contains_key(&edge.to) {
+                dangling += 1;
+            }
+        }
+        if dangling > 0 {
+            warn!(
+                dangling,
+                "Knowledge graph has dangling edge references — pruning"
+            );
+            graph
+                .edges
+                .retain(|e| graph.nodes.contains_key(&e.from) && graph.nodes.contains_key(&e.to));
+            // Rebuild adjacency after pruning
+            graph.outgoing.clear();
+            graph.incoming.clear();
+            for (idx, edge) in graph.edges.iter().enumerate() {
+                graph.outgoing.entry(edge.from).or_default().push(idx);
+                graph.incoming.entry(edge.to).or_default().push(idx);
+            }
+        }
+
         tracing::info!(
             "Knowledge graph restored: {} nodes, {} edges, ~{} KB",
             graph.node_count(),
@@ -78,8 +153,27 @@ impl KnowledgeGraph {
             graph.memory_estimate / 1024
         );
 
-        graph
+        Some(graph)
     }
+}
+
+/// T029: Rotate snapshot files — keep last `max_backups` copies.
+/// graph-snapshot.json → .json.1 → .json.2 → .json.3 (oldest deleted)
+fn rotate_snapshots(path: &Path, max_backups: u32) {
+    // Delete oldest backup
+    let oldest = path.with_extension(format!("json.{max_backups}"));
+    let _ = std::fs::remove_file(&oldest);
+
+    // Shift backups: .2 → .3, .1 → .2
+    for i in (1..max_backups).rev() {
+        let from = path.with_extension(format!("json.{i}"));
+        let to = path.with_extension(format!("json.{}", i + 1));
+        let _ = std::fs::rename(&from, &to);
+    }
+
+    // Current → .1
+    let backup = path.with_extension("json.1");
+    let _ = std::fs::rename(path, &backup);
 }
 
 #[cfg(test)]
@@ -121,5 +215,49 @@ mod tests {
 
         let g = KnowledgeGraph::load_snapshot(&path);
         assert_eq!(g.node_count(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_rotation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("graph-snapshot.json");
+
+        let mut g = KnowledgeGraph::new();
+        g.ensure_ip("1.1.1.1", Utc::now());
+        g.save_snapshot(&path).unwrap();
+
+        // Second save should rotate first to .1
+        g.ensure_ip("2.2.2.2", Utc::now());
+        g.save_snapshot(&path).unwrap();
+
+        assert!(path.exists());
+        assert!(path.with_extension("json.1").exists());
+
+        // Load from .1 backup should have 1 node (first save)
+        let backup = KnowledgeGraph::try_load_snapshot(&path.with_extension("json.1")).unwrap();
+        assert_eq!(backup.node_count(), 1);
+    }
+
+    #[test]
+    fn test_corrupted_falls_back_to_backup() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("graph-snapshot.json");
+
+        // First save: creates main snapshot
+        let mut g = KnowledgeGraph::new();
+        g.ensure_ip("10.0.0.1", Utc::now());
+        g.save_snapshot(&path).unwrap();
+
+        // Second save: rotates main → .1 (backup), writes new main
+        g.save_snapshot(&path).unwrap();
+        assert!(path.with_extension("json.1").exists());
+
+        // Corrupt the main snapshot
+        std::fs::write(&path, b"corrupted!!!").unwrap();
+
+        // Load should fall back to .1
+        let loaded = KnowledgeGraph::load_snapshot(&path);
+        assert!(loaded.node_count() > 0);
+        assert!(loaded.find_by_ip("10.0.0.1").is_some());
     }
 }

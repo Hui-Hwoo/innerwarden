@@ -254,6 +254,16 @@ pub fn generate_monthly(
         .collect();
     let mut weekly_ips: Vec<HashSet<String>> = vec![HashSet::new(); 4];
 
+    // Phase 6C: monthly reports require historical data spanning 30 days.
+    // The knowledge graph only holds today's state, so JSONL remains the
+    // source for historical aggregation.  This will be eliminated when
+    // graph persistence stores daily snapshots (Phase 6F).
+    tracing::info!(
+        month = %month,
+        days = days_in_month,
+        "threat_report: reading historical JSONL for monthly aggregation (graph lacks multi-day history)"
+    );
+
     for day_offset in 0..days_in_month {
         let date = month_start + chrono::Duration::days(day_offset as i64);
         let date_str = date.format("%Y-%m-%d").to_string();

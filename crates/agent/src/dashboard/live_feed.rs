@@ -32,6 +32,9 @@ pub(super) struct LiveFeedItem {
     title: String,
     ip: Option<String>,
     action: Option<String>,
+    /// Resolution outcome: "blocked", "monitored", "ignored", "open", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
     confidence: Option<f32>,
     reason: Option<String>,
     /// Local IP reputation data (present when the IP has been seen before).
@@ -277,12 +280,23 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
                 technique_id: m.technique_id.to_string(),
                 technique_name: m.technique_name.to_string(),
             });
+            let outcome = dec.map(|d| match d.action_type.as_str() {
+                "block_ip" => "blocked",
+                "suspend_user_sudo" => "suspended",
+                "kill_process" => "killed",
+                "block_container" => "contained",
+                "monitor" => "monitored",
+                "honeypot" => "honeypot",
+                "ignore" => "ignored",
+                _ => "resolved",
+            }.to_string());
             LiveFeedItem {
                 ts: inc.ts.to_rfc3339(),
                 severity: format!("{:?}", inc.severity).to_lowercase(),
                 title: live_feed_title(detector, &inc.severity),
                 ip,
                 action: dec.map(|d| d.action_type.clone()),
+                outcome,
                 confidence: dec.map(|d| d.confidence),
                 reason: dec.map(|d| live_feed_reason(detector, &d.action_type)),
                 reputation,
@@ -553,21 +567,22 @@ pub(super) struct MitreSummaryResponse {
     tactics: Vec<MitreTacticSummary>,
 }
 
-/// `GET /api/live-feed/mitre` - MITRE ATT&CK tactic/technique summary for today.
+/// `GET /api/live-feed/mitre` - MITRE ATT&CK tactic/technique summary for today (Phase 6A: graph-only).
 pub(super) async fn api_live_feed_mitre(State(state): State<DashboardState>) -> Json<MitreSummaryResponse> {
-    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let incidents = read_jsonl::<Incident>(&dated_path(&state.data_dir, "incidents", &date));
+    use crate::knowledge_graph::types::{Node, NodeType};
+    let graph = state.knowledge_graph.read().unwrap();
 
     // tactic -> (technique_id, technique_name) -> count
     let mut tactic_map: BTreeMap<String, BTreeMap<(String, String), usize>> = BTreeMap::new();
 
-    for inc in &incidents {
-        let detector = mitre::detector_from_incident_id(&inc.incident_id);
-        if let Some(m) = mitre::map_detector(detector) {
-            let techniques = tactic_map.entry(m.tactic.to_string()).or_default();
-            *techniques
-                .entry((m.technique_id.to_string(), m.technique_name.to_string()))
-                .or_insert(0) += 1;
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident { detector, .. }) = graph.get_node(id) {
+            if let Some(m) = mitre::map_detector(detector) {
+                let techniques = tactic_map.entry(m.tactic.to_string()).or_default();
+                *techniques
+                    .entry((m.technique_id.to_string(), m.technique_name.to_string()))
+                    .or_insert(0) += 1;
+            }
         }
     }
 

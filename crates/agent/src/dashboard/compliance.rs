@@ -6,19 +6,21 @@ use super::*;
 pub(super) async fn api_honeypot_sessions(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     let honeypot_dir = state.data_dir.join("honeypot");
 
-    // Collect blocked IPs from recent decisions for "blocked" badge
+    // Collect blocked IPs from knowledge graph (Phase 6A: no JSONL reads).
+    // Includes all block_ip decisions (dry-run and executed) to match original semantics.
     let mut blocked_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
-    for date in &[today.as_str(), yesterday.as_str()] {
-        let decisions =
-            read_jsonl::<DecisionEntry>(&state.data_dir.join(format!("decisions-{date}.jsonl")));
-        for d in decisions {
-            if d.action_type == "block_ip" {
-                if let Some(ip) = d.target_ip {
-                    blocked_ips.insert(ip);
+    {
+        use crate::knowledge_graph::types::{Node, NodeType};
+        let graph = state.knowledge_graph.read().unwrap();
+        for id in graph.nodes_of_type(NodeType::Incident) {
+            if let Some(Node::Incident {
+                decision: Some(dec),
+                decision_target: Some(target),
+                ..
+            }) = graph.get_node(id)
+            {
+                if dec == "block_ip" {
+                    blocked_ips.insert(target.clone());
                 }
             }
         }

@@ -6,55 +6,52 @@ use super::*;
 // Agent API - security context for AI agents (OpenClaw, n8n, etc.)
 // ---------------------------------------------------------------------------
 
-/// GET /api/agent/security-context - threat overview for AI agents
+/// GET /api/agent/security-context - threat overview for AI agents (Phase 6A: graph-only)
 pub(super) async fn api_agent_security_context(
     State(state): State<DashboardState>,
 ) -> Json<serde_json::Value> {
     let date = resolve_date(None);
-    let incidents = read_jsonl::<innerwarden_core::incident::Incident>(&dated_path(
-        &state.data_dir,
-        "incidents",
-        &date,
-    ));
-    let decisions = read_jsonl::<DecisionEntry>(&dated_path(&state.data_dir, "decisions", &date));
 
-    let total_incidents = incidents.len();
-    let high_or_critical = incidents
-        .iter()
-        .filter(|i| {
-            matches!(
-                i.severity,
-                innerwarden_core::event::Severity::High
-                    | innerwarden_core::event::Severity::Critical
-            )
-        })
-        .count();
-    let blocks_today = decisions
-        .iter()
-        .filter(|d| d.action_type == "block_ip" && !d.dry_run)
-        .count();
+    use crate::knowledge_graph::types::{Node, NodeType};
+    let graph = state.knowledge_graph.read().unwrap();
 
-    // Collect top detectors from incident IDs (prefix before first ':')
+    let incident_nodes = graph.nodes_of_type(NodeType::Incident);
+    let total_incidents = incident_nodes.len();
+    let mut high_or_critical = 0usize;
+    let mut blocks_today = 0usize;
+    let mut ai_actions = 0usize;
     let mut detector_counts = std::collections::HashMap::<String, usize>::new();
-    for inc in &incidents {
-        let detector = inc
-            .incident_id
-            .split(':')
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
-        *detector_counts.entry(detector).or_default() += 1;
+
+    for &id in &incident_nodes {
+        if let Some(Node::Incident {
+            detector,
+            severity,
+            decision,
+            auto_executed,
+            ..
+        }) = graph.get_node(id)
+        {
+            let sev = severity.to_lowercase();
+            if sev == "high" || sev == "critical" {
+                high_or_critical += 1;
+            }
+            *detector_counts.entry(detector.clone()).or_default() += 1;
+
+            if let Some(dec) = decision {
+                if dec != "ignore" && dec != "request_confirmation" {
+                    ai_actions += 1;
+                }
+                if dec == "block_ip" && *auto_executed {
+                    blocks_today += 1;
+                }
+            }
+        }
     }
+
     let mut top: Vec<_> = detector_counts.into_iter().collect();
     top.sort_by(|a, b| b.1.cmp(&a.1));
     let top_threats: Vec<String> = top.iter().take(5).map(|(k, _)| k.clone()).collect();
 
-    // Threat level based on AI-confirmed actions, not raw incident count.
-    // Raw incidents include noise. Only AI decisions that resulted in action matter.
-    let ai_actions = decisions
-        .iter()
-        .filter(|d| d.action_type != "ignore" && d.action_type != "request_confirmation")
-        .count();
     let threat_level = if ai_actions >= 10 {
         "critical"
     } else if ai_actions >= 5 {
@@ -88,44 +85,50 @@ pub(super) struct CheckIpQuery {
     ip: String,
 }
 
-/// GET /api/agent/check-ip?ip=X - check if an IP is known threat
+/// GET /api/agent/check-ip?ip=X - check if an IP is known threat (Phase 6A: graph-only)
 pub(super) async fn api_agent_check_ip(
     State(state): State<DashboardState>,
     Query(query): Query<CheckIpQuery>,
 ) -> Json<serde_json::Value> {
     let ip = query.ip.trim();
-    let date = resolve_date(None);
-    let incidents = read_jsonl::<innerwarden_core::incident::Incident>(&dated_path(
-        &state.data_dir,
-        "incidents",
-        &date,
-    ));
-    let decisions = read_jsonl::<DecisionEntry>(&dated_path(&state.data_dir, "decisions", &date));
 
-    // Count incidents involving this IP
-    let matching_incidents: Vec<_> = incidents
-        .iter()
-        .filter(|inc| {
-            inc.entities
-                .iter()
-                .any(|e| e.r#type == innerwarden_core::entities::EntityType::Ip && e.value == ip)
-        })
-        .collect();
+    use crate::knowledge_graph::types::{Node, NodeType, Relation};
+    let graph = state.knowledge_graph.read().unwrap();
 
-    let incident_count = matching_incidents.len();
-    let blocked = decisions
-        .iter()
-        .any(|d| d.action_type == "block_ip" && d.target_ip.as_deref() == Some(ip));
-    let last_seen = matching_incidents
-        .iter()
-        .map(|i| i.ts)
-        .max()
-        .map(|ts| ts.to_rfc3339());
+    // Find the IP node
+    let ip_node_id = graph.find_by_ip(ip);
 
+    let mut incident_count = 0usize;
+    let mut blocked = false;
+    let mut last_seen: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut detectors = std::collections::HashSet::new();
-    for inc in &matching_incidents {
-        if let Some(d) = inc.incident_id.split(':').next() {
-            detectors.insert(d.to_string());
+
+    if let Some(ip_id) = ip_node_id {
+        // Use incoming edges on the IP node — O(k) instead of scanning all incidents
+        for edge in graph.incoming_edges(ip_id) {
+            if edge.relation != Relation::TriggeredBy {
+                continue;
+            }
+            if let Some(Node::Incident {
+                detector,
+                ts,
+                decision,
+                auto_executed,
+                ..
+            }) = graph.get_node(edge.from)
+            {
+                incident_count += 1;
+                detectors.insert(detector.clone());
+                match &last_seen {
+                    Some(prev) if prev >= ts => {}
+                    _ => last_seen = Some(*ts),
+                }
+                if let Some(dec) = decision {
+                    if dec == "block_ip" && *auto_executed {
+                        blocked = true;
+                    }
+                }
+            }
         }
     }
 
@@ -142,7 +145,7 @@ pub(super) async fn api_agent_check_ip(
         "known_threat": incident_count > 0 || blocked,
         "incident_count": incident_count,
         "blocked": blocked,
-        "last_seen": last_seen,
+        "last_seen": last_seen.map(|ts| ts.to_rfc3339()),
         "detectors": detectors.into_iter().collect::<Vec<_>>(),
         "recommendation": recommendation,
     }))

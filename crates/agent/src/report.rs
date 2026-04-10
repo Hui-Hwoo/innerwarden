@@ -584,7 +584,15 @@ pub fn list_available_dates(data_dir: &Path) -> Vec<String> {
 
 pub fn generate(data_dir: &Path, output_dir: &Path) -> Result<GeneratedReport> {
     let report_date = Local::now().date_naive().format("%Y-%m-%d").to_string();
-    let report = compute_for_date(data_dir, None);
+    // Phase 6C: prefer graph snapshot, fall back to JSONL if graph is empty.
+    let graph = crate::knowledge_graph::KnowledgeGraph::load_snapshot(
+        &data_dir.join("graph-snapshot.json"),
+    );
+    let report = if graph.metrics().node_count > 0 {
+        compute_for_date_from_graph(data_dir, None, &graph)
+    } else {
+        compute_for_date(data_dir, None)
+    };
 
     let json_path = safe_dated_file(output_dir, "trial-report", &report_date, "json");
     let md_path = safe_dated_file(output_dir, "trial-report", &report_date, "md");

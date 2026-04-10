@@ -648,6 +648,8 @@ async fn main() -> Result<()> {
             retention_decisions_days: cfg.data.decisions_keep_days,
             retention_telemetry_days: cfg.data.telemetry_keep_days,
             retention_reports_days: cfg.data.reports_keep_days,
+            trusted_ips: cfg.allowlist.trusted_ips.clone(),
+            trusted_users: cfg.allowlist.trusted_users.clone(),
         };
         let dashboard_data_dir = cli.data_dir.clone();
         let dashboard_bind = cli.dashboard_bind.clone();
@@ -2167,6 +2169,27 @@ async fn process_incidents(
     for incident in &all_incidents {
         state.telemetry.observe_incident(incident);
 
+        // Dedup: suppress sensor incident if graph already detected it for the same entity
+        {
+            let sensor_detector = incident.incident_id.split(':').next().unwrap_or("");
+            let entity_value = incident
+                .entities
+                .first()
+                .map(|e| e.value.as_str())
+                .unwrap_or("");
+            if state
+                .graph_detector_state
+                .should_suppress_sensor(sensor_detector, entity_value, chrono::Utc::now())
+            {
+                tracing::debug!(
+                    incident_id = %incident.incident_id,
+                    "sensor incident suppressed: graph already detected"
+                );
+                handled += 1;
+                continue;
+            }
+        }
+
         // VirusTotal enrichment: when YARA scanner detects a binary, check its
         // SHA-256 hash against VT. Result logged for operator context.
         if incident.incident_id.starts_with("yara_scan:") {
@@ -2233,6 +2256,14 @@ async fn process_incidents(
             ai_calls_this_tick,
         ) {
             incident_flow::PreAiFlowDecision::Proceed => {}
+            incident_flow::PreAiFlowDecision::SkipAllowlisted => {
+                // Mark the incident node as allowlisted in the knowledge graph
+                let mut graph = state.knowledge_graph.write().unwrap();
+                graph.set_allowlisted(&incident.incident_id, true);
+                drop(graph);
+                handled += 1;
+                continue;
+            }
             incident_flow::PreAiFlowDecision::SkipHandled
             | incident_flow::PreAiFlowDecision::PipelineTestHandled => {
                 handled += 1;
@@ -3001,11 +3032,35 @@ async fn process_narrative_tick(
     state.narrative_acc.ingest_events(&events_entries);
 
     // Feed events into knowledge graph (in-memory attack context)
-    {
+    let trigger_incidents = {
         let mut graph = state.knowledge_graph.write().unwrap();
+        // Set host label for trigger incidents (once)
+        if graph.trigger_host.is_empty() {
+            let host_label = graph
+                .system_node()
+                .and_then(|id| graph.get_node(id))
+                .map(|n| n.label())
+                .unwrap_or_else(|| "unknown".to_string());
+            graph.set_trigger_host(&host_label);
+        }
         for ev in &events_entries {
             graph.ingest(ev);
         }
+        graph.drain_trigger_incidents()
+    };
+
+    // Process real-time trigger incidents (CRITICAL detectors, <2s latency)
+    if !trigger_incidents.is_empty() {
+        tracing::info!(count = trigger_incidents.len(), "real-time triggers fired");
+        // Ingest trigger incidents into the graph
+        {
+            let mut graph = state.knowledge_graph.write().unwrap();
+            for inc in &trigger_incidents {
+                graph.ingest_incident(inc);
+            }
+        }
+        // Phase 6E: trigger incidents are already in the knowledge graph
+        // (ingested above). No separate JSONL write needed.
     }
 
     // Periodic graph maintenance (cleanup expired + snapshot every 5 min)
@@ -3057,23 +3112,8 @@ async fn process_narrative_tick(
             }
         }
         if !graph_incidents.is_empty() {
-            // Write graph detector incidents to JSONL (spawn_blocking for sync I/O)
-            let incidents_clone = graph_incidents.clone();
-            let write_path = data_dir.join(format!("incidents-graph-{today}.jsonl"));
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&write_path)
-                {
-                    use std::io::Write;
-                    for inc in &incidents_clone {
-                        if let Ok(json) = serde_json::to_string(inc) {
-                            let _ = writeln!(f, "{}", json);
-                        }
-                    }
-                }
-            });
+            // Phase 6E: graph detector incidents are already in the knowledge graph
+            // (ingested above). No separate JSONL write needed.
             tracing::info!(count = graph_incidents.len(), "graph detectors fired");
         }
     }

@@ -224,11 +224,14 @@ pub(super) async fn api_export(
     let limit = normalize_limit(query.limit);
     let window_seconds = query.window_seconds.unwrap_or(300).clamp(30, 3600);
 
-    let overview = compute_overview(&state.data_dir, &date);
-    let pivots = build_pivots(&state.data_dir, &date, group_by, &filters, limit);
-    let clusters = build_cluster_items(&state.data_dir, &date, &filters, limit, window_seconds);
+    let graph = state.knowledge_graph.read().unwrap();
+    let overview = compute_overview_from_graph(&graph, &state.data_dir, &date);
+    drop(graph);
+    let pivots = build_pivots_from_graph(&state.knowledge_graph, group_by, limit);
+    let clusters = build_cluster_items_from_graph(&state.knowledge_graph, limit, window_seconds);
     let journey = subject.as_ref().filter(|s| !s.is_empty()).map(|s| {
-        build_journey(
+        build_journey_from_graph(
+            &state.knowledge_graph,
             &state.data_dir,
             &date,
             subject_type,
@@ -661,6 +664,127 @@ pub(super) fn build_cluster_items(
         .collect()
 }
 
+/// Build cluster items from the knowledge graph (no JSONL reads). Phase 6A.
+pub(super) fn build_cluster_items_from_graph(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    limit: usize,
+    window_seconds: u64,
+) -> Vec<ClusterItem> {
+    use crate::knowledge_graph::types::*;
+
+    let graph = kg.read().unwrap();
+
+    // Resolve hostname from System node (used for Incident.host)
+    let hostname = graph
+        .system_node
+        .and_then(|id| graph.get_node(id))
+        .map(|n| n.label())
+        .unwrap_or_default();
+
+    // Extract lightweight incidents from graph for clustering
+    let mut incidents: Vec<innerwarden_core::incident::Incident> = Vec::new();
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident {
+            incident_id,
+            severity,
+            title,
+            summary,
+            ts,
+            mitre_ids,
+            ..
+        }) = graph.get_node(id)
+        {
+            // Collect entities from TriggeredBy edges (all types)
+            let entities: Vec<innerwarden_core::entities::EntityRef> = graph
+                .outgoing_edges(id)
+                .iter()
+                .filter(|e| e.relation == Relation::TriggeredBy)
+                .filter_map(|e| {
+                    graph.get_node(e.to).map(|n| match n {
+                        Node::Ip { addr, .. } => innerwarden_core::entities::EntityRef {
+                            r#type: innerwarden_core::entities::EntityType::Ip,
+                            value: addr.clone(),
+                        },
+                        Node::User { name, .. } => innerwarden_core::entities::EntityRef {
+                            r#type: innerwarden_core::entities::EntityType::User,
+                            value: name.clone(),
+                        },
+                        Node::Container { container_id, name, .. } => {
+                            innerwarden_core::entities::EntityRef {
+                                r#type: innerwarden_core::entities::EntityType::Container,
+                                value: name.as_deref().unwrap_or(container_id).to_string(),
+                            }
+                        }
+                        Node::File { path, .. } => innerwarden_core::entities::EntityRef {
+                            r#type: innerwarden_core::entities::EntityType::Path,
+                            value: path.clone(),
+                        },
+                        Node::Process { comm, pid, .. } => innerwarden_core::entities::EntityRef {
+                            r#type: innerwarden_core::entities::EntityType::Service,
+                            value: format!("{comm}({pid})"),
+                        },
+                        // Domain/Port/Device/System/Incident/Campaign: not entity types
+                        _ => innerwarden_core::entities::EntityRef {
+                            r#type: innerwarden_core::entities::EntityType::Service,
+                            value: n.label(),
+                        },
+                    })
+                })
+                .collect();
+
+            let sev = match severity.to_lowercase().as_str() {
+                "critical" => innerwarden_core::event::Severity::Critical,
+                "high" => innerwarden_core::event::Severity::High,
+                "medium" => innerwarden_core::event::Severity::Medium,
+                "low" => innerwarden_core::event::Severity::Low,
+                _ => innerwarden_core::event::Severity::Info,
+            };
+
+            incidents.push(innerwarden_core::incident::Incident {
+                incident_id: incident_id.clone(),
+                ts: *ts,
+                severity: sev,
+                title: title.clone(),
+                summary: summary.clone(),
+                entities,
+                tags: mitre_ids.clone(),
+                recommended_checks: Vec::new(),
+                evidence: serde_json::Value::Null,
+                host: hostname.clone(),
+            });
+        }
+    }
+
+    drop(graph);
+
+    if incidents.is_empty() {
+        return Vec::new();
+    }
+
+    let mut clusters = crate::correlation::build_clusters(&incidents, window_seconds);
+    clusters.truncate(limit);
+
+    clusters
+        .into_iter()
+        .enumerate()
+        .map(|(idx, cluster)| {
+            let (pivot_type, pivot_value) = parse_cluster_pivot(&cluster.pivot);
+            let incident_count = cluster.incident_ids.len();
+            ClusterItem {
+                cluster_id: format!("cluster-{:03}", idx + 1),
+                pivot: cluster.pivot,
+                pivot_type,
+                pivot_value,
+                start_ts: cluster.start_ts,
+                end_ts: cluster.end_ts,
+                incident_count,
+                detector_kinds: cluster.detector_kinds,
+                incident_ids: cluster.incident_ids,
+            }
+        })
+        .collect()
+}
+
 /// Build the full journey timeline for a selected subject on a given date.
 /// Build a journey timeline from the knowledge graph (live, no JSONL).
 /// Falls back to honeypot JSONL for honeypot sessions (not in graph yet).
@@ -720,6 +844,7 @@ pub(super) fn build_journey_from_graph(
             decision_reason,
             decision_target,
             auto_executed,
+            is_allowlisted: _,
         }) = graph.get_node(inc_id)
         {
             has_incident = true;
