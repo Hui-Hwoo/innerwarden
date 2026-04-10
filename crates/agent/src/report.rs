@@ -584,10 +584,8 @@ pub fn list_available_dates(data_dir: &Path) -> Vec<String> {
 
 pub fn generate(data_dir: &Path, output_dir: &Path) -> Result<GeneratedReport> {
     let report_date = Local::now().date_naive().format("%Y-%m-%d").to_string();
-    // Phase 6C: prefer graph snapshot, fall back to JSONL if graph is empty.
-    let graph = crate::knowledge_graph::KnowledgeGraph::load_snapshot(
-        &data_dir.join("graph-snapshot.json"),
-    );
+    // Phase 7: prefer today's dated snapshot, fall back to JSONL if graph is empty.
+    let graph = crate::knowledge_graph::KnowledgeGraph::load_today_snapshot(data_dir);
     let report = if graph.metrics().node_count > 0 {
         compute_for_date_from_graph(data_dir, None, &graph)
     } else {
@@ -966,6 +964,13 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
 }
 
 fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
+    // Phase 7: try dated graph snapshot first
+    if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date) {
+        if graph.metrics().node_count > 0 {
+            return counters_from_graph(&graph);
+        }
+    }
+    // Fallback: JSONL
     let events = safe_dated_file(data_dir, "events", date, "jsonl");
     let incidents = safe_dated_file(data_dir, "incidents", date, "jsonl");
     let decisions = safe_dated_file(data_dir, "decisions", date, "jsonl");
@@ -974,6 +979,13 @@ fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
     parse_events_file(&events, &mut counters);
     parse_incidents_file(&incidents, &mut counters);
     parse_decisions_file(&decisions, &mut counters);
+    counters
+}
+
+/// Extract report counters from a graph snapshot (Phase 7).
+fn counters_from_graph(graph: &crate::knowledge_graph::KnowledgeGraph) -> Counters {
+    let mut counters = Counters::default();
+    populate_counters_from_graph(graph, &mut counters);
     counters
 }
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::graph::KnowledgeGraph;
 use super::types::*;
@@ -72,6 +72,84 @@ impl KnowledgeGraph {
                 }
                 tracing::warn!("No valid graph snapshot found, starting fresh");
                 Self::new()
+            }
+        }
+    }
+
+    // ── Phase 7 (spec 013): Dated snapshot API ───────────────────────────
+
+    /// Path for today's dated snapshot.
+    pub fn dated_snapshot_path(data_dir: &Path) -> PathBuf {
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        data_dir.join(format!("graph-snapshot-{today}.json"))
+    }
+
+    /// Save a dated snapshot: `graph-snapshot-YYYY-MM-DD.json` with rotation.
+    pub fn save_dated_snapshot(&self, data_dir: &Path) -> anyhow::Result<()> {
+        let path = Self::dated_snapshot_path(data_dir);
+        self.save_snapshot(&path)
+    }
+
+    /// Load today's dated snapshot (with fallback to legacy `graph-snapshot.json`).
+    pub fn load_today_snapshot(data_dir: &Path) -> Self {
+        let dated = Self::dated_snapshot_path(data_dir);
+        if dated.exists() {
+            let g = Self::load_snapshot(&dated);
+            if g.node_count() > 0 {
+                return g;
+            }
+        }
+        // Fallback: legacy non-dated snapshot (one-time migration)
+        let legacy = data_dir.join("graph-snapshot.json");
+        if legacy.exists() {
+            let g = Self::load_snapshot(&legacy);
+            if g.node_count() > 0 {
+                tracing::info!("Migrated from legacy graph-snapshot.json to dated snapshots");
+                return g;
+            }
+        }
+        tracing::warn!("No graph snapshot found, starting fresh");
+        Self::new()
+    }
+
+    /// Load a historical dated snapshot for a specific date string (e.g. "2026-04-10").
+    /// Returns None if the snapshot doesn't exist or is corrupt.
+    pub fn load_dated(data_dir: &Path, date: &str) -> Option<Self> {
+        let path = data_dir.join(format!("graph-snapshot-{date}.json"));
+        Self::try_load_snapshot(&path)
+    }
+
+    /// Delete dated snapshots older than `keep_days` days.
+    pub fn cleanup_old_snapshots(data_dir: &Path, keep_days: u32) {
+        let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days as i64);
+        let pattern = "graph-snapshot-";
+        let entries = match std::fs::read_dir(data_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(pattern) || !name.ends_with(".json") {
+                continue;
+            }
+            // Extract date from "graph-snapshot-YYYY-MM-DD.json"
+            let date_part = &name[pattern.len()..name.len() - 5]; // strip prefix and .json
+            if date_part.contains('.') {
+                // This is a rotation backup like "graph-snapshot-2026-04-10.json.1"
+                // handled separately
+                continue;
+            }
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
+                if date < cutoff {
+                    let _ = std::fs::remove_file(entry.path());
+                    // Also remove rotation backups
+                    for i in 1..=3 {
+                        let backup = entry.path().with_extension(format!("json.{i}"));
+                        let _ = std::fs::remove_file(&backup);
+                    }
+                    tracing::info!(date = %date_part, "Deleted old graph snapshot");
+                }
             }
         }
     }

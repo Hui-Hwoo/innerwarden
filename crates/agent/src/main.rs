@@ -595,9 +595,9 @@ async fn main() -> Result<()> {
         dashboard::DeepSecuritySnapshot::default(),
     ));
 
-    // Shared knowledge graph: loaded from snapshot, shared between agent loop and dashboard.
+    // Shared knowledge graph: loaded from today's dated snapshot (Phase 7: daily snapshots).
     let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(
-        knowledge_graph::KnowledgeGraph::load_snapshot(&cli.data_dir.join("graph-snapshot.json")),
+        knowledge_graph::KnowledgeGraph::load_today_snapshot(&cli.data_dir),
     ));
 
     // Advisory cache: shared between dashboard (writes advisory denials) and
@@ -3115,20 +3115,23 @@ async fn process_narrative_tick(
         // (ingested above). No separate JSONL write needed.
     }
 
-    // Periodic graph maintenance (cleanup expired + snapshot every 5 min)
+    // Periodic graph maintenance (cleanup expired + dated snapshot every 60s)
     if state.last_graph_snapshot.elapsed().as_secs() >= 60 {
         {
             let mut graph = state.knowledge_graph.write().unwrap();
             graph.cleanup_expired(chrono::Utc::now());
             graph.compact_edges();
             graph.enforce_memory_limit();
-            if let Err(e) = graph.save_snapshot(&data_dir.join("graph-snapshot.json")) {
+            // Phase 7: save to dated snapshot (graph-snapshot-YYYY-MM-DD.json)
+            if let Err(e) = graph.save_dated_snapshot(data_dir) {
                 warn!("knowledge graph snapshot failed: {e:#}");
             }
             let metrics = graph.metrics();
             if let Ok(json) = serde_json::to_vec(&metrics) {
                 let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
             }
+            // Phase 7: cleanup old snapshots (keep 7 days)
+            knowledge_graph::KnowledgeGraph::cleanup_old_snapshots(data_dir, 7);
         }
         state.last_graph_snapshot = std::time::Instant::now();
     }

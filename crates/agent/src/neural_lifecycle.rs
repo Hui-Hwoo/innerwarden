@@ -1316,39 +1316,72 @@ mod tests {
 // Blocked IP loader for clean training
 // ---------------------------------------------------------------------------
 
-/// Load all IPs that were blocked from decisions JSONL files.
-/// Used by train_nightly to exclude attack traffic from training data.
+/// Load all IPs that were blocked — used by train_nightly to exclude attack traffic.
+/// Phase 7: reads from dated graph snapshots (last 7 days), falls back to JSONL.
 fn load_blocked_ips(data_dir: &Path) -> HashSet<String> {
     let mut blocked = HashSet::new();
 
-    let entries = match std::fs::read_dir(data_dir) {
-        Ok(e) => e,
-        Err(_) => return blocked,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
-            continue;
+    // Phase 7: try dated graph snapshots (last 7 days)
+    let today = chrono::Local::now().date_naive();
+    let mut loaded_from_graph = false;
+    for days_ago in 0..7i64 {
+        let date = today - chrono::Duration::days(days_ago);
+        let date_str = date.format("%Y-%m-%d").to_string();
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str) {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    decision,
+                    decision_target,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if let Some(action) = decision {
+                        if action.contains("block") {
+                            if let Some(ip) = decision_target {
+                                if !ip.is_empty() {
+                                    blocked.insert(ip.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            loaded_from_graph = true;
         }
+    }
 
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+    if !loaded_from_graph {
+        // Fallback: read from decisions JSONL files
+        let entries = match std::fs::read_dir(data_dir) {
+            Ok(e) => e,
+            Err(_) => return blocked,
         };
 
-        for line in content.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                let action = v
-                    .get("action_type")
-                    .or_else(|| v.get("action"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("");
-                if action.contains("block") {
-                    if let Some(ip) = v.get("target_ip").and_then(|i| i.as_str()) {
-                        if !ip.is_empty() {
-                            blocked.insert(ip.to_string());
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            for line in content.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let action = v
+                        .get("action_type")
+                        .or_else(|| v.get("action"))
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("");
+                    if action.contains("block") {
+                        if let Some(ip) = v.get("target_ip").and_then(|i| i.as_str()) {
+                            if !ip.is_empty() {
+                                blocked.insert(ip.to_string());
+                            }
                         }
                     }
                 }
