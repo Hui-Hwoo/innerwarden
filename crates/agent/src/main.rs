@@ -11,6 +11,7 @@ mod ai;
 mod allowlist;
 mod attacker_intel;
 mod baseline;
+mod briefing;
 mod bot_actions;
 mod bot_commands;
 mod bot_helpers;
@@ -671,6 +672,20 @@ async fn main() -> Result<()> {
         let agent_alert_tx = agent_alert_tx.clone();
         let deep_security = deep_security_snapshot.clone();
         let dashboard_graph = shared_graph.clone();
+        let dashboard_ai: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.enabled {
+            match ai::build_provider(&cfg.ai) {
+                Ok(p) => Some(Arc::from(p)),
+                Err(e) => {
+                    warn!("briefing AI provider failed: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
+        let briefing_hour = cfg.briefing.hour;
+        let briefing_minute = cfg.briefing.minute;
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -686,6 +701,10 @@ async fn main() -> Result<()> {
                 agent_alert_tx,
                 deep_security,
                 dashboard_graph,
+                dashboard_ai,
+                dashboard_briefing,
+                briefing_hour,
+                briefing_minute,
             )
             .await
             {

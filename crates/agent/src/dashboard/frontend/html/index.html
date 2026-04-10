@@ -92,6 +92,13 @@
         <div class="kpi-label">Events Today</div>
       </div>
     </div>
+    <div class="home-section" id="briefingSection" style="display:none">
+      <div class="home-section-title" style="display:flex;justify-content:space-between;align-items:center">
+        <span>AI Intelligence Briefing</span>
+        <button id="briefingBtn" onclick="generateBriefing()" style="padding:5px 14px;border-radius:8px;border:1px solid var(--accent);background:transparent;color:var(--accent);font-size:0.7rem;font-weight:700;cursor:pointer">Generate Briefing</button>
+      </div>
+      <div id="briefingContent" style="font-size:0.78rem;color:var(--text);white-space:pre-wrap;line-height:1.6"></div>
+    </div>
     <div class="home-section">
       <div class="home-section-title"><span class="live-dot"></span> Recent Activity</div>
       <div id="homeFeed"><div class="empty">Loading…</div></div>

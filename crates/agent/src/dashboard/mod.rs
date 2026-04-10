@@ -198,6 +198,10 @@ pub async fn serve(
     agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
     deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
     knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    ai_provider: Option<Arc<dyn crate::ai::AiProvider>>,
+    briefing_state: Arc<tokio::sync::Mutex<Option<crate::briefing::Briefing>>>,
+    briefing_hour: u8,
+    briefing_minute: u8,
 ) -> Result<()> {
     if auth.is_none() {
         warn!(
@@ -277,6 +281,10 @@ pub async fn serve(
         agent_alert_tx,
         deep_security,
         knowledge_graph,
+        ai_provider,
+        latest_briefing: briefing_state,
+        briefing_hour,
+        briefing_minute,
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -378,6 +386,9 @@ pub async fn serve(
         .route("/api/report", get(api_report))
         .route("/api/report/dates", get(api_report_dates))
         .route("/api/quickwins", get(api_quickwins))
+        // AI Intelligence Briefing
+        .route("/api/briefing", get(api_briefing))
+        .route("/api/briefing/generate", post(api_briefing_generate))
         // Sensors activity
         .route("/api/sensors", get(api_sensors))
         // E6 - system status

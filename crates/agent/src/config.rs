@@ -83,6 +83,9 @@ pub struct AgentConfig {
     #[serde(default)]
     #[cfg_attr(not(feature = "redis-reader"), allow(dead_code))]
     pub redis_stream: Option<String>,
+    /// Daily AI intelligence briefing
+    #[serde(default)]
+    pub briefing: BriefingConfig,
     /// Config signing verification (Active Defence).
     #[serde(default)]
     pub config_signing: ConfigSigningConfig,
@@ -384,6 +387,37 @@ impl Default for NarrativeConfig {
         Self {
             enabled: true,
             keep_days: default_keep_days(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BriefingConfig {
+    /// Enable daily AI intelligence briefing (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Hour to auto-generate briefing (0-23, local time). Default: 8
+    #[serde(default = "default_briefing_hour")]
+    pub hour: u8,
+    /// Minute within the hour. Default: 0
+    #[serde(default)]
+    pub minute: u8,
+    /// Also send briefing via Telegram (default: true)
+    #[serde(default = "default_true")]
+    pub telegram: bool,
+}
+
+fn default_briefing_hour() -> u8 {
+    8
+}
+
+impl Default for BriefingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hour: 8,
+            minute: 0,
+            telegram: true,
         }
     }
 }

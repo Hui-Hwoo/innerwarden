@@ -176,6 +176,13 @@ pub(crate) struct DashboardState {
     pub(super) deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
     /// Shared knowledge graph for live queries (not snapshot file).
     pub(super) knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    /// AI provider for on-demand briefing generation (None if AI disabled).
+    pub(super) ai_provider: Option<Arc<dyn crate::ai::AiProvider>>,
+    /// Latest AI intelligence briefing.
+    pub(super) latest_briefing: Arc<tokio::sync::Mutex<Option<crate::briefing::Briefing>>>,
+    /// Briefing schedule (hour, minute).
+    pub(super) briefing_hour: u8,
+    pub(super) briefing_minute: u8,
 }
 
 /// Aggregated status from integrated security modules.

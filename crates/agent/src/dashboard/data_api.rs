@@ -308,6 +308,80 @@ pub(super) async fn api_report_dates(State(state): State<DashboardState>) -> Jso
     Json(dates)
 }
 // ---------------------------------------------------------------------------
+// AI Intelligence Briefing
+// ---------------------------------------------------------------------------
+
+/// GET /api/briefing — returns the latest generated briefing
+pub(super) async fn api_briefing(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
+    let briefing = state.latest_briefing.lock().await;
+    match &*briefing {
+        Some(b) => Json(serde_json::json!({
+            "available": true,
+            "generated_at": b.generated_at.to_rfc3339(),
+            "date": b.date,
+            "threat_level": b.threat_level,
+            "summary": b.summary,
+            "config": {
+                "hour": state.briefing_hour,
+                "minute": state.briefing_minute,
+            }
+        })),
+        None => Json(serde_json::json!({
+            "available": false,
+            "message": "No briefing generated yet. Click 'Generate Now' or wait for the scheduled time.",
+            "config": {
+                "hour": state.briefing_hour,
+                "minute": state.briefing_minute,
+            }
+        })),
+    }
+}
+
+/// POST /api/briefing/generate — trigger manual briefing generation
+pub(super) async fn api_briefing_generate(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
+    let context = crate::briefing::build_briefing_context(&state.knowledge_graph);
+    let prompt = crate::briefing::briefing_prompt(&context);
+
+    let threat_level = if context.contains("CRITICAL") {
+        "CRITICAL"
+    } else if context.contains("ELEVATED") {
+        "ELEVATED"
+    } else if context.contains("MODERATE") {
+        "MODERATE"
+    } else {
+        "LOW"
+    };
+
+    let Some(ref ai) = state.ai_provider else {
+        return Json(serde_json::json!({
+            "error": "AI provider not configured. Enable AI in agent.toml to generate briefings.",
+        }));
+    };
+    let system = "You are a senior security analyst. Generate a concise, actionable intelligence briefing.";
+    match ai.chat(system, &prompt).await {
+        Ok(response) => {
+            let b = crate::briefing::parse_briefing(&response, threat_level);
+            let result = serde_json::json!({
+                "available": true,
+                "generated_at": b.generated_at.to_rfc3339(),
+                "date": b.date,
+                "threat_level": b.threat_level,
+                "summary": b.summary,
+            });
+            *state.latest_briefing.lock().await = Some(b);
+            Json(result)
+        }
+        Err(e) => Json(serde_json::json!({
+            "error": format!("Failed to generate briefing: {}", e),
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Business logic - overview (graph-based, Phase 6A)
 // ---------------------------------------------------------------------------
 

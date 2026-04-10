@@ -17,6 +17,7 @@ async function loadHome() {
     updateHomeKpis(overview);
     buildHomeFeed(items);
     updateCollectorStrip(sensors);
+    loadBriefing();
   } catch(e) { console.warn('loadHome error:', e); }
 }
 
@@ -101,6 +102,49 @@ function isIncidentTrusted(inc) {
   // No IP at all = internal/local activity = trusted
   if (!hasExternalIp) return true;
   return false;
+}
+
+// ── AI Intelligence Briefing ────────────────────────────────────────
+async function loadBriefing() {
+  var section = document.getElementById('briefingSection');
+  if (!section) return;
+  try {
+    var data = await loadJson('/api/briefing');
+    section.style.display = '';
+    var content = document.getElementById('briefingContent');
+    var btn = document.getElementById('briefingBtn');
+    if (data.available) {
+      var age = data.generated_at ? new Date(data.generated_at).toLocaleTimeString() : '';
+      content.innerHTML = '<div style="margin-bottom:8px;font-size:0.65rem;color:var(--muted)">Generated ' + age + '</div>' +
+        '<div>' + esc(data.summary).replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') + '</div>';
+      btn.textContent = 'Regenerate';
+    } else {
+      content.innerHTML = '<div style="color:var(--dim);font-size:0.75rem">' + esc(data.message || 'Click Generate to create your first briefing.') + '</div>';
+    }
+  } catch(e) {
+    section.style.display = 'none';
+  }
+}
+
+async function generateBriefing() {
+  var btn = document.getElementById('briefingBtn');
+  var content = document.getElementById('briefingContent');
+  if (btn) { btn.textContent = 'Generating...'; btn.disabled = true; }
+  if (content) content.innerHTML = '<div style="color:var(--accent)">Analyzing knowledge graph and generating briefing via AI...</div>';
+  try {
+    var r = await fetch('/api/briefing/generate', { method: 'POST', cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var data = await r.json();
+    if (data.error) {
+      content.innerHTML = '<div style="color:var(--danger)">' + esc(data.error) + '</div>';
+    } else {
+      content.innerHTML = '<div style="margin-bottom:8px;font-size:0.65rem;color:var(--muted)">Generated just now</div>' +
+        '<div>' + esc(data.summary).replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') + '</div>';
+    }
+  } catch(e) {
+    content.innerHTML = '<div style="color:var(--danger)">Error: ' + esc(e.message) + '</div>';
+  }
+  if (btn) { btn.textContent = 'Regenerate'; btn.disabled = false; }
 }
 
 function buildHomeFeed(incidents) {
