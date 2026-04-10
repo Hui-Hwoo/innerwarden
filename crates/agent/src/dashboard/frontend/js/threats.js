@@ -32,8 +32,10 @@ function buildGroupedList(items) {
     var primary = 'unknown';
     var bestPrio = -1;
     dets.forEach(function(d) {
-      var p = DETECTOR_PRIORITY[d] || 0;
-      if (p > bestPrio) { bestPrio = p; primary = d; }
+      // Strip graph_ prefix for priority lookup (graph detectors use graph_threat_intel, etc.)
+      var base = d.replace(/^graph_/, '');
+      var p = DETECTOR_PRIORITY[base] || DETECTOR_PRIORITY[d] || 0;
+      if (p > bestPrio) { bestPrio = p; primary = base; }
     });
     if (bestPrio < 0 && dets.length > 0) primary = dets[0];
     if (!groups[primary]) groups[primary] = { detector: primary, items: [], hasOpen: false };

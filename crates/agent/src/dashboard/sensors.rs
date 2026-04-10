@@ -39,13 +39,32 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
     use crate::knowledge_graph::types::{Node, NodeType};
     let graph = state.knowledge_graph.read().unwrap();
 
-    // Event telemetry from graph (recorded during ingest)
-    let mut sources: Vec<_> = graph
-        .source_counts
-        .iter()
-        .map(|(s, &c)| (s.clone(), c))
-        .collect();
-    sources.sort_by(|a, b| b.1.cmp(&a.1));
+    // Event telemetry — prefer graph counters, fall back to telemetry snapshot
+    let (total_events_val, sources) = if graph.total_events_ingested > 0 {
+        let mut s: Vec<_> = graph
+            .source_counts
+            .iter()
+            .map(|(s, &c)| (s.clone(), c))
+            .collect();
+        s.sort_by(|a, b| b.1.cmp(&a.1));
+        (graph.total_events_ingested, s)
+    } else {
+        // Fallback: read from telemetry snapshot (has events_by_collector)
+        let telem = crate::telemetry::read_latest_snapshot(&state.data_dir, &today);
+        match telem {
+            Some(t) => {
+                let total = t.events_by_collector.values().sum::<u64>() as usize;
+                let mut s: Vec<_> = t
+                    .events_by_collector
+                    .into_iter()
+                    .map(|(k, v)| (k, v as usize))
+                    .collect();
+                s.sort_by(|a, b| b.1.cmp(&a.1));
+                (total, s)
+            }
+            None => (0, vec![]),
+        }
+    };
 
     let mut kinds: Vec<_> = graph
         .kind_counts
@@ -86,7 +105,7 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
 
     serde_json::json!({
         "date": today,
-        "total_events": graph.total_events_ingested,
+        "total_events": total_events_val,
         "total_incidents": total_incidents,
         "sources": sources.iter().map(|(s, c)| serde_json::json!({"name": s, "count": c})).collect::<Vec<_>>(),
         "top_kinds": kinds.iter().map(|(k, c)| serde_json::json!({"name": k, "count": c})).collect::<Vec<_>>(),
@@ -235,12 +254,36 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
             .unwrap_or(false)
     };
 
-    // Count events by source from knowledge graph (Phase 6A: no JSONL reads)
+    // Count events by source — prefer graph counters, fall back to JSONL scan
+    // when graph has no data (e.g. after restart before new events are ingested)
     let graph = state.knowledge_graph.read().unwrap();
-    let source_counts = graph.source_counts.clone();
+    let graph_source_counts = graph.source_counts.clone();
+    let graph_total = graph.total_events_ingested;
     drop(graph);
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let events_file = state.data_dir.join(format!("events-{today}.jsonl"));
     let count_source = move |source: &str| -> u64 {
-        source_counts.get(source).copied().unwrap_or(0) as u64
+        // If graph has data, use it (fast, O(1))
+        if graph_total > 0 {
+            return graph_source_counts.get(source).copied().unwrap_or(0) as u64;
+        }
+        // Fallback: scan JSONL (slower, but works when graph counters are empty)
+        use std::io::{BufRead, BufReader};
+        let f = match std::fs::File::open(&events_file) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        let needle = format!("\"source\":\"{source}\"");
+        let needle2 = format!("\"source\": \"{source}\"");
+        let mut count = 0u64;
+        for line in BufReader::new(f).lines() {
+            let Ok(l) = line else { break };
+            if l.contains(&needle) || l.contains(&needle2) {
+                count += 1;
+            }
+        }
+        count
     };
 
     // Recency threshold: active if file modified within last 2 hours
