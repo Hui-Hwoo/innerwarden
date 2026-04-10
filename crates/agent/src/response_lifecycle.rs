@@ -95,6 +95,207 @@ impl ResponseLifecycle {
         }
     }
 
+    /// Restore active responses from a previous `responses.json` snapshot.
+    /// Called once on agent startup to survive restarts. Expired entries are
+    /// moved to history automatically via the next `tick_cleanup` call.
+    pub fn load_snapshot(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("responses.json");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return Self::new(),
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return Self::new(),
+        };
+
+        let mut lifecycle = Self::new();
+        let now = Utc::now();
+
+        // Restore active responses
+        if let Some(active_arr) = json["active"].as_array() {
+            for item in active_arr {
+                let target = item["target"].as_str().unwrap_or_default();
+                let incident_id = item["incident_id"].as_str().unwrap_or_default();
+                let ttl_secs = item["ttl_secs"].as_i64().unwrap_or(3600);
+                let created_at = item["created_at"]
+                    .as_str()
+                    .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                    .unwrap_or(now);
+                let expires_at = item["expires_at"]
+                    .as_str()
+                    .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                    .unwrap_or(created_at + chrono::Duration::seconds(ttl_secs));
+                let backend = match item["backend"].as_str().unwrap_or("ufw") {
+                    "xdp" => ResponseBackend::Xdp,
+                    "iptables" => ResponseBackend::Iptables,
+                    "nftables" => ResponseBackend::Nftables,
+                    "pf" => ResponseBackend::Pf,
+                    "cloudflare" => ResponseBackend::Cloudflare,
+                    "nginx" => ResponseBackend::Nginx,
+                    "container" => ResponseBackend::Container,
+                    "sudo" => ResponseBackend::Sudo,
+                    _ => ResponseBackend::Ufw,
+                };
+                let response_type = match item["type"].as_str().unwrap_or("block_ip") {
+                    "block_container" => ResponseType::BlockContainer,
+                    "suspend_sudo" => ResponseType::SuspendSudo,
+                    "rate_limit_nginx" => ResponseType::RateLimitNginx,
+                    "kill_process" => ResponseType::KillProcess,
+                    _ => ResponseType::BlockIp,
+                };
+
+                if target.is_empty() {
+                    continue;
+                }
+
+                let id = format!("resp-{}", lifecycle.next_id);
+                lifecycle.next_id += 1;
+                lifecycle.active.push(ActiveResponse {
+                    id,
+                    response_type,
+                    backend,
+                    target: target.to_string(),
+                    incident_id: incident_id.to_string(),
+                    created_at,
+                    ttl_secs,
+                    expires_at,
+                    revert_handle: item["revert_handle"].as_str().map(String::from),
+                });
+                lifecycle.total_registered += 1;
+            }
+        }
+
+        // Restore counters from totals (keep accumulated counts across restarts)
+        if let Some(totals) = json.get("totals") {
+            lifecycle.total_registered = totals["registered"].as_u64().unwrap_or(lifecycle.total_registered);
+            lifecycle.total_expired = totals["expired"].as_u64().unwrap_or(0);
+            lifecycle.total_reverted = totals["reverted"].as_u64().unwrap_or(0);
+        }
+
+        // Restore history
+        if let Some(history_arr) = json["history"].as_array() {
+            for item in history_arr {
+                let target = item["target"].as_str().unwrap_or_default();
+                if target.is_empty() {
+                    continue;
+                }
+                let backend = match item["backend"].as_str().unwrap_or("ufw") {
+                    "xdp" => ResponseBackend::Xdp,
+                    "iptables" => ResponseBackend::Iptables,
+                    "nftables" => ResponseBackend::Nftables,
+                    "pf" => ResponseBackend::Pf,
+                    "cloudflare" => ResponseBackend::Cloudflare,
+                    _ => ResponseBackend::Ufw,
+                };
+                let response_type = match item["type"].as_str().unwrap_or("block_ip") {
+                    "block_container" => ResponseType::BlockContainer,
+                    "suspend_sudo" => ResponseType::SuspendSudo,
+                    _ => ResponseType::BlockIp,
+                };
+                lifecycle.history.push_back(CompletedResponse {
+                    id: item["id"].as_str().unwrap_or("").to_string(),
+                    response_type,
+                    backend,
+                    target: target.to_string(),
+                    incident_id: item["incident_id"].as_str().unwrap_or("").to_string(),
+                    created_at: item["created_at"].as_str().and_then(|s| s.parse().ok()).unwrap_or(now),
+                    reverted_at: item["reverted_at"].as_str().and_then(|s| s.parse().ok()).unwrap_or(now),
+                    reason: item["reason"].as_str().unwrap_or("expired").to_string(),
+                });
+            }
+        }
+
+        // Also hydrate from today's decisions JSONL to catch blocks from code paths
+        // that don't go through ResponseLifecycle (e.g. honeypot, dashboard actions).
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let decisions_path = data_dir.join(format!("decisions-{today}.jsonl"));
+        if let Ok(content) = std::fs::read_to_string(&decisions_path) {
+            let tracked_targets: std::collections::HashSet<String> = lifecycle
+                .active
+                .iter()
+                .map(|r| r.target.clone())
+                .collect();
+            let mut added = 0usize;
+            for line in content.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if entry["action_type"].as_str() != Some("block_ip") {
+                    continue;
+                }
+                let Some(ip) = entry["target_ip"].as_str() else {
+                    continue;
+                };
+                if ip.is_empty() || tracked_targets.contains(ip) {
+                    continue;
+                }
+                // Check if already in active set (may have been added from snapshot)
+                if lifecycle.active.iter().any(|r| r.target == ip) {
+                    continue;
+                }
+                let ts = entry["ts"]
+                    .as_str()
+                    .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                    .unwrap_or(now);
+                // Use 1-hour default TTL for rehydrated blocks
+                let ttl = 3600i64;
+                let expires_at = ts + chrono::Duration::seconds(ttl);
+                if expires_at <= now {
+                    // Already expired — skip
+                    continue;
+                }
+                let skill_id = entry["skill_id"].as_str().unwrap_or("block-ip-ufw");
+                let backend = if skill_id.contains("xdp") {
+                    ResponseBackend::Xdp
+                } else if skill_id.contains("iptables") {
+                    ResponseBackend::Iptables
+                } else if skill_id.contains("nftables") {
+                    ResponseBackend::Nftables
+                } else {
+                    ResponseBackend::Ufw
+                };
+                let incident_id = entry["incident_id"].as_str().unwrap_or("").to_string();
+
+                let id = format!("resp-{}", lifecycle.next_id);
+                lifecycle.next_id += 1;
+                lifecycle.active.push(ActiveResponse {
+                    id,
+                    response_type: ResponseType::BlockIp,
+                    backend,
+                    target: ip.to_string(),
+                    incident_id,
+                    created_at: ts,
+                    ttl_secs: ttl,
+                    expires_at,
+                    revert_handle: None,
+                });
+                lifecycle.total_registered += 1;
+                added += 1;
+            }
+            if added > 0 {
+                info!(added, "hydrated response lifecycle from today's decisions");
+            }
+        }
+
+        if !lifecycle.active.is_empty() || !lifecycle.history.is_empty() {
+            info!(
+                active = lifecycle.active.len(),
+                history = lifecycle.history.len(),
+                total_registered = lifecycle.total_registered,
+                "response lifecycle restored"
+            );
+        }
+
+        lifecycle
+    }
+
     /// Register a new response. Returns the response ID.
     pub fn register(
         &mut self,

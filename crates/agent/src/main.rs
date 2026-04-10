@@ -1078,7 +1078,7 @@ async fn main() -> Result<()> {
         },
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
-        response_lifecycle: response_lifecycle::ResponseLifecycle::new(),
+        response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(&cli.data_dir),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
         narrative_incidents_offset: 0,
