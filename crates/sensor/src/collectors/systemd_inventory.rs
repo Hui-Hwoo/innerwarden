@@ -13,13 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Suspicious paths for systemd unit files.
-const SUSPICIOUS_UNIT_PATHS: &[&str] = &[
-    "/tmp/",
-    "/var/tmp/",
-    "/dev/shm/",
-    "/home/",
-    "/root/",
-];
+const SUSPICIOUS_UNIT_PATHS: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/", "/home/", "/root/"];
 
 #[derive(Debug, Clone)]
 struct SystemdUnit {
@@ -128,7 +122,14 @@ fn is_suspicious_path(path: &str) -> bool {
 
 fn list_systemd_units() -> Vec<SystemdUnit> {
     let output = match std::process::Command::new("systemctl")
-        .args(["list-units", "--type=service", "--all", "--no-pager", "--plain", "--no-legend"])
+        .args([
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-pager",
+            "--plain",
+            "--no-legend",
+        ])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -170,9 +171,7 @@ fn get_unit_path(unit_name: &str) -> String {
         .output();
 
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
 }
@@ -185,7 +184,9 @@ mod tests {
     fn test_suspicious_paths() {
         assert!(is_suspicious_path("/tmp/evil.service"));
         assert!(is_suspicious_path("/dev/shm/backdoor.service"));
-        assert!(is_suspicious_path("/home/user/.config/systemd/user/mal.service"));
+        assert!(is_suspicious_path(
+            "/home/user/.config/systemd/user/mal.service"
+        ));
         assert!(!is_suspicious_path("/etc/systemd/system/nginx.service"));
         assert!(!is_suspicious_path("/usr/lib/systemd/system/sshd.service"));
     }

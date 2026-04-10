@@ -14,11 +14,11 @@ use tracing::{info, warn};
 
 /// Known suspicious USB device indicators.
 const SUSPICIOUS_VENDORS: &[&str] = &[
-    "hak5",       // Rubber Ducky, Bash Bunny
-    "0x1337",     // Common attacker vendor ID spoof
-    "ducky",      // Rubber Ducky variants
-    "teensy",     // Teensy board (HID attack tool)
-    "digispark",  // Digispark (cheap HID attack)
+    "hak5",      // Rubber Ducky, Bash Bunny
+    "0x1337",    // Common attacker vendor ID spoof
+    "ducky",     // Rubber Ducky variants
+    "teensy",    // Teensy board (HID attack tool)
+    "digispark", // Digispark (cheap HID attack)
 ];
 
 /// Run USB monitoring by polling /sys/bus/usb/devices.
@@ -32,10 +32,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
     for dev in &initial {
         known_devices.insert(dev.path.clone());
     }
-    info!(
-        "usb_monitor: baseline {} USB devices",
-        known_devices.len()
-    );
+    info!("usb_monitor: baseline {} USB devices", known_devices.len());
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;

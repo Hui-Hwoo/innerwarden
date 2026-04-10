@@ -69,7 +69,14 @@ impl KnowledgeGraph {
 
         // Threat intel IPs
         for (_, node) in &sub.nodes {
-            if let Node::Ip { datasets, is_tor, risk_score, addr, .. } = node {
+            if let Node::Ip {
+                datasets,
+                is_tor,
+                risk_score,
+                addr,
+                ..
+            } = node
+            {
                 if !datasets.is_empty() {
                     lines.push(format!(
                         "    - IP {} in threat intel: {}",
@@ -161,10 +168,7 @@ impl KnowledgeGraph {
                     .map(|n| n.label())
                     .collect();
                 lines.push(String::new());
-                lines.push(format!(
-                    "  Process chain: {}",
-                    chain.join(" → ")
-                ));
+                lines.push(format!("  Process chain: {}", chain.join(" → ")));
             }
         }
 
@@ -197,9 +201,23 @@ impl KnowledgeGraph {
         let mut production_impact = false;
 
         let production_comms = [
-            "nginx", "apache", "httpd", "postgresql", "postgres", "mysql",
-            "mysqld", "redis-server", "redis", "haproxy", "sshd", "mongod",
-            "node", "java", "python3", "gunicorn", "uwsgi",
+            "nginx",
+            "apache",
+            "httpd",
+            "postgresql",
+            "postgres",
+            "mysql",
+            "mysqld",
+            "redis-server",
+            "redis",
+            "haproxy",
+            "sshd",
+            "mongod",
+            "node",
+            "java",
+            "python3",
+            "gunicorn",
+            "uwsgi",
         ];
 
         for edge in self.incoming_edges(ip_id) {
@@ -249,7 +267,9 @@ impl KnowledgeGraph {
         let mut lines = Vec::new();
         lines.push(format!(
             "Killing PID {} ({}) — {} child process(es):",
-            pid, comm, children.len()
+            pid,
+            comm,
+            children.len()
         ));
         for child_id in &children {
             if let Some(n) = self.get_node(*child_id) {

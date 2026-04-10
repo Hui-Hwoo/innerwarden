@@ -29,7 +29,7 @@ const VM_DETECTION_PATHS: &[&str] = &[
     "/proc/scsi/scsi",
     "/sys/hypervisor/type",
     "/sys/devices/virtual/dmi",
-    "/proc/cpuinfo", // checked for hypervisor flag
+    "/proc/cpuinfo",                  // checked for hypervisor flag
     "/sys/firmware/acpi/tables/DSDT", // VM-specific ACPI tables
 ];
 
@@ -194,18 +194,13 @@ impl SandboxEvasionDetector {
                 let cmd_lower = cmd.to_lowercase();
 
                 // VM detection commands
-                if VM_DETECTION_COMMANDS
-                    .iter()
-                    .any(|c| cmd_lower.contains(c))
-                {
+                if VM_DETECTION_COMMANDS.iter().any(|c| cmd_lower.contains(c)) {
                     return Some(format!("vm_command:{}", &cmd[..cmd.len().min(50)]));
                 }
 
                 // Checking for analysis processes
                 if (cmd_lower.contains("pgrep") || cmd_lower.contains("ps "))
-                    && ANALYSIS_PROCESSES
-                        .iter()
-                        .any(|p| cmd_lower.contains(p))
+                    && ANALYSIS_PROCESSES.iter().any(|p| cmd_lower.contains(p))
                 {
                     return Some("analysis_process_check".into());
                 }
@@ -276,7 +271,11 @@ mod tests {
             .process(&file_read(1234, "/sys/class/dmi/id/product_name", now))
             .is_none());
         assert!(det
-            .process(&file_read(1234, "/sys/class/dmi/id/sys_vendor", now + Duration::seconds(1)))
+            .process(&file_read(
+                1234,
+                "/sys/class/dmi/id/sys_vendor",
+                now + Duration::seconds(1)
+            ))
             .is_none());
         let result = det.process(&cmd_exec(
             1234,
@@ -294,8 +293,6 @@ mod tests {
         let mut det = SandboxEvasionDetector::new("host1", 3, 60);
         let now = Utc::now();
         // Single check is normal (sysadmin running lspci)
-        assert!(det
-            .process(&cmd_exec(1234, "lspci", now))
-            .is_none());
+        assert!(det.process(&cmd_exec(1234, "lspci", now)).is_none());
     }
 }

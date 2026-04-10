@@ -1732,20 +1732,34 @@ async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResp
 
     for id in graph.nodes_of_type(NodeType::Incident) {
         if let Some(Node::Incident {
-            incident_id, severity, title, summary, ts, mitre_ids,
-            decision, confidence, decision_reason, decision_target, auto_executed, detector, ..
-        }) = graph.get_node(id) {
+            incident_id,
+            severity,
+            title,
+            summary,
+            ts,
+            mitre_ids,
+            decision,
+            confidence,
+            decision_reason,
+            decision_target,
+            auto_executed,
+            detector,
+            ..
+        }) = graph.get_node(id)
+        {
             // Collect entities from TriggeredBy edges
             let entities: Vec<innerwarden_core::entities::EntityRef> = graph
                 .outgoing_edges(id)
                 .iter()
                 .filter(|e| e.relation == Relation::TriggeredBy)
-                .filter_map(|e| {
-                    match graph.get_node(e.to) {
-                        Some(Node::Ip { addr, .. }) => Some(innerwarden_core::entities::EntityRef::ip(addr)),
-                        Some(Node::User { name, .. }) => Some(innerwarden_core::entities::EntityRef::user(name)),
-                        _ => None,
+                .filter_map(|e| match graph.get_node(e.to) {
+                    Some(Node::Ip { addr, .. }) => {
+                        Some(innerwarden_core::entities::EntityRef::ip(addr))
                     }
+                    Some(Node::User { name, .. }) => {
+                        Some(innerwarden_core::entities::EntityRef::user(name))
+                    }
+                    _ => None,
                 })
                 .collect();
 
@@ -1784,7 +1798,11 @@ async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResp
                     auto_executed: *auto_executed,
                     dry_run: false,
                     reason: decision_reason.clone().unwrap_or_default(),
-                    execution_result: if *auto_executed { "ok".into() } else { "skipped".into() },
+                    execution_result: if *auto_executed {
+                        "ok".into()
+                    } else {
+                        "skipped".into()
+                    },
                     estimated_threat: String::new(),
                     prev_hash: None,
                 });
@@ -2425,7 +2443,9 @@ async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json:
     }
 
     // Top 50 non-Incident nodes by degree. Strict cap to prevent browser crash.
-    let mut scored: Vec<(NodeId, usize)> = graph.nodes().iter()
+    let mut scored: Vec<(NodeId, usize)> = graph
+        .nodes()
+        .iter()
         .filter(|(_, n)| n.node_type() != NodeType::Incident)
         .map(|(&id, _)| {
             let out = graph.outgoing.get(&id).map(|v| v.len()).unwrap_or(0);
@@ -2566,11 +2586,17 @@ fn node_priority(node: Option<&crate::knowledge_graph::types::Node>) -> u8 {
     use crate::knowledge_graph::types::Node;
     match node {
         Some(Node::Incident { .. }) => 10,
-        Some(Node::Ip { datasets, risk_score, .. }) if !datasets.is_empty() || *risk_score > 50 => 9,
+        Some(Node::Ip {
+            datasets,
+            risk_score,
+            ..
+        }) if !datasets.is_empty() || *risk_score > 50 => 9,
         Some(Node::Ip { is_tor: true, .. }) => 8,
         Some(Node::Campaign { .. }) => 8,
         Some(Node::Process { .. }) => 5,
-        Some(Node::File { is_sensitive: true, .. }) => 6,
+        Some(Node::File {
+            is_sensitive: true, ..
+        }) => 6,
         Some(Node::User { .. }) => 4,
         Some(Node::Ip { .. }) => 3,
         Some(Node::Domain { .. }) => 3,
@@ -2789,7 +2815,10 @@ async fn api_overview(
     let mut ai_ignored = 0usize;
 
     for &id in &incident_nodes {
-        if let Some(Node::Incident { detector, decision, .. }) = graph.get_node(id) {
+        if let Some(Node::Incident {
+            detector, decision, ..
+        }) = graph.get_node(id)
+        {
             *by_detector.entry(detector.clone()).or_insert(0) += 1;
             if let Some(dec) = decision {
                 decisions_count += 1;
@@ -2861,10 +2890,12 @@ async fn api_incidents(
                     .outgoing_edges(id)
                     .iter()
                     .filter(|e| e.relation == crate::knowledge_graph::types::Relation::TriggeredBy)
-                    .filter_map(|e| graph.get_node(e.to).map(|n| {
-                        let ntype = format!("{:?}", n.node_type()).to_lowercase();
-                        format!("{}:{}", ntype, n.label())
-                    }))
+                    .filter_map(|e| {
+                        graph.get_node(e.to).map(|n| {
+                            let ntype = format!("{:?}", n.node_type()).to_lowercase();
+                            format!("{}:{}", ntype, n.label())
+                        })
+                    })
                     .collect();
 
                 let outcome = match decision.as_deref() {
@@ -2938,7 +2969,11 @@ async fn api_decisions(
                     auto_executed: *auto_executed,
                     dry_run: false,
                     reason: decision_reason.clone().unwrap_or_default(),
-                    execution_result: if *auto_executed { "ok".to_string() } else { "skipped".to_string() },
+                    execution_result: if *auto_executed {
+                        "ok".to_string()
+                    } else {
+                        "skipped".to_string()
+                    },
                 })
             } else {
                 None
@@ -2994,19 +3029,28 @@ async fn api_clusters(
     use crate::knowledge_graph::types::{Node, NodeType, Relation};
     let graph = state.knowledge_graph.read().unwrap();
 
-    let mut incidents_by_ip: std::collections::HashMap<String, Vec<(chrono::DateTime<Utc>, String, String)>> =
-        std::collections::HashMap::new();
+    let mut incidents_by_ip: std::collections::HashMap<
+        String,
+        Vec<(chrono::DateTime<Utc>, String, String)>,
+    > = std::collections::HashMap::new();
 
     for id in graph.nodes_of_type(NodeType::Incident) {
-        if let Some(Node::Incident { incident_id, detector, ts, .. }) = graph.get_node(id) {
+        if let Some(Node::Incident {
+            incident_id,
+            detector,
+            ts,
+            ..
+        }) = graph.get_node(id)
+        {
             // Find associated IP via TriggeredBy edge
             for edge in graph.outgoing_edges(id) {
                 if edge.relation == Relation::TriggeredBy {
                     if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
-                        incidents_by_ip
-                            .entry(addr.clone())
-                            .or_default()
-                            .push((*ts, incident_id.clone(), detector.clone()));
+                        incidents_by_ip.entry(addr.clone()).or_default().push((
+                            *ts,
+                            incident_id.clone(),
+                            detector.clone(),
+                        ));
                     }
                 }
             }
@@ -3017,7 +3061,9 @@ async fn api_clusters(
     let mut items: Vec<ClusterItem> = Vec::new();
 
     for (ip, mut incs) in incidents_by_ip {
-        if incs.len() < 2 { continue; }
+        if incs.len() < 2 {
+            continue;
+        }
         incs.sort_by_key(|(ts, _, _)| *ts);
 
         // Group into temporal clusters
@@ -3029,8 +3075,14 @@ async fn api_clusters(
                 cluster_incs.push(incs[i].clone());
             } else {
                 if cluster_incs.len() >= 2 {
-                    let dets: Vec<String> = cluster_incs.iter().map(|(_, _, d)| d.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
-                    let ids: Vec<String> = cluster_incs.iter().map(|(_, id, _)| id.clone()).collect();
+                    let dets: Vec<String> = cluster_incs
+                        .iter()
+                        .map(|(_, _, d)| d.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let ids: Vec<String> =
+                        cluster_incs.iter().map(|(_, id, _)| id.clone()).collect();
                     items.push(ClusterItem {
                         cluster_id: format!("cluster-{:03}", items.len() + 1),
                         pivot: format!("ip:{}", ip),
@@ -3049,7 +3101,12 @@ async fn api_clusters(
         }
         // Flush last cluster
         if cluster_incs.len() >= 2 {
-            let dets: Vec<String> = cluster_incs.iter().map(|(_, _, d)| d.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+            let dets: Vec<String> = cluster_incs
+                .iter()
+                .map(|(_, _, d)| d.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
             let ids: Vec<String> = cluster_incs.iter().map(|(_, id, _)| id.clone()).collect();
             items.push(ClusterItem {
                 cluster_id: format!("cluster-{:03}", items.len() + 1),
@@ -3224,11 +3281,8 @@ async fn api_report(
     Query(query): Query<ReportQuery>,
 ) -> Response {
     let graph = state.knowledge_graph.read().unwrap();
-    let report: TrialReport = report_mod::compute_for_date_from_graph(
-        &state.data_dir,
-        query.date.as_deref(),
-        &graph,
-    );
+    let report: TrialReport =
+        report_mod::compute_for_date_from_graph(&state.data_dir, query.date.as_deref(), &graph);
 
     match serde_json::to_string_pretty(&report) {
         Ok(body) => (
@@ -3637,7 +3691,7 @@ async fn api_compliance(State(state): State<DashboardState>) -> Json<serde_json:
         { "id": "A.9.1",  "name": "Access control", "met": cfg.sudo_protection_enabled, "reason": if cfg.sudo_protection_enabled { "Sudo protection detects privilege abuse" } else { "Enable sudo-protection for access control monitoring" } },
         { "id": "A.10.1", "name": "Cryptography", "met": chain_length > 0, "reason": if chain_length > 0 { "Decision audit trail uses SHA-256 hash chain" } else { "No decisions recorded yet" } },
         { "id": "A.12.1", "name": "Operations security", "met": cfg.enabled, "reason": if cfg.enabled { "Automated response enabled" } else { "Enable responder for operational security controls" } },
-        { "id": "A.12.4", "name": "Logging and monitoring", "met": true, "reason": "Continuous monitoring with 48 detectors, 20 response playbooks, and Falco-inspired allowlists" },
+        { "id": "A.12.4", "name": "Logging and monitoring", "met": true, "reason": "Continuous monitoring with 48 detectors, 20 response playbooks, and hardened allowlists" },
         { "id": "A.12.6", "name": "Technical vulnerability management", "met": cfg.execution_guard_enabled, "reason": if cfg.execution_guard_enabled { "Execution guard blocks exploit payloads" } else { "Enable execution-guard for exploit prevention" } },
         { "id": "A.13.1", "name": "Network security management", "met": cfg.enabled && !cfg.dry_run, "reason": if cfg.enabled && !cfg.dry_run { "Automated IP blocking active" } else { "Enable guard mode for network-level response" } },
         { "id": "A.13.2", "name": "Information transfer", "met": true, "reason": "Container drift detection (overlayfs upper-layer check) + io_uring monitoring prevent unauthorized data transfer via syscall bypass and dropped executables" },
@@ -3710,17 +3764,28 @@ async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
     let graph = state.knowledge_graph.read().unwrap();
 
     // Event telemetry from graph (recorded during ingest)
-    let mut sources: Vec<_> = graph.source_counts.iter().map(|(s, &c)| (s.clone(), c)).collect();
+    let mut sources: Vec<_> = graph
+        .source_counts
+        .iter()
+        .map(|(s, &c)| (s.clone(), c))
+        .collect();
     sources.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let mut kinds: Vec<_> = graph.kind_counts.iter().map(|(k, &c)| (k.clone(), c)).collect();
+    let mut kinds: Vec<_> = graph
+        .kind_counts
+        .iter()
+        .map(|(k, &c)| (k.clone(), c))
+        .collect();
     kinds.sort_by(|a, b| b.1.cmp(&a.1));
     kinds.truncate(15);
 
     // Detector counts from Incident nodes
-    let mut detector_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut detector_timeline: std::collections::BTreeMap<String, std::collections::HashMap<String, usize>> =
-        std::collections::BTreeMap::new();
+    let mut detector_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut detector_timeline: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, usize>,
+    > = std::collections::BTreeMap::new();
     let total_incidents = graph.nodes_of_type(NodeType::Incident).len();
 
     for id in graph.nodes_of_type(NodeType::Incident) {
@@ -3731,7 +3796,11 @@ async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
                 let hour = &ts_str[0..2];
                 let min: usize = ts_str[3..5].parse().unwrap_or(0);
                 let bucket = format!("{}:{:02}", hour, (min / 5) * 5);
-                *detector_timeline.entry(bucket).or_default().entry(detector.clone()).or_insert(0) += 1;
+                *detector_timeline
+                    .entry(bucket)
+                    .or_default()
+                    .entry(detector.clone())
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -3921,9 +3990,6 @@ async fn api_collectors(State(state): State<DashboardState>) -> Json<serde_json:
     let recent = |age: Option<u64>| age.map(|s| s < 7200).unwrap_or(false);
 
     let auth_log = "/var/log/auth.log";
-    let suricata = "/var/log/suricata/eve.json";
-    let wazuh = "/var/ossec/logs/alerts/alerts.json";
-    let osquery = "/var/log/osquery/osqueryd.results.log";
     let audit_log = "/var/log/audit/audit.log";
     let nginx_acc = "/var/log/nginx/access.log";
     let nginx_err = "/var/log/nginx/error.log";
@@ -4001,36 +4067,6 @@ async fn api_collectors(State(state): State<DashboardState>) -> Json<serde_json:
             "active": true,
             "events_today": count_source("ebpf"),
             "desc": "22 kernel hooks: 19 tracepoints + kprobe (privesc) + LSM (exec block) + XDP (wire-speed IP block)"
-        },
-        {
-            "id": "suricata_eve",
-            "name": "Suricata IDS",
-            "kind": "external",
-            "log_path": suricata,
-            "detected": file_exists(suricata),
-            "active": recent(file_age_secs(suricata)),
-            "events_today": count_source("suricata_eve"),
-            "desc": "Suricata network IDS (optional). InnerWarden captures DNS, HTTP, and TLS natively. Suricata adds deep packet inspection and CVE signatures for compliance-driven environments."
-        },
-        {
-            "id": "wazuh_alerts",
-            "name": "Wazuh HIDS",
-            "kind": "external",
-            "log_path": wazuh,
-            "detected": file_exists(wazuh),
-            "active": recent(file_age_secs(wazuh)),
-            "events_today": count_source("wazuh_alerts"),
-            "desc": "Wazuh HIDS/FIM/compliance alerts"
-        },
-        {
-            "id": "osquery_log",
-            "name": "osquery",
-            "kind": "external",
-            "log_path": osquery,
-            "detected": file_exists(osquery),
-            "active": recent(file_age_secs(osquery)),
-            "events_today": count_source("osquery_log"),
-            "desc": "osquery differential results (ports, users, crontabs, processes)"
         },
         {
             "id": "syslog_firewall",
@@ -5101,7 +5137,9 @@ async fn api_prometheus_metrics(State(state): State<DashboardState>) -> axum::re
             if let Some(count) = json["totals"]["expired"].as_u64() {
                 out.push_str(&format!("innerwarden_responses_expired_total {count}\n"));
             }
-            out.push_str("# HELP innerwarden_responses_reverted_total Responses manually reverted\n");
+            out.push_str(
+                "# HELP innerwarden_responses_reverted_total Responses manually reverted\n",
+            );
             out.push_str("# TYPE innerwarden_responses_reverted_total counter\n");
             if let Some(count) = json["totals"]["reverted"].as_u64() {
                 out.push_str(&format!("innerwarden_responses_reverted_total {count}\n"));
@@ -5142,8 +5180,13 @@ async fn api_mitre_navigator() -> axum::response::Response {
     let layer = crate::mitre::generate_navigator_layer();
     axum::response::Response::builder()
         .header("content-type", "application/json")
-        .header("content-disposition", "attachment; filename=\"innerwarden-coverage.json\"")
-        .body(Body::from(serde_json::to_string_pretty(&layer).unwrap_or_default()))
+        .header(
+            "content-disposition",
+            "attachment; filename=\"innerwarden-coverage.json\"",
+        )
+        .body(Body::from(
+            serde_json::to_string_pretty(&layer).unwrap_or_default(),
+        ))
         .unwrap()
         .into_response()
 }
@@ -5162,7 +5205,9 @@ async fn api_mitre_coverage() -> axum::response::Response {
 
     axum::response::Response::builder()
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&summary).unwrap_or_default()))
+        .body(Body::from(
+            serde_json::to_string(&summary).unwrap_or_default(),
+        ))
         .unwrap()
         .into_response()
 }
@@ -5265,7 +5310,12 @@ fn build_pivots_from_graph(
         .nodes_of_type(NodeType::Ip)
         .iter()
         .filter_map(|&id| {
-            if let Some(crate::knowledge_graph::types::Node::Ip { addr, is_internal: true, .. }) = graph.get_node(id) {
+            if let Some(crate::knowledge_graph::types::Node::Ip {
+                addr,
+                is_internal: true,
+                ..
+            }) = graph.get_node(id)
+            {
                 Some(addr.clone())
             } else {
                 None
@@ -5275,7 +5325,8 @@ fn build_pivots_from_graph(
 
     if group_by == PivotKind::Detector {
         // Group incidents by detector
-        let mut by_det: std::collections::HashMap<String, Vec<&Node>> = std::collections::HashMap::new();
+        let mut by_det: std::collections::HashMap<String, Vec<&Node>> =
+            std::collections::HashMap::new();
         for id in graph.nodes_of_type(NodeType::Incident) {
             if let Some(node @ Node::Incident { detector, .. }) = graph.get_node(id) {
                 by_det.entry(detector.clone()).or_default().push(node);
@@ -5284,10 +5335,38 @@ fn build_pivots_from_graph(
         let mut items: Vec<PivotItem> = by_det
             .into_iter()
             .map(|(det, nodes)| {
-                let first = nodes.iter().filter_map(|n| if let Node::Incident { ts, .. } = n { Some(*ts) } else { None }).min();
-                let last = nodes.iter().filter_map(|n| if let Node::Incident { ts, .. } = n { Some(*ts) } else { None }).max();
-                let max_sev = nodes.iter().filter_map(|n| if let Node::Incident { severity, .. } = n { Some(severity.as_str()) } else { None })
-                    .max_by_key(|s| severity_rank(s)).unwrap_or("low").to_string();
+                let first = nodes
+                    .iter()
+                    .filter_map(|n| {
+                        if let Node::Incident { ts, .. } = n {
+                            Some(*ts)
+                        } else {
+                            None
+                        }
+                    })
+                    .min();
+                let last = nodes
+                    .iter()
+                    .filter_map(|n| {
+                        if let Node::Incident { ts, .. } = n {
+                            Some(*ts)
+                        } else {
+                            None
+                        }
+                    })
+                    .max();
+                let max_sev = nodes
+                    .iter()
+                    .filter_map(|n| {
+                        if let Node::Incident { severity, .. } = n {
+                            Some(severity.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .max_by_key(|s| severity_rank(s))
+                    .unwrap_or("low")
+                    .to_string();
                 PivotItem {
                     group_by: "detector".to_string(),
                     value: det,
@@ -5307,7 +5386,8 @@ fn build_pivots_from_graph(
     }
 
     // Group by IP or User: find which have TriggeredBy edges from incidents
-    let mut pivot_data: std::collections::HashMap<NodeId, (String, Vec<NodeId>)> = std::collections::HashMap::new();
+    let mut pivot_data: std::collections::HashMap<NodeId, (String, Vec<NodeId>)> =
+        std::collections::HashMap::new();
 
     for inc_id in graph.nodes_of_type(NodeType::Incident) {
         for edge in graph.outgoing_edges(inc_id) {
@@ -5343,7 +5423,13 @@ fn build_pivots_from_graph(
             let mut outcome = "open".to_string();
 
             for &iid in &inc_ids {
-                if let Some(Node::Incident { detector, severity, decision, .. }) = graph.get_node(iid) {
+                if let Some(Node::Incident {
+                    detector,
+                    severity,
+                    decision,
+                    ..
+                }) = graph.get_node(iid)
+                {
                     detectors.insert(detector.clone());
                     if severity_rank(severity) > severity_rank(&max_sev) {
                         max_sev = severity.to_lowercase();
@@ -5355,7 +5441,8 @@ fn build_pivots_from_graph(
                             "monitor" => "monitoring",
                             "ignore" => outcome.as_str(), // keep previous non-ignore
                             _ => "resolved",
-                        }.to_string();
+                        }
+                        .to_string();
                     }
                 }
             }
@@ -5374,7 +5461,11 @@ fn build_pivots_from_graph(
         })
         .collect();
 
-    items.sort_by(|a, b| b.incident_count.cmp(&a.incident_count).then(b.last_seen.cmp(&a.last_seen)));
+    items.sort_by(|a, b| {
+        b.incident_count
+            .cmp(&a.incident_count)
+            .then(b.last_seen.cmp(&a.last_seen))
+    });
     items.truncate(limit);
     items
 }
@@ -5609,23 +5700,41 @@ fn build_journey_from_graph(
 
     // 1. Find all Incident nodes connected to this entity via TriggeredBy
     for inc_id in graph.nodes_of_type(NodeType::Incident) {
-        let connected = graph.outgoing_edges(inc_id).iter().any(|e| {
-            e.relation == Relation::TriggeredBy && e.to == center_id
-        });
-        if !connected { continue; }
+        let connected = graph
+            .outgoing_edges(inc_id)
+            .iter()
+            .any(|e| e.relation == Relation::TriggeredBy && e.to == center_id);
+        if !connected {
+            continue;
+        }
 
         if let Some(Node::Incident {
-            incident_id, detector, severity, title, summary, ts, mitre_ids,
-            decision, confidence, decision_reason, decision_target, auto_executed,
-        }) = graph.get_node(inc_id) {
+            incident_id,
+            detector,
+            severity,
+            title,
+            summary,
+            ts,
+            mitre_ids,
+            decision,
+            confidence,
+            decision_reason,
+            decision_target,
+            auto_executed,
+        }) = graph.get_node(inc_id)
+        {
             has_incident = true;
             related_detectors.insert(detector.clone());
 
             // Collect other entities from this incident
             for edge in graph.outgoing_edges(inc_id) {
                 if edge.relation == Relation::TriggeredBy && edge.to != center_id {
-                    if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) { related_ips.insert(addr.clone()); }
-                    if let Some(Node::User { name, .. }) = graph.get_node(edge.to) { related_users.insert(name.clone()); }
+                    if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                        related_ips.insert(addr.clone());
+                    }
+                    if let Some(Node::User { name, .. }) = graph.get_node(edge.to) {
+                        related_users.insert(name.clone());
+                    }
                 }
             }
 
@@ -5663,18 +5772,44 @@ fn build_journey_from_graph(
     // 2. Direct edges from/to this node (depth=1 only, capped)
     let direct_edges = graph.all_edges(center_id);
     for edge in direct_edges.iter().rev().take(50) {
-        if edge.is_snapshot() { continue; }
+        if edge.is_snapshot() {
+            continue;
+        }
 
-        let from_label = graph.get_node(edge.from).map(|n| n.label()).unwrap_or_default();
-        let to_label = graph.get_node(edge.to).map(|n| n.label()).unwrap_or_default();
-        let event_source = edge.properties.get("event_source").and_then(|v| v.as_str()).unwrap_or("sensor");
-        let event_kind = edge.properties.get("event_kind").and_then(|v| v.as_str()).unwrap_or("");
-        let summary = edge.properties.get("summary").and_then(|v| v.as_str())
-            .unwrap_or("").to_string();
-        let severity = edge.properties.get("severity").and_then(|v| v.as_str()).unwrap_or("info");
+        let from_label = graph
+            .get_node(edge.from)
+            .map(|n| n.label())
+            .unwrap_or_default();
+        let to_label = graph
+            .get_node(edge.to)
+            .map(|n| n.label())
+            .unwrap_or_default();
+        let event_source = edge
+            .properties
+            .get("event_source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sensor");
+        let event_kind = edge
+            .properties
+            .get("event_kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let summary = edge
+            .properties
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let severity = edge
+            .properties
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info");
 
         // Skip edges that are just TriggeredBy (already covered by incidents above)
-        if matches!(edge.relation, Relation::TriggeredBy) { continue; }
+        if matches!(edge.relation, Relation::TriggeredBy) {
+            continue;
+        }
 
         let display_summary = if !summary.is_empty() {
             summary
@@ -5717,7 +5852,8 @@ fn build_journey_from_graph(
     let last_seen = entries.last().map(|e| e.ts);
 
     // Determine outcome from journey entries
-    let outcome = entries.iter()
+    let outcome = entries
+        .iter()
         .filter(|e| e.kind == "decision")
         .filter_map(|e| e.data.get("action_type").and_then(|v| v.as_str()))
         .find_map(|d| match d {
@@ -8944,8 +9080,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
   // Site palette: chart-1 #7fe7ff, chart-2 #4ade80, chart-3 #fbbf24, chart-4 #fb7185, chart-5 #60a5fa
   const SENSOR_COLORS = {
     ebpf: '#7fe7ff', auditd: '#fb7185', auth_log: '#fbbf24', journald: '#4ade80',
-    docker: '#60a5fa', nginx: '#f97316', suricata: '#a78bfa', osquery: '#22d3ee',
-    syslog: '#8b9db8', wazuh: '#f472b6', integrity: '#84cc16', cloudtrail: '#3b82f6',
+    docker: '#60a5fa', nginx: '#f97316', syslog: '#8b9db8', integrity: '#84cc16', cloudtrail: '#3b82f6',
     exec_audit: '#fb7185', syslog_firewall: '#8b9db8', firmware_integrity: '#84cc16',
     macos_log: '#a78bfa',  };
   function sensorColor(name) { return SENSOR_COLORS[name] || '#78e5ff'; }
@@ -9744,7 +9879,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
         kcCard,
         card('🔒', 'Sensitive Path Guard', s.sensitive_write||true, 'LSM hook blocks writes to /etc/shadow, sudoers, authorized_keys, crontab', s.sensitive_write !== false ? 'ON' : 'OFF', 'native', 'Capability-based policy: per-cgroup and per-process write permissions via BPF maps.', ''),
         card('⚡', 'io_uring Monitor',     s.io_uring||true,       'Detects io_uring syscall bypass evasion — invisible to most security tools', s.io_uring !== false ? 'ON' : 'OFF', 'native', 'Tracepoints on submit_sqe/submit_req + create. Alerts on CONNECT, ACCEPT, OPENAT, URING_CMD.', ''),
-        card('📦', 'Container Drift',      s.container_drift||true,'Detects binaries dropped after container start via overlayfs upper-layer',   s.container_drift !== false ? 'ON' : 'OFF', 'native', 'Falco-style: checks ovl_inode.__upperdentry at execve. sizeof(struct inode) from BTF.', ''),
+        card('📦', 'Container Drift',      s.container_drift||true,'Detects binaries dropped after container start via overlayfs upper-layer',   s.container_drift !== false ? 'ON' : 'OFF', 'native', 'Overlayfs upper-layer drift check at execve using inode layout from BTF.', ''),
         card('👑', 'Sudo Protection',      s.sudo_protection||false, 'Detects privilege abuse and suspends sudo access',  s.sudo_protection ? 'ON' : 'OFF', 'native', 'Detects 11 threat categories including SUID manipulation, SSH key injection, log tampering.', 'innerwarden enable sudo-protection'),
         card('🔫', 'Execution Guard',      s.execution_guard||false, 'Structural AST analysis of shell commands - catches obfuscation', s.execution_guard ? 'ON' : 'OFF', 'native', 'tree-sitter-bash analysis. Detects reverse shells, curl|bash, hex obfuscation.', 'innerwarden enable execution-guard'),
         card('🛡️', 'Shield (DDoS)',        integ.shield||false,    'Packet flood detection + Cloudflare edge push for volumetric attacks', integ.shield ? 'ON' : 'OFF', 'native', 'Detects SYN/UDP/ICMP floods. Pushes to Cloudflare edge when enabled.', ''),
@@ -9837,7 +9972,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     if (collectors.length > 0) {
       const colIcons = {
         auth_log:'🔑', journald:'📋', docker:'🐳', nginx_access:'🌐', nginx_error:'⚠️',
-        exec_audit:'🔎', ebpf:'⚡', suricata_eve:'🐉', wazuh_alerts:'🔒', osquery_log:'🔍',
+        exec_audit:'🔎', ebpf:'⚡',
         syslog_firewall:'🧱', firmware_integrity:'🔧', cloudtrail:'☁️', macos_log:'🍎',      };
       const colStyle =
         '.col-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:4px}' +

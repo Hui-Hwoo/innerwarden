@@ -50,7 +50,6 @@ mod incident_decision_eval;
 mod incident_enrichment;
 mod incident_execution_gate;
 mod incident_flow;
-mod knowledge_graph;
 mod incident_forensics;
 mod incident_honeypot_router;
 mod incident_honeypot_suggestion;
@@ -63,6 +62,7 @@ mod incident_reputation;
 mod ioc;
 mod ip_reputation;
 mod killchain_inline;
+mod knowledge_graph;
 mod mesh;
 mod mitre;
 mod narrative;
@@ -596,9 +596,7 @@ async fn main() -> Result<()> {
 
     // Shared knowledge graph: loaded from snapshot, shared between agent loop and dashboard.
     let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(
-        knowledge_graph::KnowledgeGraph::load_snapshot(
-            &cli.data_dir.join("graph-snapshot.json"),
-        ),
+        knowledge_graph::KnowledgeGraph::load_snapshot(&cli.data_dir.join("graph-snapshot.json")),
     ));
 
     // Advisory cache: shared between dashboard (writes advisory denials) and
@@ -2427,9 +2425,13 @@ async fn process_incidents(
                 ai::AiAction::BlockIp { ip, .. } => ("block_ip", Some(ip.as_str())),
                 ai::AiAction::Monitor { ip } => ("monitor", Some(ip.as_str())),
                 ai::AiAction::Honeypot { ip } => ("honeypot", Some(ip.as_str())),
-                ai::AiAction::SuspendUserSudo { user, .. } => ("suspend_user_sudo", Some(user.as_str())),
+                ai::AiAction::SuspendUserSudo { user, .. } => {
+                    ("suspend_user_sudo", Some(user.as_str()))
+                }
                 ai::AiAction::KillProcess { user, .. } => ("kill_process", Some(user.as_str())),
-                ai::AiAction::BlockContainer { container_id, .. } => ("block_container", Some(container_id.as_str())),
+                ai::AiAction::BlockContainer { container_id, .. } => {
+                    ("block_container", Some(container_id.as_str()))
+                }
                 ai::AiAction::Ignore { .. } => ("ignore", None),
                 ai::AiAction::RequestConfirmation { .. } => ("request_confirmation", None),
                 ai::AiAction::KillChainResponse { .. } => ("kill_chain_response", None),
@@ -3035,7 +3037,8 @@ async fn process_narrative_tick(
     {
         let (graph_incidents, host_label) = {
             let graph = state.knowledge_graph.read().unwrap();
-            let host = graph.system_node()
+            let host = graph
+                .system_node()
                 .and_then(|id| graph.get_node(id))
                 .map(|n| n.label())
                 .unwrap_or_else(|| "unknown".to_string());
@@ -3071,10 +3074,7 @@ async fn process_narrative_tick(
                     }
                 }
             });
-            tracing::info!(
-                count = graph_incidents.len(),
-                "graph detectors fired"
-            );
+            tracing::info!(count = graph_incidents.len(), "graph detectors fired");
         }
     }
 
@@ -3378,9 +3378,9 @@ mod tests {
             shield_state: None,
             deep_security_snapshot: None,
             dynamic_trusted_ips: Vec::new(),
-        dynamic_trusted_users: Vec::new(),
-        dynamic_trusted_processes: Vec::new(),
-        operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
+            operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -3388,7 +3388,9 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -3662,9 +3664,9 @@ mod tests {
             shield_state: None,
             deep_security_snapshot: None,
             dynamic_trusted_ips: Vec::new(),
-        dynamic_trusted_users: Vec::new(),
-        dynamic_trusted_processes: Vec::new(),
-        operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
+            operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -3672,7 +3674,9 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -3841,9 +3845,9 @@ mod tests {
             shield_state: None,
             deep_security_snapshot: None,
             dynamic_trusted_ips: Vec::new(),
-        dynamic_trusted_users: Vec::new(),
-        dynamic_trusted_processes: Vec::new(),
-        operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
+            operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -3851,7 +3855,9 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -3995,9 +4001,9 @@ mod tests {
             shield_state: None,
             deep_security_snapshot: None,
             dynamic_trusted_ips: Vec::new(),
-        dynamic_trusted_users: Vec::new(),
-        dynamic_trusted_processes: Vec::new(),
-        operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
+            operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -4005,7 +4011,9 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -4161,9 +4169,9 @@ mod tests {
             shield_state: None,
             deep_security_snapshot: None,
             dynamic_trusted_ips: Vec::new(),
-        dynamic_trusted_users: Vec::new(),
-        dynamic_trusted_processes: Vec::new(),
-        operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
+            operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -4171,7 +4179,9 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -4304,9 +4314,9 @@ mod tests {
             shield_state: None,
             deep_security_snapshot: None,
             dynamic_trusted_ips: Vec::new(),
-        dynamic_trusted_users: Vec::new(),
-        dynamic_trusted_processes: Vec::new(),
-        operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
+            operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -4314,7 +4324,9 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -4459,9 +4471,9 @@ mod tests {
             shield_state: None,
             deep_security_snapshot: None,
             dynamic_trusted_ips: Vec::new(),
-        dynamic_trusted_users: Vec::new(),
-        dynamic_trusted_processes: Vec::new(),
-        operator_ips: std::collections::HashMap::new(),
+            dynamic_trusted_users: Vec::new(),
+            dynamic_trusted_processes: Vec::new(),
+            operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
             suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
@@ -4469,7 +4481,9 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                knowledge_graph::KnowledgeGraph::new(),
+            )),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]

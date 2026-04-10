@@ -2,7 +2,11 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
-use crate::{abuseipdb, ai, config, response_lifecycle::{ResponseBackend, ResponseType}, skills, AgentState};
+use crate::{
+    abuseipdb, ai, config,
+    response_lifecycle::{ResponseBackend, ResponseType},
+    skills, AgentState,
+};
 
 /// Execute the layered `BlockIp` decision path (XDP + firewall + Cloudflare + AbuseIPDB report).
 pub(crate) async fn execute_block_ip_decision(

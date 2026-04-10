@@ -92,7 +92,7 @@ fn extract_from_http(fe: &FlowEvent, filestore_dir: &Path) -> Option<ExtractedFi
             || resp.body.starts_with(b"MZ")              // PE (Windows, but relevant)
             || resp.body.starts_with(b"#!/")             // Shebang script
             || resp.body.starts_with(b"<?php")           // PHP
-            || resp.body.starts_with(b"PK\x03\x04"));   // ZIP/JAR
+            || resp.body.starts_with(b"PK\x03\x04")); // ZIP/JAR
 
     if !is_binary && !has_disposition && !has_exec_magic {
         return None;
@@ -275,24 +275,24 @@ fn shannon_entropy(data: &[u8]) -> f32 {
 }
 
 /// Convert an ExtractedFile into an InnerWarden Event.
-pub fn to_event(
-    ef: &ExtractedFile,
-    host_id: &str,
-) -> innerwarden_core::event::Event {
-    use innerwarden_core::event::{Event, Severity};
+pub fn to_event(ef: &ExtractedFile, host_id: &str) -> innerwarden_core::event::Event {
     use innerwarden_core::entities::EntityRef;
+    use innerwarden_core::event::{Event, Severity};
 
-    let severity = if ef.signals.iter().any(|s| {
-        s.contains("elf_binary") || s.contains("pe_binary") || s.contains("upx_packed")
-    }) {
-        Severity::High
-    } else if ef.signals.iter().any(|s| {
-        s.contains("script") || s.contains("php") || s.contains("high_entropy")
-    }) {
-        Severity::Medium
-    } else {
-        Severity::Low
-    };
+    let severity =
+        if ef.signals.iter().any(|s| {
+            s.contains("elf_binary") || s.contains("pe_binary") || s.contains("upx_packed")
+        }) {
+            Severity::High
+        } else if ef
+            .signals
+            .iter()
+            .any(|s| s.contains("script") || s.contains("php") || s.contains("high_entropy"))
+        {
+            Severity::Medium
+        } else {
+            Severity::Low
+        };
 
     Event {
         ts: ef.timestamp,
@@ -355,7 +355,10 @@ mod tests {
             content_length: None,
             content_disposition: None,
         };
-        assert_eq!(extract_filename(&resp, "/downloads/payload.sh"), "payload.sh");
+        assert_eq!(
+            extract_filename(&resp, "/downloads/payload.sh"),
+            "payload.sh"
+        );
     }
 
     #[test]
@@ -363,7 +366,10 @@ mod tests {
         let sanitized = sanitize_filename("../../../etc/passwd");
         assert!(!sanitized.contains('/'));
         assert!(sanitized.contains("passwd"));
-        assert_eq!(sanitize_filename("normal-file_v2.tar.gz"), "normal-file_v2.tar.gz");
+        assert_eq!(
+            sanitize_filename("normal-file_v2.tar.gz"),
+            "normal-file_v2.tar.gz"
+        );
         assert_eq!(sanitize_filename(""), "unknown");
     }
 

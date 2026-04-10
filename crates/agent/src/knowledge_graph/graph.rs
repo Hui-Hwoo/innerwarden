@@ -134,15 +134,14 @@ impl KnowledgeGraph {
 
     pub fn remove_node(&mut self, id: NodeId) {
         if let Some(node) = self.nodes.remove(&id) {
-            self.memory_estimate = self.memory_estimate.saturating_sub(Self::estimate_node_size(&node));
+            self.memory_estimate = self
+                .memory_estimate
+                .saturating_sub(Self::estimate_node_size(&node));
             self.deindex_node(id, &node);
             self.threat_intel_nodes.remove(&id);
 
             // Collect edge indexes to tombstone
-            let mut edge_idxs: Vec<usize> = self
-                .outgoing
-                .remove(&id)
-                .unwrap_or_default();
+            let mut edge_idxs: Vec<usize> = self.outgoing.remove(&id).unwrap_or_default();
             edge_idxs.extend(self.incoming.remove(&id).unwrap_or_default());
             edge_idxs.sort_unstable();
             edge_idxs.dedup();
@@ -191,16 +190,24 @@ impl KnowledgeGraph {
                 old_to_new.insert(old_idx, new_idx);
                 new_edges.push(edge.clone());
             } else {
-                self.memory_estimate = self.memory_estimate.saturating_sub(Self::estimate_edge_size(edge));
+                self.memory_estimate = self
+                    .memory_estimate
+                    .saturating_sub(Self::estimate_edge_size(edge));
             }
         }
 
         // Remap adjacency lists
         for idxs in self.outgoing.values_mut() {
-            *idxs = idxs.iter().filter_map(|i| old_to_new.get(i).copied()).collect();
+            *idxs = idxs
+                .iter()
+                .filter_map(|i| old_to_new.get(i).copied())
+                .collect();
         }
         for idxs in self.incoming.values_mut() {
-            *idxs = idxs.iter().filter_map(|i| old_to_new.get(i).copied()).collect();
+            *idxs = idxs
+                .iter()
+                .filter_map(|i| old_to_new.get(i).copied())
+                .collect();
         }
 
         let removed = self.edges.len() - new_edges.len();
@@ -208,7 +215,11 @@ impl KnowledgeGraph {
         self.tombstoned_edges = 0;
 
         if removed > 0 {
-            tracing::debug!(removed, live = self.edges.len(), "knowledge graph: compacted edges");
+            tracing::debug!(
+                removed,
+                live = self.edges.len(),
+                "knowledge graph: compacted edges"
+            );
         }
     }
 
@@ -220,24 +231,32 @@ impl KnowledgeGraph {
         // Enrich edge with current event metadata if available
         if let Some(ref src) = self._current_event_source {
             if !edge.properties.contains_key("event_source") {
-                edge.properties.insert("event_source".into(), serde_json::Value::from(src.as_str()));
+                edge.properties
+                    .insert("event_source".into(), serde_json::Value::from(src.as_str()));
             }
         }
         if let Some(ref kind) = self._current_event_kind {
             if !edge.properties.contains_key("event_kind") {
-                edge.properties.insert("event_kind".into(), serde_json::Value::from(kind.as_str()));
+                edge.properties
+                    .insert("event_kind".into(), serde_json::Value::from(kind.as_str()));
             }
         }
         if let Some(ref summary) = self._current_event_summary {
             if !summary.is_empty() && !edge.properties.contains_key("summary") {
                 // Truncate summary to save memory
-                let trunc = if summary.len() > 200 { &summary[..200] } else { summary.as_str() };
-                edge.properties.insert("summary".into(), serde_json::Value::from(trunc));
+                let trunc = if summary.len() > 200 {
+                    &summary[..200]
+                } else {
+                    summary.as_str()
+                };
+                edge.properties
+                    .insert("summary".into(), serde_json::Value::from(trunc));
             }
         }
         if let Some(ref sev) = self._current_event_severity {
             if !edge.properties.contains_key("severity") {
-                edge.properties.insert("severity".into(), serde_json::Value::from(sev.as_str()));
+                edge.properties
+                    .insert("severity".into(), serde_json::Value::from(sev.as_str()));
             }
         }
 
@@ -284,7 +303,9 @@ impl KnowledgeGraph {
     }
 
     pub fn find_by_port(&self, number: u16, protocol: &str) -> Option<NodeId> {
-        self.port_index.get(&(number, protocol.to_string())).copied()
+        self.port_index
+            .get(&(number, protocol.to_string()))
+            .copied()
     }
 
     pub fn find_by_container(&self, id: &str) -> Option<NodeId> {
@@ -438,8 +459,16 @@ impl KnowledgeGraph {
     /// All edges (in + out) for a node, sorted by timestamp. Deduplicated by index.
     pub fn all_edges(&self, node: NodeId) -> Vec<&Edge> {
         let mut seen = HashSet::new();
-        let out = self.outgoing.get(&node).map(|v| v.as_slice()).unwrap_or(&[]);
-        let inc = self.incoming.get(&node).map(|v| v.as_slice()).unwrap_or(&[]);
+        let out = self
+            .outgoing
+            .get(&node)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let inc = self
+            .incoming
+            .get(&node)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
 
         let mut edges: Vec<&Edge> = out
             .iter()
@@ -520,12 +549,7 @@ impl KnowledgeGraph {
     }
 
     /// BFS shortest path between two nodes. Returns edge chain or None.
-    pub fn path_between(
-        &self,
-        from: NodeId,
-        to: NodeId,
-        max_depth: usize,
-    ) -> Option<Vec<Edge>> {
+    pub fn path_between(&self, from: NodeId, to: NodeId, max_depth: usize) -> Option<Vec<Edge>> {
         if from == to {
             return Some(Vec::new());
         }
@@ -547,8 +571,10 @@ impl KnowledgeGraph {
                 for &idx in idxs {
                     if let Some(edge) = self.edges.get(idx) {
                         if edge.to == to {
-                            let mut result: Vec<Edge> =
-                                path.iter().filter_map(|&i| self.edges.get(i).cloned()).collect();
+                            let mut result: Vec<Edge> = path
+                                .iter()
+                                .filter_map(|&i| self.edges.get(i).cloned())
+                                .collect();
                             result.push(edge.clone());
                             return Some(result);
                         }
@@ -567,8 +593,10 @@ impl KnowledgeGraph {
                 for &idx in idxs {
                     if let Some(edge) = self.edges.get(idx) {
                         if edge.from == to {
-                            let mut result: Vec<Edge> =
-                                path.iter().filter_map(|&i| self.edges.get(i).cloned()).collect();
+                            let mut result: Vec<Edge> = path
+                                .iter()
+                                .filter_map(|&i| self.edges.get(i).cloned())
+                                .collect();
                             result.push(edge.clone());
                             return Some(result);
                         }
@@ -690,7 +718,11 @@ impl KnowledgeGraph {
     }
 
     /// Nodes matching a type and predicate.
-    pub fn find_nodes(&self, node_type: NodeType, predicate: impl Fn(&Node) -> bool) -> Vec<NodeId> {
+    pub fn find_nodes(
+        &self,
+        node_type: NodeType,
+        predicate: impl Fn(&Node) -> bool,
+    ) -> Vec<NodeId> {
         self.nodes
             .iter()
             .filter(|(_, n)| n.node_type() == node_type && predicate(n))
@@ -800,11 +832,16 @@ impl KnowledgeGraph {
             Node::File { path, .. } => self.file_index.get(path).copied(),
             Node::User { name, .. } => self.user_index.get(name).copied(),
             Node::Domain { name, .. } => self.domain_index.get(name).copied(),
-            Node::Port { number, protocol, .. } => {
-                self.port_index.get(&(*number, protocol.clone())).copied()
-            }
+            Node::Port {
+                number, protocol, ..
+            } => self.port_index.get(&(*number, protocol.clone())).copied(),
             Node::Container { container_id, .. } => self.container_index.get(container_id).copied(),
-            Node::Device { vendor, product, serial, .. } => {
+            Node::Device {
+                vendor,
+                product,
+                serial,
+                ..
+            } => {
                 let key = device_key(vendor, product, serial.as_deref());
                 self.device_index.get(&key).copied()
             }
@@ -834,13 +871,20 @@ impl KnowledgeGraph {
             Node::Domain { name, .. } => {
                 self.domain_index.insert(name.clone(), id);
             }
-            Node::Port { number, protocol, .. } => {
+            Node::Port {
+                number, protocol, ..
+            } => {
                 self.port_index.insert((*number, protocol.clone()), id);
             }
             Node::Container { container_id, .. } => {
                 self.container_index.insert(container_id.clone(), id);
             }
-            Node::Device { vendor, product, serial, .. } => {
+            Node::Device {
+                vendor,
+                product,
+                serial,
+                ..
+            } => {
                 let key = device_key(vendor, product, serial.as_deref());
                 self.device_index.insert(key, id);
             }
@@ -873,13 +917,20 @@ impl KnowledgeGraph {
             Node::Domain { name, .. } => {
                 self.domain_index.remove(name);
             }
-            Node::Port { number, protocol, .. } => {
+            Node::Port {
+                number, protocol, ..
+            } => {
                 self.port_index.remove(&(*number, protocol.clone()));
             }
             Node::Container { container_id, .. } => {
                 self.container_index.remove(container_id);
             }
-            Node::Device { vendor, product, serial, .. } => {
+            Node::Device {
+                vendor,
+                product,
+                serial,
+                ..
+            } => {
                 let key = device_key(vendor, product, serial.as_deref());
                 self.device_index.remove(&key);
             }
@@ -900,7 +951,12 @@ impl KnowledgeGraph {
     fn merge_node(existing: &mut Node, incoming: &Node) {
         match (existing, incoming) {
             (
-                Node::Process { exe, exit_ts, container_id, .. },
+                Node::Process {
+                    exe,
+                    exit_ts,
+                    container_id,
+                    ..
+                },
                 Node::Process {
                     exe: new_exe,
                     exit_ts: new_exit,
@@ -919,7 +975,13 @@ impl KnowledgeGraph {
                 }
             }
             (
-                Node::Ip { last_seen, datasets, risk_score, is_tor, .. },
+                Node::Ip {
+                    last_seen,
+                    datasets,
+                    risk_score,
+                    is_tor,
+                    ..
+                },
                 Node::Ip {
                     last_seen: new_last,
                     datasets: new_ds,
@@ -944,7 +1006,13 @@ impl KnowledgeGraph {
                 }
             }
             (
-                Node::File { sha256, size, entropy, yara_matches, .. },
+                Node::File {
+                    sha256,
+                    size,
+                    entropy,
+                    yara_matches,
+                    ..
+                },
                 Node::File {
                     sha256: new_sha,
                     size: new_size,
@@ -969,7 +1037,14 @@ impl KnowledgeGraph {
                 }
             }
             (
-                Node::Container { name, image, start_ts, exit_ts, oom_killed, .. },
+                Node::Container {
+                    name,
+                    image,
+                    start_ts,
+                    exit_ts,
+                    oom_killed,
+                    ..
+                },
                 Node::Container {
                     name: nn,
                     image: ni,
@@ -996,7 +1071,12 @@ impl KnowledgeGraph {
                 }
             }
             (
-                Node::Domain { datasets, is_dga, entropy, .. },
+                Node::Domain {
+                    datasets,
+                    is_dga,
+                    entropy,
+                    ..
+                },
                 Node::Domain {
                     datasets: nd,
                     is_dga: ndga,
@@ -1022,9 +1102,10 @@ impl KnowledgeGraph {
 
     fn is_expired(&self, node: &Node, node_id: NodeId, now: DateTime<Utc>) -> bool {
         match node {
-            Node::Process { exit_ts: Some(exit), .. } => {
-                now - *exit > Duration::hours(1)
-            }
+            Node::Process {
+                exit_ts: Some(exit),
+                ..
+            } => now - *exit > Duration::hours(1),
             Node::Process { exit_ts: None, .. } => {
                 // Check last edge
                 let last = self.all_edges(node_id).last().map(|e| e.ts);
@@ -1033,7 +1114,12 @@ impl KnowledgeGraph {
                     None => now - self.created_at > Duration::hours(24),
                 }
             }
-            Node::Ip { datasets, risk_score, last_seen, .. } => {
+            Node::Ip {
+                datasets,
+                risk_score,
+                last_seen,
+                ..
+            } => {
                 if !datasets.is_empty() || *risk_score > 0 {
                     return false; // Permanent if threat intel
                 }
@@ -1067,9 +1153,10 @@ impl KnowledgeGraph {
                     None => false,
                 }
             }
-            Node::Container { exit_ts: Some(exit), .. } => {
-                now - *exit > Duration::hours(1)
-            }
+            Node::Container {
+                exit_ts: Some(exit),
+                ..
+            } => now - *exit > Duration::hours(1),
             Node::Container { .. } => false, // Running
             Node::Incident { decision, ts, .. } => {
                 if decision.as_deref() == Some("block") {

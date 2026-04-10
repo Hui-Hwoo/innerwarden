@@ -106,8 +106,12 @@ impl Datasets {
             }
         }
 
-        let total = self.ips.len() + self.domains.len() + self.sha256.len()
-            + self.ja3.len() + self.urls.len() + self.tor_exits.len();
+        let total = self.ips.len()
+            + self.domains.len()
+            + self.sha256.len()
+            + self.ja3.len()
+            + self.urls.len()
+            + self.tor_exits.len();
 
         if total > 0 {
             info!(
@@ -212,8 +216,12 @@ impl Datasets {
 
     /// Total entries across all datasets.
     pub fn total_entries(&self) -> usize {
-        self.ips.len() + self.domains.len() + self.sha256.len()
-            + self.ja3.len() + self.urls.len() + self.tor_exits.len()
+        self.ips.len()
+            + self.domains.len()
+            + self.sha256.len()
+            + self.ja3.len()
+            + self.urls.len()
+            + self.tor_exits.len()
     }
 
     /// Is any dataset loaded?
@@ -249,13 +257,7 @@ fn load_set_lowercase(path: &Path) -> HashSet<String> {
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
-        .map(|l| {
-            l.split(',')
-                .next()
-                .unwrap_or(l)
-                .trim()
-                .to_lowercase()
-        })
+        .map(|l| l.split(',').next().unwrap_or(l).trim().to_lowercase())
         .filter(|l| !l.is_empty())
         .collect()
 }
@@ -295,8 +297,7 @@ pub fn download_feed(url: &str, dest: &Path) -> Result<usize, String> {
 
     let count = lines.len();
 
-    std::fs::write(dest, lines.join("\n"))
-        .map_err(|e| format!("write {}: {e}", dest.display()))?;
+    std::fs::write(dest, lines.join("\n")).map_err(|e| format!("write {}: {e}", dest.display()))?;
 
     Ok(count)
 }
@@ -378,11 +379,7 @@ mod tests {
     fn test_load_set_skips_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
-        std::fs::write(
-            &path,
-            "# Comment\n1.2.3.4\n// Another comment\n5.6.7.8\n\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "# Comment\n1.2.3.4\n// Another comment\n5.6.7.8\n\n").unwrap();
         let set = load_set(&path);
         assert_eq!(set.len(), 2);
         assert!(set.contains("1.2.3.4"));

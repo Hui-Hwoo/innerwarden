@@ -138,11 +138,7 @@ impl DataEncodingDetector {
         Some(Incident {
             ts: now,
             host: self.host.clone(),
-            incident_id: format!(
-                "data_encoding:{}:{}",
-                dst_ip,
-                now.format("%Y-%m-%dT%H:%MZ")
-            ),
+            incident_id: format!("data_encoding:{}:{}", dst_ip, now.format("%Y-%m-%dT%H:%MZ")),
             severity: Severity::Medium,
             title: format!("Encoded outbound traffic to {dst_ip}"),
             summary: format!(
@@ -188,8 +184,12 @@ impl DataEncodingDetector {
             .or(event.details.get("cmdline"))
             .and_then(|v| v.as_str())?;
 
-        let is_encode_pipe = (cmd.contains("base64") || cmd.contains("xxd") || cmd.contains("openssl enc"))
-            && (cmd.contains('|') || cmd.contains("curl") || cmd.contains("wget") || cmd.contains("nc "));
+        let is_encode_pipe =
+            (cmd.contains("base64") || cmd.contains("xxd") || cmd.contains("openssl enc"))
+                && (cmd.contains('|')
+                    || cmd.contains("curl")
+                    || cmd.contains("wget")
+                    || cmd.contains("nc "));
 
         if !is_encode_pipe {
             return None;
@@ -299,7 +299,10 @@ mod tests {
 
     #[test]
     fn test_base64_detection() {
-        assert!(has_base64_segment("data=SGVsbG8gV29ybGQhIFRoaXMgaXMgYmFzZTY0IGVuY29kZWQ=", 40));
+        assert!(has_base64_segment(
+            "data=SGVsbG8gV29ybGQhIFRoaXMgaXMgYmFzZTY0IGVuY29kZWQ=",
+            40
+        ));
         assert!(!has_base64_segment("normal_path/to/resource", 40));
     }
 

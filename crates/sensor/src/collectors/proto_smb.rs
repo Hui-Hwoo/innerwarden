@@ -70,10 +70,10 @@ pub fn parse_session(client_data: &[u8]) -> Option<SmbSession> {
             if offset + 5 <= client_data.len() {
                 let cmd = client_data[offset + 4];
                 match cmd {
-                    0x75 => session.signals.push("tree_connect".into()),     // Tree Connect
-                    0x2D => session.signals.push("open_file".into()),         // Open
-                    0x32 => session.signals.push("transaction".into()),       // Transaction
-                    0xA2 => session.signals.push("nt_create".into()),         // NT Create AndX
+                    0x75 => session.signals.push("tree_connect".into()), // Tree Connect
+                    0x2D => session.signals.push("open_file".into()),    // Open
+                    0x32 => session.signals.push("transaction".into()),  // Transaction
+                    0xA2 => session.signals.push("nt_create".into()),    // NT Create AndX
                     _ => {}
                 }
             }
@@ -89,16 +89,13 @@ pub fn parse_session(client_data: &[u8]) -> Option<SmbSession> {
             }
             // SMB2 command at offset+12 (2 bytes LE)
             if offset + 14 <= client_data.len() {
-                let cmd = u16::from_le_bytes([
-                    client_data[offset + 12],
-                    client_data[offset + 13],
-                ]);
+                let cmd = u16::from_le_bytes([client_data[offset + 12], client_data[offset + 13]]);
                 match cmd {
-                    0x0003 => session.signals.push("tree_connect".into()),    // TREE_CONNECT
-                    0x0005 => session.signals.push("create_file".into()),     // CREATE
-                    0x0008 => session.signals.push("read_file".into()),       // READ
-                    0x0009 => session.signals.push("write_file".into()),      // WRITE
-                    0x000B => session.signals.push("ioctl".into()),           // IOCTL (psexec uses this)
+                    0x0003 => session.signals.push("tree_connect".into()), // TREE_CONNECT
+                    0x0005 => session.signals.push("create_file".into()),  // CREATE
+                    0x0008 => session.signals.push("read_file".into()),    // READ
+                    0x0009 => session.signals.push("write_file".into()),   // WRITE
+                    0x000B => session.signals.push("ioctl".into()), // IOCTL (psexec uses this)
                     _ => {}
                 }
             }
@@ -116,13 +113,13 @@ pub fn parse_session(client_data: &[u8]) -> Option<SmbSession> {
         ("\\IPC$", "ipc_share"),
         ("\\ADMIN$", "admin_share"),
         ("\\C$", "c_share"),
-        ("svcctl", "remote_service_control"),   // psexec
-        ("atsvc", "remote_task_scheduler"),      // at.exe
-        ("srvsvc", "server_service"),            // share enumeration
-        ("samr", "sam_enumeration"),             // user enumeration
-        ("lsarpc", "lsa_enumeration"),           // policy enumeration
-        ("winreg", "remote_registry"),           // registry access
-        ("PSEXESVC", "psexec_service"),          // psexec indicator
+        ("svcctl", "remote_service_control"), // psexec
+        ("atsvc", "remote_task_scheduler"),   // at.exe
+        ("srvsvc", "server_service"),         // share enumeration
+        ("samr", "sam_enumeration"),          // user enumeration
+        ("lsarpc", "lsa_enumeration"),        // policy enumeration
+        ("winreg", "remote_registry"),        // registry access
+        ("PSEXESVC", "psexec_service"),       // psexec indicator
     ];
 
     let data_str = String::from_utf8_lossy(client_data);
@@ -140,7 +137,9 @@ pub fn parse_session(client_data: &[u8]) -> Option<SmbSession> {
 
     // Flag high-risk combinations
     if session.signals.contains(&"ipc_share".to_string())
-        && (session.signals.contains(&"remote_service_control".to_string())
+        && (session
+            .signals
+            .contains(&"remote_service_control".to_string())
             || session.signals.contains(&"psexec_service".to_string()))
     {
         session.signals.push("LATERAL_MOVEMENT_PSEXEC".into());
@@ -165,15 +164,19 @@ mod tests {
         let mut data = vec![0x00, 0x00, 0x00, 0x50]; // NB header, len=80
         data.extend_from_slice(&[0xFE, b'S', b'M', b'B']); // SMB2 magic
         data.extend_from_slice(&[0; 72]); // Pad to fill NB length
-        // Append named pipe strings (scanned by string matching)
+                                          // Append named pipe strings (scanned by string matching)
         data.extend_from_slice(b"\\IPC$\x00svcctl\x00PSEXESVC\x00");
 
         let session = parse_session(&data).unwrap();
         assert_eq!(session.version, SmbVersion::Smb2);
         assert!(session.signals.contains(&"ipc_share".to_string()));
-        assert!(session.signals.contains(&"remote_service_control".to_string()));
+        assert!(session
+            .signals
+            .contains(&"remote_service_control".to_string()));
         assert!(session.signals.contains(&"psexec_service".to_string()));
-        assert!(session.signals.contains(&"LATERAL_MOVEMENT_PSEXEC".to_string()));
+        assert!(session
+            .signals
+            .contains(&"LATERAL_MOVEMENT_PSEXEC".to_string()));
     }
 
     #[test]

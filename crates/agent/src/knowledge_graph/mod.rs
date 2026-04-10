@@ -44,7 +44,10 @@ impl KnowledgeGraph {
         let avg_process_degree = if process_nodes.is_empty() {
             0.0
         } else {
-            let total: usize = process_nodes.iter().map(|&id| self.all_edges(id).len()).sum();
+            let total: usize = process_nodes
+                .iter()
+                .map(|&id| self.all_edges(id).len())
+                .sum();
             total as f32 / process_nodes.len() as f32
         };
 
@@ -75,9 +78,7 @@ impl KnowledgeGraph {
             .iter()
             .filter(|e| {
                 e.relation == Relation::Wrote
-                    && self
-                        .get_node(e.to)
-                        .map_or(false, |n| n.is_sensitive_file())
+                    && self.get_node(e.to).map_or(false, |n| n.is_sensitive_file())
             })
             .count() as u32;
 

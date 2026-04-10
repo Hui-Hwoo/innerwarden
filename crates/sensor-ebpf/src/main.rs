@@ -771,7 +771,7 @@ static LSM_POLICY: HashMap<u32, u32> = HashMap::with_max_entries(16, 0);
 /// sizeof(struct inode) for the running kernel - populated by userspace from BTF.
 /// Used for overlayfs upper-layer detection: __upperdentry is at inode_ptr + sizeof(struct inode).
 /// Key: 0. Value: sizeof(struct inode) in bytes.
-/// Trick from Falco: avoids needing BTF for the private ovl_inode struct.
+/// Avoids needing BTF for the private ovl_inode struct.
 #[map]
 static INODE_SIZE: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
@@ -844,7 +844,7 @@ pub fn innerwarden_lsm_exec(ctx: LsmContext) -> i32 {
 fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
     // ── Container drift detection (ALWAYS runs, even without guard mode) ──
     // Check if the binary is on an overlayfs upper layer (dropped after container start).
-    // Uses the Falco trick: __upperdentry is at inode_ptr + sizeof(struct inode).
+    // __upperdentry is at inode_ptr + sizeof(struct inode).
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     if cgroup_id != 0 {
         // In a container — check for overlayfs drift
@@ -1067,7 +1067,7 @@ fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
 // The upper layer contains files created/modified after container start —
 // i.e., not in the original image. This is container drift.
 //
-// Technique (from Falco): __upperdentry is the first field after vfs_inode
+// Technique: __upperdentry is the first field after vfs_inode
 // in struct ovl_inode. So its offset = inode_ptr + sizeof(struct inode).
 // sizeof(struct inode) is queried from kernel BTF by userspace and stored
 // in the INODE_SIZE map.

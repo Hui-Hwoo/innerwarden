@@ -14,9 +14,7 @@ use collectors::{
     auth_log::AuthLogCollector, cloudtrail::CloudTrailCollector, docker::DockerCollector,
     exec_audit::ExecAuditCollector, integrity::IntegrityCollector, journald::JournaldCollector,
     macos_log::MacosLogCollector, nginx_access::NginxAccessCollector,
-    nginx_error::NginxErrorCollector, osquery_log::OsqueryLogCollector,
-    suricata_eve::SuricataEveCollector, syslog_firewall::SyslogFirewallCollector,
-    wazuh_alerts::WazuhAlertsCollector,
+    nginx_error::NginxErrorCollector, syslog_firewall::SyslogFirewallCollector,
 };
 use detectors::c2_callback::C2CallbackDetector;
 use detectors::container_escape::ContainerEscapeDetector;
@@ -34,7 +32,6 @@ use detectors::integrity_alert::IntegrityAlertDetector;
 use detectors::kernel_module_load::KernelModuleLoadDetector;
 use detectors::lateral_movement::LateralMovementDetector;
 use detectors::log_tampering::LogTamperingDetector;
-use detectors::osquery_anomaly::OsqueryAnomalyDetector;
 use detectors::outbound_anomaly::OutboundAnomalyDetector;
 use detectors::packet_flood::PacketFloodDetector;
 use detectors::port_scan::PortScanDetector;
@@ -48,7 +45,6 @@ use detectors::search_abuse::SearchAbuseDetector;
 use detectors::ssh_bruteforce::SshBruteforceDetector;
 use detectors::ssh_key_injection::SshKeyInjectionDetector;
 use detectors::sudo_abuse::SudoAbuseDetector;
-use detectors::suricata_alert::SuricataAlertDetector;
 use detectors::suspicious_login::SuspiciousLoginDetector;
 use detectors::systemd_persistence::SystemdPersistenceDetector;
 use detectors::user_agent_scanner::UserAgentScannerDetector;
@@ -95,11 +91,9 @@ struct DetectorSet {
     web_scan: Option<WebScanDetector>,
     user_agent_scanner: Option<UserAgentScannerDetector>,
     execution_guard: Option<ExecutionGuardDetector>,
-    suricata_alert: Option<SuricataAlertDetector>,
     docker_anomaly: Option<DockerAnomalyDetector>,
     integrity_alert: Option<IntegrityAlertDetector>,
     log_tampering: Option<LogTamperingDetector>,
-    osquery_anomaly: Option<OsqueryAnomalyDetector>,
     distributed_ssh: Option<DistributedSshDetector>,
     suspicious_login: Option<SuspiciousLoginDetector>,
     c2_callback: Option<C2CallbackDetector>,
@@ -236,9 +230,6 @@ async fn main() -> Result<()> {
     let shared_exec_audit_offset = Arc::new(AtomicU64::new(0));
     let shared_nginx_offset = Arc::new(AtomicU64::new(0));
     let shared_nginx_error_offset = Arc::new(AtomicU64::new(0));
-    let shared_suricata_offset = Arc::new(AtomicU64::new(0));
-    let shared_osquery_offset = Arc::new(AtomicU64::new(0));
-    let shared_wazuh_offset = Arc::new(AtomicU64::new(0));
     let shared_syslog_firewall_offset = Arc::new(AtomicU64::new(0));
 
     // SSH brute force detector (stateful, lives in main loop)
@@ -319,15 +310,6 @@ async fn main() -> Result<()> {
             ExecutionMode::from_str(&d.mode),
         )
     });
-    let suricata_alert_detector = cfg.detectors.suricata_alert.enabled.then(|| {
-        let d = &cfg.detectors.suricata_alert;
-        info!(
-            threshold = d.threshold,
-            window_seconds = d.window_seconds,
-            "suricata_alert detector enabled"
-        );
-        SuricataAlertDetector::new(&cfg.agent.host_id, d.threshold, d.window_seconds)
-    });
     let docker_anomaly_detector = cfg.detectors.docker_anomaly.enabled.then(|| {
         let d = &cfg.detectors.docker_anomaly;
         info!(
@@ -352,14 +334,6 @@ async fn main() -> Result<()> {
             "log_tampering detector enabled (eBPF openat log file monitoring)"
         );
         LogTamperingDetector::new(&cfg.agent.host_id, d.cooldown_seconds)
-    });
-    let osquery_anomaly_detector = cfg.detectors.osquery_anomaly.enabled.then(|| {
-        let d = &cfg.detectors.osquery_anomaly;
-        info!(
-            cooldown_seconds = d.cooldown_seconds,
-            "osquery_anomaly detector enabled"
-        );
-        OsqueryAnomalyDetector::new(&cfg.agent.host_id, d.cooldown_seconds)
     });
     // Distributed SSH detector - always on when ssh_bruteforce is on
     let distributed_ssh_detector = cfg.detectors.ssh_bruteforce.enabled.then(|| {
@@ -399,11 +373,9 @@ async fn main() -> Result<()> {
         web_scan: web_scan_detector,
         user_agent_scanner: user_agent_scanner_detector,
         execution_guard: execution_guard_detector,
-        suricata_alert: suricata_alert_detector,
         docker_anomaly: docker_anomaly_detector,
         integrity_alert: integrity_alert_detector,
         log_tampering: log_tampering_detector,
-        osquery_anomaly: osquery_anomaly_detector,
         distributed_ssh: distributed_ssh_detector,
         suspicious_login: cfg.detectors.ssh_bruteforce.enabled.then(|| {
             info!("suspicious_login detector enabled");
@@ -719,7 +691,11 @@ async fn main() -> Result<()> {
     if !threat_datasets.is_loaded() {
         info!("downloading threat intelligence feeds for the first time...");
         let (ok, total) = detectors::datasets::update_all_feeds(&datasets_dir);
-        info!(feeds_updated = ok, total_entries = total, "initial feed download complete");
+        info!(
+            feeds_updated = ok,
+            total_entries = total,
+            "initial feed download complete"
+        );
         threat_datasets.reload();
     }
 
@@ -888,50 +864,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Spawn suricata_eve collector
-    if cfg.collectors.suricata_eve.enabled {
-        let sc = &cfg.collectors.suricata_eve;
-        let offset = state
-            .get_cursor("suricata_eve")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        shared_suricata_offset.store(offset, Ordering::Relaxed);
-        let collector =
-            SuricataEveCollector::new(&sc.path, &cfg.agent.host_id, offset, sc.event_types.clone());
-        info!(
-            path = %sc.path,
-            event_types = ?sc.event_types,
-            offset,
-            "starting suricata_eve collector"
-        );
-        let tx_suricata = tx.clone();
-        let shared = Arc::clone(&shared_suricata_offset);
-        tokio::spawn(async move {
-            if let Err(e) = collector.run(tx_suricata, shared).await {
-                tracing::error!("suricata_eve collector error: {e:#}");
-            }
-        });
-    }
-
-    // Spawn osquery_log collector
-    if cfg.collectors.osquery_log.enabled {
-        let oc = &cfg.collectors.osquery_log;
-        let offset = state
-            .get_cursor("osquery_log")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        shared_osquery_offset.store(offset, Ordering::Relaxed);
-        let collector = OsqueryLogCollector::new(&oc.path, &cfg.agent.host_id, offset);
-        info!(path = %oc.path, offset, "starting osquery_log collector");
-        let tx_osquery = tx.clone();
-        let shared = Arc::clone(&shared_osquery_offset);
-        tokio::spawn(async move {
-            if let Err(e) = collector.run(tx_osquery, shared).await {
-                tracing::error!("osquery_log collector error: {e:#}");
-            }
-        });
-    }
-
     // Spawn macos_log collector
     if cfg.collectors.macos_log.enabled {
         let collector = MacosLogCollector::new(&cfg.agent.host_id);
@@ -940,25 +872,6 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = collector.run(tx_macos).await {
                 tracing::error!("macos_log collector error: {e:#}");
-            }
-        });
-    }
-
-    // Spawn wazuh_alerts collector
-    if cfg.collectors.wazuh_alerts.enabled {
-        let wc = &cfg.collectors.wazuh_alerts;
-        let offset = state
-            .get_cursor("wazuh_alerts")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        shared_wazuh_offset.store(offset, Ordering::Relaxed);
-        let collector = WazuhAlertsCollector::new(&wc.path, &cfg.agent.host_id, offset);
-        info!(path = %wc.path, offset, "starting wazuh_alerts collector");
-        let tx_wazuh = tx.clone();
-        let shared = Arc::clone(&shared_wazuh_offset);
-        tokio::spawn(async move {
-            if let Err(e) = collector.run(tx_wazuh, shared).await {
-                tracing::error!("wazuh_alerts collector error: {e:#}");
             }
         });
     }
@@ -1153,7 +1066,10 @@ async fn main() -> Result<()> {
         let seccomp_path = data_dir.join("sensor.seccomp.json");
         if seccomp_path.exists() {
             match apply_seccomp_profile(&seccomp_path) {
-                Ok(count) => info!(syscalls_allowed = count, "seccomp profile applied — sensor hardened"),
+                Ok(count) => info!(
+                    syscalls_allowed = count,
+                    "seccomp profile applied — sensor hardened"
+                ),
                 Err(e) => warn!("seccomp profile failed to apply: {e:#} — continuing without"),
             }
         }
@@ -1281,15 +1197,6 @@ async fn main() -> Result<()> {
     let nginx_error_offset = shared_nginx_error_offset.load(Ordering::Relaxed);
     state.set_cursor("nginx_error", serde_json::json!(nginx_error_offset));
 
-    let suricata_offset = shared_suricata_offset.load(Ordering::Relaxed);
-    state.set_cursor("suricata_eve", serde_json::json!(suricata_offset));
-
-    let osquery_offset = shared_osquery_offset.load(Ordering::Relaxed);
-    state.set_cursor("osquery_log", serde_json::json!(osquery_offset));
-
-    let wazuh_offset = shared_wazuh_offset.load(Ordering::Relaxed);
-    state.set_cursor("wazuh_alerts", serde_json::json!(wazuh_offset));
-
     let syslog_firewall_offset = shared_syslog_firewall_offset.load(Ordering::Relaxed);
     state.set_cursor("syslog_firewall", serde_json::json!(syslog_firewall_offset));
 
@@ -1326,11 +1233,9 @@ fn severity_rank(s: &innerwarden_core::event::Severity) -> u8 {
     }
 }
 
-/// Sources that already performed their own detection.
-/// High/Critical events from these sources are promoted directly to incidents
-/// without going through an InnerWarden detector.
 fn is_passthrough_source(source: &str) -> bool {
-    matches!(source, "suricata" | "wazuh")
+    let _ = source;
+    false
 }
 
 fn process_event(
@@ -1468,8 +1373,6 @@ fn process_event(
         }
     }
 
-    // Incident passthrough: tools that already ran their own detection
-    // (Falco, Suricata) emit High/Critical events that are incidents by definition.
     if is_passthrough_source(&ev.source) {
         let is_actionable = matches!(ev.severity, Severity::High | Severity::Critical);
         if is_actionable {
@@ -1529,12 +1432,6 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.suricata_alert {
-        if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
-        }
-    }
-
     if let Some(ref mut det) = detectors.docker_anomaly {
         if let Some(incident) = det.process(&ev) {
             write_incident(writer, stats, incident, syslog, dedup_cache);
@@ -1548,12 +1445,6 @@ fn process_event(
     }
 
     if let Some(ref mut det) = detectors.log_tampering {
-        if let Some(incident) = det.process(&ev) {
-            write_incident(writer, stats, incident, syslog, dedup_cache);
-        }
-    }
-
-    if let Some(ref mut det) = detectors.osquery_anomaly {
         if let Some(incident) = det.process(&ev) {
             write_incident(writer, stats, incident, syslog, dedup_cache);
         }
@@ -1792,9 +1683,6 @@ fn process_event(
     }
 }
 
-/// Build an Incident directly from an event emitted by a passthrough source
-/// (Falco, Suricata). The external tool already detected the threat; this
-/// promotes it into InnerWarden's incident pipeline for AI triage and response.
 fn passthrough_incident(
     ev: &innerwarden_core::event::Event,
 ) -> Option<innerwarden_core::incident::Incident> {
@@ -1807,19 +1695,7 @@ fn passthrough_incident(
         ev.ts.format("%Y-%m-%dT%H:%MZ")
     );
 
-    let recommended_checks = match ev.source.as_str() {
-        "suricata" => vec![
-            "Review Suricata IDS signature".to_string(),
-            "Check network flow context in eve.json".to_string(),
-            "Consider blocking source IP if attack pattern confirmed".to_string(),
-        ],
-        "wazuh" => vec![
-            "Review Wazuh alert rule and level".to_string(),
-            "Check agent logs for additional context".to_string(),
-            "Consider blocking source IP if attack pattern confirmed".to_string(),
-        ],
-        _ => vec!["Review source alert details".to_string()],
-    };
+    let recommended_checks = vec!["Review source alert details".to_string()];
 
     Some(Incident {
         ts: ev.ts,
@@ -1891,8 +1767,8 @@ fn apply_seccomp_profile(path: &Path) -> Result<usize> {
         .with_context(|| format!("read seccomp profile: {}", path.display()))?;
 
     // Parse the JSON profile to get the syscall allowlist
-    let profile = serde_json::from_str::<serde_json::Value>(&data)
-        .context("parse seccomp profile JSON")?;
+    let profile =
+        serde_json::from_str::<serde_json::Value>(&data).context("parse seccomp profile JSON")?;
 
     let syscalls = profile["allowed_syscalls"]
         .as_array()
@@ -1950,15 +1826,15 @@ fn apply_seccomp_profile(path: &Path) -> Result<usize> {
     filter.push(bpf_stmt(0x06, 0x7fff0000)); // SECCOMP_RET_ALLOW
 
     // Convert to sock_filter array (each is 8 bytes: u16 code, u8 jt, u8 jf, u32 k)
-    let filter_bytes: Vec<[u8; 8]> = filter
-        .iter()
-        .map(|&v| v.to_ne_bytes())
-        .collect();
+    let filter_bytes: Vec<[u8; 8]> = filter.iter().map(|&v| v.to_ne_bytes()).collect();
 
     // Set NO_NEW_PRIVS (required before seccomp)
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
-        anyhow::bail!("prctl(PR_SET_NO_NEW_PRIVS) failed: {}", std::io::Error::last_os_error());
+        anyhow::bail!(
+            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     // Apply the BPF program via prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)
@@ -1984,10 +1860,16 @@ fn apply_seccomp_profile(path: &Path) -> Result<usize> {
     };
 
     if ret != 0 {
-        anyhow::bail!("seccomp(FILTER) failed: {}", std::io::Error::last_os_error());
+        anyhow::bail!(
+            "seccomp(FILTER) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
-    info!(count, "seccomp filter installed: {} syscalls allowed", count);
+    info!(
+        count,
+        "seccomp filter installed: {} syscalls allowed", count
+    );
     Ok(count)
 }
 

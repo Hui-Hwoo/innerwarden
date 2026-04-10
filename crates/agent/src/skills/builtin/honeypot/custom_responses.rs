@@ -83,9 +83,7 @@ impl CustomResponses {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match serde_yaml::from_str::<CustomResponses>(&content) {
                     Ok(custom) => {
-                        merged
-                            .shell_commands
-                            .extend(custom.shell_commands);
+                        merged.shell_commands.extend(custom.shell_commands);
                         merged.http_routes.extend(custom.http_routes);
                         count += 1;
                     }

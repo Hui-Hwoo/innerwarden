@@ -40,17 +40,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 ### How is this different?
 
-| | Inner Warden | Falco | Wazuh | CrowdSec |
-|---|:---:|:---:|:---:|:---:|
-| Kernel-level detection (eBPF) | 40 hooks | Rules-based | No | No |
-| Autonomous response (block, kill, isolate) | 20 playbooks | Alert only | Limited | IP only |
-| AI-powered triage | 12 providers | No | No | No |
-| Behavioral DNA fingerprinting | Per-attacker | No | No | No |
-| Mesh collaborative defense | Ed25519 signed | No | No | Community lists |
-| AI agent protection | Agent Guard + 71 rules | No | No | No |
-| Dry-run by default | Yes | N/A | Yes | Yes |
-| Memory footprint | ~150 MB | ~60 MB | ~500 MB+ | ~50 MB |
-| License | Apache-2.0 | Apache-2.0 | GPL | AGPL |
+Inner Warden is a self-contained runtime defense stack: kernel-level telemetry, native network visibility, AI triage, and autonomous response in one system. No SIEM bundle, no external IDS/HIDS dependency, and no cloud control plane required.
 
 40 eBPF kernel hooks. 49 detectors. 22 collectors. 40 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. No cloud. No dependencies. Just two Rust daemons and a CLI.
 
@@ -82,7 +72,7 @@ https://github.com/user-attachments/assets/6ea1e124-52c2-48fe-8600-4b2f3d670116
 
 ### Why this exists
 
-I built Inner Warden because every security tool I tried either just alerted (Falco), required a massive stack (Wazuh + ELK), or couldn't act autonomously. I wanted something that could detect a reverse shell at the kernel level, block the attacker, deploy a honeypot, and alert me on Telegram, all in under 5 seconds, with zero external dependencies. So I built it.
+I built Inner Warden because I wanted something that could detect a reverse shell at the kernel level, block the attacker, deploy a honeypot, and alert me on Telegram, all in under 5 seconds, with zero external dependencies. So I built it.
 
 Solo developer. Apache-2.0. If this project helps protect your servers, [give it a star](https://github.com/InnerWarden/innerwarden/stargazers) so others can find it.
 
@@ -197,7 +187,7 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 
 ## What it does
 
-1. **Watches**: 20+ collectors across all layers — eBPF syscall tracing (40 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting — no Suricata needed), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, osquery, CloudTrail
+1. **Watches**: 20+ collectors across all layers — eBPF syscall tracing (40 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, and CloudTrail
 2. **Detects**: 48 stateful detectors + 8 YARA malware rules + 8 Sigma log rules identify brute-force, credential stuffing, port scans, C2 callbacks, privilege escalation, container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID), timestomping, log tampering, discovery bursts, and more. **65 MITRE ATT&CK techniques covered** across 14 tactics.
 3. **Correlates**: 40 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP. Kill chain tracker follows 7 attack stages per entity (IP, user, container).
 4. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
@@ -285,7 +275,7 @@ Blocking is **layered**: a single block decision triggers XDP (instant kernel dr
 | `packet_flood` | DDoS / volumetric attack detection | - |
 | `user_agent_scanner` | Known scanner signatures (Nikto, sqlmap, Nuclei, 20+) | T1595.002 |
 
-Plus: `docker_anomaly`, `osquery_anomaly`, `suricata_alert`, `search_abuse`, `credential_harvest`, `ssh_key_injection`, `user_creation`, `crontab_persistence`, `systemd_persistence`, `process_injection`, `outbound_anomaly`, `data_exfil_ebpf` (sensitive file read → outbound connect by PID), `yara_scan` (8 built-in rules: XMRig, webshells, Cobalt Strike, Metasploit, rootkits), `sigma_rule` (8 built-in rules: cron modification, /tmp execution, shadow access, docker.sock), `cgroup_abuse` (CPU/memory resource abuse), `io_uring_anomaly`, `container_drift`, `host_drift`, `sensitive_write`.
+Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection`, `user_creation`, `crontab_persistence`, `systemd_persistence`, `process_injection`, `outbound_anomaly`, `data_exfil_ebpf` (sensitive file read → outbound connect by PID), `yara_scan` (8 built-in rules: XMRig, webshells, Cobalt Strike, Metasploit, rootkits), `sigma_rule` (8 built-in rules: cron modification, /tmp execution, shadow access, docker.sock), `cgroup_abuse` (CPU/memory resource abuse), `io_uring_anomaly`, `container_drift`, `host_drift`, `sensitive_write`.
 
 `execution_guard` parses commands structurally using tree-sitter-bash. It catches `curl | sh` pipelines, `/tmp` execution, reverse shell patterns, and staged download-chmod-execute sequences.
 
@@ -297,7 +287,7 @@ Plus: `docker_anomaly`, `osquery_anomaly`, `suricata_alert`, `search_abuse`, `cr
 
 ## How it works
 
-**Sensor**: deterministic signal collection. No AI, no HTTP. 22 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 40 kernel hooks, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection). Optional: Suricata, osquery, Wazuh, AWS CloudTrail. Events flow through JSONL files or Redis Streams to the agent. Syslog CEF output for SIEM integration.
+**Sensor**: deterministic signal collection. No AI, no HTTP. 22 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 40 kernel hooks, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, AWS CloudTrail). Events flow through JSONL files or Redis Streams to the agent. Syslog CEF output for SIEM integration.
 
 **eBPF**: 40 kernel hooks running inside Linux (5.8+, CO-RE/BTF portable):
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
@@ -412,9 +402,6 @@ Enable what you need.
 | `geoip-enrichment` | Country/ISP geolocation | Enriched AI prompt |
 | `fail2ban-integration` | Sync active fail2ban bans | Block enforcement |
 | `crowdsec-integration` | CrowdSec community intel | Block enforcement (experimental) |
-| `suricata-integration` | Network IDS alerts (optional) | Incident passthrough |
-| `osquery-integration` | Host state queries | Enriched events |
-| `wazuh-integration` | Wazuh HIDS alerts | Incident passthrough |
 
 ```bash
 innerwarden enable block-ip

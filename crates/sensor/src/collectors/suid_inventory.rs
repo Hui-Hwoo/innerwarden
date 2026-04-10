@@ -90,7 +90,10 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
                 severity,
                 summary: format!(
                     "SUID binary {}: {} (mode: {:o}, sha256: {})",
-                    action, bin.path, bin.mode, &bin.sha256[..16]
+                    action,
+                    bin.path,
+                    bin.mode,
+                    &bin.sha256[..16]
                 ),
                 details: serde_json::json!({
                     "action": action,
@@ -200,7 +203,9 @@ mod tests {
     #[test]
     fn test_danger_paths() {
         assert!(DANGER_PATHS.iter().any(|p| "/tmp/evil".starts_with(p)));
-        assert!(DANGER_PATHS.iter().any(|p| "/dev/shm/backdoor".starts_with(p)));
+        assert!(DANGER_PATHS
+            .iter()
+            .any(|p| "/dev/shm/backdoor".starts_with(p)));
         assert!(!DANGER_PATHS.iter().any(|p| "/usr/bin/sudo".starts_with(p)));
     }
 }

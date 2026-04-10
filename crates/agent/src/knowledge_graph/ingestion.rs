@@ -6,15 +6,27 @@ use super::types::*;
 
 /// Helper to extract a string field from event.details JSON.
 fn detail_str(event: &Event, key: &str) -> Option<String> {
-    event.details.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    event
+        .details
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn detail_u32(event: &Event, key: &str) -> Option<u32> {
-    event.details.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
+    event
+        .details
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
 }
 
 fn detail_u16(event: &Event, key: &str) -> Option<u16> {
-    event.details.get(key).and_then(|v| v.as_u64()).map(|v| v as u16)
+    event
+        .details
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u16)
 }
 
 fn detail_u64(event: &Event, key: &str) -> Option<u64> {
@@ -22,7 +34,11 @@ fn detail_u64(event: &Event, key: &str) -> Option<u64> {
 }
 
 fn detail_f32(event: &Event, key: &str) -> Option<f32> {
-    event.details.get(key).and_then(|v| v.as_f64()).map(|v| v as f32)
+    event
+        .details
+        .get(key)
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
 }
 
 fn detail_i64(event: &Event, key: &str) -> Option<i64> {
@@ -32,14 +48,24 @@ fn detail_i64(event: &Event, key: &str) -> Option<i64> {
 impl KnowledgeGraph {
     /// Record event source/kind for sensors tab telemetry.
     /// Stored in a lightweight counter, not on every edge.
-    pub fn record_event_telemetry(&mut self, source: &str, kind: &str, ts: chrono::DateTime<chrono::Utc>) {
+    pub fn record_event_telemetry(
+        &mut self,
+        source: &str,
+        kind: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) {
         let hour = ts.format("%H").to_string();
         let min: usize = ts.format("%M").to_string().parse().unwrap_or(0);
         let bucket = format!("{}:{:02}", hour, (min / 5) * 5);
 
         *self.source_counts.entry(source.to_string()).or_insert(0) += 1;
         *self.kind_counts.entry(kind.to_string()).or_insert(0) += 1;
-        *self.event_timeline.entry(bucket).or_default().entry(source.to_string()).or_insert(0) += 1;
+        *self
+            .event_timeline
+            .entry(bucket)
+            .or_default()
+            .entry(source.to_string())
+            .or_insert(0) += 1;
         self.total_events_ingested += 1;
     }
 
@@ -83,7 +109,7 @@ impl KnowledgeGraph {
             "http.request" | "http.error" => self.ingest_http_request(event),
 
             // ── DNS ─────────────────────────────────────────────────
-            "dns.query" | "suricata.dns.query" => self.ingest_dns_query(event),
+            "dns.query" => self.ingest_dns_query(event),
 
             // ── File & Filesystem ───────────────────────────────────
             "file.write_access" => self.ingest_file_write(event),
@@ -134,7 +160,6 @@ impl KnowledgeGraph {
             // ── System & Misc ───────────────────────────────────────
             "system.sysctl_changed" => self.ingest_sysctl_changed(event),
             "lsm.exec_blocked" => self.ingest_lsm_exec_blocked(event),
-            "suricata.alert.potentially_bad_traffic" => self.ingest_suricata_alert(event),
             "web_scan" => self.ingest_web_scan(event),
 
             _ => {} // Unknown event kind — skip silently
@@ -190,7 +215,12 @@ impl KnowledgeGraph {
                 innerwarden_core::entities::EntityType::Service => None,
             };
             if let Some(target_id) = target {
-                self.add_edge(Edge::new(inc_id, target_id, Relation::TriggeredBy, incident.ts));
+                self.add_edge(Edge::new(
+                    inc_id,
+                    target_id,
+                    Relation::TriggeredBy,
+                    incident.ts,
+                ));
             }
         }
     }
@@ -233,7 +263,10 @@ impl KnowledgeGraph {
                         let sys_id = self.ensure_system(""); // will find existing singleton
                         let edge = Edge::new(ip_id, sys_id, Relation::BlockedBy, ts)
                             .with_prop("reason", serde_json::Value::from(reason.to_string()))
-                            .with_prop("incident_id", serde_json::Value::from(incident_id.to_string()))
+                            .with_prop(
+                                "incident_id",
+                                serde_json::Value::from(incident_id.to_string()),
+                            )
                             .with_prop("auto_executed", serde_json::Value::from(auto_executed))
                             .with_prop("confidence", serde_json::Value::from(confidence));
                         self.add_edge(edge);
@@ -248,7 +281,10 @@ impl KnowledgeGraph {
                         let sys_id = self.ensure_system("");
                         let edge = Edge::new(ip_id, sys_id, Relation::BlockedBy, ts)
                             .with_prop("reason", serde_json::Value::from("honeypot_diversion"))
-                            .with_prop("incident_id", serde_json::Value::from(incident_id.to_string()));
+                            .with_prop(
+                                "incident_id",
+                                serde_json::Value::from(incident_id.to_string()),
+                            );
                         self.add_edge(edge);
                     }
                 }
@@ -258,7 +294,10 @@ impl KnowledgeGraph {
                         let sys_id = self.ensure_system("");
                         let edge = Edge::new(user_id, sys_id, Relation::BlockedBy, ts)
                             .with_prop("reason", serde_json::Value::from("sudo_suspended"))
-                            .with_prop("incident_id", serde_json::Value::from(incident_id.to_string()));
+                            .with_prop(
+                                "incident_id",
+                                serde_json::Value::from(incident_id.to_string()),
+                            );
                         self.add_edge(edge);
                     }
                 }
@@ -268,7 +307,10 @@ impl KnowledgeGraph {
                         let sys_id = self.ensure_system("");
                         let edge = Edge::new(user_id, sys_id, Relation::BlockedBy, ts)
                             .with_prop("reason", serde_json::Value::from("process_killed"))
-                            .with_prop("incident_id", serde_json::Value::from(incident_id.to_string()));
+                            .with_prop(
+                                "incident_id",
+                                serde_json::Value::from(incident_id.to_string()),
+                            );
                         self.add_edge(edge);
                     }
                 }
@@ -358,14 +400,21 @@ impl KnowledgeGraph {
             Some(p) => p,
             None => return,
         };
-        let parent_pid = detail_u32(event, "ppid").or_else(|| detail_u32(event, "parent_pid")).unwrap_or(0);
+        let parent_pid = detail_u32(event, "ppid")
+            .or_else(|| detail_u32(event, "parent_pid"))
+            .unwrap_or(0);
         let comm = detail_str(event, "comm").unwrap_or_default();
         let uid = detail_u32(event, "uid").unwrap_or(0);
 
         let child_id = self.ensure_process(child_pid, parent_pid, &comm, uid, event.ts);
         if parent_pid > 0 {
             let parent_id = self.ensure_process(parent_pid, 0, "", 0, event.ts);
-            self.add_edge(Edge::new(child_id, parent_id, Relation::SpawnedBy, event.ts));
+            self.add_edge(Edge::new(
+                child_id,
+                parent_id,
+                Relation::SpawnedBy,
+                event.ts,
+            ));
         }
     }
 
@@ -603,7 +652,8 @@ impl KnowledgeGraph {
                 if let (Some(pid), Some(dst_ip)) = (pid, dst_ip) {
                     let proc_id = self.ensure_process(pid, 0, "", 0, event.ts);
                     let ip_id = self.ensure_ip(dst_ip, event.ts);
-                    let mut edge = Edge::new(proc_id, ip_id, Relation::SnapshotConnectedTo, event.ts);
+                    let mut edge =
+                        Edge::new(proc_id, ip_id, Relation::SnapshotConnectedTo, event.ts);
                     if let Some(p) = port {
                         edge = edge.with_prop("port", serde_json::Value::from(p));
                     }
@@ -616,7 +666,11 @@ impl KnowledgeGraph {
             }
         }
 
-        if let Some(listening) = event.details.get("listening_ports").and_then(|v| v.as_array()) {
+        if let Some(listening) = event
+            .details
+            .get("listening_ports")
+            .and_then(|v| v.as_array())
+        {
             for entry in listening {
                 if snapshot_count >= MAX_SNAPSHOT_EDGES {
                     break;
@@ -628,7 +682,12 @@ impl KnowledgeGraph {
                 if let (Some(pid), Some(port_num)) = (pid, port_num) {
                     let proc_id = self.ensure_process(pid, 0, "", 0, event.ts);
                     let port_id = self.ensure_port(port_num, proto);
-                    self.add_edge(Edge::new(proc_id, port_id, Relation::SnapshotListensOn, event.ts));
+                    self.add_edge(Edge::new(
+                        proc_id,
+                        port_id,
+                        Relation::SnapshotListensOn,
+                        event.ts,
+                    ));
                     snapshot_count += 1;
                 }
             }
@@ -851,7 +910,13 @@ impl KnowledgeGraph {
         let ip_id = self.ensure_ip(&source_ip, event.ts);
 
         // Enrich file node
-        if let Some(Node::File { entropy, size, sha256, .. }) = self.get_node_mut(file_id) {
+        if let Some(Node::File {
+            entropy,
+            size,
+            sha256,
+            ..
+        }) = self.get_node_mut(file_id)
+        {
             if let Some(e) = detail_f32(event, "entropy") {
                 *entropy = Some(e);
             }
@@ -891,7 +956,9 @@ impl KnowledgeGraph {
             Some(p) => p,
             None => return,
         };
-        let mount_point = detail_str(event, "path").or_else(|| detail_str(event, "mount_point")).unwrap_or_default();
+        let mount_point = detail_str(event, "path")
+            .or_else(|| detail_str(event, "mount_point"))
+            .unwrap_or_default();
         let proc_id = self.ensure_process(pid, 0, "", 0, event.ts);
         let file_id = self.ensure_file(&mount_point);
 
@@ -936,7 +1003,13 @@ impl KnowledgeGraph {
         };
         let cont_id = self.ensure_container(&container_id);
 
-        if let Some(Node::Container { name, image, start_ts, .. }) = self.get_node_mut(cont_id) {
+        if let Some(Node::Container {
+            name,
+            image,
+            start_ts,
+            ..
+        }) = self.get_node_mut(cont_id)
+        {
             if let Some(n) = detail_str(event, "name") {
                 *name = Some(n);
             }
@@ -1022,7 +1095,12 @@ impl KnowledgeGraph {
 
     fn ingest_syscall_table_modified(&mut self, event: &Event) {
         let sys_id = self.ensure_system(&event.host);
-        self.add_edge(Edge::new(sys_id, sys_id, Relation::SyscallTableModified, event.ts));
+        self.add_edge(Edge::new(
+            sys_id,
+            sys_id,
+            Relation::SyscallTableModified,
+            event.ts,
+        ));
     }
 
     fn ingest_firmware_event(&mut self, event: &Event, relation: Relation) {
@@ -1051,7 +1129,8 @@ impl KnowledgeGraph {
     // ── Process & Memory ────────────────────────────────────────────
 
     fn ingest_ptrace_attach(&mut self, event: &Event) {
-        let parent_pid = match detail_u32(event, "parent_pid").or_else(|| detail_u32(event, "pid")) {
+        let parent_pid = match detail_u32(event, "parent_pid").or_else(|| detail_u32(event, "pid"))
+        {
             Some(p) => p,
             None => return,
         };
@@ -1232,22 +1311,6 @@ impl KnowledgeGraph {
         }
     }
 
-    fn ingest_suricata_alert(&mut self, event: &Event) {
-        let src_ip = detail_str(event, "src_ip");
-        let dst_ip = detail_str(event, "dst_ip");
-
-        if let (Some(src), Some(dst)) = (src_ip, dst_ip) {
-            let src_id = self.ensure_ip(&src, event.ts);
-            let dst_id = self.ensure_ip(&dst, event.ts);
-            let mut edge = Edge::new(src_id, dst_id, Relation::ConnectedTo, event.ts);
-            edge = edge.with_prop("suricata_alert", serde_json::Value::from(true));
-            if let Some(sig) = detail_str(event, "signature") {
-                edge = edge.with_prop("signature", serde_json::Value::from(sig));
-            }
-            self.add_edge(edge);
-        }
-    }
-
     fn ingest_web_scan(&mut self, event: &Event) {
         if let Some(src_ip) = detail_str(event, "src_ip").or_else(|| detail_str(event, "ip")) {
             let src_id = self.ensure_ip(&src_ip, event.ts);
@@ -1396,7 +1459,10 @@ mod tests {
             _ => panic!("expected Container"),
         }
 
-        let die = make_event("container.die", serde_json::json!({"container_id": "abc123"}));
+        let die = make_event(
+            "container.die",
+            serde_json::json!({"container_id": "abc123"}),
+        );
         g.ingest(&die);
 
         match g.get_node(cont_id) {
@@ -1445,10 +1511,7 @@ mod tests {
             evidence: serde_json::json!({}),
             recommended_checks: Vec::new(),
             tags: vec!["T1110.001".to_string()],
-            entities: vec![
-                EntityRef::ip("185.1.1.1"),
-                EntityRef::user("root"),
-            ],
+            entities: vec![EntityRef::ip("185.1.1.1"), EntityRef::user("root")],
         };
         g.ingest_incident(&incident);
 

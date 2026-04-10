@@ -1474,9 +1474,7 @@ fn verify_config_signature(content: &str, path: &Path) -> Result<()> {
     let signing_cfg: ConfigSigningConfig = match toml::from_str::<toml::Value>(payload) {
         Ok(val) => {
             if let Some(cs) = val.get("config_signing") {
-                cs.clone()
-                    .try_into()
-                    .unwrap_or_default()
+                cs.clone().try_into().unwrap_or_default()
             } else {
                 ConfigSigningConfig::default()
             }
@@ -1487,7 +1485,9 @@ fn verify_config_signature(content: &str, path: &Path) -> Result<()> {
     // No public key configured → skip verification (backwards compatible).
     let Some(pub_key_hex) = &signing_cfg.public_key else {
         if has_signature {
-            tracing::debug!("config has [signature] but no config_signing.public_key — skipping verification");
+            tracing::debug!(
+                "config has [signature] but no config_signing.public_key — skipping verification"
+            );
         }
         return Ok(());
     };
@@ -1515,7 +1515,9 @@ fn verify_config_signature(content: &str, path: &Path) -> Result<()> {
         .find_map(|l| {
             let l = l.trim();
             if l.starts_with("value") {
-                l.split('=').nth(1).map(|v| v.trim().trim_matches('"').to_string())
+                l.split('=')
+                    .nth(1)
+                    .map(|v| v.trim().trim_matches('"').to_string())
             } else {
                 None
             }

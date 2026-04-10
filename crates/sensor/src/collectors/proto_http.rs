@@ -200,7 +200,10 @@ pub fn extract_signals(req: &HttpRequest, resp: Option<&HttpResponse>) -> Vec<St
         || ua_lower.contains("gobuster")
         || ua_lower.contains("dirbuster")
     {
-        signals.push(format!("scanner_tool:{}", req.user_agent.split('/').next().unwrap_or("unknown")));
+        signals.push(format!(
+            "scanner_tool:{}",
+            req.user_agent.split('/').next().unwrap_or("unknown")
+        ));
     }
 
     // Suspicious request body
@@ -245,7 +248,8 @@ mod tests {
 
     #[test]
     fn test_parse_get_request() {
-        let raw = b"GET /api/v1/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\n\r\n";
+        let raw =
+            b"GET /api/v1/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: Mozilla/5.0\r\n\r\n";
         let req = parse_request(raw).unwrap();
         assert_eq!(req.method, "GET");
         assert_eq!(req.uri, "/api/v1/users");

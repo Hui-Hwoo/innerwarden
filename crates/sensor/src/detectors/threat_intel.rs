@@ -117,7 +117,9 @@ impl ThreatIntelDetector {
             "tor_exit" => format!("Tor exit node detected: {value}"),
             "threat_domain" => format!("Threat intel match: domain {value} in malicious feed"),
             "threat_hash" => format!("Threat intel match: file hash {value} in malicious feed"),
-            "threat_ja3" => format!("Threat intel match: TLS fingerprint {value} matches known malware"),
+            "threat_ja3" => {
+                format!("Threat intel match: TLS fingerprint {value} matches known malware")
+            }
             "threat_url" => format!("Threat intel match: URL {value} in malicious feed"),
             _ => format!("Threat intel match: {value}"),
         };
@@ -157,10 +159,7 @@ impl ThreatIntelDetector {
                 "Correlate with other incidents from the same source".into(),
                 format!("Block if confirmed malicious: innerwarden action block-ip {value}"),
             ],
-            tags: vec![
-                "threat_intel".into(),
-                m.dataset.to_string(),
-            ],
+            tags: vec!["threat_intel".into(), m.dataset.to_string()],
             entities: vec![entity],
         })
     }
@@ -209,10 +208,7 @@ mod tests {
         let ds = Datasets::load(dir.path(), 3600);
         let mut det = ThreatIntelDetector::new("host1", 300);
 
-        let ev = make_event(
-            "dns.query",
-            serde_json::json!({"domain": "c2.evil.com"}),
-        );
+        let ev = make_event("dns.query", serde_json::json!({"domain": "c2.evil.com"}));
         let result = det.process(&ev, &ds);
         assert!(result.is_some()); // parent domain match
     }

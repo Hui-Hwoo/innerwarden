@@ -15,20 +15,35 @@ use tracing::info;
 /// Security-critical sysctls to monitor.
 const CRITICAL_SYSCTLS: &[(&str, &str)] = &[
     // Network
-    ("net.ipv4.ip_forward", "IP forwarding (enables routing/pivoting)"),
-    ("net.ipv4.conf.all.accept_redirects", "ICMP redirect acceptance"),
+    (
+        "net.ipv4.ip_forward",
+        "IP forwarding (enables routing/pivoting)",
+    ),
+    (
+        "net.ipv4.conf.all.accept_redirects",
+        "ICMP redirect acceptance",
+    ),
     ("net.ipv4.conf.all.send_redirects", "ICMP redirect sending"),
     ("net.ipv4.conf.all.accept_source_route", "Source routing"),
     ("net.ipv4.tcp_syncookies", "SYN cookie protection"),
     ("net.ipv6.conf.all.accept_redirects", "IPv6 ICMP redirects"),
     // Kernel hardening
-    ("kernel.randomize_va_space", "ASLR (address space randomization)"),
+    (
+        "kernel.randomize_va_space",
+        "ASLR (address space randomization)",
+    ),
     ("kernel.kptr_restrict", "Kernel pointer restriction"),
     ("kernel.dmesg_restrict", "dmesg restriction"),
     ("kernel.yama.ptrace_scope", "ptrace restriction (Yama LSM)"),
     ("kernel.modules_disabled", "Kernel module loading disabled"),
-    ("kernel.unprivileged_bpf_disabled", "Unprivileged BPF disabled"),
-    ("kernel.kexec_load_disabled", "kexec disabled (prevents kernel replacement)"),
+    (
+        "kernel.unprivileged_bpf_disabled",
+        "Unprivileged BPF disabled",
+    ),
+    (
+        "kernel.kexec_load_disabled",
+        "kexec disabled (prevents kernel replacement)",
+    ),
     ("kernel.sysrq", "Magic SysRq key"),
     // Filesystem
     ("fs.protected_symlinks", "Symlink protection"),
@@ -41,7 +56,10 @@ const CRITICAL_SYSCTLS: &[(&str, &str)] = &[
 ];
 
 pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
-    info!("sysctl_drift: starting (interval: {interval_secs}s, monitoring {} sysctls)", CRITICAL_SYSCTLS.len());
+    info!(
+        "sysctl_drift: starting (interval: {interval_secs}s, monitoring {} sysctls)",
+        CRITICAL_SYSCTLS.len()
+    );
 
     // Build baseline
     let mut baseline: HashMap<String, String> = HashMap::new();

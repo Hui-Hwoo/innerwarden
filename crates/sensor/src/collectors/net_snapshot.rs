@@ -192,9 +192,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
         // Filter to interesting connections (skip loopback, TIME_WAIT)
         let interesting: Vec<&SocketEntry> = entries
             .iter()
-            .filter(|e| {
-                e.state == "ESTABLISHED" || e.state == "LISTEN" || e.state == "SYN_SENT"
-            })
+            .filter(|e| e.state == "ESTABLISHED" || e.state == "LISTEN" || e.state == "SYN_SENT")
             .filter(|e| e.remote_addr != "0.0.0.0" || e.state == "LISTEN")
             .filter(|e| !e.local_addr.starts_with("127.") || e.state == "LISTEN")
             .collect();

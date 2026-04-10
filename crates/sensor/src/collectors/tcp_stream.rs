@@ -416,8 +416,7 @@ fn probe_protocol(data: &[u8]) -> AppProtocol {
     }
 
     // SMB: starts with NetBIOS session header (0x00) + SMB magic (0xFF, 'S', 'M', 'B')
-    if data.len() >= 8 && data[4] == 0xFF && data[5] == b'S' && data[6] == b'M' && data[7] == b'B'
-    {
+    if data.len() >= 8 && data[4] == 0xFF && data[5] == b'S' && data[6] == b'M' && data[7] == b'B' {
         return AppProtocol::Smb;
     }
 
@@ -510,10 +509,7 @@ pub fn parse_tcp_packet(raw: &[u8]) -> Option<(FlowKey, u8, u32, &[u8])> {
 /// Captures all TCP traffic, reassembles streams, detects protocols, and
 /// emits events for further analysis.
 #[cfg(target_os = "linux")]
-pub async fn run(
-    tx: tokio::sync::mpsc::Sender<innerwarden_core::event::Event>,
-    host_id: String,
-) {
+pub async fn run(tx: tokio::sync::mpsc::Sender<innerwarden_core::event::Event>, host_id: String) {
     use innerwarden_core::event::{Event, Severity};
 
     info!("tcp_stream: starting TCP stream reassembly engine");
@@ -556,7 +552,9 @@ pub async fn run(
 
                 // Try file extraction from HTTP flows
                 let filestore = std::path::Path::new("/var/lib/innerwarden/filestore");
-                if let Some(extracted) = super::file_extract::extract_from_flow(&flow_event, filestore) {
+                if let Some(extracted) =
+                    super::file_extract::extract_from_flow(&flow_event, filestore)
+                {
                     let file_event = super::file_extract::to_event(&extracted, &host_id);
                     let _ = tx.send(file_event).await;
                 }
@@ -572,7 +570,9 @@ pub async fn run(
                 let _ = tx.send(event).await;
 
                 let filestore = std::path::Path::new("/var/lib/innerwarden/filestore");
-                if let Some(extracted) = super::file_extract::extract_from_flow(&flow_event, filestore) {
+                if let Some(extracted) =
+                    super::file_extract::extract_from_flow(&flow_event, filestore)
+                {
                     let file_event = super::file_extract::to_event(&extracted, &host_id);
                     let _ = tx.send(file_event).await;
                 }
@@ -583,14 +583,11 @@ pub async fn run(
 
 /// Convert a FlowEvent into an InnerWarden Event for the detector pipeline.
 /// Uses deep protocol parsers for HTTP, SSH, and SMB when available.
-fn flow_event_to_event(
-    fe: &FlowEvent,
-    host_id: &str,
-) -> innerwarden_core::event::Event {
-    use innerwarden_core::event::{Event, Severity};
+fn flow_event_to_event(fe: &FlowEvent, host_id: &str) -> innerwarden_core::event::Event {
     use super::proto_http;
-    use super::proto_ssh;
     use super::proto_smb;
+    use super::proto_ssh;
+    use innerwarden_core::event::{Event, Severity};
 
     let src_ip = fe.key.src_ip_str();
     let dst_ip = fe.key.dst_ip_str();
@@ -611,9 +608,10 @@ fn flow_event_to_event(
             let user_agent = req.as_ref().map(|r| r.user_agent.as_str()).unwrap_or("?");
             let status = resp.as_ref().map(|r| r.status_code).unwrap_or(0);
 
-            let sev = if signals.iter().any(|s| {
-                s.contains("LATERAL") || s.contains("injection") || s.contains("webshell")
-            }) {
+            let sev = if signals
+                .iter()
+                .any(|s| s.contains("LATERAL") || s.contains("injection") || s.contains("webshell"))
+            {
                 Severity::High
             } else if !signals.is_empty() {
                 Severity::Medium
@@ -646,10 +644,22 @@ fn flow_event_to_event(
         AppProtocol::Ssh => {
             // Deep SSH parsing
             let session = proto_ssh::parse_session(&fe.client_data, &fe.server_data);
-            let client_ver = session.as_ref().map(|s| s.client_version.as_str()).unwrap_or("?");
-            let server_ver = session.as_ref().map(|s| s.server_version.as_str()).unwrap_or("?");
-            let signals: Vec<String> = session.as_ref().map(|s| s.signals.clone()).unwrap_or_default();
-            let has_tunnel = session.as_ref().map(|s| s.has_tunnel_request).unwrap_or(false);
+            let client_ver = session
+                .as_ref()
+                .map(|s| s.client_version.as_str())
+                .unwrap_or("?");
+            let server_ver = session
+                .as_ref()
+                .map(|s| s.server_version.as_str())
+                .unwrap_or("?");
+            let signals: Vec<String> = session
+                .as_ref()
+                .map(|s| s.signals.clone())
+                .unwrap_or_default();
+            let has_tunnel = session
+                .as_ref()
+                .map(|s| s.has_tunnel_request)
+                .unwrap_or(false);
 
             let sev = if has_tunnel || signals.iter().any(|s| s.contains("bruteforce")) {
                 Severity::High
@@ -690,13 +700,28 @@ fn flow_event_to_event(
         AppProtocol::Smb => {
             // Deep SMB parsing
             let session = proto_smb::parse_session(&fe.client_data);
-            let signals: Vec<String> = session.as_ref().map(|s| s.signals.clone()).unwrap_or_default();
-            let pipes: Vec<String> = session.as_ref().map(|s| s.named_pipes.clone()).unwrap_or_default();
-            let version = session.as_ref().map(|s| format!("{:?}", s.version)).unwrap_or("?".into());
+            let signals: Vec<String> = session
+                .as_ref()
+                .map(|s| s.signals.clone())
+                .unwrap_or_default();
+            let pipes: Vec<String> = session
+                .as_ref()
+                .map(|s| s.named_pipes.clone())
+                .unwrap_or_default();
+            let version = session
+                .as_ref()
+                .map(|s| format!("{:?}", s.version))
+                .unwrap_or("?".into());
 
-            let sev = if signals.iter().any(|s| s.contains("LATERAL") || s.contains("CREDENTIAL")) {
+            let sev = if signals
+                .iter()
+                .any(|s| s.contains("LATERAL") || s.contains("CREDENTIAL"))
+            {
                 Severity::Critical
-            } else if signals.iter().any(|s| s.contains("admin_share") || s.contains("remote_")) {
+            } else if signals
+                .iter()
+                .any(|s| s.contains("admin_share") || s.contains("remote_"))
+            {
                 Severity::High
             } else {
                 Severity::Medium // SMB itself is notable
@@ -705,7 +730,11 @@ fn flow_event_to_event(
             (
                 "tcp_stream.smb",
                 sev,
-                format!("SMB {version} ({src_ip} -> {dst_ip}:{}) pipes:{}", fe.key.dst_port, pipes.join(",")),
+                format!(
+                    "SMB {version} ({src_ip} -> {dst_ip}:{}) pipes:{}",
+                    fe.key.dst_port,
+                    pipes.join(",")
+                ),
                 serde_json::json!({
                     "app_proto": "smb",
                     "smb_version": version,
@@ -723,8 +752,10 @@ fn flow_event_to_event(
         _ => (
             "tcp_stream.flow",
             Severity::Info,
-            format!("TCP flow: {src_ip}:{} -> {dst_ip}:{} ({:?})",
-                fe.key.src_port, fe.key.dst_port, fe.app_proto),
+            format!(
+                "TCP flow: {src_ip}:{} -> {dst_ip}:{} ({:?})",
+                fe.key.src_port, fe.key.dst_port, fe.app_proto
+            ),
             serde_json::json!({
                 "app_proto": format!("{:?}", fe.app_proto),
                 "src_ip": src_ip,
@@ -746,7 +777,10 @@ fn flow_event_to_event(
         severity,
         summary,
         details,
-        tags: vec!["network".into(), format!("{:?}", fe.app_proto).to_lowercase()],
+        tags: vec![
+            "network".into(),
+            format!("{:?}", fe.app_proto).to_lowercase(),
+        ],
         entities: vec![
             innerwarden_core::entities::EntityRef::ip(src_ip),
             innerwarden_core::entities::EntityRef::ip(dst_ip),
@@ -755,10 +789,7 @@ fn flow_event_to_event(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub async fn run(
-    _tx: tokio::sync::mpsc::Sender<innerwarden_core::event::Event>,
-    _host_id: String,
-) {
+pub async fn run(_tx: tokio::sync::mpsc::Sender<innerwarden_core::event::Event>, _host_id: String) {
     info!("tcp_stream: not available on this platform (requires Linux AF_PACKET)");
 }
 
@@ -842,12 +873,16 @@ mod tests {
         };
 
         // SYN
-        assert!(table.process_packet(key.clone(), 0x02, 1000, &[], now).is_none());
+        assert!(table
+            .process_packet(key.clone(), 0x02, 1000, &[], now)
+            .is_none());
         assert_eq!(table.active_flows(), 1);
 
         // SYN-ACK
         let rev = key.reverse();
-        assert!(table.process_packet(rev.clone(), 0x12, 2000, &[], now).is_none());
+        assert!(table
+            .process_packet(rev.clone(), 0x12, 2000, &[], now)
+            .is_none());
 
         // Data from client
         assert!(table

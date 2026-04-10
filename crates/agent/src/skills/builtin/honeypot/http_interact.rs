@@ -325,9 +325,7 @@ fn route(req: &RawRequest, capture: &mut HttpRequestCapture) -> Vec<u8> {
         ("GET", "/.env" | "/.git/config" | "/wp-config.php" | "/config.php") => {
             http_200(FAKE_ENV_FILE)
         }
-        ("GET", "/.aws/credentials" | "/aws/credentials") => {
-            http_200(FAKE_AWS_CREDENTIALS)
-        }
+        ("GET", "/.aws/credentials" | "/aws/credentials") => http_200(FAKE_AWS_CREDENTIALS),
 
         _ => http_404(),
     }

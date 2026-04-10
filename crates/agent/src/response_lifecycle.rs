@@ -222,9 +222,7 @@ impl ResponseLifecycle {
     pub fn to_prometheus_lines(&self) -> String {
         let mut out = String::new();
 
-        out.push_str(
-            "# HELP innerwarden_responses_active Currently active response actions\n",
-        );
+        out.push_str("# HELP innerwarden_responses_active Currently active response actions\n");
         out.push_str("# TYPE innerwarden_responses_active gauge\n");
 
         // Count by backend
@@ -249,27 +247,21 @@ impl ResponseLifecycle {
             ));
         }
 
-        out.push_str(
-            "# HELP innerwarden_responses_total Total response actions registered\n",
-        );
+        out.push_str("# HELP innerwarden_responses_total Total response actions registered\n");
         out.push_str("# TYPE innerwarden_responses_total counter\n");
         out.push_str(&format!(
             "innerwarden_responses_total {}\n",
             self.total_registered
         ));
 
-        out.push_str(
-            "# HELP innerwarden_responses_expired_total Responses expired by TTL\n",
-        );
+        out.push_str("# HELP innerwarden_responses_expired_total Responses expired by TTL\n");
         out.push_str("# TYPE innerwarden_responses_expired_total counter\n");
         out.push_str(&format!(
             "innerwarden_responses_expired_total {}\n",
             self.total_expired
         ));
 
-        out.push_str(
-            "# HELP innerwarden_responses_reverted_total Responses manually reverted\n",
-        );
+        out.push_str("# HELP innerwarden_responses_reverted_total Responses manually reverted\n");
         out.push_str("# TYPE innerwarden_responses_reverted_total counter\n");
         out.push_str(&format!(
             "innerwarden_responses_reverted_total {}\n",
@@ -349,7 +341,15 @@ pub async fn execute_revert(revert: &RevertAction, dry_run: bool) {
         ResponseBackend::Iptables => {
             run_cmd(
                 "sudo",
-                &["iptables", "-D", "INPUT", "-s", &revert.target, "-j", "DROP"],
+                &[
+                    "iptables",
+                    "-D",
+                    "INPUT",
+                    "-s",
+                    &revert.target,
+                    "-j",
+                    "DROP",
+                ],
             )
             .await
         }
@@ -357,7 +357,9 @@ pub async fn execute_revert(revert: &RevertAction, dry_run: bool) {
             if let Some(handle) = &revert.revert_handle {
                 run_cmd(
                     "sudo",
-                    &["nft", "delete", "rule", "inet", "filter", "input", "handle", handle],
+                    &[
+                        "nft", "delete", "rule", "inet", "filter", "input", "handle", handle,
+                    ],
                 )
                 .await
             } else {
@@ -371,7 +373,10 @@ pub async fn execute_revert(revert: &RevertAction, dry_run: bool) {
                 run_cmd(
                     "sudo",
                     &[
-                        "bpftool", "map", "delete", "pinned",
+                        "bpftool",
+                        "map",
+                        "delete",
+                        "pinned",
                         "/sys/fs/bpf/innerwarden/blocklist",
                         "key",
                         &b[0].to_string(),
@@ -403,8 +408,12 @@ pub async fn execute_revert(revert: &RevertAction, dry_run: bool) {
     };
 
     match result {
-        Ok(()) => info!(id = %revert.id, backend = ?revert.backend, target = %revert.target, "response reverted"),
-        Err(e) => warn!(id = %revert.id, backend = ?revert.backend, target = %revert.target, error = %e, "revert failed"),
+        Ok(()) => {
+            info!(id = %revert.id, backend = ?revert.backend, target = %revert.target, "response reverted")
+        }
+        Err(e) => {
+            warn!(id = %revert.id, backend = ?revert.backend, target = %revert.target, error = %e, "revert failed")
+        }
     }
 }
 

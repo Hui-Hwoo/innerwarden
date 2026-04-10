@@ -130,11 +130,18 @@ impl Node {
             Node::File { path, .. } => path.clone(),
             Node::User { name, .. } => name.clone(),
             Node::Domain { name, .. } => name.clone(),
-            Node::Port { number, protocol, .. } => format!("{}/{}", number, protocol),
-            Node::Container { container_id, name, .. } => {
-                name.as_deref().unwrap_or(&container_id[..12.min(container_id.len())]).to_string()
-            }
-            Node::Device { vendor, product, .. } => format!("{} {}", vendor, product),
+            Node::Port {
+                number, protocol, ..
+            } => format!("{}/{}", number, protocol),
+            Node::Container {
+                container_id, name, ..
+            } => name
+                .as_deref()
+                .unwrap_or(&container_id[..12.min(container_id.len())])
+                .to_string(),
+            Node::Device {
+                vendor, product, ..
+            } => format!("{} {}", vendor, product),
             Node::System { hostname, .. } => hostname.clone(),
             Node::Incident { incident_id, .. } => incident_id.clone(),
             Node::Campaign { campaign_id, .. } => campaign_id.clone(),
@@ -142,7 +149,13 @@ impl Node {
     }
 
     pub fn is_sensitive_file(&self) -> bool {
-        matches!(self, Node::File { is_sensitive: true, .. })
+        matches!(
+            self,
+            Node::File {
+                is_sensitive: true,
+                ..
+            }
+        )
     }
 }
 

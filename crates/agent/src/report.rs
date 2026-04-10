@@ -229,21 +229,34 @@ fn populate_counters_from_graph(
     use crate::knowledge_graph::types::*;
 
     // Events: count non-snapshot edges
-    counters.total_events = graph.edges_slice().iter().filter(|e| !e.is_snapshot()).count() as u64;
+    counters.total_events = graph
+        .edges_slice()
+        .iter()
+        .filter(|e| !e.is_snapshot())
+        .count() as u64;
 
     // Incidents
     for id in graph.nodes_of_type(NodeType::Incident) {
         if let Some(Node::Incident {
-            incident_id, detector, decision, confidence, auto_executed, ..
+            incident_id,
+            detector,
+            decision,
+            confidence,
+            auto_executed,
+            ..
         }) = graph.get_node(id)
         {
             counters.total_incidents += 1;
-            *counters.incidents_by_type.entry(detector.clone()).or_insert(0) += 1;
+            *counters
+                .incidents_by_type
+                .entry(detector.clone())
+                .or_insert(0) += 1;
 
             // Collect IPs from TriggeredBy edges
-            let has_entity = graph.outgoing_edges(id).iter().any(|e| {
-                e.relation == Relation::TriggeredBy
-            });
+            let has_entity = graph
+                .outgoing_edges(id)
+                .iter()
+                .any(|e| e.relation == Relation::TriggeredBy);
             if !has_entity {
                 counters.incidents_without_entities += 1;
             }
@@ -251,10 +264,16 @@ fn populate_counters_from_graph(
                 if edge.relation == Relation::TriggeredBy {
                     if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
                         *counters.ip_counts.entry(addr.clone()).or_insert(0) += 1;
-                        *counters.entity_counts.entry(format!("ip:{}", addr)).or_insert(0) += 1;
+                        *counters
+                            .entity_counts
+                            .entry(format!("ip:{}", addr))
+                            .or_insert(0) += 1;
                     }
                     if let Some(Node::User { name, .. }) = graph.get_node(edge.to) {
-                        *counters.entity_counts.entry(format!("user:{}", name)).or_insert(0) += 1;
+                        *counters
+                            .entity_counts
+                            .entry(format!("user:{}", name))
+                            .or_insert(0) += 1;
                     }
                 }
             }
@@ -262,7 +281,10 @@ fn populate_counters_from_graph(
             // Decisions
             if let Some(action) = decision {
                 counters.total_decisions += 1;
-                *counters.decisions_by_action.entry(action.clone()).or_insert(0) += 1;
+                *counters
+                    .decisions_by_action
+                    .entry(action.clone())
+                    .or_insert(0) += 1;
                 counters.confidence_sum += confidence.unwrap_or(0.0) as f64;
                 match action.as_str() {
                     "ignore" => counters.ignore_count += 1,

@@ -23,17 +23,17 @@ const TRUSTED_PATHS: &[&str] = &[
 /// Paths where executables are expected but not from package managers.
 /// These are NOT flagged as drift.
 const DEVELOPMENT_PATHS: &[&str] = &[
-    "/home/",           // user binaries, development
-    "/root/",           // root home
-    "/var/lib/docker/", // container layers
-    "/run/",            // runtime mounts
-    "/proc/",           // procfs
-    "/sys/",            // sysfs
-    "/tmp/cargo-",      // cargo build temp files
-    "/tmp/rustc",       // rustc temp files
-    "/tmp/npm-",        // npm temp files
-    "/tmp/pip-",        // pip temp files
-    "/var/cache/",      // package manager caches
+    "/home/",            // user binaries, development
+    "/root/",            // root home
+    "/var/lib/docker/",  // container layers
+    "/run/",             // runtime mounts
+    "/proc/",            // procfs
+    "/sys/",             // sysfs
+    "/tmp/cargo-",       // cargo build temp files
+    "/tmp/rustc",        // rustc temp files
+    "/tmp/npm-",         // npm temp files
+    "/tmp/pip-",         // pip temp files
+    "/var/cache/",       // package manager caches
     "/usr/lib/rustlib/", // Rust toolchain
     "/usr/share/cargo/", // cargo shared
 ];

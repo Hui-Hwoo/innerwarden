@@ -8,7 +8,7 @@
 //! Works on events from the tcp_stream reassembly engine.
 //! Checks HTTP, SSH, TLS, and generic TCP anomalies.
 //!
-//! Inspired by Suricata's APPLAYER_MISMATCH and protocol anomaly events.
+//! Inspired by protocol mismatch and anomaly detection patterns used in mature IDS engines.
 
 use std::collections::HashMap;
 
@@ -77,13 +77,35 @@ impl ProtoAnomalyDetector {
             return incidents;
         }
 
-        let src_ip = event.details.get("src_ip").and_then(|v| v.as_str()).unwrap_or("?");
-        let dst_ip = event.details.get("dst_ip").and_then(|v| v.as_str()).unwrap_or("?");
-        let dst_port = event.details.get("dst_port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-        let app_proto = event.details.get("app_proto").and_then(|v| v.as_str()).unwrap_or("?");
-        let signals: Vec<String> = event.details.get("signals")
+        let src_ip = event
+            .details
+            .get("src_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let dst_ip = event
+            .details
+            .get("dst_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let dst_port = event
+            .details
+            .get("dst_port")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u16;
+        let app_proto = event
+            .details
+            .get("app_proto")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let signals: Vec<String> = event
+            .details
+            .get("signals")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let now = event.ts;
 
@@ -129,11 +151,31 @@ impl ProtoAnomalyDetector {
 
         // ── HTTP-specific anomalies ──
         if event.kind == "tcp_stream.http" {
-            let uri = event.details.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-            let method = event.details.get("method").and_then(|v| v.as_str()).unwrap_or("");
-            let user_agent = event.details.get("user_agent").and_then(|v| v.as_str()).unwrap_or("");
-            let client_bytes = event.details.get("client_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-            let server_bytes = event.details.get("server_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let uri = event
+                .details
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let method = event
+                .details
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let user_agent = event
+                .details
+                .get("user_agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let client_bytes = event
+                .details
+                .get("client_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let server_bytes = event
+                .details
+                .get("server_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
 
             // Double encoding: %25xx patterns (evasion technique)
             if uri.contains("%25") || uri.contains("%252f") || uri.contains("%252e") {
@@ -177,7 +219,11 @@ impl ProtoAnomalyDetector {
             }
 
             // Slow connection (slow loris detection)
-            let duration_ms = event.details.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+            let duration_ms = event
+                .details
+                .get("duration_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             if duration_ms > 30_000 && client_bytes < 500 {
                 if let Some(inc) = self.emit(
                     AnomalyType::SlowConnection,
@@ -193,7 +239,11 @@ impl ProtoAnomalyDetector {
 
         // ── SSH anomalies ──
         if event.kind == "tcp_stream.ssh" {
-            let client_version = event.details.get("client_version").and_then(|v| v.as_str()).unwrap_or("");
+            let client_version = event
+                .details
+                .get("client_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             // Malformed SSH version
             if !client_version.is_empty()
@@ -300,13 +350,16 @@ mod tests {
     #[test]
     fn test_http_on_non_standard_port() {
         let mut det = ProtoAnomalyDetector::new("host1", 300);
-        let ev = make_stream_event("tcp_stream.http", serde_json::json!({
-            "app_proto": "http",
-            "src_ip": "1.2.3.4",
-            "dst_ip": "10.0.0.1",
-            "dst_port": 4444,
-            "signals": [],
-        }));
+        let ev = make_stream_event(
+            "tcp_stream.http",
+            serde_json::json!({
+                "app_proto": "http",
+                "src_ip": "1.2.3.4",
+                "dst_ip": "10.0.0.1",
+                "dst_port": 4444,
+                "signals": [],
+            }),
+        );
         let incidents = det.process(&ev);
         assert_eq!(incidents.len(), 1);
         assert!(incidents[0].title.contains("HTTP on port 4444"));
@@ -316,13 +369,16 @@ mod tests {
     #[test]
     fn test_http_on_standard_port_no_alert() {
         let mut det = ProtoAnomalyDetector::new("host1", 300);
-        let ev = make_stream_event("tcp_stream.http", serde_json::json!({
-            "app_proto": "http",
-            "src_ip": "1.2.3.4",
-            "dst_ip": "10.0.0.1",
-            "dst_port": 80,
-            "signals": [],
-        }));
+        let ev = make_stream_event(
+            "tcp_stream.http",
+            serde_json::json!({
+                "app_proto": "http",
+                "src_ip": "1.2.3.4",
+                "dst_ip": "10.0.0.1",
+                "dst_port": 80,
+                "signals": [],
+            }),
+        );
         let incidents = det.process(&ev);
         assert!(incidents.is_empty());
     }
@@ -330,32 +386,40 @@ mod tests {
     #[test]
     fn test_double_encoding() {
         let mut det = ProtoAnomalyDetector::new("host1", 300);
-        let ev = make_stream_event("tcp_stream.http", serde_json::json!({
-            "app_proto": "http",
-            "src_ip": "1.2.3.4",
-            "dst_ip": "10.0.0.1",
-            "dst_port": 80,
-            "uri": "/admin%252f..%252f..%252fetc/passwd",
-            "method": "GET",
-            "user_agent": "curl",
-            "client_bytes": 200,
-            "server_bytes": 500,
-            "signals": [],
-        }));
+        let ev = make_stream_event(
+            "tcp_stream.http",
+            serde_json::json!({
+                "app_proto": "http",
+                "src_ip": "1.2.3.4",
+                "dst_ip": "10.0.0.1",
+                "dst_port": 80,
+                "uri": "/admin%252f..%252f..%252fetc/passwd",
+                "method": "GET",
+                "user_agent": "curl",
+                "client_bytes": 200,
+                "server_bytes": 500,
+                "signals": [],
+            }),
+        );
         let incidents = det.process(&ev);
-        assert!(incidents.iter().any(|i| i.title.contains("double encoding")));
+        assert!(incidents
+            .iter()
+            .any(|i| i.title.contains("double encoding")));
     }
 
     #[test]
     fn test_smb_non_standard_port() {
         let mut det = ProtoAnomalyDetector::new("host1", 300);
-        let ev = make_stream_event("tcp_stream.smb", serde_json::json!({
-            "app_proto": "smb",
-            "src_ip": "10.0.0.5",
-            "dst_ip": "10.0.0.10",
-            "dst_port": 8445,
-            "signals": [],
-        }));
+        let ev = make_stream_event(
+            "tcp_stream.smb",
+            serde_json::json!({
+                "app_proto": "smb",
+                "src_ip": "10.0.0.5",
+                "dst_ip": "10.0.0.10",
+                "dst_port": 8445,
+                "signals": [],
+            }),
+        );
         let incidents = det.process(&ev);
         assert!(incidents.iter().any(|i| i.title.contains("SMB on port")));
     }
@@ -363,14 +427,17 @@ mod tests {
     #[test]
     fn test_ssh_malformed_version() {
         let mut det = ProtoAnomalyDetector::new("host1", 300);
-        let ev = make_stream_event("tcp_stream.ssh", serde_json::json!({
-            "app_proto": "ssh",
-            "src_ip": "1.2.3.4",
-            "dst_ip": "10.0.0.1",
-            "dst_port": 22,
-            "client_version": "EXPLOIT-TOOL-v1",
-            "signals": [],
-        }));
+        let ev = make_stream_event(
+            "tcp_stream.ssh",
+            serde_json::json!({
+                "app_proto": "ssh",
+                "src_ip": "1.2.3.4",
+                "dst_ip": "10.0.0.1",
+                "dst_port": 22,
+                "client_version": "EXPLOIT-TOOL-v1",
+                "signals": [],
+            }),
+        );
         let incidents = det.process(&ev);
         assert!(incidents.iter().any(|i| i.title.contains("Malformed SSH")));
     }
@@ -378,13 +445,16 @@ mod tests {
     #[test]
     fn test_cooldown() {
         let mut det = ProtoAnomalyDetector::new("host1", 300);
-        let ev = make_stream_event("tcp_stream.http", serde_json::json!({
-            "app_proto": "http",
-            "src_ip": "1.2.3.4",
-            "dst_ip": "10.0.0.1",
-            "dst_port": 4444,
-            "signals": [],
-        }));
+        let ev = make_stream_event(
+            "tcp_stream.http",
+            serde_json::json!({
+                "app_proto": "http",
+                "src_ip": "1.2.3.4",
+                "dst_ip": "10.0.0.1",
+                "dst_port": 4444,
+                "signals": [],
+            }),
+        );
         assert_eq!(det.process(&ev).len(), 1);
         assert_eq!(det.process(&ev).len(), 0); // cooldown
     }

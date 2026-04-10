@@ -128,7 +128,9 @@ impl DnsC2Detector {
             .filter(|(_, _, qt)| qt == "TXT" || qt == "CNAME" || qt == "MX" || qt == "NULL")
             .count();
         if txt_count >= 3 {
-            signals.push(format!("{txt_count} TXT/CNAME/MX queries (C2 response channel)"));
+            signals.push(format!(
+                "{txt_count} TXT/CNAME/MX queries (C2 response channel)"
+            ));
             score += 0.3;
         }
 
@@ -140,8 +142,7 @@ impl DnsC2Detector {
                 Some(stripped)
             })
             .collect();
-        let unique_ratio =
-            unique_subdomains.len() as f32 / entries.len().max(1) as f32;
+        let unique_ratio = unique_subdomains.len() as f32 / entries.len().max(1) as f32;
         if unique_ratio > 0.7 && unique_subdomains.len() >= 5 {
             signals.push(format!(
                 "{} unique subdomains ({:.0}% unique — encoded payloads)",
@@ -174,8 +175,7 @@ impl DnsC2Detector {
                 .filter(|i| *i > 0)
                 .collect();
             if intervals.len() >= 4 {
-                let mean =
-                    intervals.iter().sum::<i64>() as f64 / intervals.len() as f64;
+                let mean = intervals.iter().sum::<i64>() as f64 / intervals.len() as f64;
                 let variance = intervals
                     .iter()
                     .map(|i| (*i as f64 - mean).powi(2))
@@ -208,11 +208,7 @@ impl DnsC2Detector {
         Some(Incident {
             ts: now,
             host: self.host.clone(),
-            incident_id: format!(
-                "dns_c2:{}:{}",
-                root,
-                now.format("%Y-%m-%dT%H:%MZ")
-            ),
+            incident_id: format!("dns_c2:{}:{}", root, now.format("%Y-%m-%dT%H:%MZ")),
             severity,
             title: format!("Possible DNS C2 channel: {root}"),
             summary: format!(
@@ -284,14 +280,8 @@ mod tests {
     #[test]
     fn test_extract_root_domain() {
         assert_eq!(extract_root_domain("evil.com"), "evil.com");
-        assert_eq!(
-            extract_root_domain("abc123.payload.evil.com"),
-            "evil.com"
-        );
-        assert_eq!(
-            extract_root_domain("data.exfil.co.uk"),
-            "exfil.co.uk"
-        );
+        assert_eq!(extract_root_domain("abc123.payload.evil.com"), "evil.com");
+        assert_eq!(extract_root_domain("data.exfil.co.uk"), "exfil.co.uk");
     }
 
     #[test]

@@ -87,7 +87,10 @@ fn detect_threat_intel(
             continue;
         }
 
-        let proc_label = graph.get_node(proc_id).map(|n| n.label()).unwrap_or_default();
+        let proc_label = graph
+            .get_node(proc_id)
+            .map(|n| n.label())
+            .unwrap_or_default();
         let ip_addr = match graph.get_node(ip_id) {
             Some(Node::Ip { addr, .. }) => addr.clone(),
             _ => continue,
@@ -98,7 +101,10 @@ fn detect_threat_intel(
             host: host.to_string(),
             incident_id: format!("graph_threat_intel:{}:{}", ip_addr, now.timestamp()),
             severity: Severity::High,
-            title: format!("Threat intel match: {} → {} ({})", proc_label, ip_addr, dataset),
+            title: format!(
+                "Threat intel match: {} → {} ({})",
+                proc_label, ip_addr, dataset
+            ),
             summary: format!(
                 "Process {} connected to IP {} which is in threat dataset '{}'.",
                 proc_label, ip_addr, dataset
@@ -155,7 +161,12 @@ fn detect_lateral_movement(
             if port != 22 {
                 continue;
             }
-            if let Some(Node::Ip { addr, is_internal: true, .. }) = graph.get_node(edge.to) {
+            if let Some(Node::Ip {
+                addr,
+                is_internal: true,
+                ..
+            }) = graph.get_node(edge.to)
+            {
                 ssh_scans.entry(proc_id).or_default().insert(addr.clone());
             }
         }
@@ -170,7 +181,10 @@ fn detect_lateral_movement(
             continue;
         }
 
-        let proc_label = graph.get_node(proc_id).map(|n| n.label()).unwrap_or_default();
+        let proc_label = graph
+            .get_node(proc_id)
+            .map(|n| n.label())
+            .unwrap_or_default();
         let ip_list: Vec<String> = ips.into_iter().collect();
 
         incidents.push(Incident {
@@ -178,7 +192,11 @@ fn detect_lateral_movement(
             host: host.to_string(),
             incident_id: format!("graph_lateral_movement:{}:{}", proc_id, now.timestamp()),
             severity: Severity::High,
-            title: format!("Lateral movement: {} SSH scanning {} internal IPs", proc_label, ip_list.len()),
+            title: format!(
+                "Lateral movement: {} SSH scanning {} internal IPs",
+                proc_label,
+                ip_list.len()
+            ),
             summary: format!(
                 "Process {} connected via SSH (port 22) to {} internal IPs in 5 minutes: {}",
                 proc_label,
@@ -212,8 +230,8 @@ fn detect_process_tree_anomaly(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let suspicious_parents = [
-        "nginx", "apache", "apache2", "httpd", "mysqld", "postgres",
-        "java", "node", "php-fpm", "uwsgi", "gunicorn", "mongod",
+        "nginx", "apache", "apache2", "httpd", "mysqld", "postgres", "java", "node", "php-fpm",
+        "uwsgi", "gunicorn", "mongod",
     ];
     let shell_comms = ["bash", "sh", "dash", "zsh", "ash", "fish", "csh"];
 
@@ -254,7 +272,12 @@ fn detect_process_tree_anomaly(
                 incidents.push(Incident {
                     ts: now,
                     host: host.to_string(),
-                    incident_id: format!("graph_process_tree:{}:{}:{}", anc_comm, pid, now.timestamp()),
+                    incident_id: format!(
+                        "graph_process_tree:{}:{}:{}",
+                        anc_comm,
+                        pid,
+                        now.timestamp()
+                    ),
                     severity: Severity::High,
                     title: format!("Suspicious process tree: {} spawned shell", anc_comm),
                     summary: format!("Process chain: {}", chain.join(" → ")),
@@ -317,7 +340,11 @@ fn detect_reverse_shell(
         let external_ip = edges.iter().find_map(|e| {
             if e.relation == Relation::ConnectedTo && e.ts >= cutoff {
                 match graph.get_node(e.to) {
-                    Some(Node::Ip { addr, is_internal: false, .. }) => Some(addr.clone()),
+                    Some(Node::Ip {
+                        addr,
+                        is_internal: false,
+                        ..
+                    }) => Some(addr.clone()),
                     _ => None,
                 }
             } else {
@@ -335,7 +362,10 @@ fn detect_reverse_shell(
                 continue;
             }
 
-            let label = graph.get_node(proc_id).map(|n| n.label()).unwrap_or_default();
+            let label = graph
+                .get_node(proc_id)
+                .map(|n| n.label())
+                .unwrap_or_default();
 
             incidents.push(Incident {
                 ts: now,
@@ -354,10 +384,7 @@ fn detect_reverse_shell(
                     "pid": pid,
                     "dst_ip": ip,
                 }),
-                recommended_checks: vec![
-                    format!("Kill PID {}", pid),
-                    format!("Block IP {}", ip),
-                ],
+                recommended_checks: vec![format!("Kill PID {}", pid), format!("Block IP {}", ip)],
                 tags: vec!["T1059.004".to_string()],
                 entities: vec![EntityRef::ip(&ip)],
             });
@@ -396,9 +423,15 @@ fn detect_fileless(
         let has_external = edges.iter().any(|e| {
             e.relation == Relation::ConnectedTo
                 && e.ts >= cutoff
-                && graph
-                    .get_node(e.to)
-                    .map_or(false, |n| matches!(n, Node::Ip { is_internal: false, .. }))
+                && graph.get_node(e.to).map_or(false, |n| {
+                    matches!(
+                        n,
+                        Node::Ip {
+                            is_internal: false,
+                            ..
+                        }
+                    )
+                })
         });
 
         if has_memfd && has_mprotect && has_external {
@@ -411,7 +444,10 @@ fn detect_fileless(
                 continue;
             }
 
-            let label = graph.get_node(proc_id).map(|n| n.label()).unwrap_or_default();
+            let label = graph
+                .get_node(proc_id)
+                .map(|n| n.label())
+                .unwrap_or_default();
 
             incidents.push(Incident {
                 ts: now,
@@ -473,7 +509,10 @@ fn detect_discovery_burst(
         for &proc_id in &recent_procs {
             for edge in graph.outgoing_edges(proc_id) {
                 if edge.relation == Relation::Read && edge.ts >= cutoff {
-                    if let Some(Node::File { is_sensitive: true, .. }) = graph.get_node(edge.to) {
+                    if let Some(Node::File {
+                        is_sensitive: true, ..
+                    }) = graph.get_node(edge.to)
+                    {
                         sensitive_reads += 1;
                     }
                 }
@@ -484,7 +523,11 @@ fn detect_discovery_burst(
         let exec_count = recent_procs.len();
 
         let total = sensitive_reads + exec_count;
-        let adjusted_threshold = if user_name == "root" { threshold * 3 } else { threshold };
+        let adjusted_threshold = if user_name == "root" {
+            threshold * 3
+        } else {
+            threshold
+        };
 
         if total >= adjusted_threshold {
             let key = format!("graph_discovery:{}", user_name);
@@ -571,7 +614,10 @@ fn detect_persistence(
                     continue;
                 }
 
-                let proc_label = graph.get_node(proc_id).map(|n| n.label()).unwrap_or_default();
+                let proc_label = graph
+                    .get_node(proc_id)
+                    .map(|n| n.label())
+                    .unwrap_or_default();
 
                 incidents.push(Incident {
                     ts: now,
@@ -645,9 +691,15 @@ fn detect_data_exfil(
         let external_conn = edges.iter().find(|e| {
             e.relation == Relation::ConnectedTo
                 && e.ts >= cutoff
-                && graph
-                    .get_node(e.to)
-                    .map_or(false, |n| matches!(n, Node::Ip { is_internal: false, .. }))
+                && graph.get_node(e.to).map_or(false, |n| {
+                    matches!(
+                        n,
+                        Node::Ip {
+                            is_internal: false,
+                            ..
+                        }
+                    )
+                })
         });
 
         if let Some(conn_edge) = external_conn {
@@ -666,7 +718,10 @@ fn detect_data_exfil(
                 continue;
             }
 
-            let label = graph.get_node(proc_id).map(|n| n.label()).unwrap_or_default();
+            let label = graph
+                .get_node(proc_id)
+                .map(|n| n.label())
+                .unwrap_or_default();
 
             incidents.push(Incident {
                 ts: now,
