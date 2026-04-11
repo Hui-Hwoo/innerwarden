@@ -1,4 +1,14 @@
-// Auto-extracted from mod.rs — dashboard helpers handlers
+// Auto-extracted from mod.rs — dashboard helpers handlers.
+//
+// Several of the JSONL-based helpers in this file (incident_detector,
+// extract_ip_entities, determine_outcome, dated_path, etc.) are only
+// exercised by the `#[cfg(test)] mod tests` in `dashboard/mod.rs` and by
+// the legacy `build_*` fallback functions in `dashboard/investigation.rs`
+// which are themselves only reached through test fixtures now that the
+// live dashboard reads from the knowledge graph (Phase 6/7). They are
+// retained to keep that legacy test coverage wired up until spec 016
+// deprecates the JSONL path entirely.
+#![allow(dead_code)]
 
 use super::*;
 
@@ -33,7 +43,9 @@ pub(super) fn safe_write_data_file(data_dir: &Path, filename: &str, contents: &s
     }
     std::fs::write(target, contents).is_ok()
 }
-pub(super) fn extract_ip_entities(entities: &[innerwarden_core::entities::EntityRef]) -> Vec<String> {
+pub(super) fn extract_ip_entities(
+    entities: &[innerwarden_core::entities::EntityRef],
+) -> Vec<String> {
     extract_entity_values(entities, EntityType::Ip)
 }
 
@@ -98,7 +110,10 @@ pub(super) fn incident_group_values(
     }
 }
 
-pub(super) fn event_group_values(event: &innerwarden_core::event::Event, group_by: PivotKind) -> Vec<String> {
+pub(super) fn event_group_values(
+    event: &innerwarden_core::event::Event,
+    group_by: PivotKind,
+) -> Vec<String> {
     match group_by {
         PivotKind::Ip => extract_entity_values(&event.entities, EntityType::Ip),
         PivotKind::User => extract_entity_values(&event.entities, EntityType::User),
@@ -157,20 +172,13 @@ pub(super) fn determine_outcome_for_ips(
     "unknown".to_string()
 }
 
-pub(super) fn severity_order(s: &str) -> u8 {
-    match s {
-        "critical" => 5,
-        "high" => 4,
-        "medium" => 3,
-        "low" => 2,
-        "info" => 1,
-        _ => 0,
-    }
-}
-
 /// Determine the outcome for an IP given the full decisions list and whether
 /// it has at least one incident.
-pub(super) fn determine_outcome(decisions: &[DecisionEntry], ip: &str, has_incident: bool) -> String {
+pub(super) fn determine_outcome(
+    decisions: &[DecisionEntry],
+    ip: &str,
+    has_incident: bool,
+) -> String {
     let ip_decisions: Vec<&DecisionEntry> = decisions
         .iter()
         .filter(|d| d.target_ip.as_deref() == Some(ip))
@@ -291,7 +299,7 @@ pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
 
     // Cache miss - read only the tail of the file (last 256KB ≈ 500 entries).
     // Dashboard lists show max 50-100 items; reading the full file wastes memory.
-pub(super) const MAX_READ_BYTES: u64 = 256 * 1024;
+    pub(super) const MAX_READ_BYTES: u64 = 256 * 1024;
     let content = if file_size > MAX_READ_BYTES {
         match std::fs::File::open(path) {
             Ok(mut f) => {

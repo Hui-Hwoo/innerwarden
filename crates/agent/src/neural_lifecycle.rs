@@ -950,7 +950,8 @@ pub fn read_fp_report_detectors(data_dir: &Path, days: i64) -> HashSet<String> {
     for d in 0..days {
         let date = today - chrono::Duration::days(d);
         let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str) {
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        {
             use crate::knowledge_graph::types::{Node, NodeType};
             for id in graph.nodes_of_type(NodeType::Incident) {
                 if let Some(Node::Incident {
@@ -1029,7 +1030,8 @@ pub fn read_fp_report_counts(data_dir: &Path, days: i64) -> Vec<(String, String,
     for d in 0..days {
         let date = today - chrono::Duration::days(d);
         let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str) {
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        {
             use crate::knowledge_graph::types::{Node, NodeType};
             for id in graph.nodes_of_type(NodeType::Incident) {
                 if let Some(Node::Incident {
@@ -1400,21 +1402,20 @@ fn load_blocked_ips(data_dir: &Path) -> HashSet<String> {
     for days_ago in 0..7i64 {
         let date = today - chrono::Duration::days(days_ago);
         let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str) {
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        {
             use crate::knowledge_graph::types::{Node, NodeType};
             for id in graph.nodes_of_type(NodeType::Incident) {
                 if let Some(Node::Incident {
-                    decision,
+                    decision: Some(action),
                     decision_target,
                     ..
                 }) = graph.get_node(id)
                 {
-                    if let Some(action) = decision {
-                        if action.contains("block") {
-                            if let Some(ip) = decision_target {
-                                if !ip.is_empty() {
-                                    blocked.insert(ip.clone());
-                                }
+                    if action.contains("block") {
+                        if let Some(ip) = decision_target {
+                            if !ip.is_empty() {
+                                blocked.insert(ip.clone());
                             }
                         }
                     }

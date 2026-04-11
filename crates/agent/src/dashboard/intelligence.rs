@@ -135,12 +135,16 @@ pub(super) struct ThreatReportQuery {
 }
 
 /// `GET /api/threat-report/months` - list available months.
-pub(super) async fn api_threat_report_months(State(state): State<DashboardState>) -> Json<Vec<String>> {
+pub(super) async fn api_threat_report_months(
+    State(state): State<DashboardState>,
+) -> Json<Vec<String>> {
     Json(crate::threat_report::available_months(&state.data_dir))
 }
 
 /// `GET /api/correlation-chains` - recent attack chain detections.
-pub(super) async fn api_correlation_chains(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_correlation_chains(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let chains: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "attack-chains.json")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -151,7 +155,9 @@ pub(super) async fn api_correlation_chains(State(state): State<DashboardState>) 
 }
 
 /// `GET /api/graph/stats` - knowledge graph metrics (live from shared graph).
-pub(super) async fn api_graph_stats(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_graph_stats(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let graph = state.knowledge_graph.read().unwrap();
     let metrics = graph.metrics();
     Json(serde_json::to_value(&metrics).unwrap_or_default())
@@ -230,8 +236,6 @@ pub(super) async fn api_graph_neighborhood(
     State(state): State<DashboardState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    use crate::knowledge_graph::types::*;
-
     let subject_type = params.get("type").map(|s| s.as_str()).unwrap_or("ip");
     let subject_value = match params.get("value") {
         Some(v) => v.clone(),
@@ -307,32 +311,10 @@ pub(super) async fn api_graph_neighborhood(
     }))
 }
 
-pub(super) fn node_priority(node: Option<&crate::knowledge_graph::types::Node>) -> u8 {
-    use crate::knowledge_graph::types::Node;
-    match node {
-        Some(Node::Incident { .. }) => 10,
-        Some(Node::Ip {
-            datasets,
-            risk_score,
-            ..
-        }) if !datasets.is_empty() || *risk_score > 50 => 9,
-        Some(Node::Ip { is_tor: true, .. }) => 8,
-        Some(Node::Campaign { .. }) => 8,
-        Some(Node::Process { .. }) => 5,
-        Some(Node::File {
-            is_sensitive: true, ..
-        }) => 6,
-        Some(Node::User { .. }) => 4,
-        Some(Node::Ip { .. }) => 3,
-        Some(Node::Domain { .. }) => 3,
-        Some(Node::File { .. }) => 2,
-        Some(Node::Port { .. }) => 1,
-        _ => 0,
-    }
-}
-
 /// `GET /api/baseline-status` - baseline learning status and recent anomalies.
-pub(super) async fn api_baseline_status(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_baseline_status(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let baseline: serde_json::Value = safe_read_data_file(&state.data_dir, "baseline.json")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::json!({"mature": false, "training_days": 0}));
@@ -340,7 +322,9 @@ pub(super) async fn api_baseline_status(State(state): State<DashboardState>) -> 
 }
 
 /// `GET /api/playbook-log` - recent playbook executions.
-pub(super) async fn api_playbook_log(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_playbook_log(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let log: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "playbook-log.json")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -350,7 +334,9 @@ pub(super) async fn api_playbook_log(State(state): State<DashboardState>) -> Jso
     }))
 }
 /// `GET /api/deep-security` - aggregated status from firmware, hypervisor, killchain, DNA.
-pub(super) async fn api_deep_security(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_deep_security(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let snap = state.deep_security.read().unwrap();
     Json(serde_json::to_value(&*snap).unwrap_or_default())
 }
@@ -375,19 +361,26 @@ pub(super) async fn api_graph_path(
 ) -> Json<serde_json::Value> {
     let from: u64 = params.get("from").and_then(|v| v.parse().ok()).unwrap_or(0);
     let to: u64 = params.get("to").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let max_depth: usize = params.get("max_depth").and_then(|v| v.parse().ok()).unwrap_or(10).min(10);
+    let max_depth: usize = params
+        .get("max_depth")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+        .min(10);
 
     let graph = state.knowledge_graph.read().unwrap();
     match graph.path_between(from, to, max_depth) {
         Some(edges) => {
-            let items: Vec<serde_json::Value> = edges.iter().map(|e| {
-                serde_json::json!({
-                    "from": e.from, "to": e.to,
-                    "relation": format!("{:?}", e.relation),
-                    "ts": e.ts.to_rfc3339(),
-                    "properties": e.properties,
+            let items: Vec<serde_json::Value> = edges
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "from": e.from, "to": e.to,
+                        "relation": format!("{:?}", e.relation),
+                        "ts": e.ts.to_rfc3339(),
+                        "properties": e.properties,
+                    })
                 })
-            }).collect();
+                .collect();
             Json(serde_json::json!({ "path": items }))
         }
         None => Json(serde_json::json!({ "path": [] })),
@@ -408,36 +401,55 @@ pub(super) async fn api_graph_process_tree(
     let descendants = graph.descendants(pid);
     let center = graph.find_by_pid(pid);
 
-    let mut all_ids: Vec<NodeId> = ancestors.iter().chain(descendants.iter()).copied().collect();
-    if let Some(c) = center { all_ids.push(c); }
+    let mut all_ids: Vec<NodeId> = ancestors
+        .iter()
+        .chain(descendants.iter())
+        .copied()
+        .collect();
+    if let Some(c) = center {
+        all_ids.push(c);
+    }
     all_ids.sort();
     all_ids.dedup();
 
     let keep: std::collections::HashSet<NodeId> = all_ids.iter().copied().collect();
 
-    let cy_nodes: Vec<serde_json::Value> = all_ids.iter().filter_map(|&id| {
-        graph.get_node(id).map(|n| serde_json::json!({
-            "data": {
-                "id": format!("n{}", id),
-                "label": n.label(),
-                "type": format!("{:?}", n.node_type()),
-                "is_center": center == Some(id),
-            }
-        }))
-    }).collect();
+    let cy_nodes: Vec<serde_json::Value> = all_ids
+        .iter()
+        .filter_map(|&id| {
+            graph.get_node(id).map(|n| {
+                serde_json::json!({
+                    "data": {
+                        "id": format!("n{}", id),
+                        "label": n.label(),
+                        "type": format!("{:?}", n.node_type()),
+                        "is_center": center == Some(id),
+                    }
+                })
+            })
+        })
+        .collect();
 
-    let cy_edges: Vec<serde_json::Value> = graph.edges_slice().iter().enumerate()
-        .filter(|(_, e)| keep.contains(&e.from) && keep.contains(&e.to)
-            && matches!(e.relation, Relation::SpawnedBy))
-        .map(|(i, e)| serde_json::json!({
-            "data": {
-                "id": format!("e{}", i),
-                "source": format!("n{}", e.from),
-                "target": format!("n{}", e.to),
-                "relation": format!("{:?}", e.relation),
-                "ts": e.ts.to_rfc3339(),
-            }
-        }))
+    let cy_edges: Vec<serde_json::Value> = graph
+        .edges_slice()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            keep.contains(&e.from)
+                && keep.contains(&e.to)
+                && matches!(e.relation, Relation::SpawnedBy)
+        })
+        .map(|(i, e)| {
+            serde_json::json!({
+                "data": {
+                    "id": format!("e{}", i),
+                    "source": format!("n{}", e.from),
+                    "target": format!("n{}", e.to),
+                    "relation": format!("{:?}", e.relation),
+                    "ts": e.ts.to_rfc3339(),
+                }
+            })
+        })
         .collect();
 
     Json(serde_json::json!({ "nodes": cy_nodes, "edges": cy_edges }))
@@ -448,21 +460,33 @@ pub(super) async fn api_graph_timeline(
     State(state): State<DashboardState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let node_id: u64 = params.get("node_id").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let node_id: u64 = params
+        .get("node_id")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let graph = state.knowledge_graph.read().unwrap();
 
     let edges = graph.timeline(node_id);
-    let items: Vec<serde_json::Value> = edges.iter().map(|e| {
-        let from_label = graph.get_node(e.from).map(|n| n.label().to_string()).unwrap_or_default();
-        let to_label = graph.get_node(e.to).map(|n| n.label().to_string()).unwrap_or_default();
-        serde_json::json!({
-            "from": e.from, "to": e.to,
-            "from_label": from_label, "to_label": to_label,
-            "relation": format!("{:?}", e.relation),
-            "ts": e.ts.to_rfc3339(),
-            "properties": e.properties,
+    let items: Vec<serde_json::Value> = edges
+        .iter()
+        .map(|e| {
+            let from_label = graph
+                .get_node(e.from)
+                .map(|n| n.label().to_string())
+                .unwrap_or_default();
+            let to_label = graph
+                .get_node(e.to)
+                .map(|n| n.label().to_string())
+                .unwrap_or_default();
+            serde_json::json!({
+                "from": e.from, "to": e.to,
+                "from_label": from_label, "to_label": to_label,
+                "relation": format!("{:?}", e.relation),
+                "ts": e.ts.to_rfc3339(),
+                "properties": e.properties,
+            })
         })
-    }).collect();
+        .collect();
 
     Json(serde_json::json!({ "timeline": items }))
 }
@@ -474,15 +498,24 @@ pub(super) async fn api_graph_threats(
     let graph = state.knowledge_graph.read().unwrap();
     let hits = graph.threat_intel_hits();
 
-    let items: Vec<serde_json::Value> = hits.iter().map(|(proc_id, ip_id, dataset)| {
-        let proc_label = graph.get_node(*proc_id).map(|n| n.label().to_string()).unwrap_or_default();
-        let ip_label = graph.get_node(*ip_id).map(|n| n.label().to_string()).unwrap_or_default();
-        serde_json::json!({
-            "process_id": proc_id, "process_label": proc_label,
-            "ip_id": ip_id, "ip_label": ip_label,
-            "dataset": dataset,
+    let items: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(proc_id, ip_id, dataset)| {
+            let proc_label = graph
+                .get_node(*proc_id)
+                .map(|n| n.label().to_string())
+                .unwrap_or_default();
+            let ip_label = graph
+                .get_node(*ip_id)
+                .map(|n| n.label().to_string())
+                .unwrap_or_default();
+            serde_json::json!({
+                "process_id": proc_id, "process_label": proc_label,
+                "ip_id": ip_id, "ip_label": ip_label,
+                "dataset": dataset,
+            })
         })
-    }).collect();
+        .collect();
 
     Json(serde_json::json!({ "total": items.len(), "hits": items }))
 }

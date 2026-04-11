@@ -1,6 +1,7 @@
 // Auto-extracted from mod.rs — dashboard sse handlers
 
 use super::*;
+use std::sync::atomic::Ordering;
 
 // ---------------------------------------------------------------------------
 // D6 - SSE file watcher and stream handler

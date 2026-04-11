@@ -179,39 +179,37 @@ pub(crate) fn load_startup_decision_state(
             for id in graph.nodes_of_type(NodeType::Incident) {
                 if let Some(Node::Incident {
                     incident_id,
-                    decision,
+                    decision: Some(action),
                     decision_target,
                     ts,
                     ..
                 }) = graph.get_node(id)
                 {
-                    if let Some(action) = decision {
-                        if action == "block_ip" {
-                            if let Some(ip) = decision_target {
-                                blocklist.insert(ip.clone());
-                            }
+                    if action == "block_ip" {
+                        if let Some(ip) = decision_target {
+                            blocklist.insert(ip.clone());
                         }
-                        // Build cooldown key from graph data
-                        let detector = crate::agent_context::incident_detector(incident_id);
-                        let key = match action.as_str() {
-                            "block_ip" | "monitor" | "honeypot" => decision_target
-                                .as_ref()
-                                .map(|ip| decision_cooldown_key(action, detector, "ip", ip)),
-                            "suspend_user_sudo" => decision_target
-                                .as_ref()
-                                .map(|user| decision_cooldown_key("suspend_user_sudo", detector, "user", user)),
-                            _ => None,
-                        };
-                        if let Some(key) = key {
-                            cooldowns
-                                .entry(key)
-                                .and_modify(|existing| {
-                                    if *ts > *existing {
-                                        *existing = *ts;
-                                    }
-                                })
-                                .or_insert(*ts);
-                        }
+                    }
+                    // Build cooldown key from graph data
+                    let detector = crate::agent_context::incident_detector(incident_id);
+                    let key = match action.as_str() {
+                        "block_ip" | "monitor" | "honeypot" => decision_target
+                            .as_ref()
+                            .map(|ip| decision_cooldown_key(action, detector, "ip", ip)),
+                        "suspend_user_sudo" => decision_target.as_ref().map(|user| {
+                            decision_cooldown_key("suspend_user_sudo", detector, "user", user)
+                        }),
+                        _ => None,
+                    };
+                    if let Some(key) = key {
+                        cooldowns
+                            .entry(key)
+                            .and_modify(|existing| {
+                                if *ts > *existing {
+                                    *existing = *ts;
+                                }
+                            })
+                            .or_insert(*ts);
                     }
                 }
             }

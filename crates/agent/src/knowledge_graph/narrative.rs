@@ -1,5 +1,3 @@
-use chrono::{DateTime, Utc};
-
 use super::graph::KnowledgeGraph;
 use super::types::*;
 
@@ -68,7 +66,7 @@ impl KnowledgeGraph {
         let mut risk_count = 0;
 
         // Threat intel IPs
-        for (_, node) in &sub.nodes {
+        for node in sub.nodes.values() {
             if let Node::Ip {
                 datasets,
                 is_tor,
@@ -97,7 +95,7 @@ impl KnowledgeGraph {
         }
 
         // High entropy files
-        for (_, node) in &sub.nodes {
+        for node in sub.nodes.values() {
             if let Node::File {
                 path,
                 entropy: Some(ent),
@@ -115,7 +113,7 @@ impl KnowledgeGraph {
         }
 
         // Sensitive file access
-        for (_, node) in &sub.nodes {
+        for node in sub.nodes.values() {
             if let Node::File {
                 path,
                 is_sensitive: true,
@@ -129,7 +127,7 @@ impl KnowledgeGraph {
                         .iter()
                         .find(|(_, n)| matches!(n, Node::File { path: p, .. } if p == path))
                         .map(|(&id, _)| id);
-                    target_id.map_or(false, |tid| {
+                    target_id.is_some_and(|tid| {
                         (e.to == tid || e.from == tid)
                             && matches!(e.relation, Relation::Read | Relation::Wrote)
                     })
@@ -191,7 +189,10 @@ impl KnowledgeGraph {
         {
             if *false_positive {
                 lines.push(String::new());
-                lines.push("  ⚠ This incident was previously marked as FALSE POSITIVE by an operator".to_string());
+                lines.push(
+                    "  ⚠ This incident was previously marked as FALSE POSITIVE by an operator"
+                        .to_string(),
+                );
             }
             if let Some(action) = decision {
                 let conf = confidence.unwrap_or(0.0);
@@ -208,6 +209,7 @@ impl KnowledgeGraph {
     }
 
     /// Analyze the impact of blocking an IP or killing a process.
+    #[allow(dead_code)] // kept on graph narrative surface; wired in spec 016 proposal UI
     pub fn impact_analysis(&self, action: &str, target: &str) -> String {
         match action {
             "block_ip" => self.impact_block_ip(target),
@@ -222,6 +224,7 @@ impl KnowledgeGraph {
         }
     }
 
+    #[allow(dead_code)]
     fn impact_block_ip(&self, ip: &str) -> String {
         let ip_id = match self.find_by_ip(ip) {
             Some(id) => id,
@@ -286,6 +289,7 @@ impl KnowledgeGraph {
         lines.join("\n")
     }
 
+    #[allow(dead_code)]
     fn impact_kill_process(&self, pid: u32) -> String {
         let proc_id = match self.find_by_pid(pid) {
             Some(id) => id,
@@ -315,6 +319,7 @@ impl KnowledgeGraph {
     }
 
     /// Generate confidence signals for an incident based on graph structure.
+    #[allow(dead_code)] // surfaced in future neural/dashboard confidence hover panels
     pub fn confidence_signals(&self, node: NodeId) -> Vec<(String, f32)> {
         let mut signals = Vec::new();
 
@@ -359,10 +364,7 @@ impl KnowledgeGraph {
         // Sensitive file access
         let sensitive_access = sub.edges.iter().any(|e| {
             matches!(e.relation, Relation::Read | Relation::Wrote)
-                && sub
-                    .nodes
-                    .get(&e.to)
-                    .map_or(false, |n| n.is_sensitive_file())
+                && sub.nodes.get(&e.to).is_some_and(|n| n.is_sensitive_file())
         });
         if sensitive_access {
             signals.push(("sensitive_file_access".to_string(), 0.15));
@@ -371,7 +373,7 @@ impl KnowledgeGraph {
         // Persistence indicators
         let has_persistence = sub.edges.iter().any(|e| {
             e.relation == Relation::Wrote
-                && sub.nodes.get(&e.to).map_or(false, |n| {
+                && sub.nodes.get(&e.to).is_some_and(|n| {
                     if let Node::File { path, .. } = n {
                         path.contains("/etc/cron")
                             || path.contains("authorized_keys")
@@ -392,6 +394,7 @@ impl KnowledgeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1700000000 + secs, 0).unwrap()

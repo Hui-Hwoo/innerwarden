@@ -10,7 +10,7 @@ use chrono::Utc;
 use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::{Event, Severity};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 /// Suspicious paths for systemd unit files.
 const SUSPICIOUS_UNIT_PATHS: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/", "/home/", "/root/"];
@@ -39,7 +39,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
     for unit in &initial {
         if is_suspicious_path(&unit.fragment_path) {
             let event = build_event(
-                &unit,
+                unit,
                 "suspicious_existing_unit",
                 Severity::High,
                 &host_id,
@@ -73,7 +73,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
             };
 
             let event = build_event(
-                &unit,
+                unit,
                 "new_systemd_unit",
                 severity,
                 &host_id,

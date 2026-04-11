@@ -2,6 +2,10 @@
 //!
 //! Extracts: version strings, auth methods, tunneling indicators.
 //! Works on any port (not just 22).
+//!
+//! Consumed by the Linux-only tcp_stream `run()` loop. See note in
+//! `file_extract.rs` for why dead_code is silenced on non-Linux builds.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 /// Parsed SSH session info.
 #[derive(Debug, Clone)]

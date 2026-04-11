@@ -105,6 +105,16 @@ pub(crate) fn graph_last_incidents(
     )
 }
 
+/// Row collected for the Telegram "last decisions" summary:
+/// (timestamp, action, target, confidence, auto_executed).
+type DecisionRow = (
+    chrono::DateTime<chrono::Utc>,
+    String,
+    String,
+    Option<f32>,
+    bool,
+);
+
 /// Read the last N decisions from graph, formatted for Telegram display.
 pub(crate) fn graph_last_decisions(
     kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
@@ -113,13 +123,7 @@ pub(crate) fn graph_last_decisions(
     use knowledge_graph::types::{Node, NodeType};
     let graph = kg.read().unwrap();
 
-    let mut items: Vec<(
-        chrono::DateTime<chrono::Utc>,
-        String,
-        String,
-        Option<f32>,
-        bool,
-    )> = Vec::new();
+    let mut items: Vec<DecisionRow> = Vec::new();
 
     for id in graph.nodes_of_type(NodeType::Incident) {
         if let Some(Node::Incident {
@@ -131,10 +135,7 @@ pub(crate) fn graph_last_decisions(
             ..
         }) = graph.get_node(id)
         {
-            let target = decision_target
-                .as_deref()
-                .unwrap_or("?")
-                .to_string();
+            let target = decision_target.as_deref().unwrap_or("?").to_string();
             items.push((*ts, action.clone(), target, *confidence, *auto_executed));
         }
     }

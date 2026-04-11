@@ -1706,7 +1706,7 @@ fn format_incident_message(
 #[allow(dead_code)]
 fn incident_quip(incident: &Incident) -> &'static str {
     let title = incident.title.to_lowercase();
-    let tags: Vec<&str> = incident.tags.iter().map(|s| s.as_str()).collect();
+    let _tags: Vec<&str> = incident.tags.iter().map(|s| s.as_str()).collect();
 
     if title.contains("brute") || (title.contains("ssh") && title.contains("fail")) {
         return "💥 Script kiddie hammering the front door. Dictionary attack, classic.";

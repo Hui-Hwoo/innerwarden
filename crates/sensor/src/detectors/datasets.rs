@@ -48,6 +48,8 @@ pub struct Datasets {
 #[derive(Debug)]
 pub struct DatasetMatch {
     pub dataset: &'static str,
+    #[allow(dead_code)]
+    // returned to callers for future enrichment; currently only `dataset` is consumed
     pub value: String,
 }
 

@@ -13,7 +13,7 @@ use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::{Event, Severity};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Paths to scan for SUID binaries.
 const SCAN_PATHS: &[&str] = &[

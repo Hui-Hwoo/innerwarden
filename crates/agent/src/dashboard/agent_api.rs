@@ -92,7 +92,7 @@ pub(super) async fn api_agent_check_ip(
 ) -> Json<serde_json::Value> {
     let ip = query.ip.trim();
 
-    use crate::knowledge_graph::types::{Node, NodeType, Relation};
+    use crate::knowledge_graph::types::{Node, Relation};
     let graph = state.knowledge_graph.read().unwrap();
 
     // Find the IP node
@@ -334,7 +334,9 @@ pub(super) async fn api_agent_guard_disconnect(
 }
 
 /// GET /api/agent-guard/agents — list all connected agents and detected tools.
-pub(super) async fn api_agent_guard_list(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_agent_guard_list(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let registry = state.agent_registry.lock().await;
     let agents = registry.list();
     Json(serde_json::json!({
@@ -347,7 +349,9 @@ pub(super) async fn api_agent_guard_list(State(state): State<DashboardState>) ->
 
 // ---------------------------------------------------------------------------
 
-pub(super) async fn api_prometheus_metrics(State(state): State<DashboardState>) -> axum::response::Response {
+pub(super) async fn api_prometheus_metrics(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
     let date = resolve_date(None);
 
     // Read latest telemetry snapshot (small file, already cached)

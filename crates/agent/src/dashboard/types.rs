@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
@@ -70,6 +71,7 @@ pub(crate) struct ListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // severity_min/detector accepted for API forward-compat; graph filters land in spec 016
 pub(crate) struct EntitiesQuery {
     pub(super) limit: Option<usize>,
     pub(super) date: Option<String>,
@@ -79,6 +81,7 @@ pub(crate) struct EntitiesQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // severity_min/detector accepted for API forward-compat; graph filters land in spec 016
 pub(crate) struct JourneyQuery {
     pub(super) subject_type: Option<String>,
     pub(super) subject: Option<String>,
@@ -91,6 +94,7 @@ pub(crate) struct JourneyQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // severity_min/detector accepted for API forward-compat; graph filters land in spec 016
 pub(crate) struct ClusterQuery {
     pub(super) limit: Option<usize>,
     pub(super) date: Option<String>,
@@ -386,6 +390,7 @@ impl PivotKind {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by `#[cfg(test)]` legacy JSONL helpers until spec 016
 pub(crate) struct InvestigationFilters {
     pub(super) severity_min: Option<u8>,
     pub(super) detector: Option<String>,
@@ -418,6 +423,7 @@ impl InvestigationFilters {
 // Internal accumulator for grouping events/incidents by IP
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct IpAccumulator {
     pub(super) first_seen: Option<chrono::DateTime<Utc>>,
@@ -430,6 +436,7 @@ pub(crate) struct IpAccumulator {
     pub(super) event_count: usize,
 }
 
+#[cfg(test)]
 impl IpAccumulator {
     pub(crate) fn update_time(&mut self, ts: chrono::DateTime<Utc>) {
         if self.first_seen.is_none_or(|existing| ts < existing) {

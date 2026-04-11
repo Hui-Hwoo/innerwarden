@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::sync::{Arc, RwLock};
 
-use crate::knowledge_graph::KnowledgeGraph;
 use crate::knowledge_graph::types::{Node, NodeType, Relation};
+use crate::knowledge_graph::KnowledgeGraph;
 
 /// The generated briefing result.
 #[derive(Debug, Clone, Serialize)]
@@ -19,9 +19,7 @@ pub struct Briefing {
 /// Build the structured context from the knowledge graph for LLM consumption.
 /// Separates contained (resolved) from unresolved, marks internal IPs,
 /// and shows actions already taken.
-pub fn build_briefing_context(
-    kg: &Arc<RwLock<KnowledgeGraph>>,
-) -> String {
+pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
     let graph = kg.read().unwrap();
 
     let incident_nodes = graph.nodes_of_type(NodeType::Incident);
@@ -31,15 +29,24 @@ pub fn build_briefing_context(
     let mut ignored = 0usize;
     let mut unresolved = 0usize;
     let mut unresolved_high_crit = 0usize;
-    let mut by_detector: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut by_severity: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_detector: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut by_severity: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut actions_taken: Vec<String> = Vec::new();
     let mut unresolved_list: Vec<(String, String, String)> = Vec::new(); // (severity, title, entity)
 
     for &id in &incident_nodes {
         if let Some(Node::Incident {
-            detector, severity, title, decision, decision_target, auto_executed, ..
-        }) = graph.get_node(id) {
+            detector,
+            severity,
+            title,
+            decision,
+            decision_target,
+            auto_executed,
+            ..
+        }) = graph.get_node(id)
+        {
             *by_detector.entry(detector.clone()).or_default() += 1;
             *by_severity.entry(severity.to_lowercase()).or_default() += 1;
 
@@ -47,11 +54,19 @@ pub fn build_briefing_context(
                 Some("block_ip") => {
                     contained += 1;
                     let target = decision_target.as_deref().unwrap_or("?");
-                    let mode = if *auto_executed { "auto-blocked" } else { "manual" };
+                    let mode = if *auto_executed {
+                        "auto-blocked"
+                    } else {
+                        "manual"
+                    };
                     actions_taken.push(format!("Blocked IP {} ({}) — {}", target, mode, title));
                 }
-                Some("monitor") => { contained += 1; }
-                Some("honeypot") => { contained += 1; }
+                Some("monitor") => {
+                    contained += 1;
+                }
+                Some("honeypot") => {
+                    contained += 1;
+                }
                 Some("kill_process") => {
                     contained += 1;
                     actions_taken.push(format!("Killed process — {}", title));
@@ -60,14 +75,20 @@ pub fn build_briefing_context(
                     contained += 1;
                     actions_taken.push(format!("Suspended sudo — {}", title));
                 }
-                Some("ignore") => { ignored += 1; }
-                Some(_) => { contained += 1; }
+                Some("ignore") => {
+                    ignored += 1;
+                }
+                Some(_) => {
+                    contained += 1;
+                }
                 None => {
                     unresolved += 1;
                     let sev = severity.to_lowercase();
                     if sev == "high" || sev == "critical" {
                         unresolved_high_crit += 1;
-                        let entity = graph.outgoing_edges(id).iter()
+                        let entity = graph
+                            .outgoing_edges(id)
+                            .iter()
                             .find(|e| e.relation == Relation::TriggeredBy)
                             .and_then(|e| graph.get_node(e.to))
                             .map(|n| n.label())
@@ -85,15 +106,34 @@ pub fn build_briefing_context(
     let mut ip_data: std::collections::HashMap<String, (usize, Vec<String>, bool)> =
         std::collections::HashMap::new();
     for &inc_id in &incident_nodes {
-        if let Some(Node::Incident { detector, decision, decision_target, .. }) = graph.get_node(inc_id) {
+        if let Some(Node::Incident {
+            detector,
+            decision,
+            decision_target,
+            ..
+        }) = graph.get_node(inc_id)
+        {
             for edge in graph.outgoing_edges(inc_id) {
-                if edge.relation != Relation::TriggeredBy { continue; }
-                if let Some(Node::Ip { addr, is_internal, .. }) = graph.get_node(edge.to) {
-                    if *is_internal { continue; } // Skip server's own IPs
-                    let entry = ip_data.entry(addr.clone()).or_insert((0, Vec::new(), false));
+                if edge.relation != Relation::TriggeredBy {
+                    continue;
+                }
+                if let Some(Node::Ip {
+                    addr, is_internal, ..
+                }) = graph.get_node(edge.to)
+                {
+                    if *is_internal {
+                        continue;
+                    } // Skip server's own IPs
+                    let entry = ip_data
+                        .entry(addr.clone())
+                        .or_insert((0, Vec::new(), false));
                     entry.0 += 1;
-                    if !entry.1.contains(detector) { entry.1.push(detector.clone()); }
-                    if decision.as_deref() == Some("block_ip") && decision_target.as_deref() == Some(addr.as_str()) {
+                    if !entry.1.contains(detector) {
+                        entry.1.push(detector.clone());
+                    }
+                    if decision.as_deref() == Some("block_ip")
+                        && decision_target.as_deref() == Some(addr.as_str())
+                    {
                         entry.2 = true; // Already blocked
                     }
                 }
@@ -101,7 +141,7 @@ pub fn build_briefing_context(
         }
     }
     let mut top_attackers: Vec<_> = ip_data.into_iter().collect();
-    top_attackers.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    top_attackers.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     top_attackers.truncate(10);
 
     // Detectors sorted
@@ -110,7 +150,7 @@ pub fn build_briefing_context(
     sorted_detectors.truncate(10);
 
     // Threat level — based on UNRESOLVED, not total
-    let threat_level = if unresolved_high_crit > 5 {
+    let _threat_level = if unresolved_high_crit > 5 {
         "CRITICAL"
     } else if unresolved_high_crit > 0 {
         "ELEVATED"
@@ -149,7 +189,10 @@ pub fn build_briefing_context(
             ctx.push_str(&format!("  {}. {}\n", i + 1, action));
         }
         if actions_taken.len() > 10 {
-            ctx.push_str(&format!("  ... and {} more actions\n", actions_taken.len() - 10));
+            ctx.push_str(&format!(
+                "  ... and {} more actions\n",
+                actions_taken.len() - 10
+            ));
         }
         ctx.push('\n');
     }
@@ -157,7 +200,12 @@ pub fn build_briefing_context(
     if !unresolved_list.is_empty() {
         ctx.push_str("UNRESOLVED THREATS NEEDING ATTENTION:\n");
         for (sev, title, entity) in &unresolved_list {
-            ctx.push_str(&format!("  - [{}] {} ({})\n", sev.to_uppercase(), title, entity));
+            ctx.push_str(&format!(
+                "  - [{}] {} ({})\n",
+                sev.to_uppercase(),
+                title,
+                entity
+            ));
         }
         ctx.push('\n');
     }
@@ -165,7 +213,13 @@ pub fn build_briefing_context(
     ctx.push_str("TOP ATTACKERS (external IPs only):\n");
     for (ip, (count, dets, blocked)) in &top_attackers {
         let status = if *blocked { " [ALREADY BLOCKED]" } else { "" };
-        ctx.push_str(&format!("  - {} — {} incidents, detectors: {}{}\n", ip, count, dets.join(", "), status));
+        ctx.push_str(&format!(
+            "  - {} — {} incidents, detectors: {}{}\n",
+            ip,
+            count,
+            dets.join(", "),
+            status
+        ));
     }
 
     ctx.push_str("\nDETECTOR ACTIVITY:\n");

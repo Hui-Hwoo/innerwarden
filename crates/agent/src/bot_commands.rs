@@ -38,13 +38,12 @@ pub(crate) async fn handle_telegram_bot_command(
         if cfg.telegram.bot.enabled {
             if cfg.telegram.is_simple_profile() {
                 // Simple profile: semaphore status
-                let today = chrono::Local::now()
+                let _today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
                 let decision_count =
-                    bot_helpers::graph_count(&state.knowledge_graph, "decisions")
-                        as u64;
+                    bot_helpers::graph_count(&state.knowledge_graph, "decisions") as u64;
 
                 // Check for recent critical/high incidents from narrative accumulator
                 let now_utc = chrono::Utc::now();
@@ -105,14 +104,12 @@ pub(crate) async fn handle_telegram_bot_command(
                 tg_reply(state, text);
             } else {
                 // Technical profile: full status
-                let today = chrono::Local::now()
+                let _today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
-                let incident_count =
-                    bot_helpers::graph_count(&state.knowledge_graph, "incidents");
-                let decision_count =
-                    bot_helpers::graph_count(&state.knowledge_graph, "decisions");
+                let incident_count = bot_helpers::graph_count(&state.knowledge_graph, "incidents");
+                let decision_count = bot_helpers::graph_count(&state.knowledge_graph, "decisions");
                 let mode = guardian_mode(cfg);
                 let mode_label = mode.label();
                 let mode_desc = mode.description();
@@ -242,7 +239,7 @@ pub(crate) async fn handle_telegram_bot_command(
     if result.incident_id == "__threats__" {
         info!(operator = %result.operator_name, "Telegram /threats command received");
         if cfg.telegram.bot.enabled {
-            let today = chrono::Local::now()
+            let _today = chrono::Local::now()
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();
@@ -255,7 +252,7 @@ pub(crate) async fn handle_telegram_bot_command(
     if result.incident_id == "__decisions__" {
         info!(operator = %result.operator_name, "Telegram /decisions command received");
         if cfg.telegram.bot.enabled {
-            let today = chrono::Local::now()
+            let _today = chrono::Local::now()
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();
@@ -502,14 +499,12 @@ pub(crate) async fn handle_telegram_bot_command(
         info!(operator = %result.operator_name, "Telegram /start command received");
         if cfg.telegram.bot.enabled {
             if let Some(ref tg) = state.telegram_client {
-                let today = chrono::Local::now()
+                let _today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
-                let incident_count =
-                    bot_helpers::graph_count(&state.knowledge_graph, "incidents");
-                let decision_count =
-                    bot_helpers::graph_count(&state.knowledge_graph, "decisions");
+                let incident_count = bot_helpers::graph_count(&state.knowledge_graph, "incidents");
+                let decision_count = bot_helpers::graph_count(&state.knowledge_graph, "decisions");
                 let mode = guardian_mode(cfg);
                 let host = std::env::var("HOSTNAME")
                     .or_else(|_| {
@@ -624,7 +619,7 @@ pub(crate) async fn handle_telegram_bot_command(
         let question = question.to_string();
         info!(operator = %result.operator_name, question = %question, "Telegram /ask command received");
         if cfg.telegram.bot.enabled {
-            let today = chrono::Local::now()
+            let _today = chrono::Local::now()
                 .date_naive()
                 .format("%Y-%m-%d")
                 .to_string();

@@ -4,6 +4,10 @@
 //! extracting: method, URI, headers, body, status code.
 //!
 //! Works on any port (feeds from tcp_stream reassembly, not port-filtered).
+//!
+//! Consumed by the Linux-only tcp_stream `run()` loop. See note in
+//! `file_extract.rs` for why dead_code is silenced on non-Linux builds.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 /// Parsed HTTP request.
 #[derive(Debug, Clone)]

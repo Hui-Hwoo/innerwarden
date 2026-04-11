@@ -198,7 +198,7 @@ impl KnowledgeGraph {
 
         // T027: integrity check — verify indexes are consistent
         let node_count = graph.nodes.len();
-        let edge_count = graph.edges.len();
+        let _edge_count = graph.edges.len();
         let indexed_nodes = graph.pid_index.len()
             + graph.ip_index.len()
             + graph.file_index.len()

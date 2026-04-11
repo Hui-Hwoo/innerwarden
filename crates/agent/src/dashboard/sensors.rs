@@ -283,9 +283,8 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
             })
             .unwrap_or_default()
     };
-    let count_source = move |source: &str| -> u64 {
-        telem_source_counts.get(source).copied().unwrap_or(0) as u64
-    };
+    let count_source =
+        move |source: &str| -> u64 { telem_source_counts.get(source).copied().unwrap_or(0) as u64 };
 
     // Recency threshold: active if file modified within last 2 hours
     let recent = |age: Option<u64>| age.map(|s| s < 7200).unwrap_or(false);

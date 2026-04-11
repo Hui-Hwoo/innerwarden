@@ -16,12 +16,19 @@
 //!
 //! Requires: Linux, CAP_NET_RAW.
 //! Memory-capped: max 10K concurrent flows, 1MB per flow, 100MB total.
+//!
+//! The `run()` packet loop and `parse_tcp_packet` helper are gated with
+//! `#[cfg(target_os = "linux")]`. On non-Linux builds (local dev on
+//! macOS) they're compiled out and clippy sees every struct/method they
+//! consume as dead. Silence that at the module level rather than gating
+//! each item individually.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Flow tracking

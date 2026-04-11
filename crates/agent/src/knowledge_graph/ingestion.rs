@@ -152,7 +152,9 @@ impl KnowledgeGraph {
             "memory.mprotect_exec" => self.ingest_mprotect_exec(event),
             "memory.anon_executable" => self.ingest_memory_region(event, "anon_executable"),
             "memory.rwx_memory" => self.ingest_memory_region(event, "rwx_memory"),
-            "memory.deleted_file_mapping" => self.ingest_memory_region(event, "deleted_file_mapping"),
+            "memory.deleted_file_mapping" => {
+                self.ingest_memory_region(event, "deleted_file_mapping")
+            }
             "cgroup.memory_spike" => self.ingest_cgroup_event(event, "memory_spike"),
             "cgroup.cpu_abuse" => self.ingest_cgroup_event(event, "cpu_abuse"),
 
@@ -248,10 +250,7 @@ impl KnowledgeGraph {
                 if pid == 0 {
                     continue; // Invalid PID, skip
                 }
-                let comm = ev
-                    .get("comm")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let comm = ev.get("comm").and_then(|v| v.as_str()).unwrap_or("");
                 let uid = ev.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let proc_id = self.ensure_process(pid as u32, 0, comm, uid, incident.ts);
                 self.add_edge(Edge::new(
@@ -265,14 +264,8 @@ impl KnowledgeGraph {
             // Some incidents store evidence as a single object instead of array
             if let Some(pid) = ev_obj.get("pid").and_then(|v| v.as_u64()) {
                 if pid > 0 {
-                    let comm = ev_obj
-                        .get("comm")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let uid = ev_obj
-                        .get("uid")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
+                    let comm = ev_obj.get("comm").and_then(|v| v.as_str()).unwrap_or("");
+                    let uid = ev_obj.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     let proc_id = self.ensure_process(pid as u32, 0, comm, uid, incident.ts);
                     self.add_edge(Edge::new(
                         inc_id,
@@ -300,6 +293,7 @@ impl KnowledgeGraph {
 
     /// Ingest an AI decision into the graph.
     /// Updates the Incident node with the decision and creates action edges.
+    #[allow(clippy::too_many_arguments)]
     pub fn ingest_decision(
         &mut self,
         incident_id: &str,
@@ -1531,20 +1525,17 @@ impl KnowledgeGraph {
 
         // Dedup: look for existing ConnectedTo edge between these two IPs with same dst_port
         let port_val = serde_json::Value::from(dst_port);
-        let existing_idx = self
-            .outgoing
-            .get(&src_id)
-            .and_then(|idxs| {
-                idxs.iter().copied().find(|&i| {
-                    if let Some(e) = self.edges.get(i) {
-                        e.to == dst_id
-                            && e.relation == Relation::ConnectedTo
-                            && e.properties.get("dst_port") == Some(&port_val)
-                    } else {
-                        false
-                    }
-                })
-            });
+        let existing_idx = self.outgoing.get(&src_id).and_then(|idxs| {
+            idxs.iter().copied().find(|&i| {
+                if let Some(e) = self.edges.get(i) {
+                    e.to == dst_id
+                        && e.relation == Relation::ConnectedTo
+                        && e.properties.get("dst_port") == Some(&port_val)
+                } else {
+                    false
+                }
+            })
+        });
 
         if let Some(idx) = existing_idx {
             // Update existing edge: increment flow count and accumulate bytes

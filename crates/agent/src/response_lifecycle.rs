@@ -126,6 +126,7 @@ pub struct ActiveResponse {
 }
 
 impl LifecycleState {
+    #[allow(dead_code)] // used as serde default; also kept for explicit initialization callers
     fn default_active() -> Self {
         LifecycleState::Active
     }
@@ -594,6 +595,7 @@ impl ResponseLifecycle {
     /// `Active` or `RevertFailed` to `RevertPending { Manual }` and returns
     /// the action to execute. The caller must then call `mark_reverted` or
     /// `mark_revert_failed` to close the loop.
+    #[allow(dead_code)] // wired to POST /api/responses/:id/revert in spec 016
     pub fn request_manual_revert(&mut self, id: &str) -> Option<RevertAction> {
         let now = Utc::now();
         let entry = self.active.iter_mut().find(|r| r.id == id)?;
@@ -775,11 +777,13 @@ impl ResponseLifecycle {
     }
 
     /// Get all currently active responses.
+    #[allow(dead_code)] // snapshot read path for the dashboard lifecycle view
     pub fn list_active(&self) -> &[ActiveResponse] {
         &self.active
     }
 
     /// Get recent history of completed (expired/reverted) responses.
+    #[allow(dead_code)] // snapshot read path for the dashboard history drawer
     pub fn list_history(&self) -> &VecDeque<CompletedResponse> {
         &self.history
     }
@@ -792,6 +796,7 @@ impl ResponseLifecycle {
     }
 
     /// Generate Prometheus metrics lines.
+    #[allow(dead_code)] // exposed by /metrics endpoint in spec 016
     pub fn to_prometheus_lines(&self) -> String {
         let mut out = String::new();
 
@@ -1291,24 +1296,20 @@ mod tests {
             // ──── iptables (VERIFIED on iptables-1.8.10) ────
             // `sudo iptables -D INPUT -s 198.51.100.42 -j DROP` → exit 1
             "iptables: Bad rule (does a matching rule exist in that chain?).",
-
             // ──── nftables (VERIFIED on nft-1.0.9) ────
             // `sudo nft delete rule inet iwtest input handle <gone>` → exit 1
             "Error: Could not process rule: No such file or directory",
-
             // ──── bpftool (VERIFIED on bpftool from kernel 6.8) ────
             // `sudo bpftool map delete pinned <missing_path> key ...` → exit 255
             "Error: bpf obj get (/tmp/nonexistent_map): No such file or directory",
             // `sudo bpftool map delete pinned <real_path> key <missing>` → exit 254
             "Error: delete failed: No such file or directory",
-
             // ──── ufw (defense-in-depth only) ────
             // In practice ufw exits 0 for delete-non-existent so this path
             // is never hit via run_cmd. Kept in case a future ufw version
             // starts returning non-zero, or a wrapper forwards the message
             // through some stderr-carrying channel.
             "ERROR: Could not delete non-existent rule",
-
             // ──── defense-in-depth: plausible variants ────
             "iptables v1.8.7: No chain/target/match by that name.",
             "Error: Could not process rule: No such process",
@@ -1366,10 +1367,7 @@ mod tests {
         assert_eq!(active[0]["state"]["attempts"], 1);
 
         // Write to temp dir and reload.
-        let tmp = std::env::temp_dir().join(format!(
-            "innerwarden-test-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("innerwarden-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(
             tmp.join("responses.json"),
@@ -1393,10 +1391,8 @@ mod tests {
         // Backwards-compat: snapshots from before the state machine don't
         // have a `state` field. Those entries must load as Active so legacy
         // responses.json files Just Work on first run after upgrade.
-        let tmp = std::env::temp_dir().join(format!(
-            "innerwarden-test-legacy-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("innerwarden-test-legacy-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let legacy = serde_json::json!({
             "active": [{

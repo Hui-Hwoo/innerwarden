@@ -217,7 +217,7 @@ fn connect_to_event(
     let mut tags = vec!["ebpf".to_string(), "network".to_string()];
     let mut entities = vec![
         EntityRef::ip(dst_ip.to_string()),
-        EntityRef::user(&uid_to_name(uid)),
+        EntityRef::user(uid_to_name(uid)),
     ];
     if let Some(cid) = container_id {
         tags.push("container".to_string());
@@ -281,7 +281,7 @@ fn file_open_to_event(
     }
 
     let mut tags = vec!["ebpf".to_string(), "file".to_string()];
-    let mut entities = vec![EntityRef::user(&uid_to_name(uid))];
+    let mut entities = vec![EntityRef::user(uid_to_name(uid))];
     entities.push(EntityRef::path(filename));
     if let Some(cid) = container_id {
         tags.push("container".to_string());

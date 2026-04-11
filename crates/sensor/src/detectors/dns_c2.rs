@@ -306,8 +306,7 @@ mod tests {
             let result = det.process(&e);
             if i >= 5 {
                 // Should eventually trigger
-                if result.is_some() {
-                    let inc = result.unwrap();
+                if let Some(inc) = result {
                     assert!(inc.incident_id.contains("dns_c2"));
                     assert!(inc.tags.contains(&"T1071.004".into()));
                     return;

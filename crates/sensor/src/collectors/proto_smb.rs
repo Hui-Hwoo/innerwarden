@@ -3,6 +3,10 @@
 //! Detects SMB lateral movement patterns: file access, share enumeration,
 //! remote execution via named pipes (psexec, smbexec).
 //! Works on any port (not just 445).
+//!
+//! Consumed by the Linux-only tcp_stream `run()` loop. See note in
+//! `file_extract.rs` for why dead_code is silenced on non-Linux builds.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 /// Parsed SMB session info.
 #[derive(Debug, Clone)]

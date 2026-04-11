@@ -3,7 +3,9 @@
 use super::*;
 
 /// GET /api/honeypot/sessions - list honeypot sessions from the honeypot/ subdirectory.
-pub(super) async fn api_honeypot_sessions(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_honeypot_sessions(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let honeypot_dir = state.data_dir.join("honeypot");
 
     // Collect blocked IPs from knowledge graph (Phase 6A: no JSONL reads).
@@ -58,7 +60,9 @@ pub(super) async fn api_honeypot_sessions(State(state): State<DashboardState>) -
     }
 
     // Helper: extract commands + auth_attempts from a .jsonl evidence file
-pub(super) async fn read_evidence(path: &std::path::Path) -> (Vec<String>, usize, String, String) {
+    pub(super) async fn read_evidence(
+        path: &std::path::Path,
+    ) -> (Vec<String>, usize, String, String) {
         let mut commands: Vec<String> = Vec::new();
         let mut auth_count = 0usize;
         let mut ts = String::new();
@@ -180,7 +184,9 @@ pub(super) async fn read_evidence(path: &std::path::Path) -> (Vec<String>, usize
     Json(serde_json::json!({ "sessions": sessions }))
 }
 /// GET /api/admin-actions - recent admin action entries for compliance view.
-pub(super) async fn api_admin_actions(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_admin_actions(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let path = state.data_dir.join(format!("admin-actions-{date}.jsonl"));
     let entries = read_jsonl::<AdminActionEntry>(&path);
@@ -203,7 +209,9 @@ pub(super) async fn api_admin_actions(State(state): State<DashboardState>) -> Js
 }
 
 /// GET /api/advisory-cache - current advisory cache for compliance view.
-pub(super) async fn api_advisory_cache(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_advisory_cache(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let cache = state
         .advisory_cache
         .read()

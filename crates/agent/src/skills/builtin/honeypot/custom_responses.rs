@@ -1,5 +1,10 @@
 //! Custom honeypot responses loaded from YAML files.
 //!
+//! Module scaffolding — the YAML loader and response types are defined
+//! but not yet wired into the fake-shell / fake-HTTP pipelines. They will
+//! be consumed once custom-responses integration lands. Until then, the
+//! items are retained as a documented API surface.
+//!
 //! Operators can drop YAML files in /etc/innerwarden/honeypot.d/ to customize
 //! the honeypot behavior without modifying code:
 //!
@@ -30,6 +35,8 @@
 //!     content_type: "application/json"
 //!     body: '[{"id":1,"name":"admin","role":"superadmin"}]'
 //! ```
+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::Path;

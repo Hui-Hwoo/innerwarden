@@ -2,9 +2,9 @@ pub(crate) mod state;
 pub(crate) mod types;
 
 // Re-export types used by other modules in the crate.
+pub use auth::generate_password_hash_interactive;
 pub use state::{AgentGuardAlert, DashboardActionConfig, DeepSecuritySnapshot};
 pub use types::AdvisoryEntry;
-pub use auth::generate_password_hash_interactive;
 
 #[allow(unused_imports)]
 use state::*;
@@ -55,7 +55,6 @@ use sse::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use anyhow::{Context, Result};
@@ -72,18 +71,17 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use chrono::{DateTime, Datelike, Utc};
-use rand_core::{OsRng, RngCore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 use tracing::{info, warn};
 
+#[cfg(test)]
 use crate::correlation::build_clusters;
 use crate::decisions::DecisionEntry;
 use crate::mitre;
 use crate::report::{self as report_mod, TrialReport};
-use crate::telemetry::TelemetrySnapshot;
 use innerwarden_core::audit::{append_admin_action, AdminActionEntry};
 use innerwarden_core::entities::{EntityRef, EntityType};
 use innerwarden_core::event::Severity;
@@ -177,7 +175,6 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
-
 
 // ---------------------------------------------------------------------------
 // Server entry point
@@ -511,12 +508,6 @@ pub async fn serve(
         .context("dashboard server failed")
 }
 
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 
 async fn index() -> impl IntoResponse {
@@ -530,17 +521,17 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn serve_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        APP_CSS,
-    )
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS)
 }
 
 macro_rules! js_handler {
     ($name:ident, $content:expr) => {
         async fn $name() -> impl IntoResponse {
             (
-                [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+                [(
+                    header::CONTENT_TYPE,
+                    "application/javascript; charset=utf-8",
+                )],
                 $content,
             )
         }
@@ -566,27 +557,9 @@ js_handler!(serve_js_responses, JS_RESPONSES);
 js_handler!(serve_js_actions, JS_ACTIONS);
 js_handler!(serve_js_sse, JS_SSE);
 
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // D10 - Report API
 // ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // UI
@@ -613,7 +586,6 @@ const JS_RESPONSES: &str = include_str!("frontend/js/responses.js");
 const JS_ACTIONS: &str = include_str!("frontend/js/actions.js");
 const JS_SSE: &str = include_str!("frontend/js/sse.js");
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -621,6 +593,7 @@ const JS_SSE: &str = include_str!("frontend/js/sse.js");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::TelemetrySnapshot;
     use argon2::password_hash::SaltString;
     use argon2::PasswordHasher;
     use chrono::Utc;
@@ -629,6 +602,7 @@ mod tests {
         event::{Event, Severity},
         incident::Incident,
     };
+    use rand_core::{OsRng, RngCore};
     use tempfile::TempDir;
 
     // ── Existing tests (unchanged) ──────────────────────────────────────

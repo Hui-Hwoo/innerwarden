@@ -21,6 +21,7 @@ use innerwarden_core::{
 
 /// Anomaly types detected.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // many variants are constructed only by the Linux-gated tcp_stream run loop; kept as a closed set
 pub enum AnomalyType {
     /// Protocol detected doesn't match the expected port service.
     ProtocolMismatch,
@@ -156,12 +157,12 @@ impl ProtoAnomalyDetector {
                 .get("uri")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let method = event
+            let _method = event
                 .details
                 .get("method")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let user_agent = event
+            let _user_agent = event
                 .details
                 .get("user_agent")
                 .and_then(|v| v.as_str())
@@ -171,7 +172,7 @@ impl ProtoAnomalyDetector {
                 .get("client_bytes")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let server_bytes = event
+            let _server_bytes = event
                 .details
                 .get("server_bytes")
                 .and_then(|v| v.as_u64())
@@ -265,6 +266,7 @@ impl ProtoAnomalyDetector {
         incidents
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
         anomaly_type: AnomalyType,

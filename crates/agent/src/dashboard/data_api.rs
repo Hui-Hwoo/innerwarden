@@ -179,13 +179,11 @@ pub(super) async fn api_incidents(
                 // Effective severity: downgrade for handled incidents
                 let sev_lower = severity.to_lowercase();
                 let effective_severity = match outcome {
-                    "blocked" | "killed" | "contained" | "suspended" => {
-                        match sev_lower.as_str() {
-                            "critical" => "medium".to_string(),
-                            "high" => "low".to_string(),
-                            _ => sev_lower.clone(),
-                        }
-                    }
+                    "blocked" | "killed" | "contained" | "suspended" => match sev_lower.as_str() {
+                        "critical" => "medium".to_string(),
+                        "high" => "low".to_string(),
+                        _ => sev_lower.clone(),
+                    },
                     "ignored" => "info".to_string(),
                     _ => sev_lower.clone(), // open, monitored, honeypot: keep original
                 };
@@ -309,9 +307,7 @@ pub(super) async fn api_report_dates(State(state): State<DashboardState>) -> Jso
 // ---------------------------------------------------------------------------
 
 /// GET /api/briefing — returns the latest generated briefing
-pub(super) async fn api_briefing(
-    State(state): State<DashboardState>,
-) -> Json<serde_json::Value> {
+pub(super) async fn api_briefing(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     let briefing = state.latest_briefing.lock().await;
     match &*briefing {
         Some(b) => Json(serde_json::json!({
@@ -358,7 +354,8 @@ pub(super) async fn api_briefing_generate(
             "error": "AI provider not configured. Enable AI in agent.toml to generate briefings.",
         }));
     };
-    let system = "You are a senior security analyst. Generate a concise, actionable intelligence briefing.";
+    let system =
+        "You are a senior security analyst. Generate a concise, actionable intelligence briefing.";
     match ai.chat(system, &prompt).await {
         Ok(response) => {
             let b = crate::briefing::parse_briefing(&response, threat_level);

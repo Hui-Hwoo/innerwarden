@@ -3,7 +3,9 @@
 use super::*;
 
 /// `GET /api/defender-brain/recent` - recent brain suggestions with AI comparison.
-pub(super) async fn api_brain_recent(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_brain_recent(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let entries: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "brain-log.json")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -11,7 +13,9 @@ pub(super) async fn api_brain_recent(State(state): State<DashboardState>) -> Jso
 }
 
 /// `GET /api/defender-brain/stats` - brain performance statistics.
-pub(super) async fn api_brain_stats(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_brain_stats(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let entries: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "brain-log.json")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();

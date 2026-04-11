@@ -238,7 +238,7 @@ fn populate_counters_from_graph(
     // Incidents
     for id in graph.nodes_of_type(NodeType::Incident) {
         if let Some(Node::Incident {
-            incident_id,
+            incident_id: _,
             detector,
             decision,
             confidence,
@@ -818,8 +818,7 @@ static RECENT_WINDOW_CACHE: std::sync::OnceLock<
 
 fn recent_window_cache_handle(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<(String, u64), RecentWindow>> {
-    RECENT_WINDOW_CACHE
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    RECENT_WINDOW_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
@@ -843,7 +842,8 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
 
     // Phase 7 Gap 5: try graph snapshot for approximate 6h window.
     // event_timeline uses 5-min buckets (HH:MM keys). Sum last 72 buckets.
-    if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, analyzed_date) {
+    if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, analyzed_date)
+    {
         if graph.metrics().node_count > 0 {
             use crate::knowledge_graph::types::{Node, NodeType};
             let cutoff_key = cutoff.format("%H:%M").to_string();
@@ -865,7 +865,10 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
 
             for id in graph.nodes_of_type(NodeType::Incident) {
                 if let Some(Node::Incident {
-                    ts, severity, decision, ..
+                    ts,
+                    severity,
+                    decision,
+                    ..
                 }) = graph.get_node(id)
                 {
                     if *ts >= cutoff {
@@ -1096,17 +1099,16 @@ fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
     }
 
     // Phase 7: try dated graph snapshot first
-    let counters = if let Some(graph) =
-        crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date)
-    {
-        if graph.metrics().node_count > 0 {
-            counters_from_graph(&graph)
+    let counters =
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, date) {
+            if graph.metrics().node_count > 0 {
+                counters_from_graph(&graph)
+            } else {
+                counters_from_jsonl(data_dir, date)
+            }
         } else {
             counters_from_jsonl(data_dir, date)
-        }
-    } else {
-        counters_from_jsonl(data_dir, date)
-    };
+        };
 
     if let Ok(mut cache) = cache_handle().lock() {
         // Cap cache size to prevent unbounded growth

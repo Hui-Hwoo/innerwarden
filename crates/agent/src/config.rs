@@ -88,6 +88,7 @@ pub struct AgentConfig {
     pub briefing: BriefingConfig,
     /// Config signing verification (Active Defence).
     #[serde(default)]
+    #[allow(dead_code)] // parsed for future signing-verification integration
     pub config_signing: ConfigSigningConfig,
     /// Detectors that run graph-only (sensor version suppressed).
     /// After parallel validation, add detector names here to disable the sensor version.
@@ -392,6 +393,7 @@ impl Default for NarrativeConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // enabled/telegram consumed by briefing scheduler wiring in main.rs; kept accessible for inspection
 pub struct BriefingConfig {
     /// Enable daily AI intelligence briefing (default: true)
     #[serde(default = "default_true")]

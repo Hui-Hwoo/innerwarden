@@ -6,6 +6,13 @@
 //!
 //! This catches malware delivery that never touches disk (fileless via
 //! network → memory execution) by capturing the file FROM THE WIRE.
+//!
+//! The items in this module are consumed from the Linux-only TCP stream
+//! reassembly `run()` loop in `collectors::tcp_stream`. On non-Linux
+//! builds (local dev on macOS) `run()` is gated out, so clippy sees the
+//! types and helpers as dead. Silence that cleanly at the module level
+//! rather than gating each item with `cfg_attr`.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 
@@ -134,10 +141,8 @@ fn extract_from_http(fe: &FlowEvent, filestore_dir: &Path) -> Option<ExtractedFi
     }
 
     // Check for known packer signatures
-    if resp.body.len() >= 16 {
-        if resp.body.windows(3).any(|w| w == b"UPX") {
-            signals.push("upx_packed".into());
-        }
+    if resp.body.len() >= 16 && resp.body.windows(3).any(|w| w == b"UPX") {
+        signals.push("upx_packed".into());
     }
 
     // Store to filestore

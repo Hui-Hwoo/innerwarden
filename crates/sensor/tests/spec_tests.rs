@@ -158,9 +158,7 @@ fn run_test_case(name: &str, case: &Value) -> TestResult {
     {
         // Return expected result to count as passed
         let expected_alert = case["expected"]["alert"].as_bool().unwrap_or(false);
-        let expected_sev = case["expected"]["severity"]
-            .as_str()
-            .map(|s| parse_severity(s));
+        let expected_sev = case["expected"]["severity"].as_str().map(parse_severity);
         return TestResult {
             alerted: expected_alert,
             severity: expected_sev,
@@ -180,10 +178,10 @@ fn run_test_case(name: &str, case: &Value) -> TestResult {
         "c2_callback" => run_c2_callback(case),
         _ => {
             eprintln!("  [skip] no runner for detector '{}' yet", name);
-            return TestResult {
+            TestResult {
                 alerted: false,
                 severity: None,
-            };
+            }
         }
     }
 }

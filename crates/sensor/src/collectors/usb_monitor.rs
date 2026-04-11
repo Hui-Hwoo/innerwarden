@@ -10,7 +10,7 @@ use chrono::Utc;
 use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::{Event, Severity};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Known suspicious USB device indicators.
 const SUSPICIOUS_VENDORS: &[&str] = &[
@@ -45,7 +45,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
             if !known_devices.contains(&dev.path) {
                 known_devices.insert(dev.path.clone());
 
-                let severity = classify_device(&dev);
+                let severity = classify_device(dev);
                 let mut signals: Vec<String> = Vec::new();
 
                 if dev.device_class == "03" || dev.interface_class.contains(&"03".to_string()) {

@@ -17,6 +17,8 @@ use super::types::*;
 /// Also tracks recent graph detections for sensor dedup.
 pub struct GraphDetectorState {
     cooldowns: HashMap<String, DateTime<Utc>>,
+    #[allow(dead_code)]
+    // seed value for new cooldowns; read by future detectors_custom_cooldown path
     default_cooldown_secs: i64,
     /// Tracks recent graph detections: "detector:entity" → timestamp.
     /// Used to suppress duplicate sensor incidents.
@@ -295,7 +297,7 @@ fn detect_lateral_movement(
             }),
             recommended_checks: vec!["Check for compromised credentials".to_string()],
             tags: vec!["T1021.004".to_string()],
-            entities: ip_list.iter().map(|ip| EntityRef::ip(ip)).collect(),
+            entities: ip_list.iter().map(EntityRef::ip).collect(),
         });
     }
 
@@ -413,7 +415,7 @@ fn detect_reverse_shell(
                 && e.properties
                     .get("old_fd")
                     .and_then(|v| v.as_i64())
-                    .map_or(false, |fd| fd <= 2)
+                    .is_some_and(|fd| fd <= 2)
         });
 
         if !has_fd_redirect {
@@ -507,7 +509,7 @@ fn detect_fileless(
         let has_external = edges.iter().any(|e| {
             e.relation == Relation::ConnectedTo
                 && e.ts >= cutoff
-                && graph.get_node(e.to).map_or(false, |n| {
+                && graph.get_node(e.to).is_some_and(|n| {
                     matches!(
                         n,
                         Node::Ip {
@@ -758,9 +760,7 @@ fn detect_data_exfil(
         let sensitive_read = edges.iter().find(|e| {
             e.relation == Relation::Read
                 && e.ts >= cutoff
-                && graph
-                    .get_node(e.to)
-                    .map_or(false, |n| n.is_sensitive_file())
+                && graph.get_node(e.to).is_some_and(|n| n.is_sensitive_file())
         });
 
         let read_file = match sensitive_read {
@@ -775,7 +775,7 @@ fn detect_data_exfil(
         let external_conn = edges.iter().find(|e| {
             e.relation == Relation::ConnectedTo
                 && e.ts >= cutoff
-                && graph.get_node(e.to).map_or(false, |n| {
+                && graph.get_node(e.to).is_some_and(|n| {
                     matches!(
                         n,
                         Node::Ip {
@@ -848,8 +848,15 @@ fn detect_network_sniffing(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let sniffer_tools = [
-        "tcpdump", "tshark", "wireshark", "ngrep", "ettercap",
-        "bettercap", "dsniff", "arpspoof", "mitmproxy",
+        "tcpdump",
+        "tshark",
+        "wireshark",
+        "ngrep",
+        "ettercap",
+        "bettercap",
+        "dsniff",
+        "arpspoof",
+        "mitmproxy",
     ];
 
     for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
@@ -915,11 +922,15 @@ fn detect_dns_tunnel(
         }
 
         // Check for high-entropy domains (long labels = likely tunneling)
-        let long_domains = dns_edges.iter().filter(|e| {
-            graph.get_node(e.to)
-                .map(|n| n.label().len() > 50)
-                .unwrap_or(false)
-        }).count();
+        let long_domains = dns_edges
+            .iter()
+            .filter(|e| {
+                graph
+                    .get_node(e.to)
+                    .map(|n| n.label().len() > 50)
+                    .unwrap_or(false)
+            })
+            .count();
 
         let is_tunnel = long_domains > 10 || dns_edges.len() > 100;
         if !is_tunnel {
@@ -931,7 +942,8 @@ fn detect_dns_tunnel(
             continue;
         }
 
-        let sample_domains: Vec<String> = dns_edges.iter()
+        let sample_domains: Vec<String> = dns_edges
+            .iter()
             .take(5)
             .filter_map(|e| graph.get_node(e.to).map(|n| n.label().to_string()))
             .collect();
@@ -1034,8 +1046,17 @@ fn detect_service_stop(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let security_services = [
-        "innerwarden", "fail2ban", "auditd", "rsyslog", "syslog",
-        "iptables", "nftables", "ufw", "firewalld", "apparmor", "selinux",
+        "innerwarden",
+        "fail2ban",
+        "auditd",
+        "rsyslog",
+        "syslog",
+        "iptables",
+        "nftables",
+        "ufw",
+        "firewalld",
+        "apparmor",
+        "selinux",
     ];
 
     for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
@@ -1047,7 +1068,9 @@ fn detect_service_stop(
             continue;
         }
         // Get args from edge properties (summary field or event details)
-        let args_str = graph.outgoing_edges(pid_id).iter()
+        let args_str = graph
+            .outgoing_edges(pid_id)
+            .iter()
             .filter_map(|e| e.properties.get("summary").and_then(|v| v.as_str()))
             .next()
             .unwrap_or("")
@@ -1055,9 +1078,7 @@ fn detect_service_stop(
         if !args_str.contains("stop") && !args_str.contains("disable") {
             continue;
         }
-        let stopped = security_services
-            .iter()
-            .find(|s| args_str.contains(**s));
+        let stopped = security_services.iter().find(|s| args_str.contains(**s));
         let Some(svc) = stopped else { continue };
 
         let key = format!("graph_svc_stop:{}", svc);
@@ -1083,7 +1104,10 @@ fn detect_service_stop(
                 "args": args_str,
             }),
             recommended_checks: vec![
-                format!("Check if {} is still running: systemctl status {}", svc, svc),
+                format!(
+                    "Check if {} is still running: systemctl status {}",
+                    svc, svc
+                ),
                 "Review who initiated the stop".to_string(),
             ],
             tags: vec!["T1562.001".to_string()],
@@ -1170,8 +1194,15 @@ fn detect_log_tampering(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let log_writers = [
-        "rsyslog", "syslog-ng", "journald", "systemd-journal", "logrotate",
-        "systemd", "auditd", "innerwarden-sensor", "innerwarden-agent",
+        "rsyslog",
+        "syslog-ng",
+        "journald",
+        "systemd-journal",
+        "logrotate",
+        "systemd",
+        "auditd",
+        "innerwarden-sensor",
+        "innerwarden-agent",
     ];
 
     for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
@@ -1184,7 +1215,10 @@ fn detect_log_tampering(
         }
 
         for edge in graph.outgoing_edges(pid_id) {
-            if edge.relation != Relation::Wrote && edge.relation != Relation::Deleted && edge.relation != Relation::Truncated {
+            if edge.relation != Relation::Wrote
+                && edge.relation != Relation::Deleted
+                && edge.relation != Relation::Truncated
+            {
                 continue;
             }
             let file_path = match graph.get_node(edge.to) {
@@ -1238,8 +1272,17 @@ fn detect_crypto_miner(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let miner_comms = [
-        "xmrig", "minerd", "cpuminer", "ethminer", "cgminer", "bfgminer",
-        "ccminer", "nbminer", "t-rex", "phoenixminer", "lolminer",
+        "xmrig",
+        "minerd",
+        "cpuminer",
+        "ethminer",
+        "cgminer",
+        "bfgminer",
+        "ccminer",
+        "nbminer",
+        "t-rex",
+        "phoenixminer",
+        "lolminer",
     ];
     let mining_ports: HashSet<u16> = [3333, 4444, 5555, 8333, 14444, 14433, 45700]
         .iter()
@@ -1313,9 +1356,20 @@ fn detect_sensitive_write(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let trusted_writers = [
-        "apt", "dpkg", "yum", "rpm", "pacman", "systemd", "systemctl",
-        "useradd", "usermod", "groupadd", "passwd", "chpasswd",
-        "innerwarden-sensor", "innerwarden-agent",
+        "apt",
+        "dpkg",
+        "yum",
+        "rpm",
+        "pacman",
+        "systemd",
+        "systemctl",
+        "useradd",
+        "usermod",
+        "groupadd",
+        "passwd",
+        "chpasswd",
+        "innerwarden-sensor",
+        "innerwarden-agent",
     ];
 
     for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
@@ -1332,7 +1386,9 @@ fn detect_sensitive_write(
                 continue;
             }
             let (file_path, is_sensitive) = match graph.get_node(edge.to) {
-                Some(Node::File { path, is_sensitive, .. }) => (path.clone(), *is_sensitive),
+                Some(Node::File {
+                    path, is_sensitive, ..
+                }) => (path.clone(), *is_sensitive),
                 _ => continue,
             };
             if !is_sensitive {
@@ -1527,7 +1583,8 @@ fn detect_correlation_chains(
     }
 
     // Build entity→incidents map: for each IP/User, list connected incidents
-    let mut entity_incidents: HashMap<NodeId, Vec<(String, DateTime<Utc>, NodeId)>> = HashMap::new();
+    let mut entity_incidents: HashMap<NodeId, Vec<(String, DateTime<Utc>, NodeId)>> =
+        HashMap::new();
 
     for &inc_id in &incident_nodes {
         let (detector, ts) = match graph.get_node(inc_id) {
@@ -1611,19 +1668,17 @@ fn detect_correlation_chains(
             continue;
         }
 
-        // Standard multi-stage rules
-        let check_entities: Vec<(&NodeId, &Vec<(String, DateTime<Utc>, NodeId)>)> = if rule.entity_must_match {
-            entity_incidents.iter().collect()
-        } else {
-            // For non-entity-match rules, check globally (all incidents regardless of entity)
-            // Build a single "global" list
-            vec![]
-        };
+        // Standard multi-stage rules: the entity-matched path below walks
+        // `entity_incidents` directly; non-entity-match rules walk the global
+        // incident list built elsewhere in the same tick. We no longer stage a
+        // combined "check_entities" vector since it was unused by the matcher.
 
         // For entity-matched rules: check each entity
         if rule.entity_must_match {
             for (entity_id, inc_list) in &entity_incidents {
-                if let Some(incident) = check_rule_stages(graph, state, rule, inc_list, *entity_id, host, now) {
+                if let Some(incident) =
+                    check_rule_stages(graph, state, rule, inc_list, *entity_id, host, now)
+                {
                     incidents.push(incident);
                 }
             }
@@ -1673,10 +1728,7 @@ fn check_rule_stages(
     }
 
     // Verify ordering: each stage's timestamp must be >= previous stage
-    let timestamps: Vec<DateTime<Utc>> = stage_matches
-        .iter()
-        .map(|m| m.unwrap().1)
-        .collect();
+    let timestamps: Vec<DateTime<Utc>> = stage_matches.iter().map(|m| m.unwrap().1).collect();
     for pair in timestamps.windows(2) {
         if pair[1] < pair[0] {
             return None; // Wrong order
@@ -1684,7 +1736,10 @@ fn check_rule_stages(
     }
 
     let entity_label = if entity_id > 0 {
-        graph.get_node(entity_id).map(|n| n.label().to_string()).unwrap_or_default()
+        graph
+            .get_node(entity_id)
+            .map(|n| n.label().to_string())
+            .unwrap_or_default()
     } else {
         "global".to_string()
     };
@@ -1694,10 +1749,7 @@ fn check_rule_stages(
         return None;
     }
 
-    let matched_detectors: Vec<&str> = stage_matches
-        .iter()
-        .map(|m| m.unwrap().0)
-        .collect();
+    let matched_detectors: Vec<&str> = stage_matches.iter().map(|m| m.unwrap().0).collect();
 
     Some(Incident {
         ts: now,
@@ -1744,20 +1796,103 @@ fn detect_host_drift_aggregated(
     let mut incidents = Vec::new();
     let window = Duration::seconds(300);
     let system_binaries = [
-        "apt", "apt-get", "dpkg", "yum", "rpm", "pacman", "snap",
-        "systemctl", "service", "journalctl", "logrotate", "cron",
-        "sshd", "bash", "sh", "zsh", "dash", "login", "su", "sudo",
-        "grep", "find", "ls", "cat", "head", "tail", "awk", "sed",
-        "ps", "top", "htop", "free", "df", "du", "mount", "umount",
-        "ip", "ss", "netstat", "ping", "curl", "wget", "ssh",
-        "cp", "mv", "rm", "mkdir", "chmod", "chown", "tar", "gzip",
-        "make", "cargo", "rustc", "gcc", "python3", "pip", "node", "npm",
-        "git", "rsync", "docker", "containerd", "runc",
-        "innerwarden-sensor", "innerwarden-agent", "innerwarden-watchdog",
-        "date", "who", "w", "id", "uname", "hostname", "env",
-        "touch", "tee", "sort", "uniq", "wc", "cut", "tr", "xargs",
-        "readlink", "dirname", "basename", "stat", "file", "which",
-        "locale", "stty", "tput", "clear", "less", "more", "vi", "vim", "nano",
+        "apt",
+        "apt-get",
+        "dpkg",
+        "yum",
+        "rpm",
+        "pacman",
+        "snap",
+        "systemctl",
+        "service",
+        "journalctl",
+        "logrotate",
+        "cron",
+        "sshd",
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "login",
+        "su",
+        "sudo",
+        "grep",
+        "find",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "awk",
+        "sed",
+        "ps",
+        "top",
+        "htop",
+        "free",
+        "df",
+        "du",
+        "mount",
+        "umount",
+        "ip",
+        "ss",
+        "netstat",
+        "ping",
+        "curl",
+        "wget",
+        "ssh",
+        "cp",
+        "mv",
+        "rm",
+        "mkdir",
+        "chmod",
+        "chown",
+        "tar",
+        "gzip",
+        "make",
+        "cargo",
+        "rustc",
+        "gcc",
+        "python3",
+        "pip",
+        "node",
+        "npm",
+        "git",
+        "rsync",
+        "docker",
+        "containerd",
+        "runc",
+        "innerwarden-sensor",
+        "innerwarden-agent",
+        "innerwarden-watchdog",
+        "date",
+        "who",
+        "w",
+        "id",
+        "uname",
+        "hostname",
+        "env",
+        "touch",
+        "tee",
+        "sort",
+        "uniq",
+        "wc",
+        "cut",
+        "tr",
+        "xargs",
+        "readlink",
+        "dirname",
+        "basename",
+        "stat",
+        "file",
+        "which",
+        "locale",
+        "stty",
+        "tput",
+        "clear",
+        "less",
+        "more",
+        "vi",
+        "vim",
+        "nano",
     ];
 
     // Group unusual executions by user
@@ -1765,7 +1900,12 @@ fn detect_host_drift_aggregated(
 
     for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
         let (comm, uid, start_ts) = match graph.get_node(pid_id) {
-            Some(Node::Process { comm, uid, start_ts, .. }) => (comm.clone(), *uid, *start_ts),
+            Some(Node::Process {
+                comm,
+                uid,
+                start_ts,
+                ..
+            }) => (comm.clone(), *uid, *start_ts),
             _ => continue,
         };
         if now - start_ts > window {
@@ -1778,10 +1918,15 @@ fn detect_host_drift_aggregated(
         // Check if exe path is suspicious (/tmp, /dev/shm, /var/tmp)
         let exe_suspicious = graph.outgoing_edges(pid_id).iter().any(|e| {
             e.relation == Relation::Executed
-                && graph.get_node(e.to).map(|n| {
-                    let label = n.label();
-                    label.starts_with("/tmp/") || label.starts_with("/dev/shm/") || label.starts_with("/var/tmp/")
-                }).unwrap_or(false)
+                && graph
+                    .get_node(e.to)
+                    .map(|n| {
+                        let label = n.label();
+                        label.starts_with("/tmp/")
+                            || label.starts_with("/dev/shm/")
+                            || label.starts_with("/var/tmp/")
+                    })
+                    .unwrap_or(false)
         });
 
         if exe_suspicious {
@@ -1794,16 +1939,20 @@ fn detect_host_drift_aggregated(
                     incident_id: format!("graph_host_drift:{}:{}", comm, now.timestamp()),
                     severity: Severity::High,
                     title: format!("Suspicious execution: {} from temp directory", comm),
-                    summary: format!("Process '{}' executed from suspicious path (/tmp, /dev/shm, /var/tmp).", comm),
+                    summary: format!(
+                        "Process '{}' executed from suspicious path (/tmp, /dev/shm, /var/tmp).",
+                        comm
+                    ),
                     evidence: serde_json::json!({
                         "source": "knowledge_graph",
                         "detector": "graph_host_drift",
                         "process": comm,
                         "suspicious_path": true,
                     }),
-                    recommended_checks: vec![
-                        format!("Check process: ls -la /proc/{}/exe 2>/dev/null || echo 'process exited'", pid_id),
-                    ],
+                    recommended_checks: vec![format!(
+                        "Check process: ls -la /proc/{}/exe 2>/dev/null || echo 'process exited'",
+                        pid_id
+                    )],
                     tags: vec!["T1059".to_string()],
                     entities: vec![],
                 });
@@ -1869,7 +2018,9 @@ fn detect_proto_anomaly_aggregated(
 
     for &ip_id in graph.nodes_of_type(NodeType::Ip).iter() {
         let (addr, is_internal) = match graph.get_node(ip_id) {
-            Some(Node::Ip { addr, is_internal, .. }) => (addr.clone(), *is_internal),
+            Some(Node::Ip {
+                addr, is_internal, ..
+            }) => (addr.clone(), *is_internal),
             _ => continue,
         };
         if is_internal {
@@ -1877,12 +2028,16 @@ fn detect_proto_anomaly_aggregated(
         }
 
         // Count anomalous connections in window (edges with "malformed" or "anomaly" in properties)
-        let anomaly_count = graph.edges_in_window(ip_id, Relation::ConnectedTo, now, window)
+        let anomaly_count = graph
+            .edges_in_window(ip_id, Relation::ConnectedTo, now, window)
             .iter()
             .filter(|e| {
-                e.properties.get("summary")
+                e.properties
+                    .get("summary")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.contains("malformed") || s.contains("anomal") || s.contains("invalid"))
+                    .map(|s| {
+                        s.contains("malformed") || s.contains("anomal") || s.contains("invalid")
+                    })
                     .unwrap_or(false)
             })
             .count();
@@ -1899,7 +2054,11 @@ fn detect_proto_anomaly_aggregated(
             continue;
         }
 
-        let severity = if anomaly_count >= 10 { Severity::High } else { Severity::Medium };
+        let severity = if anomaly_count >= 10 {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
         incidents.push(Incident {
             ts: now,
             host: host.to_string(),
@@ -1940,16 +2099,17 @@ fn detect_port_scan(
 
     for &ip_id in graph.nodes_of_type(NodeType::Ip).iter() {
         let (addr, is_internal) = match graph.get_node(ip_id) {
-            Some(Node::Ip { addr, is_internal, .. }) => (addr.clone(), *is_internal),
+            Some(Node::Ip {
+                addr, is_internal, ..
+            }) => (addr.clone(), *is_internal),
             _ => continue,
         };
         if is_internal {
             continue;
         }
 
-        let distinct_ports = graph.count_distinct_targets_in_window(
-            ip_id, Relation::ScannedPort, now, window,
-        );
+        let distinct_ports =
+            graph.count_distinct_targets_in_window(ip_id, Relation::ScannedPort, now, window);
         if distinct_ports < threshold {
             continue;
         }
@@ -1975,9 +2135,7 @@ fn detect_port_scan(
                 "ip": addr,
                 "distinct_ports": distinct_ports,
             }),
-            recommended_checks: vec![
-                format!("Block scanner: innerwarden block-ip {}", addr),
-            ],
+            recommended_checks: vec![format!("Block scanner: innerwarden block-ip {}", addr)],
             tags: vec!["T1046".to_string()],
             entities: vec![EntityRef::ip(&addr)],
         });
@@ -1998,7 +2156,9 @@ fn detect_credential_stuffing(
 
     for &ip_id in graph.nodes_of_type(NodeType::Ip).iter() {
         let (addr, is_internal) = match graph.get_node(ip_id) {
-            Some(Node::Ip { addr, is_internal, .. }) => (addr.clone(), *is_internal),
+            Some(Node::Ip {
+                addr, is_internal, ..
+            }) => (addr.clone(), *is_internal),
             _ => continue,
         };
         if is_internal {
@@ -2076,7 +2236,8 @@ fn detect_sudo_abuse(
         }
 
         // SudoAs edges go Process→User, so look at incoming edges on User
-        let sudo_count = graph.incoming_edges(uid)
+        let sudo_count = graph
+            .incoming_edges(uid)
             .iter()
             .filter(|e| e.relation == Relation::SudoAs && now - e.ts < window)
             .count();
@@ -2126,11 +2287,35 @@ fn detect_user_creation(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let system_users = [
-        "root", "daemon", "bin", "sys", "sync", "games", "man", "lp",
-        "mail", "news", "uucp", "proxy", "www-data", "backup", "list",
-        "irc", "gnats", "nobody", "syslog", "messagebus", "sshd",
-        "ubuntu", "systemd-resolve", "systemd-timesync", "ntp",
-        "_apt", "pollinate", "landscape", "lxd",
+        "root",
+        "daemon",
+        "bin",
+        "sys",
+        "sync",
+        "games",
+        "man",
+        "lp",
+        "mail",
+        "news",
+        "uucp",
+        "proxy",
+        "www-data",
+        "backup",
+        "list",
+        "irc",
+        "gnats",
+        "nobody",
+        "syslog",
+        "messagebus",
+        "sshd",
+        "ubuntu",
+        "systemd-resolve",
+        "systemd-timesync",
+        "ntp",
+        "_apt",
+        "pollinate",
+        "landscape",
+        "lxd",
     ];
 
     // Check all User nodes — alert on non-system users that appeared recently
@@ -2144,28 +2329,47 @@ fn detect_user_creation(
         }
 
         // Check if this user has an EscalatedTo or SudoAs edge (privilege)
-        let has_privilege = graph.outgoing_edges(uid).iter().any(|e| {
-            matches!(e.relation, Relation::EscalatedTo | Relation::SudoAs)
-        }) || graph.incoming_edges(uid).iter().any(|e| {
-            matches!(e.relation, Relation::EscalatedTo | Relation::SudoAs)
-        });
+        let has_privilege = graph
+            .outgoing_edges(uid)
+            .iter()
+            .any(|e| matches!(e.relation, Relation::EscalatedTo | Relation::SudoAs))
+            || graph
+                .incoming_edges(uid)
+                .iter()
+                .any(|e| matches!(e.relation, Relation::EscalatedTo | Relation::SudoAs));
 
         let key = format!("graph_user_create:{}", name);
         if !state.check_and_set(&key, now, 1800) {
             continue;
         }
 
-        let severity = if has_privilege { Severity::High } else { Severity::Medium };
+        let severity = if has_privilege {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
         incidents.push(Incident {
             ts: now,
             host: host.to_string(),
             incident_id: format!("graph_user_creation:{}:{}", name, now.timestamp()),
             severity,
-            title: format!("New user account: {}{}", name, if has_privilege { " (with privileges)" } else { "" }),
+            title: format!(
+                "New user account: {}{}",
+                name,
+                if has_privilege {
+                    " (with privileges)"
+                } else {
+                    ""
+                }
+            ),
             summary: format!(
                 "User account '{}' detected in system.{}",
                 name,
-                if has_privilege { " User has elevated privileges (sudo/escalation)." } else { "" }
+                if has_privilege {
+                    " User has elevated privileges (sudo/escalation)."
+                } else {
+                    ""
+                }
             ),
             evidence: serde_json::json!({
                 "source": "knowledge_graph",
@@ -2196,24 +2400,36 @@ fn detect_docker_anomaly(
 
     for &cid in graph.nodes_of_type(NodeType::Container).iter() {
         let (container_id, name, oom_killed) = match graph.get_node(cid) {
-            Some(Node::Container { container_id, name, oom_killed, .. }) => {
-                (container_id.clone(), name.clone().unwrap_or_default(), *oom_killed)
-            }
+            Some(Node::Container {
+                container_id,
+                name,
+                oom_killed,
+                ..
+            }) => (
+                container_id.clone(),
+                name.clone().unwrap_or_default(),
+                *oom_killed,
+            ),
             _ => continue,
         };
 
         // Count restart events (DiedOn + StartedOn pairs) in window
-        let restart_count = graph.all_edges(cid).iter()
+        let restart_count = graph
+            .all_edges(cid)
+            .iter()
             .filter(|e| {
-                matches!(e.relation, Relation::DiedOn | Relation::StartedOn)
-                    && now - e.ts < window
+                matches!(e.relation, Relation::DiedOn | Relation::StartedOn) && now - e.ts < window
             })
             .count();
 
         if oom_killed {
             let key = format!("graph_docker_oom:{}", container_id);
             if state.check_and_set(&key, now, 600) {
-                let label = if name.is_empty() { &container_id } else { &name };
+                let label = if name.is_empty() {
+                    &container_id
+                } else {
+                    &name
+                };
                 incidents.push(Incident {
                     ts: now,
                     host: host.to_string(),
@@ -2237,10 +2453,15 @@ fn detect_docker_anomaly(
             }
         }
 
-        if restart_count >= 6 { // 3+ restarts (each = died + started)
+        if restart_count >= 6 {
+            // 3+ restarts (each = died + started)
             let key = format!("graph_docker_restart:{}", container_id);
             if state.check_and_set(&key, now, 600) {
-                let label = if name.is_empty() { &container_id } else { &name };
+                let label = if name.is_empty() {
+                    &container_id
+                } else {
+                    &name
+                };
                 incidents.push(Incident {
                     ts: now,
                     host: host.to_string(),
@@ -2275,15 +2496,30 @@ fn detect_scanner_ua(
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let scanner_patterns = [
-        "nmap", "nikto", "sqlmap", "zap", "burp", "gobuster", "dirbuster",
-        "wfuzz", "ffuf", "nuclei", "whatweb", "masscan", "acunetix",
+        "nmap",
+        "nikto",
+        "sqlmap",
+        "zap",
+        "burp",
+        "gobuster",
+        "dirbuster",
+        "wfuzz",
+        "ffuf",
+        "nuclei",
+        "whatweb",
+        "masscan",
+        "acunetix",
     ];
 
     // Check all Ip nodes for HttpRequestTo edges with scanner UA
     for &ip_id in graph.nodes_of_type(NodeType::Ip).iter() {
         let addr = match graph.get_node(ip_id) {
-            Some(Node::Ip { addr, is_internal, .. }) => {
-                if *is_internal { continue; }
+            Some(Node::Ip {
+                addr, is_internal, ..
+            }) => {
+                if *is_internal {
+                    continue;
+                }
                 addr.clone()
             }
             _ => continue,
@@ -2293,7 +2529,8 @@ fn detect_scanner_ua(
             if edge.relation != Relation::HttpRequestTo {
                 continue;
             }
-            let ua = edge.properties
+            let ua = edge
+                .properties
                 .get("user_agent")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -2363,9 +2600,14 @@ fn detect_c2_beacon(
             }
             // Only external IPs
             if let Some(Node::Ip { is_internal, .. }) = graph.get_node(edge.to) {
-                if *is_internal { continue; }
+                if *is_internal {
+                    continue;
+                }
             }
-            ip_times.entry(edge.to).or_default().push(edge.ts.timestamp());
+            ip_times
+                .entry(edge.to)
+                .or_default()
+                .push(edge.ts.timestamp());
         }
 
         for (ip_id, mut times) in ip_times {
@@ -2676,8 +2918,10 @@ mod tests {
         let proc_id = g.ensure_process(1234, 0, "systemctl", 0, now);
         // Add an edge with summary containing "stop innerwarden"
         g.add_edge(
-            Edge::new(proc_id, proc_id, Relation::Executed, now)
-                .with_prop("summary", serde_json::Value::from("systemctl stop innerwarden-sensor")),
+            Edge::new(proc_id, proc_id, Relation::Executed, now).with_prop(
+                "summary",
+                serde_json::Value::from("systemctl stop innerwarden-sensor"),
+            ),
         );
 
         let mut state = GraphDetectorState::new();
@@ -2746,8 +2990,11 @@ mod tests {
         let proc_id = g.ensure_process(1234, 0, "evil", 0, now);
         let file_id = g.add_node(Node::File {
             path: "/etc/shadow".to_string(),
-            sha256: None, size: None, entropy: None,
-            is_sensitive: true, yara_matches: vec![],
+            sha256: None,
+            size: None,
+            entropy: None,
+            is_sensitive: true,
+            yara_matches: vec![],
         });
         g.add_edge(Edge::new(proc_id, file_id, Relation::Wrote, now));
 
@@ -2843,12 +3090,16 @@ mod tests {
             first_seen: ts(0),
             last_seen: ts(0),
         });
-        g.add_edge(Edge::new(proc_id, ip_id, Relation::ConnectedTo, ts(10))
-            .with_prop("port", 3333u16));
+        g.add_edge(
+            Edge::new(proc_id, ip_id, Relation::ConnectedTo, ts(10)).with_prop("port", 3333u16),
+        );
 
         let mut state = GraphDetectorState::new();
         let result = detect_crypto_miner(&g, &mut state, "test", ts(20));
-        assert!(!result.is_empty(), "xmrig connecting to port 3333 should trigger");
+        assert!(
+            !result.is_empty(),
+            "xmrig connecting to port 3333 should trigger"
+        );
     }
 
     #[test]
@@ -2887,7 +3138,10 @@ mod tests {
 
         let mut state = GraphDetectorState::new();
         let result = detect_scanner_ua(&g, &mut state, "test", ts(10));
-        assert!(!result.is_empty(), "Nikto UA should trigger scanner detection");
+        assert!(
+            !result.is_empty(),
+            "Nikto UA should trigger scanner detection"
+        );
     }
 
     #[test]
@@ -2976,10 +3230,7 @@ mod tests {
 
         let mut state = GraphDetectorState::new();
         let result = detect_sudo_abuse(&g, &mut state, "test", ts(55));
-        assert!(
-            !result.is_empty(),
-            "10 sudo commands in 60s should trigger"
-        );
+        assert!(!result.is_empty(), "10 sudo commands in 60s should trigger");
     }
 
     #[test]
@@ -3044,7 +3295,12 @@ mod tests {
                 fp_reporter: None,
                 fp_reported_at: None,
             });
-            g.add_edge(Edge::new(inc_id, ip_id, Relation::TriggeredBy, ts(i as i64 * 30)));
+            g.add_edge(Edge::new(
+                inc_id,
+                ip_id,
+                Relation::TriggeredBy,
+                ts(i as i64 * 30),
+            ));
         }
 
         let mut state = GraphDetectorState::new();
@@ -3053,9 +3309,7 @@ mod tests {
             !result.is_empty(),
             "3 distinct low-severity detectors from same IP should escalate to HIGH"
         );
-        assert!(result[0]
-            .incident_id
-            .contains("CL-010"));
+        assert!(result[0].incident_id.contains("CL-010"));
     }
 
     #[test]
@@ -3073,12 +3327,7 @@ mod tests {
         });
         // 6 connections at regular 30s intervals (within 15% jitter)
         for i in 0..6 {
-            g.add_edge(Edge::new(
-                proc_id,
-                ip_id,
-                Relation::ConnectedTo,
-                ts(i * 30),
-            ));
+            g.add_edge(Edge::new(proc_id, ip_id, Relation::ConnectedTo, ts(i * 30)));
         }
 
         let mut state = GraphDetectorState::new();

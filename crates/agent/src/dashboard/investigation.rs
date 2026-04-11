@@ -83,9 +83,9 @@ pub(super) async fn api_clusters(
         let mut cluster_start = incs[0].0;
         let mut cluster_incs = vec![incs[0].clone()];
 
-        for i in 1..incs.len() {
-            if incs[i].0 - cluster_incs.last().unwrap().0 <= window {
-                cluster_incs.push(incs[i].clone());
+        for inc in incs.iter().skip(1) {
+            if inc.0 - cluster_incs.last().unwrap().0 <= window {
+                cluster_incs.push(inc.clone());
             } else {
                 if cluster_incs.len() >= 2 {
                     let dets: Vec<String> = cluster_incs
@@ -108,8 +108,8 @@ pub(super) async fn api_clusters(
                         incident_ids: ids,
                     });
                 }
-                cluster_start = incs[i].0;
-                cluster_incs = vec![incs[i].clone()];
+                cluster_start = inc.0;
+                cluster_incs = vec![inc.clone()];
             }
         }
         // Flush last cluster
@@ -283,7 +283,6 @@ pub(super) async fn api_export(
             .into_response(),
     }
 }
-use std::io::BufRead;
 
 // ---------------------------------------------------------------------------
 // Business logic - D2 entities / journey
@@ -502,6 +501,7 @@ pub(super) fn build_attackers_from_graph(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn build_attackers(
     data_dir: &Path,
     date: &str,
@@ -523,6 +523,7 @@ pub(super) fn build_attackers(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn build_pivots(
     data_dir: &Path,
     date: &str,
@@ -619,6 +620,7 @@ pub(super) fn build_pivots(
     items
 }
 
+#[cfg(test)]
 pub(super) fn build_cluster_items(
     data_dir: &Path,
     date: &str,
@@ -709,12 +711,12 @@ pub(super) fn build_cluster_items_from_graph(
                             r#type: innerwarden_core::entities::EntityType::User,
                             value: name.clone(),
                         },
-                        Node::Container { container_id, name, .. } => {
-                            innerwarden_core::entities::EntityRef {
-                                r#type: innerwarden_core::entities::EntityType::Container,
-                                value: name.as_deref().unwrap_or(container_id).to_string(),
-                            }
-                        }
+                        Node::Container {
+                            container_id, name, ..
+                        } => innerwarden_core::entities::EntityRef {
+                            r#type: innerwarden_core::entities::EntityType::Container,
+                            value: name.as_deref().unwrap_or(container_id).to_string(),
+                        },
                         Node::File { path, .. } => innerwarden_core::entities::EntityRef {
                             r#type: innerwarden_core::entities::EntityType::Path,
                             value: path.clone(),
@@ -1052,6 +1054,7 @@ pub(super) fn empty_journey(subject_type: PivotKind, subject: &str, date: &str) 
     }
 }
 
+#[cfg(test)]
 pub(super) fn build_journey(
     data_dir: &Path,
     date: &str,
@@ -1571,7 +1574,10 @@ pub(super) fn derive_chapters(entries: &[JourneyEntry]) -> Vec<JourneyChapter> {
 }
 
 /// Generate human-readable title / summary / highlights for a chapter.
-pub(super) fn describe_chapter(stage: &str, entries: &[JourneyEntry]) -> (String, String, Vec<String>) {
+pub(super) fn describe_chapter(
+    stage: &str,
+    entries: &[JourneyEntry],
+) -> (String, String, Vec<String>) {
     match stage {
         "reconnaissance" => {
             let title = "Reconnaissance activity".to_string();

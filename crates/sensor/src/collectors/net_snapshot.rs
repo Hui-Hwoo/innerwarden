@@ -11,13 +11,11 @@
 //! exactly which process is talking to the C2 server.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use chrono::Utc;
-use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::{Event, Severity};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// A single TCP connection with process ownership.
 #[derive(Debug, Clone)]

@@ -79,7 +79,7 @@ impl KnowledgeGraph {
             .iter()
             .filter(|e| {
                 e.relation == Relation::Wrote
-                    && self.get_node(e.to).map_or(false, |n| n.is_sensitive_file())
+                    && self.get_node(e.to).is_some_and(|n| n.is_sensitive_file())
             })
             .count() as u32;
 
@@ -173,10 +173,8 @@ impl KnowledgeGraph {
         }
 
         // Count distinct roots
-        let roots: std::collections::HashSet<NodeId> = node_ids
-            .iter()
-            .map(|&id| find(&mut parent, id))
-            .collect();
+        let roots: std::collections::HashSet<NodeId> =
+            node_ids.iter().map(|&id| find(&mut parent, id)).collect();
         roots.len() as u32
     }
 }

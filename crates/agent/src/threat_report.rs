@@ -273,7 +273,8 @@ pub fn generate_monthly(
         let week_idx = (day_offset / 7).min(3) as usize;
 
         // Try graph snapshot first
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str) {
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        {
             use crate::knowledge_graph::types::{Node, NodeType, Relation};
             let event_count = graph.edge_count() as u64; // approximate: edges ≈ events
             total_events += event_count;
@@ -284,7 +285,7 @@ pub fn generate_monthly(
 
             for id in graph.nodes_of_type(NodeType::Incident) {
                 if let Some(Node::Incident {
-                    incident_id,
+                    incident_id: _,
                     detector,
                     decision,
                     ..

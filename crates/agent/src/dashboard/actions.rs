@@ -7,7 +7,9 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 /// GET /api/action/config - exposes the current action mode to the UI (read-only).
-pub(super) async fn api_action_config(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+pub(super) async fn api_action_config(
+    State(state): State<DashboardState>,
+) -> Json<serde_json::Value> {
     let cfg = &state.action_cfg;
     let mode = if cfg.enabled {
         if cfg.dry_run {

@@ -1,6 +1,8 @@
 // Auto-extracted from mod.rs — dashboard auth handlers
 
 use super::*;
+use rand_core::OsRng;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 pub fn generate_password_hash_interactive() -> Result<()> {
     let password =
@@ -273,7 +275,10 @@ pub(super) fn rate_limited_response() -> Response {
 // ---------------------------------------------------------------------------
 
 /// POST /api/auth/login - authenticate with Basic Auth header, returns a session token.
-pub(super) async fn api_auth_login(State(state): State<DashboardState>, req: Request<Body>) -> Response {
+pub(super) async fn api_auth_login(
+    State(state): State<DashboardState>,
+    req: Request<Body>,
+) -> Response {
     // Auth must be configured for session login to work
     let auth = match DashboardAuth::try_from_env() {
         Ok(Some(a)) => a,
@@ -378,7 +383,10 @@ pub(super) async fn api_auth_login(State(state): State<DashboardState>, req: Req
 }
 
 /// POST /api/auth/logout - invalidate the current session.
-pub(super) async fn api_auth_logout(State(state): State<DashboardState>, req: Request<Body>) -> Response {
+pub(super) async fn api_auth_logout(
+    State(state): State<DashboardState>,
+    req: Request<Body>,
+) -> Response {
     let token = match extract_bearer_token(&req) {
         Some(t) => t.to_string(),
         None => {

@@ -8,7 +8,7 @@ use super::*;
 
 /// GET /sw.js - Service Worker that handles incoming push events.
 pub(super) async fn service_worker_js() -> impl IntoResponse {
-pub(super) const SW: &str = r#"
+    pub(super) const SW: &str = r#"
 self.addEventListener('push', function(event) {
   let data = {};
   try { data = event.data ? event.data.json() : {}; } catch (_) {}

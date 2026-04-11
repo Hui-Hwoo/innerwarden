@@ -1,6 +1,7 @@
 // Auto-extracted from mod.rs — dashboard live_feed handlers
 
 use super::*;
+use std::sync::atomic::Ordering;
 
 // ---------------------------------------------------------------------------
 // Public live-feed endpoints (CORS-enabled, no auth)
@@ -90,7 +91,7 @@ pub(super) struct LiveFeedResponse {
 
 /// `GET /api/live-feed` - last 200 incidents with totals for the day (public).
 pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResponse> {
-    let now = chrono::Utc::now();
+    let _now = chrono::Utc::now();
     let reputation_map = load_ip_reputation_map(&state.data_dir);
 
     // Read incidents from knowledge graph
@@ -114,7 +115,7 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
             decision_reason,
             decision_target,
             auto_executed,
-            detector,
+            detector: _,
             ..
         }) = graph.get_node(id)
         {
@@ -283,17 +284,24 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
                 technique_id: m.technique_id.to_string(),
                 technique_name: m.technique_name.to_string(),
             });
-            let outcome = dec.map(|d| match d.action_type.as_str() {
-                "block_ip" => "blocked",
-                "suspend_user_sudo" => "suspended",
-                "kill_process" => "killed",
-                "block_container" => "contained",
-                "monitor" => "monitored",
-                "honeypot" => "honeypot",
-                "ignore" => "ignored",
-                _ => "resolved",
-            }.to_string());
-            let det_name = if detector.is_empty() { None } else { Some(detector.to_string()) };
+            let outcome = dec.map(|d| {
+                match d.action_type.as_str() {
+                    "block_ip" => "blocked",
+                    "suspend_user_sudo" => "suspended",
+                    "kill_process" => "killed",
+                    "block_container" => "contained",
+                    "monitor" => "monitored",
+                    "honeypot" => "honeypot",
+                    "ignore" => "ignored",
+                    _ => "resolved",
+                }
+                .to_string()
+            });
+            let det_name = if detector.is_empty() {
+                None
+            } else {
+                Some(detector.to_string())
+            };
             LiveFeedItem {
                 ts: inc.ts.to_rfc3339(),
                 severity: format!("{:?}", inc.severity).to_lowercase(),
@@ -475,7 +483,9 @@ pub(super) struct HoneypotSession {
 }
 
 /// `GET /api/live-feed/honeypot` - recent honeypot sessions (public).
-pub(super) async fn api_live_feed_honeypot(State(state): State<DashboardState>) -> Json<Vec<HoneypotSession>> {
+pub(super) async fn api_live_feed_honeypot(
+    State(state): State<DashboardState>,
+) -> Json<Vec<HoneypotSession>> {
     let honeypot_dir = state.data_dir.join("honeypot");
     let mut sessions = Vec::new();
 
@@ -573,7 +583,9 @@ pub(super) struct MitreSummaryResponse {
 }
 
 /// `GET /api/live-feed/mitre` - MITRE ATT&CK tactic/technique summary for today (Phase 6A: graph-only).
-pub(super) async fn api_live_feed_mitre(State(state): State<DashboardState>) -> Json<MitreSummaryResponse> {
+pub(super) async fn api_live_feed_mitre(
+    State(state): State<DashboardState>,
+) -> Json<MitreSummaryResponse> {
     use crate::knowledge_graph::types::{Node, NodeType};
     let graph = state.knowledge_graph.read().unwrap();
 

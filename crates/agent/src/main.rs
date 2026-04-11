@@ -3278,7 +3278,7 @@ async fn process_narrative_tick(
 
     // Run graph-based detectors (parallel to sensor detectors)
     {
-        let (graph_incidents, host_label) = {
+        let (graph_incidents, _host_label) = {
             let graph = state.knowledge_graph.read().unwrap();
             let host = graph
                 .system_node()

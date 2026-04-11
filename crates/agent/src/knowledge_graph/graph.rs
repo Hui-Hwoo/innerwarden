@@ -305,6 +305,7 @@ impl KnowledgeGraph {
         idx
     }
 
+    #[allow(dead_code)] // part of KnowledgeGraph public surface; kept for future callers
     pub fn get_edge(&self, idx: usize) -> Option<&Edge> {
         self.edges.get(idx)
     }
@@ -353,6 +354,7 @@ impl KnowledgeGraph {
         self.incident_index.get(incident_id).copied()
     }
 
+    #[allow(dead_code)] // campaign lookup kept for spec 016 campaign tab wiring
     pub fn find_by_campaign(&self, campaign_id: &str) -> Option<NodeId> {
         self.campaign_index.get(campaign_id).copied()
     }
@@ -379,6 +381,7 @@ impl KnowledgeGraph {
     /// Phase 014-C: Link incidents in a correlation chain via CorrelatedWith edges.
     /// Given a list of incident IDs that form a multi-stage attack chain,
     /// connects each pair with a CorrelatedWith edge for graph traversal.
+    #[allow(dead_code)] // entity-overlap path wires chains today; kept for explicit chain-id usage
     pub fn link_correlated_incidents(&mut self, incident_ids: &[String], chain_id: &str) {
         let node_ids: Vec<NodeId> = incident_ids
             .iter()
@@ -855,6 +858,7 @@ impl KnowledgeGraph {
     }
 
     /// Nodes matching a type and predicate.
+    #[allow(dead_code)] // general query helper kept on KG public surface
     pub fn find_nodes(
         &self,
         node_type: NodeType,
@@ -918,6 +922,7 @@ impl KnowledgeGraph {
     }
 
     /// Current estimated memory usage in bytes.
+    #[allow(dead_code)] // exposed via metrics() but also retained for direct callers
     pub fn memory_estimate(&self) -> usize {
         self.memory_estimate
     }
