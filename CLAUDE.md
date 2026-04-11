@@ -34,15 +34,17 @@ make check        # clippy + fmt
 make replay-qa    # validacao E2E
 ```
 
-## Estado (2026-04-04)
+## Estado (2026-04-11)
 
-- 49 sensor detectors + 27 graph detectors (Phase 3A-C complete), 40 eBPF hooks, 65 MITRE IDs, 43 correlation rules + 10 graph correlation rules
+- 49 sensor detectors + 27 graph detectors (Phase 3A-C complete), 40 eBPF hooks, 65 MITRE IDs, 47 correlation rules (CL-001 to CL-047, includes 5 AlphaZero V4 discoveries + 3 hypervisor rules + 3 cross-module integration rules) + 10 graph correlation rules
 - Knowledge graph: in-memory directed graph (11 node types, 50 relation types, 60 event kinds mapped). Dashboard tab + AI triage integration + 58-feature autoencoder (10 graph structural features). **Phase 6 + Phase 7 complete**: graph is single source of truth. Daily dated snapshots (`graph-snapshot-YYYY-MM-DD.json`), 7-day retention. FP tracking in graph (false_positive, fp_reporter, fp_reported_at on Incident nodes). decision_cooldown, report, neural_lifecycle, threat_report all read from graph snapshots (JSONL fallback). ~30+ JSONL reads eliminated. Snapshot rotation (3 backups) + integrity check + corruption fallback.
+- 2475 tests passing
 - Server producao: ver config local (nao expor no repo publico)
 - Branches: main = stable, develop = bleeding edge
 - CI: `make check` + `make test` + `make spec-check`
 - Licenca: Apache-2.0 (migrado de BUSL-1.1 em 2026-04-03)
-- Release atual: v0.9.2
+- Release atual: v0.10.0
+- CTL reestruturado: 8 grupos (get, stream, action, trust, config, system, module, agent)
 
 ## Convencoes
 
