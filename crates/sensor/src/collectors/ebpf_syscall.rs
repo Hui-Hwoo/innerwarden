@@ -215,7 +215,10 @@ fn connect_to_event(
     }
 
     let mut tags = vec!["ebpf".to_string(), "network".to_string()];
-    let mut entities = vec![EntityRef::ip(dst_ip.to_string())];
+    let mut entities = vec![
+        EntityRef::ip(dst_ip.to_string()),
+        EntityRef::user(&uid_to_name(uid)),
+    ];
     if let Some(cid) = container_id {
         tags.push("container".to_string());
         entities.push(EntityRef::container(cid));
@@ -235,6 +238,16 @@ fn connect_to_event(
         details,
         tags,
         entities,
+    }
+}
+
+/// Resolve a uid to a user name for entity tagging. Used by eBPF events
+/// so that correlation rules with `entity_must_match` can match two events
+/// from the same user (e.g. file read + network connect → CL-008 exfil).
+fn uid_to_name(uid: u32) -> String {
+    match uid {
+        0 => "root".to_string(),
+        _ => format!("uid:{uid}"),
     }
 }
 
@@ -268,7 +281,8 @@ fn file_open_to_event(
     }
 
     let mut tags = vec!["ebpf".to_string(), "file".to_string()];
-    let mut entities = vec![];
+    let mut entities = vec![EntityRef::user(&uid_to_name(uid))];
+    entities.push(EntityRef::path(filename));
     if let Some(cid) = container_id {
         tags.push("container".to_string());
         entities.push(EntityRef::container(cid));
