@@ -116,9 +116,18 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
             decision_target,
             auto_executed,
             detector: _,
+            research_only,
             ..
         }) = graph.get_node(id)
         {
+            // Spec 015 follow-up: hide research_only incidents from the
+            // operator live feed. They still live in the graph (neural
+            // training + investigation views still see them) but don't
+            // pollute the Threats tab with self-traffic to Telegram,
+            // Cloudflare, AWS, Oracle peers, etc.
+            if *research_only {
+                continue;
+            }
             // Collect entities from TriggeredBy edges
             let entities: Vec<innerwarden_core::entities::EntityRef> = graph
                 .outgoing_edges(id)

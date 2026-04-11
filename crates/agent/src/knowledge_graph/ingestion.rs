@@ -29,6 +29,46 @@ fn detail_u16(event: &Event, key: &str) -> Option<u16> {
         .map(|v| v as u16)
 }
 
+/// Spec 015 follow-up: decide whether an incoming incident is research-only
+/// (hidden from the operator dashboard, still kept for neural training).
+///
+/// Two orthogonal rules:
+///
+/// 1. **Kill chain forming** (severity Medium with "Kill chain forming"
+///    title) — near-miss LSM patterns (2/3 bits set) that fire hundreds
+///    of times per hour. Valuable training signal, but the operator
+///    cannot act on them. Fully formed kill chains (severity Critical)
+///    stay user-visible.
+///
+/// 2. **Self-traffic** — the incident has ≥1 `Ip` entity AND every `Ip`
+///    entity is in the cloud/agent-service safelist. Mixed chains (one
+///    attacker IP + one Cloudflare IP) stay operator-visible.
+fn is_self_traffic_incident(incident: &Incident) -> bool {
+    use innerwarden_core::entities::EntityType;
+    use innerwarden_core::event::Severity;
+
+    // Rule 1: kill chain forming
+    if matches!(incident.severity, Severity::Medium)
+        && incident.incident_id.starts_with("kill_chain")
+        && incident.title.starts_with("Kill chain forming")
+    {
+        return true;
+    }
+
+    // Rule 2: self-traffic IPs
+    let ips: Vec<&str> = incident
+        .entities
+        .iter()
+        .filter(|e| e.r#type == EntityType::Ip)
+        .map(|e| e.value.as_str())
+        .collect();
+    if ips.is_empty() {
+        return false;
+    }
+    ips.iter()
+        .all(|ip| crate::cloud_safelist::is_self_traffic_ip(ip))
+}
+
 fn detail_u64(event: &Event, key: &str) -> Option<u64> {
     event.details.get(key).and_then(|v| v.as_u64())
 }
@@ -194,6 +234,13 @@ impl KnowledgeGraph {
             .unwrap_or("unknown")
             .to_string();
 
+        // Spec 015 follow-up: flag incidents whose only external entity is
+        // self-traffic (Telegram, Cloudflare, Oracle peers, GeoIP, AWS
+        // eu-west-1, Canonical) as research_only. They still land in the
+        // graph for neural training and investigation, but the operator
+        // dashboard filters them out so real threats are visible.
+        let research_only = is_self_traffic_incident(incident);
+
         let inc_id = self.upsert_node(Node::Incident {
             incident_id: incident.incident_id.clone(),
             detector,
@@ -211,6 +258,7 @@ impl KnowledgeGraph {
             false_positive: false,
             fp_reporter: None,
             fp_reported_at: None,
+            research_only,
         });
 
         // Create TriggeredBy edges from Incident to each entity
@@ -554,18 +602,26 @@ impl KnowledgeGraph {
             return;
         }
 
-        let user_id = self.ensure_user(&user_str);
         let ip_id = self.ensure_ip(&ip_str, event.ts);
 
+        if !success {
+            // Spec 015: failed SSH auth must NOT create User nodes, because
+            // attacker brute-force dictionaries (admin, ansible, blockchain,
+            // bot, ...) would otherwise pollute the User namespace forever
+            // and feed the removed detect_user_creation false-positive loop.
+            // Record the attempted username on the Ip node instead, where it
+            // belongs semantically (attacker fingerprinting data).
+            self.record_attempted_username(ip_id, &user_str);
+            return;
+        }
+
+        // Successful login: the user is a real local account. Create/fetch
+        // the User node and record the LoggedInFrom edge as before.
+        let user_id = self.ensure_user(&user_str);
         let mut edge = Edge::new(user_id, ip_id, Relation::LoggedInFrom, event.ts);
-        edge = edge.with_prop("success", serde_json::Value::from(success));
+        edge = edge.with_prop("success", serde_json::Value::from(true));
         if let Some(method) = detail_str(event, "method") {
             edge = edge.with_prop("method", serde_json::Value::from(method));
-        }
-        if !success {
-            if let Some(reason) = detail_str(event, "reason") {
-                edge = edge.with_prop("reason", serde_json::Value::from(reason));
-            }
         }
         self.add_edge(edge);
     }
@@ -1636,17 +1692,89 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_ssh_login() {
+    fn test_ingest_ssh_login_success_creates_user() {
+        // Successful login: User node created, LoggedInFrom edge added.
         let mut g = KnowledgeGraph::new();
         let event = make_event(
-            "ssh.login_failed",
-            serde_json::json!({"ip": "185.1.1.1", "user": "root", "reason": "invalid password", "method": "password"}),
+            "ssh.login_success",
+            serde_json::json!({"ip": "185.1.1.1", "user": "root", "method": "password"}),
         );
         g.ingest(&event);
 
         assert!(g.find_by_ip("185.1.1.1").is_some());
-        assert!(g.find_by_user("root").is_some());
-        assert_eq!(g.edge_count(), 1); // LoggedInFrom
+        assert!(
+            g.find_by_user("root").is_some(),
+            "successful login should create User node"
+        );
+        assert_eq!(g.edge_count(), 1, "LoggedInFrom edge expected");
+    }
+
+    #[test]
+    fn test_ingest_ssh_login_failed_does_not_create_user() {
+        // Spec 015 Bug 2: failed SSH auth must NOT create User nodes.
+        // The attempted username lands in Ip.attempted_usernames instead.
+        let mut g = KnowledgeGraph::new();
+        let event = make_event(
+            "ssh.login_failed",
+            serde_json::json!({
+                "ip": "185.1.1.1",
+                "user": "admin",
+                "reason": "invalid password",
+                "method": "password"
+            }),
+        );
+        g.ingest(&event);
+
+        let ip_id = g.find_by_ip("185.1.1.1").expect("Ip node expected");
+        assert!(
+            g.find_by_user("admin").is_none(),
+            "failed login must NOT create a User node for the attempted username"
+        );
+        assert_eq!(
+            g.edge_count(),
+            0,
+            "no LoggedInFrom edge is created for failed auth"
+        );
+        let attempted = g.attempted_usernames_for_ip(ip_id);
+        assert_eq!(attempted, vec!["admin".to_string()]);
+    }
+
+    #[test]
+    fn test_ingest_ssh_login_failed_dedups_and_caps_attempts() {
+        // Multiple failed auths from the same IP accumulate usernames,
+        // deduplicated and LIFO-capped.
+        let mut g = KnowledgeGraph::new();
+        let usernames = [
+            "admin", "ansible", "root", "admin", "bot", "ansible", "oracle",
+        ];
+        for u in usernames {
+            let e = make_event(
+                "ssh.login_failed",
+                serde_json::json!({
+                    "ip": "185.1.1.1",
+                    "user": u,
+                    "reason": "invalid_user",
+                }),
+            );
+            g.ingest(&e);
+        }
+
+        let ip_id = g.find_by_ip("185.1.1.1").unwrap();
+        let attempted = g.attempted_usernames_for_ip(ip_id);
+        // No User nodes, no LoggedInFrom edges.
+        assert_eq!(g.nodes_of_type(NodeType::User).len(), 0);
+        assert_eq!(g.edge_count(), 0);
+        // Dedup: unique set preserved, last-write-wins order.
+        assert_eq!(
+            attempted,
+            vec![
+                "root".to_string(),
+                "admin".to_string(),
+                "bot".to_string(),
+                "ansible".to_string(),
+                "oracle".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1752,6 +1880,103 @@ mod tests {
 
         assert!(g.system_node().is_some());
         assert_eq!(g.edge_count(), 1); // InsertedOn
+    }
+
+    #[test]
+    fn test_ingest_incident_flags_self_traffic_as_research_only() {
+        // Spec 015 follow-up: an incident whose only external IP is
+        // Telegram / Cloudflare / OCI peers must land in the graph with
+        // research_only=true so the operator dashboard hides it.
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let telegram_inc = Incident {
+            ts: Utc::now(),
+            host: "prod-01".to_string(),
+            incident_id: "graph_data_exfil:tokio-rt-worker:12345".to_string(),
+            severity: Severity::Critical,
+            title: "Data exfil → 149.154.166.110".to_string(),
+            summary: String::new(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: vec!["T1041".to_string()],
+            entities: vec![EntityRef::ip("149.154.166.110")], // Telegram
+        };
+        g.ingest_incident(&telegram_inc);
+        let id = g
+            .find_by_incident("graph_data_exfil:tokio-rt-worker:12345")
+            .expect("incident node");
+        match g.get_node(id) {
+            Some(Node::Incident { research_only, .. }) => {
+                assert!(
+                    *research_only,
+                    "Telegram self-traffic must be flagged as research_only"
+                );
+            }
+            _ => panic!("expected Incident node"),
+        }
+    }
+
+    #[test]
+    fn test_ingest_incident_real_attacker_stays_operator_visible() {
+        // Opposite case: a real external IP must stay operator-visible.
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let attacker_inc = Incident {
+            ts: Utc::now(),
+            host: "prod-01".to_string(),
+            incident_id: "ssh_bruteforce:185.113.139.51:999".to_string(),
+            severity: Severity::High,
+            title: "SSH brute force".to_string(),
+            summary: String::new(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: vec!["T1110.001".to_string()],
+            entities: vec![EntityRef::ip("185.113.139.51")],
+        };
+        g.ingest_incident(&attacker_inc);
+        let id = g
+            .find_by_incident("ssh_bruteforce:185.113.139.51:999")
+            .unwrap();
+        match g.get_node(id) {
+            Some(Node::Incident { research_only, .. }) => {
+                assert!(!*research_only, "real attacker must stay visible");
+            }
+            _ => panic!("expected Incident node"),
+        }
+    }
+
+    #[test]
+    fn test_ingest_incident_mixed_entities_stays_visible() {
+        // Conservative rule: if an incident touches ANY non-self IP, show it.
+        // We only hide incidents where *every* external IP is self-traffic.
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let mixed = Incident {
+            ts: Utc::now(),
+            host: "prod-01".to_string(),
+            incident_id: "cross_layer_chain:mixed:1".to_string(),
+            severity: Severity::High,
+            title: "Mixed chain".to_string(),
+            summary: String::new(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: vec![],
+            entities: vec![
+                EntityRef::ip("149.154.166.110"), // Telegram self-traffic
+                EntityRef::ip("185.113.139.51"),  // real attacker
+            ],
+        };
+        g.ingest_incident(&mixed);
+        let id = g.find_by_incident("cross_layer_chain:mixed:1").unwrap();
+        match g.get_node(id) {
+            Some(Node::Incident { research_only, .. }) => {
+                assert!(!*research_only, "mixed chain must stay visible");
+            }
+            _ => panic!("expected Incident node"),
+        }
     }
 
     #[test]

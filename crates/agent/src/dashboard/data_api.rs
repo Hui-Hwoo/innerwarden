@@ -64,9 +64,15 @@ pub(super) async fn api_overview(
             decision,
             severity,
             is_allowlisted,
+            research_only,
             ..
         }) = graph.get_node(id)
         {
+            // Spec 015 follow-up: skip research-only incidents so overview
+            // counts reflect actual operator workload, not self-traffic.
+            if *research_only {
+                continue;
+            }
             if *is_allowlisted {
                 allowlisted_count += 1;
             }
@@ -148,9 +154,16 @@ pub(super) async fn api_incidents(
                 decision,
                 confidence,
                 is_allowlisted,
+                research_only,
                 ..
             }) = graph.get_node(id)
             {
+                // Spec 015 follow-up: research-only incidents belong to
+                // the neural training / investigation views, not the
+                // operator incident list.
+                if *research_only {
+                    return None;
+                }
                 // Collect entities from TriggeredBy edges
                 let entities: Vec<String> = graph
                     .outgoing_edges(id)
@@ -407,9 +420,15 @@ pub(super) fn compute_overview_from_graph(
             decision,
             severity,
             is_allowlisted,
+            research_only,
             ..
         }) = graph.get_node(id)
         {
+            // Spec 015 follow-up: skip research-only incidents so overview
+            // counts reflect actual operator workload, not self-traffic.
+            if *research_only {
+                continue;
+            }
             if *is_allowlisted {
                 allowlisted_count += 1;
             }

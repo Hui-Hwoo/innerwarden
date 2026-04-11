@@ -65,6 +65,40 @@ const CLOUDFLARE_RANGES: &[&str] = &[
     "172.64.0.0/13",
 ];
 
+/// Agent-owned service endpoints — IPs the agent itself talks to for its
+/// notification, enrichment, and threat-intel pipelines. Traffic to these
+/// destinations is *self-traffic* and MUST NOT fire data-exfil / C2-beacon
+/// style detectors in the operator view. Added after spec 015 surfaced the
+/// self-detection pattern (see the dashboard flood on 2026-04-11 where the
+/// agent was flagging its own Telegram calls as "Data Exfil → CRITICAL").
+const AGENT_SERVICE_RANGES: &[&str] = &[
+    // Telegram (Bot API + MTProto) — AS62041
+    "149.154.160.0/20",
+    "91.108.0.0/16",
+    "91.108.4.0/22",
+    "91.108.56.0/22",
+    "95.161.64.0/20",
+    // ip-api.com (GeoIP enrichment used by crate::geoip)
+    "208.95.112.0/24",
+    // Canonical / Ubuntu archive + snapcraft + livepatch
+    "185.125.188.0/23",
+    "91.189.88.0/21",
+    "162.213.32.0/22",
+];
+
+/// Oracle Cloud peer ranges not already covered by CLOUD_PROVIDER_RANGES.
+/// These are the infrastructure peers of OCI instances (metadata, NTP,
+/// internal DNS, OKE control plane, etc.) that an OCI-hosted agent will
+/// regularly connect to. Keeping them separate from the main cloud list
+/// makes it obvious *why* they're in the safelist — they're the agent's
+/// own home provider, not some random customer workload.
+const ORACLE_PEER_RANGES: &[&str] = &[
+    "138.1.16.0/22",    // OCI peer range
+    "140.91.0.0/16",    // OCI London peers
+    "147.154.224.0/20", // OCI customer /20 that the server peers with
+    "193.122.0.0/15",   // OCI EU-London
+];
+
 /// Major cloud provider CIDR ranges that should not be auto-blocked.
 /// These are broad ranges — individual IPs may still be malicious,
 /// but auto-blocking risks collateral damage.
@@ -157,7 +191,12 @@ const CLOUD_PROVIDER_RANGES: &[&str] = &[
 pub fn init() {
     let mut ranges = Vec::new();
 
-    for cidr in CLOUDFLARE_RANGES.iter().chain(CLOUD_PROVIDER_RANGES.iter()) {
+    for cidr in CLOUDFLARE_RANGES
+        .iter()
+        .chain(CLOUD_PROVIDER_RANGES.iter())
+        .chain(AGENT_SERVICE_RANGES.iter())
+        .chain(ORACLE_PEER_RANGES.iter())
+    {
         if let Some(r) = CidrRange::from_str(cidr) {
             ranges.push(r);
         }
@@ -167,6 +206,33 @@ pub fn init() {
     let _ = CLOUD_RANGES.set(ranges);
     let _ = CLOUD_PROVIDER_COUNT.set(count);
     info!(ranges = count, "Cloud provider safelist loaded");
+}
+
+/// Returns true if the IP should be treated as *self-traffic* — either a
+/// known cloud provider, the agent's own notification / enrichment
+/// endpoints (Telegram, GeoIP), or the OCI peer ranges of the host the
+/// agent runs on.
+///
+/// Callers that generate operator-facing incidents should use this to
+/// flag the incident as `research_only` instead of surfacing it in the
+/// threats feed.
+pub fn is_self_traffic_ip(ip_str: &str) -> bool {
+    is_cloud_provider_ip(ip_str)
+}
+
+/// Returns true if `comm` is the agent itself or one of its spawned
+/// workers. Matches the graph detector convention (`detect_network_sniffing`)
+/// used in spec 015.
+#[allow(dead_code)] // reserved for future process-side self-filter unification
+pub fn is_agent_process(comm: &str) -> bool {
+    matches!(
+        comm,
+        "innerwarden-agent"
+            | "innerwarden-sensor"
+            | "innerwarden-watchdog"
+            | "tokio-rt-worker"
+            | "openclaw-gatewa"
+    )
 }
 
 /// Check if an IP belongs to a known cloud provider.
@@ -251,5 +317,63 @@ mod tests {
         assert_eq!(identify_provider("34.95.197.36"), Some("Google Cloud"));
         assert_eq!(identify_provider("52.1.1.1"), Some("AWS"));
         assert_eq!(identify_provider("20.12.41.6"), Some("Azure"));
+    }
+
+    #[test]
+    fn telegram_detected() {
+        // Spec 015 follow-up: Telegram Bot API must be recognized as
+        // self-traffic. Without this, 222+ false positives per day from
+        // the agent's own notification channel (149.154.166.110:443).
+        init();
+        assert!(is_self_traffic_ip("149.154.160.1"));
+        assert!(is_self_traffic_ip("149.154.166.110"));
+        assert!(is_self_traffic_ip("149.154.175.255"));
+        assert!(is_self_traffic_ip("91.108.4.200"));
+    }
+
+    #[test]
+    fn ip_api_com_detected() {
+        // GeoIP enrichment endpoint used by crate::geoip.
+        init();
+        assert!(is_self_traffic_ip("208.95.112.1"));
+    }
+
+    #[test]
+    fn canonical_detected() {
+        // Ubuntu apt archive + snapcraft + livepatch.
+        init();
+        assert!(is_self_traffic_ip("185.125.188.58"));
+        assert!(is_self_traffic_ip("91.189.88.1"));
+    }
+
+    #[test]
+    fn oracle_peer_range_detected() {
+        // OCI London peer ranges outside the main CLOUD_PROVIDER_RANGES
+        // list. These are the /20 the server peers with on its internal
+        // network, not random Oracle customer IPs.
+        init();
+        assert!(is_self_traffic_ip("147.154.225.94"));
+        assert!(is_self_traffic_ip("138.1.16.172"));
+        assert!(is_self_traffic_ip("140.91.26.100"));
+    }
+
+    #[test]
+    fn real_attacker_still_detected() {
+        // Safety net: random external IPs that are NOT cloud providers or
+        // agent services must still be reported to the operator.
+        init();
+        assert!(!is_self_traffic_ip("147.185.132.13")); // dashboard shows this as an attacker
+        assert!(!is_self_traffic_ip("198.235.24.154"));
+        assert!(!is_self_traffic_ip("185.113.139.51"));
+    }
+
+    #[test]
+    fn agent_process_recognition() {
+        assert!(is_agent_process("innerwarden-agent"));
+        assert!(is_agent_process("innerwarden-sensor"));
+        assert!(is_agent_process("tokio-rt-worker"));
+        assert!(is_agent_process("openclaw-gatewa"));
+        assert!(!is_agent_process("sshd"));
+        assert!(!is_agent_process("bash"));
     }
 }
