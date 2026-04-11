@@ -2771,6 +2771,7 @@ mod tests {
             is_tor: false,
             first_seen: ts(0),
             last_seen: ts(0),
+            attempted_usernames: Vec::new(),
         });
         g.add_edge(Edge::new(proc_id, ip_id, Relation::ConnectedTo, ts(1)));
 
@@ -3089,6 +3090,7 @@ mod tests {
             is_tor: false,
             first_seen: ts(0),
             last_seen: ts(0),
+            attempted_usernames: Vec::new(),
         });
         g.add_edge(
             Edge::new(proc_id, ip_id, Relation::ConnectedTo, ts(10)).with_prop("port", 3333u16),
@@ -3129,6 +3131,7 @@ mod tests {
             is_tor: false,
             first_seen: ts(0),
             last_seen: ts(0),
+            attempted_usernames: Vec::new(),
         });
         let sys_id = g.ensure_system("test-host");
         g.add_edge(
@@ -3197,6 +3200,7 @@ mod tests {
             is_tor: false,
             first_seen: ts(0),
             last_seen: ts(0),
+            attempted_usernames: Vec::new(),
         });
         // 5 distinct users with failed auth from same IP
         for i in 0..5 {
@@ -3271,6 +3275,7 @@ mod tests {
             is_tor: false,
             first_seen: ts(0),
             last_seen: ts(0),
+            attempted_usernames: Vec::new(),
         });
         // Create 3 incidents from different detectors all connected to same IP
         for (i, det) in ["port_scan", "user_agent_scanner", "discovery_burst"]
@@ -3324,6 +3329,7 @@ mod tests {
             is_tor: false,
             first_seen: ts(0),
             last_seen: ts(0),
+            attempted_usernames: Vec::new(),
         });
         // 6 connections at regular 30s intervals (within 15% jitter)
         for i in 0..6 {

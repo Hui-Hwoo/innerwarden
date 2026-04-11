@@ -554,18 +554,26 @@ impl KnowledgeGraph {
             return;
         }
 
-        let user_id = self.ensure_user(&user_str);
         let ip_id = self.ensure_ip(&ip_str, event.ts);
 
+        if !success {
+            // Spec 015: failed SSH auth must NOT create User nodes, because
+            // attacker brute-force dictionaries (admin, ansible, blockchain,
+            // bot, ...) would otherwise pollute the User namespace forever
+            // and feed the removed detect_user_creation false-positive loop.
+            // Record the attempted username on the Ip node instead, where it
+            // belongs semantically (attacker fingerprinting data).
+            self.record_attempted_username(ip_id, &user_str);
+            return;
+        }
+
+        // Successful login: the user is a real local account. Create/fetch
+        // the User node and record the LoggedInFrom edge as before.
+        let user_id = self.ensure_user(&user_str);
         let mut edge = Edge::new(user_id, ip_id, Relation::LoggedInFrom, event.ts);
-        edge = edge.with_prop("success", serde_json::Value::from(success));
+        edge = edge.with_prop("success", serde_json::Value::from(true));
         if let Some(method) = detail_str(event, "method") {
             edge = edge.with_prop("method", serde_json::Value::from(method));
-        }
-        if !success {
-            if let Some(reason) = detail_str(event, "reason") {
-                edge = edge.with_prop("reason", serde_json::Value::from(reason));
-            }
         }
         self.add_edge(edge);
     }
@@ -1636,17 +1644,89 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_ssh_login() {
+    fn test_ingest_ssh_login_success_creates_user() {
+        // Successful login: User node created, LoggedInFrom edge added.
         let mut g = KnowledgeGraph::new();
         let event = make_event(
-            "ssh.login_failed",
-            serde_json::json!({"ip": "185.1.1.1", "user": "root", "reason": "invalid password", "method": "password"}),
+            "ssh.login_success",
+            serde_json::json!({"ip": "185.1.1.1", "user": "root", "method": "password"}),
         );
         g.ingest(&event);
 
         assert!(g.find_by_ip("185.1.1.1").is_some());
-        assert!(g.find_by_user("root").is_some());
-        assert_eq!(g.edge_count(), 1); // LoggedInFrom
+        assert!(
+            g.find_by_user("root").is_some(),
+            "successful login should create User node"
+        );
+        assert_eq!(g.edge_count(), 1, "LoggedInFrom edge expected");
+    }
+
+    #[test]
+    fn test_ingest_ssh_login_failed_does_not_create_user() {
+        // Spec 015 Bug 2: failed SSH auth must NOT create User nodes.
+        // The attempted username lands in Ip.attempted_usernames instead.
+        let mut g = KnowledgeGraph::new();
+        let event = make_event(
+            "ssh.login_failed",
+            serde_json::json!({
+                "ip": "185.1.1.1",
+                "user": "admin",
+                "reason": "invalid password",
+                "method": "password"
+            }),
+        );
+        g.ingest(&event);
+
+        let ip_id = g.find_by_ip("185.1.1.1").expect("Ip node expected");
+        assert!(
+            g.find_by_user("admin").is_none(),
+            "failed login must NOT create a User node for the attempted username"
+        );
+        assert_eq!(
+            g.edge_count(),
+            0,
+            "no LoggedInFrom edge is created for failed auth"
+        );
+        let attempted = g.attempted_usernames_for_ip(ip_id);
+        assert_eq!(attempted, vec!["admin".to_string()]);
+    }
+
+    #[test]
+    fn test_ingest_ssh_login_failed_dedups_and_caps_attempts() {
+        // Multiple failed auths from the same IP accumulate usernames,
+        // deduplicated and LIFO-capped.
+        let mut g = KnowledgeGraph::new();
+        let usernames = [
+            "admin", "ansible", "root", "admin", "bot", "ansible", "oracle",
+        ];
+        for u in usernames {
+            let e = make_event(
+                "ssh.login_failed",
+                serde_json::json!({
+                    "ip": "185.1.1.1",
+                    "user": u,
+                    "reason": "invalid_user",
+                }),
+            );
+            g.ingest(&e);
+        }
+
+        let ip_id = g.find_by_ip("185.1.1.1").unwrap();
+        let attempted = g.attempted_usernames_for_ip(ip_id);
+        // No User nodes, no LoggedInFrom edges.
+        assert_eq!(g.nodes_of_type(NodeType::User).len(), 0);
+        assert_eq!(g.edge_count(), 0);
+        // Dedup: unique set preserved, last-write-wins order.
+        assert_eq!(
+            attempted,
+            vec![
+                "root".to_string(),
+                "admin".to_string(),
+                "bot".to_string(),
+                "ansible".to_string(),
+                "oracle".to_string(),
+            ]
+        );
     }
 
     #[test]

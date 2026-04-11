@@ -41,6 +41,11 @@ pub enum Node {
         is_tor: bool,
         first_seen: DateTime<Utc>,
         last_seen: DateTime<Utc>,
+        /// Spec 015: attacker-supplied usernames from failed SSH auth.
+        /// Stored here (not as User nodes) so the User namespace only
+        /// contains real local users. Dedup + LIFO cap of 50.
+        #[serde(default)]
+        attempted_usernames: Vec<String>,
     },
     File {
         path: String,
