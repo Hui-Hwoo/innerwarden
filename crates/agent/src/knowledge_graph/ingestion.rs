@@ -789,7 +789,10 @@ impl KnowledgeGraph {
     // ── File & Filesystem ───────────────────────────────────────────
 
     fn ingest_file_write(&mut self, event: &Event) {
-        let path = match detail_str(event, "path") {
+        let path = match detail_str(event, "path")
+            .or_else(|| detail_str(event, "filename"))
+            .or_else(|| detail_str(event, "pathname"))
+        {
             Some(p) => p,
             None => return,
         };
@@ -804,7 +807,10 @@ impl KnowledgeGraph {
     }
 
     fn ingest_file_read(&mut self, event: &Event) {
-        let path = match detail_str(event, "path") {
+        let path = match detail_str(event, "path")
+            .or_else(|| detail_str(event, "filename"))
+            .or_else(|| detail_str(event, "pathname"))
+        {
             Some(p) => p,
             None => return,
         };
@@ -818,7 +824,10 @@ impl KnowledgeGraph {
     }
 
     fn ingest_file_delete(&mut self, event: &Event) {
-        let path = match detail_str(event, "pathname").or_else(|| detail_str(event, "path")) {
+        let path = match detail_str(event, "pathname")
+            .or_else(|| detail_str(event, "filename"))
+            .or_else(|| detail_str(event, "path"))
+        {
             Some(p) => p,
             None => return,
         };
@@ -831,11 +840,16 @@ impl KnowledgeGraph {
     }
 
     fn ingest_file_rename(&mut self, event: &Event) {
-        let old_path = match detail_str(event, "old_path").or_else(|| detail_str(event, "path")) {
+        let old_path = match detail_str(event, "old_path")
+            .or_else(|| detail_str(event, "oldname"))
+            .or_else(|| detail_str(event, "path"))
+        {
             Some(p) => p,
             None => return,
         };
-        let new_path = detail_str(event, "new_path").unwrap_or_default();
+        let new_path = detail_str(event, "new_path")
+            .or_else(|| detail_str(event, "newname"))
+            .unwrap_or_default();
 
         let file_id = self.ensure_file(&old_path);
         if !new_path.is_empty() {
@@ -852,7 +866,10 @@ impl KnowledgeGraph {
     }
 
     fn ingest_file_truncate(&mut self, event: &Event) {
-        let path = match detail_str(event, "path").or_else(|| detail_str(event, "pathname")) {
+        let path = match detail_str(event, "path")
+            .or_else(|| detail_str(event, "filename"))
+            .or_else(|| detail_str(event, "pathname"))
+        {
             Some(p) => p,
             None => return,
         };
@@ -865,7 +882,10 @@ impl KnowledgeGraph {
     }
 
     fn ingest_file_timestomp(&mut self, event: &Event) {
-        let path = match detail_str(event, "path").or_else(|| detail_str(event, "pathname")) {
+        let path = match detail_str(event, "path")
+            .or_else(|| detail_str(event, "filename"))
+            .or_else(|| detail_str(event, "pathname"))
+        {
             Some(p) => p,
             None => return,
         };
