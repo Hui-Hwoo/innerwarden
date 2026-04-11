@@ -293,7 +293,12 @@ impl KnowledgeGraph {
         let trigger_props = self.edges[idx].properties.clone();
         if !self.edges[idx].is_snapshot() {
             super::triggers::check_critical_triggers(
-                self, trigger_rel, trigger_from, trigger_to, trigger_ts, &trigger_props,
+                self,
+                trigger_rel,
+                trigger_from,
+                trigger_to,
+                trigger_ts,
+                &trigger_props,
             );
         }
 
@@ -518,8 +523,27 @@ impl KnowledgeGraph {
         })
     }
 
+    /// Return the singleton System node id, creating it if necessary.
+    ///
+    /// The first caller may not know the real hostname (e.g. the decision
+    /// recording path calls `ensure_system("")` before any event has flowed
+    /// through). In that case the node is created with an empty label, and
+    /// later calls that *do* have a real hostname will upgrade the label in
+    /// place. Once a non-empty hostname is recorded it becomes immutable —
+    /// the graph is single-host so there's no legitimate reason to rename.
     pub fn ensure_system(&mut self, hostname: &str) -> NodeId {
         if let Some(id) = self.system_node {
+            // Late-upgrade: fill an empty hostname the first time a real one
+            // shows up. This fixes the bug where the System node was stuck
+            // with "" because the decision path happened to create it before
+            // any ingested event did.
+            if !hostname.is_empty() {
+                if let Some(Node::System { hostname: h, .. }) = self.get_node_mut(id) {
+                    if h.is_empty() {
+                        *h = hostname.to_string();
+                    }
+                }
+            }
             return id;
         }
         let id = self.add_node(Node::System {
@@ -1322,7 +1346,10 @@ impl KnowledgeGraph {
                 // Keep active response incidents permanently for audit trail
                 if matches!(
                     decision.as_deref(),
-                    Some("block_ip") | Some("kill_process") | Some("suspend_user_sudo") | Some("block_container")
+                    Some("block_ip")
+                        | Some("kill_process")
+                        | Some("suspend_user_sudo")
+                        | Some("block_container")
                 ) {
                     return false;
                 }
@@ -1570,6 +1597,33 @@ mod tests {
         let id2 = g.ensure_system("prod-01");
         assert_eq!(id1, id2);
         assert_eq!(g.node_count(), 1);
+    }
+
+    #[test]
+    fn test_system_hostname_late_upgrade() {
+        // Regression: the decision recording path used to call
+        // ensure_system("") before any event had flowed through, creating
+        // the singleton with an empty hostname. Subsequent calls with real
+        // hostnames did nothing, so downstream consumers (investigation
+        // clusters, reports) ended up with host="".
+        let mut g = KnowledgeGraph::new();
+        let first = g.ensure_system("");
+        let second = g.ensure_system("real-host-01");
+        assert_eq!(first, second, "still the same singleton");
+        let node = g.get_node(first).unwrap();
+        if let Node::System { hostname, .. } = node {
+            assert_eq!(
+                hostname, "real-host-01",
+                "empty hostname should be upgraded"
+            );
+        } else {
+            panic!("expected System node");
+        }
+        // And once set, further calls with different hostnames don't clobber.
+        g.ensure_system("different");
+        if let Some(Node::System { hostname, .. }) = g.get_node(first) {
+            assert_eq!(hostname, "real-host-01");
+        }
     }
 
     #[test]
