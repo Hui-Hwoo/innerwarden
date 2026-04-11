@@ -3265,6 +3265,7 @@ mod tests {
                 false_positive: false,
                 fp_reporter: None,
                 fp_reported_at: None,
+                research_only: false,
             });
             g.add_edge(Edge::new(
                 inc_id,

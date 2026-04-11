@@ -111,6 +111,13 @@ pub enum Node {
         /// When the FP was reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fp_reported_at: Option<DateTime<Utc>>,
+        /// Spec 015 follow-up: incident is useful for AI research/training
+        /// but NOT for the operator (e.g. self-traffic to cloud providers,
+        /// the agent's own Telegram/GeoIP/Cloudflare calls, near-miss LSM
+        /// patterns). Dashboard operator views filter these out; neural
+        /// training and investigation views still see them.
+        #[serde(default)]
+        research_only: bool,
     },
     Campaign {
         campaign_id: String,

@@ -182,6 +182,15 @@ struct Cli {
     /// `<name>.bak-015` before writing.
     #[arg(long)]
     cleanup_015_graph_signal_quality: bool,
+
+    /// Spec 015 follow-up: load today's dated graph snapshot and set the
+    /// `research_only` flag on every Incident whose connected IPs are
+    /// 100% self-traffic (cloud providers, Telegram, GeoIP, Canonical,
+    /// OCI peers). Incidents are preserved for neural training — only
+    /// the operator dashboard filter changes. Creates a backup as
+    /// `<name>.bak-015-researchonly-<stamp>` before writing.
+    #[arg(long)]
+    backfill_015_research_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +606,54 @@ fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn run_backfill_015_research_only(data_dir: &std::path::Path) -> Result<()> {
+    use chrono::Local;
+    use std::fs;
+
+    cloud_safelist::init();
+
+    let snapshot_path = knowledge_graph::KnowledgeGraph::dated_snapshot_path(data_dir);
+    if !snapshot_path.exists() {
+        anyhow::bail!(
+            "No dated snapshot found at {} — run the agent at least once first",
+            snapshot_path.display()
+        );
+    }
+
+    let stamp = Local::now().format("%Y%m%dT%H%M%S");
+    let backup_path = snapshot_path.with_extension(format!("json.bak-015-researchonly-{stamp}"));
+    fs::copy(&snapshot_path, &backup_path)
+        .with_context(|| format!("failed to back up snapshot to {}", backup_path.display()))?;
+    println!(
+        "spec 015 research-only backfill: backed up snapshot to {}",
+        backup_path.display()
+    );
+
+    let mut graph = knowledge_graph::KnowledgeGraph::load_snapshot(&snapshot_path);
+    let report = knowledge_graph::migrations::backfill_research_only_flag(&mut graph);
+    graph.save_snapshot(&snapshot_path).with_context(|| {
+        format!(
+            "failed to save cleaned snapshot to {}",
+            snapshot_path.display()
+        )
+    })?;
+
+    println!("spec 015 research-only backfill complete:");
+    println!("  snapshot       : {}", snapshot_path.display());
+    println!("  backup         : {}", backup_path.display());
+    println!("  scanned        : {}", report.incidents_scanned);
+    println!("  flagged        : {}", report.incidents_flagged);
+    if !report.by_detector.is_empty() {
+        println!("  by detector    :");
+        let mut top: Vec<(&String, &usize)> = report.by_detector.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        for (det, n) in top.iter().take(15) {
+            println!("    {det:<28} {n}");
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -639,6 +696,10 @@ async fn main() -> Result<()> {
 
     if cli.cleanup_015_graph_signal_quality {
         return run_cleanup_015(&cli.data_dir);
+    }
+
+    if cli.backfill_015_research_only {
+        return run_backfill_015_research_only(&cli.data_dir);
     }
 
     if cli.report {

@@ -147,6 +147,84 @@ pub fn cleanup_015_graph_signal_quality(graph: &mut KnowledgeGraph) -> Cleanup01
     report
 }
 
+/// Report returned by [`backfill_research_only_flag`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BackfillResearchOnlyReport {
+    /// Total Incident nodes scanned.
+    pub incidents_scanned: usize,
+    /// Incidents that had their `research_only` flag flipped from false → true.
+    pub incidents_flagged: usize,
+    /// Breakdown by detector slug (top contributors).
+    pub by_detector: std::collections::BTreeMap<String, usize>,
+}
+
+/// Spec 015 follow-up: walk the graph and backfill the `research_only`
+/// flag on every Incident node whose connected `Ip` nodes are all
+/// self-traffic (cloud providers, Telegram, GeoIP, Canonical, OCI peers).
+///
+/// Safe to run multiple times — idempotent. The migration never *unflags*
+/// an incident; it only promotes false → true when the data matches.
+///
+/// The rule is the same as `ingest_incident`'s: an incident is research_only
+/// iff it has at least one connected Ip node AND every connected Ip node is
+/// a safelist match. Incidents with a single attacker IP and a self-traffic
+/// IP stay visible.
+pub fn backfill_research_only_flag(graph: &mut KnowledgeGraph) -> BackfillResearchOnlyReport {
+    let mut report = BackfillResearchOnlyReport::default();
+
+    // Collect (incident_id, should_flag) in a first pass so we don't hold a
+    // mutable borrow while iterating.
+    let mut updates: Vec<(NodeId, String)> = Vec::new();
+
+    let incident_nodes = graph.nodes_of_type(NodeType::Incident);
+    report.incidents_scanned = incident_nodes.len();
+
+    for inc_id in incident_nodes {
+        let (already_flagged, detector) = match graph.get_node(inc_id) {
+            Some(Node::Incident {
+                research_only,
+                detector,
+                ..
+            }) => (*research_only, detector.clone()),
+            _ => continue,
+        };
+        if already_flagged {
+            continue;
+        }
+
+        // Gather the Ip nodes this incident is TriggeredBy.
+        let mut ip_addrs: Vec<String> = Vec::new();
+        for edge in graph.outgoing_edges(inc_id) {
+            if edge.relation != super::types::Relation::TriggeredBy {
+                continue;
+            }
+            if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                ip_addrs.push(addr.clone());
+            }
+        }
+        if ip_addrs.is_empty() {
+            continue; // not a specifically IP-anchored incident
+        }
+        let all_self = ip_addrs
+            .iter()
+            .all(|ip| crate::cloud_safelist::is_self_traffic_ip(ip));
+        if all_self {
+            updates.push((inc_id, detector));
+        }
+    }
+
+    // Apply.
+    for (inc_id, detector) in updates {
+        if let Some(Node::Incident { research_only, .. }) = graph.nodes.get_mut(&inc_id) {
+            *research_only = true;
+            report.incidents_flagged += 1;
+            *report.by_detector.entry(detector).or_insert(0) += 1;
+        }
+    }
+
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +256,7 @@ mod tests {
             false_positive: false,
             fp_reporter: None,
             fp_reported_at: None,
+            research_only: false,
         });
         g.add_edge(Edge::new(inc, user, Relation::TriggeredBy, ts(0)));
 
@@ -245,6 +324,144 @@ mod tests {
         let report = cleanup_015_graph_signal_quality(&mut g);
         assert_eq!(report.brute_force_user_nodes_removed, 0);
         assert!(g.find_by_user("deploy").is_some());
+    }
+
+    #[test]
+    fn backfill_research_only_flags_telegram_chain() {
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        // Telegram IP (Bot API) → incident
+        let telegram = g.ensure_ip("149.154.166.110", ts(0));
+        let inc = g.add_node(Node::Incident {
+            incident_id: "graph_data_exfil:tokio-rt-worker:1".to_string(),
+            detector: "graph_data_exfil".to_string(),
+            severity: "critical".to_string(),
+            title: "exfil → telegram".to_string(),
+            summary: String::new(),
+            ts: ts(0),
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, telegram, Relation::TriggeredBy, ts(0)));
+
+        let report = backfill_research_only_flag(&mut g);
+        assert_eq!(report.incidents_flagged, 1);
+        assert_eq!(report.by_detector.get("graph_data_exfil"), Some(&1));
+        match g.get_node(inc) {
+            Some(Node::Incident { research_only, .. }) => assert!(*research_only),
+            _ => panic!("incident lost"),
+        }
+    }
+
+    #[test]
+    fn backfill_preserves_real_attacker_incidents() {
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let attacker = g.ensure_ip("185.113.139.51", ts(0));
+        let inc = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:1".to_string(),
+            detector: "ssh_bruteforce".to_string(),
+            severity: "high".to_string(),
+            title: "brute force".to_string(),
+            summary: String::new(),
+            ts: ts(0),
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, attacker, Relation::TriggeredBy, ts(0)));
+
+        let report = backfill_research_only_flag(&mut g);
+        assert_eq!(report.incidents_flagged, 0);
+        match g.get_node(inc) {
+            Some(Node::Incident { research_only, .. }) => assert!(!*research_only),
+            _ => panic!("incident lost"),
+        }
+    }
+
+    #[test]
+    fn backfill_mixed_chain_stays_visible() {
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let telegram = g.ensure_ip("149.154.166.110", ts(0));
+        let attacker = g.ensure_ip("185.113.139.51", ts(0));
+        let inc = g.add_node(Node::Incident {
+            incident_id: "cross_layer_chain:mixed:1".to_string(),
+            detector: "cross_layer_chain".to_string(),
+            severity: "high".to_string(),
+            title: "mixed".to_string(),
+            summary: String::new(),
+            ts: ts(0),
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, telegram, Relation::TriggeredBy, ts(0)));
+        g.add_edge(Edge::new(inc, attacker, Relation::TriggeredBy, ts(0)));
+
+        let report = backfill_research_only_flag(&mut g);
+        assert_eq!(report.incidents_flagged, 0, "mixed chain must stay visible");
+    }
+
+    #[test]
+    fn backfill_is_idempotent() {
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let telegram = g.ensure_ip("149.154.166.110", ts(0));
+        let inc = g.add_node(Node::Incident {
+            incident_id: "graph_data_exfil:1".to_string(),
+            detector: "graph_data_exfil".to_string(),
+            severity: "critical".to_string(),
+            title: "t".to_string(),
+            summary: String::new(),
+            ts: ts(0),
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, telegram, Relation::TriggeredBy, ts(0)));
+
+        let first = backfill_research_only_flag(&mut g);
+        let second = backfill_research_only_flag(&mut g);
+        assert_eq!(first.incidents_flagged, 1);
+        assert_eq!(second.incidents_flagged, 0);
     }
 
     #[test]

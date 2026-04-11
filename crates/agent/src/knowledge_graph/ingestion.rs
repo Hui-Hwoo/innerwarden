@@ -29,6 +29,30 @@ fn detail_u16(event: &Event, key: &str) -> Option<u16> {
         .map(|v| v as u16)
 }
 
+/// Spec 015 follow-up: decide whether an incoming incident is self-traffic
+/// (research-only) vs a real external threat (user-facing).
+///
+/// An incident is research_only when it has at least one Ip entity AND
+/// EVERY Ip entity is in the cloud/agent-service safelist. The conservative
+/// "all IPs match" rule means that if a chain has one attacker IP and one
+/// Cloudflare IP, we still show it to the operator — only pure self-traffic
+/// is hidden. Incidents with zero Ip entities are treated as "not specifically
+/// about an external IP" and keep their default operator-visible status.
+fn is_self_traffic_incident(incident: &Incident) -> bool {
+    use innerwarden_core::entities::EntityType;
+    let ips: Vec<&str> = incident
+        .entities
+        .iter()
+        .filter(|e| e.r#type == EntityType::Ip)
+        .map(|e| e.value.as_str())
+        .collect();
+    if ips.is_empty() {
+        return false;
+    }
+    ips.iter()
+        .all(|ip| crate::cloud_safelist::is_self_traffic_ip(ip))
+}
+
 fn detail_u64(event: &Event, key: &str) -> Option<u64> {
     event.details.get(key).and_then(|v| v.as_u64())
 }
@@ -194,6 +218,13 @@ impl KnowledgeGraph {
             .unwrap_or("unknown")
             .to_string();
 
+        // Spec 015 follow-up: flag incidents whose only external entity is
+        // self-traffic (Telegram, Cloudflare, Oracle peers, GeoIP, AWS
+        // eu-west-1, Canonical) as research_only. They still land in the
+        // graph for neural training and investigation, but the operator
+        // dashboard filters them out so real threats are visible.
+        let research_only = is_self_traffic_incident(incident);
+
         let inc_id = self.upsert_node(Node::Incident {
             incident_id: incident.incident_id.clone(),
             detector,
@@ -211,6 +242,7 @@ impl KnowledgeGraph {
             false_positive: false,
             fp_reporter: None,
             fp_reported_at: None,
+            research_only,
         });
 
         // Create TriggeredBy edges from Incident to each entity
@@ -1832,6 +1864,103 @@ mod tests {
 
         assert!(g.system_node().is_some());
         assert_eq!(g.edge_count(), 1); // InsertedOn
+    }
+
+    #[test]
+    fn test_ingest_incident_flags_self_traffic_as_research_only() {
+        // Spec 015 follow-up: an incident whose only external IP is
+        // Telegram / Cloudflare / OCI peers must land in the graph with
+        // research_only=true so the operator dashboard hides it.
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let telegram_inc = Incident {
+            ts: Utc::now(),
+            host: "prod-01".to_string(),
+            incident_id: "graph_data_exfil:tokio-rt-worker:12345".to_string(),
+            severity: Severity::Critical,
+            title: "Data exfil → 149.154.166.110".to_string(),
+            summary: String::new(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: vec!["T1041".to_string()],
+            entities: vec![EntityRef::ip("149.154.166.110")], // Telegram
+        };
+        g.ingest_incident(&telegram_inc);
+        let id = g
+            .find_by_incident("graph_data_exfil:tokio-rt-worker:12345")
+            .expect("incident node");
+        match g.get_node(id) {
+            Some(Node::Incident { research_only, .. }) => {
+                assert!(
+                    *research_only,
+                    "Telegram self-traffic must be flagged as research_only"
+                );
+            }
+            _ => panic!("expected Incident node"),
+        }
+    }
+
+    #[test]
+    fn test_ingest_incident_real_attacker_stays_operator_visible() {
+        // Opposite case: a real external IP must stay operator-visible.
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let attacker_inc = Incident {
+            ts: Utc::now(),
+            host: "prod-01".to_string(),
+            incident_id: "ssh_bruteforce:185.113.139.51:999".to_string(),
+            severity: Severity::High,
+            title: "SSH brute force".to_string(),
+            summary: String::new(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: vec!["T1110.001".to_string()],
+            entities: vec![EntityRef::ip("185.113.139.51")],
+        };
+        g.ingest_incident(&attacker_inc);
+        let id = g
+            .find_by_incident("ssh_bruteforce:185.113.139.51:999")
+            .unwrap();
+        match g.get_node(id) {
+            Some(Node::Incident { research_only, .. }) => {
+                assert!(!*research_only, "real attacker must stay visible");
+            }
+            _ => panic!("expected Incident node"),
+        }
+    }
+
+    #[test]
+    fn test_ingest_incident_mixed_entities_stays_visible() {
+        // Conservative rule: if an incident touches ANY non-self IP, show it.
+        // We only hide incidents where *every* external IP is self-traffic.
+        crate::cloud_safelist::init();
+        let mut g = KnowledgeGraph::new();
+
+        let mixed = Incident {
+            ts: Utc::now(),
+            host: "prod-01".to_string(),
+            incident_id: "cross_layer_chain:mixed:1".to_string(),
+            severity: Severity::High,
+            title: "Mixed chain".to_string(),
+            summary: String::new(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: vec![],
+            entities: vec![
+                EntityRef::ip("149.154.166.110"), // Telegram self-traffic
+                EntityRef::ip("185.113.139.51"),  // real attacker
+            ],
+        };
+        g.ingest_incident(&mixed);
+        let id = g.find_by_incident("cross_layer_chain:mixed:1").unwrap();
+        match g.get_node(id) {
+            Some(Node::Incident { research_only, .. }) => {
+                assert!(!*research_only, "mixed chain must stay visible");
+            }
+            _ => panic!("expected Incident node"),
+        }
     }
 
     #[test]
