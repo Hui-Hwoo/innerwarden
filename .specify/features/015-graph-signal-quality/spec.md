@@ -2,7 +2,7 @@
 
 **Feature Branch**: `015-graph-signal-quality`
 **Created**: 2026-04-11
-**Status**: Draft — execution scheduled for a follow-up session
+**Status**: In execution (investigation phase complete, audit table below)
 **Priority**: P0 (blocks operator UX quality AND AI research data quality)
 **Depends on**: nothing (independent from spec 017 Phase 1 work)
 
@@ -73,11 +73,26 @@ Result: the attacker's dictionary of usernames (admin, ansible, blockchain, ali,
 - Neural model training features
 - Attacker fingerprinting (the attacker's usernames leak into user-facing graph queries)
 
-### Bug 3 — Parser bug creating a User node named `uid`
+### Bug 3 — **Not a bug (investigation artifact, reclassified 2026-04-11)**
 
-Location: unknown until investigated. Symptom: a User node with `name == "uid"` exists in the graph and fires `graph_user_creation` 156 times.
+Original hypothesis: a User node with literal name `"uid"` existed in the graph and fired `graph_user_creation` 156 times, suggesting a parser bug.
 
-Hypothesis: some event parser reads a string like `"uid:1001 (user)"` or `"user=uid:1001"` and extracts `uid` as the username instead of `1001` or the resolved name. This is a single parser bug that should be easy to locate once `ensure_user` call sites are audited.
+Investigation result: **No such User node exists.** The `"uid"` string in the original top-20 table was produced by `jq '... | split(":")[1]'` on incident_ids of the form `graph_user_creation:uid:1001:<timestamp>`, which splits on `:` and returns the first segment `"uid"`. The actual User nodes involved are `uid:0, uid:1001, uid:105, uid:33, uid:584788, uid:6, uid:998` — 7 distinct fallback names created legitimately by `ingest_privilege_escalation` (`crates/agent/src/knowledge_graph/ingestion.rs:511`) via `format!("uid:{}", new_uid)` when an event has no resolved username.
+
+These `uid:N` User nodes are not a parser bug:
+- They come from `privilege.escalation` / `privilege.setuid` events that carry a numeric `new_uid` but no symbolic username.
+- Once Bug 1 is fixed (no presence scan) they stop firing `graph_user_creation` regardless.
+- A future enhancement could resolve them against `/etc/passwd` or drop them entirely, but that is not in scope for spec 015.
+
+Verification queries (run against `/var/lib/innerwarden/graph-snapshot-2026-04-11.json` on prod):
+```
+jq '[.nodes[] | select(.User != null)] | length'  # 175
+jq '.nodes[] | select(.User != null and .User.name == "uid")'  # empty
+jq '[.nodes[] | select(.User != null) | .User.name] | map(select(startswith("uid")))'
+# → ["uid:0","uid:1001","uid:105","uid:33","uid:584788","uid:6","uid:998"]
+```
+
+**Conclusion**: Change 4 (below) is dropped from this spec. Bug 1 + Bug 2 fixes + cleanup migration cover the observed 3,954 false positives without any parser work.
 
 ## Scope
 
@@ -126,6 +141,44 @@ Hypothesis: some event parser reads a string like `"uid:1001 (user)"` or `"user=
 
 **Risk**: medium. Audit is code review, low risk. Fixes vary by detector and carry their own risk.
 
+#### Audit table (executed 2026-04-11)
+
+All 27 `detect_*` functions in `crates/agent/src/knowledge_graph/detectors.rs` were scored against the checklist. Heuristic: iterates `nodes_of_type` with no timestamp filter (`edges_in_window` / `active_nodes_since` / `start_ts` check) → presence-scan smell. Prod snapshot counts as of 2026-04-11.
+
+| # | Detector | Line | Presence scan | Prod count | Verdict |
+|---|---|---|---|---|---|
+| 1 | `detect_threat_intel` | 161 | no (query helper) | (merged) | PASS |
+| 2 | `detect_lateral_movement` | 221 | no (`active_nodes_since`) | (rare) | PASS |
+| 3 | `detect_process_tree_anomaly` | 311 | **yes** (shell comm scan) | 0 | SMELL — bounded by Process 24h TTL |
+| 4 | `detect_reverse_shell` | 395 | no (`active_nodes_since`, edge ts) | 2 | PASS |
+| 5 | `detect_fileless` | 487 | no | 0 | PASS |
+| 6 | `detect_discovery_burst` | 568 | no (filters RunAs edges by `ts >= cutoff`) | 30 (legit) | PASS |
+| 7 | `detect_persistence` | 661 | no (`active_nodes_since`) | 0 | PASS |
+| 8 | `detect_data_exfil` | 743 | no | 13 | PASS |
+| 9 | `detect_network_sniffing` | 843 | **yes** (comm whitelist, no edge ts filter) | **67** (likely agent tcpdump self-detect) | **FIX** — Change 8 |
+| 10 | `detect_dns_tunnel` | 903 | no (`edges_in_window`) | 0 | PASS |
+| 11 | `detect_kernel_module` | 983 | **yes** | 0 | SMELL — bounded |
+| 12 | `detect_service_stop` | 1041 | **yes** | 0 | SMELL — bounded |
+| 13 | `detect_container_escape` | 1121 | **yes** | 0 | SMELL — bounded |
+| 14 | `detect_log_tampering` | 1189 | **yes** | 0 | SMELL — bounded |
+| 15 | `detect_crypto_miner` | 1267 | **yes** | 0 | SMELL — bounded |
+| 16 | `detect_sensitive_write` | 1351 | **yes** | 0 | SMELL — bounded |
+| 17 | `detect_correlation_chains` | 1571 | no (windowed per rule) | 36 (legit) | PASS |
+| 18 | `detect_host_drift_aggregated` | 1790 | no (`now - start_ts > window` skip) | 43 | PASS |
+| 19 | `detect_proto_anomaly_aggregated` | 2009 | no (`edges_in_window`) | 597 (legit) | PASS |
+| 20 | `detect_port_scan` | 2090 | no (window) | 0 | PASS |
+| 21 | `detect_credential_stuffing` | 2147 | no (window) | 0 | PASS |
+| 22 | `detect_sudo_abuse` | 2219 | no (window on SudoAs edge) | 0 | PASS |
+| 23 | **`detect_user_creation`** | **2282** | **yes** | **3,954** | **FAIL — Change 2 (delete detector)** |
+| 24 | `detect_docker_anomaly` | 2392 | no (`edges_in_window`) | 0 | PASS |
+| 25 | `detect_scanner_ua` | 2491 | **yes** (iterates Ip, no edge ts filter) | 0 | SMELL — bounded |
+| 26 | `detect_c2_beacon` | 2575 | no (`now - edge.ts > window`) | 3 | PASS |
+| 27 | `detect_cgroup_abuse` | 2687 | no (window) | 0 | PASS |
+
+**Key insight**: Only `detect_user_creation` produces *unbounded* noise. `User` nodes are permanent by schema (`graph.rs:1327` — `Node::User { .. } => false // Permanent`), so every new User name the graph ever sees fires forever under the presence-scan loop. All other smells iterate `Process` or `Ip` nodes, which have a 24h TTL (`graph.rs:1292-1305`), so accumulated noise is naturally capped. The prod snapshot confirms this: only `detect_user_creation` (3,954) and `detect_network_sniffing` (67 — the agent's own tcpdump) produce measurable false-positive volume; the other 8 SMELL detectors sit at 0.
+
+**Scope decision**: fix the two with measurable prod noise (#23 + #9). Document the 8 bounded smells here; leave them untouched this cycle. If they start showing up in snapshots, file follow-up specs.
+
 ### Change 2 — Fix `detect_user_creation`
 
 **Where**: `crates/agent/src/knowledge_graph/detectors.rs:2282`.
@@ -164,16 +217,9 @@ Hypothesis: some event parser reads a string like `"uid:1001 (user)"` or `"user=
 
 **Risk**: medium-high. Schema change on Ip node. Requires migration for existing graph snapshots. Any code that currently reads User nodes expecting to find brute-force usernames (e.g., threat-dna behavioral fingerprinting) must be updated.
 
-### Change 4 — Fix the `uid` parser bug
+### Change 4 — DROPPED (see Bug 3 reclassification above)
 
-**Where**: unknown until investigated. Plan:
-
-1. Grep for all call sites of `ensure_user` in `crates/agent/src/`.
-2. For each call site, check the source string being passed.
-3. Find the one that produces `name == "uid"` from input like `"uid:1001"` or similar.
-4. Fix the parser to extract the numeric uid or resolve to the actual username.
-
-**Risk**: low once located. The fix is a one-line parser correction.
+No parser bug exists. The `uid:N` User nodes are a legitimate fallback in `ingest_privilege_escalation` and disappear from the `graph_user_creation` feed once Bug 1 is fixed. No code change required for this item.
 
 ### Change 5 — Garbage-collect existing pollution
 
@@ -211,6 +257,28 @@ stages: &[
 **Task**: after Change 2 lands, verify CL-012 still fires correctly for its intended pattern (real persistence via user account creation). If Change 2 makes `graph_user_creation` rarer (which it should), CL-012 will fire less — but the firings should be higher-signal. Validate this empirically after cleanup.
 
 **Risk**: low. Read-only audit.
+
+#### CL-012 audit (executed 2026-04-11)
+
+`detect_correlation_chains` (`crates/agent/src/knowledge_graph/detectors.rs:1571`) walks `Incident` nodes in the graph via `TriggeredBy` edges and groups them by entity. For each rule, every stage matches an incident whose `detector` field `starts_with(pattern) || contains(pattern)` (`check_rule_stages` at line 1716).
+
+`CL-012 Multi-Persistence` has two stages:
+
+```
+&["crontab_persistence", "systemd_persistence"]
+&["ssh_key_injection", "user_creation"]
+```
+
+After Change 2 deletes `detect_user_creation`, the `graph_user_creation:*` incident slug stops being emitted. **However, CL-012 still fires correctly** because:
+
+1. The sensor-side `user_creation` detector (`crates/sensor/src/detectors/user_creation.rs`) continues to emit incidents whose `incident_id` is `user_creation:<comm>:<alert_key>:<ts>`.
+2. These incidents land in the graph via `ingest_incident` (`ingestion.rs:182`) which sets `detector = "user_creation"` from the `incident_id` prefix.
+3. `check_rule_stages` matches `"user_creation"` against the stage pattern `["ssh_key_injection", "user_creation"]` via exact `starts_with`, so the stage still resolves.
+4. The same path previously also accepted `graph_user_creation:*` via `contains("user_creation")`, which is now dead but harmless.
+
+Net effect on CL-012: **signal preserved, false-positive floor removed**. Before spec 015, any User node lingering in the graph caused CL-012 to *almost* match when combined with a real `crontab_persistence` incident on the same entity — which would have occasionally fired the rule for no real reason. After spec 015, only a legitimate sensor-side `user_creation` incident can satisfy stage 2, and the rule's signal-to-noise improves.
+
+No code change required in CL-012. No synthetic multi-persistence test added in this spec — the existing detector-level tests for `user_creation` and `crontab_persistence` already cover the upstream signals, and the correlation rule's matcher (`check_rule_stages`) has its own unit tests via `test_correlation_multi_low_elevation` and friends.
 
 ### Change 7 — Document the signal-quality principle in CLAUDE.md
 
