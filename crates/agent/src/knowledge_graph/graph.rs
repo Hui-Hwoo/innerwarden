@@ -595,6 +595,13 @@ impl KnowledgeGraph {
 
     /// BFS neighborhood: subgraph within `depth` hops of `start`.
     pub fn neighborhood(&self, start: NodeId, depth: usize) -> SubGraph {
+        // Caps prevent the BFS from exploding on hot nodes (a single attacker
+        // IP can have thousands of incident edges). The frontend cytoscape viz
+        // is unusable beyond a few hundred nodes anyway, and /api/graph/neighborhood
+        // was the reason the dashboard hung on Investigation pivots.
+        const MAX_TOTAL_EDGES: usize = 500;
+        const MAX_EDGES_PER_NODE: usize = 50;
+
         let mut sub = SubGraph::default();
         let mut visited: HashSet<NodeId> = HashSet::new();
         let mut queue: VecDeque<(NodeId, usize)> = VecDeque::new();
@@ -605,14 +612,23 @@ impl KnowledgeGraph {
             queue.push_back((start, 0));
         }
 
-        while let Some((current, d)) = queue.pop_front() {
+        'bfs: while let Some((current, d)) = queue.pop_front() {
             if d >= depth {
                 continue;
             }
 
-            // Outgoing
+            let mut per_node_edges = 0usize;
+
+            // Outgoing (capped per-node)
             for edge in self.outgoing_edges(current) {
+                if sub.edges.len() >= MAX_TOTAL_EDGES {
+                    break 'bfs;
+                }
+                if per_node_edges >= MAX_EDGES_PER_NODE {
+                    break;
+                }
                 sub.edges.push(edge.clone());
+                per_node_edges += 1;
                 if !visited.contains(&edge.to) {
                     visited.insert(edge.to);
                     if let Some(n) = self.nodes.get(&edge.to) {
@@ -622,9 +638,16 @@ impl KnowledgeGraph {
                 }
             }
 
-            // Incoming
+            // Incoming (capped per-node, shares budget with outgoing)
             for edge in self.incoming_edges(current) {
+                if sub.edges.len() >= MAX_TOTAL_EDGES {
+                    break 'bfs;
+                }
+                if per_node_edges >= MAX_EDGES_PER_NODE * 2 {
+                    break;
+                }
                 sub.edges.push(edge.clone());
+                per_node_edges += 1;
                 if !visited.contains(&edge.from) {
                     visited.insert(edge.from);
                     if let Some(n) = self.nodes.get(&edge.from) {
