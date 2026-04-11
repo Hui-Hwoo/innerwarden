@@ -10,10 +10,33 @@
 
 | Phase | Status | Result |
 |-------|--------|--------|
-| **A: tcp_stream → graph** | DONE | 98 ConnectedTo (deduped from 344K flows/day) |
-| **B: eBPF typed events** | DONE (rebuild only) | Sensor was missing `--features ebpf` flag. No code changes needed — all 30 hooks already emit typed Events. Rebuild + deploy unlocked: SpawnedBy(80), RedirectedFd(701), RunAs(313), ConnectedTo(98+) |
-| **C: Cross-entity edges** | Not started | |
-| **D: Incident enrichment** | Not started | |
+| **A: tcp_stream → graph** | DONE | ConnectedTo edges populated from 247K tcp_stream events/day, deduped by (src,dst,port) |
+| **B: eBPF typed events** | DONE (rebuild + filename fix) | Sensor was missing `--features ebpf` flag. After rebuild, file ingestors had path/filename mismatch — added field aliasing |
+| **C: Cross-entity edges** | DONE | CorrelatedWith edges between incidents in same kill chain via correlation_engine |
+| **D: Incident enrichment** | DONE | ingest_incident now extracts pid from evidence array, links Incident → Process |
+| **Leftover: memory.* events** | DONE | anon_executable, rwx_memory, deleted_file_mapping → Read with memory_anomaly property |
+| **Leftover: cgroup.* events** | DONE | memory_spike, cpu_abuse → Signaled with cgroup_event property |
+| **Critical bug fix** | DONE | JSONL sink had 200MB/day cap silently dropping events. Bumped to 1GB |
+
+## Final metrics (2026-04-11)
+
+| Metric | Before (013) | After (014 complete) | Δ |
+|--------|--------------|---------------------|---|
+| Total edges | 12,559 | 33,456 | +166% |
+| Process nodes | 411 | 4,470 | +988% |
+| Active relations | 8 | 18 | +125% |
+| SpawnedBy | 0 | 1,662 | ✅ |
+| ConnectedTo | 0 | 692 | ✅ |
+| Read | 0 | 2,126 | ✅ |
+| Wrote | 0 | 4 | ✅ |
+| RunAs | 0 | 3,539 | ✅ |
+| RedirectedFd | 0 | 6,410 | ✅ |
+| Memory anomaly | 0 | 62 | ✅ |
+| Cgroup edges | 0 | 6 | ✅ |
+| Incident→Process | 0 | 3 | ✅ |
+| ListensOn | 0 | 4 | ✅ |
+| MprotectExec | 0 | 40 | ✅ |
+| TimingAnomaly | 0 | 30 | ✅ |
 
 ## Problem
 
