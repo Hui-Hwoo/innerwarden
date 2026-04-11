@@ -2402,19 +2402,28 @@ async fn process_incidents(
             ip_reputation.as_ref(),
         );
 
-        // Build graph context: attack narrative from knowledge graph neighborhood
+        // Build graph context: attack narrative from knowledge graph neighborhood.
+        // Phase 015: prefer the Incident node as center (richest context after 014-D
+        // incident enrichment links incidents to processes), fall back to entity nodes.
         let graph_context = {
             let graph = state.knowledge_graph.read().unwrap();
-            // Find the best center node from incident entities
-            let center_node = incident.entities.iter().find_map(|e| match e.r#type {
-                innerwarden_core::entities::EntityType::Ip => graph.find_by_ip(&e.value),
-                innerwarden_core::entities::EntityType::User => graph.find_by_user(&e.value),
-                innerwarden_core::entities::EntityType::Path => graph.find_by_path(&e.value),
-                innerwarden_core::entities::EntityType::Container => {
-                    graph.find_by_container(&e.value)
-                }
-                _ => None,
-            });
+            let center_node = graph
+                .find_by_incident(&incident.incident_id)
+                .or_else(|| {
+                    incident.entities.iter().find_map(|e| match e.r#type {
+                        innerwarden_core::entities::EntityType::Ip => graph.find_by_ip(&e.value),
+                        innerwarden_core::entities::EntityType::User => {
+                            graph.find_by_user(&e.value)
+                        }
+                        innerwarden_core::entities::EntityType::Path => {
+                            graph.find_by_path(&e.value)
+                        }
+                        innerwarden_core::entities::EntityType::Container => {
+                            graph.find_by_container(&e.value)
+                        }
+                        _ => None,
+                    })
+                });
             center_node.map(|node| graph.attack_narrative(node, 3))
         };
 

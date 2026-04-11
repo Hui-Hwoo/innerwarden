@@ -158,17 +158,49 @@ impl KnowledgeGraph {
             lines.push("    - No specific risk indicators found".to_string());
         }
 
-        // Process tree depth
-        if let Some(Node::Process { pid, .. }) = self.get_node(center) {
-            let ancestors = self.ancestors(*pid);
-            if ancestors.len() >= 3 {
-                let chain: Vec<String> = std::iter::once(center)
+        // Process tree depth — try center first, then any process in the neighborhood.
+        let process_pid = match self.get_node(center) {
+            Some(Node::Process { pid, .. }) => Some(*pid),
+            _ => sub.nodes.values().find_map(|n| match n {
+                Node::Process { pid, .. } => Some(*pid),
+                _ => None,
+            }),
+        };
+        if let Some(pid) = process_pid {
+            let ancestors = self.ancestors(pid);
+            if ancestors.len() >= 2 {
+                let proc_id = self.find_by_pid(pid);
+                let chain: Vec<String> = proc_id
+                    .into_iter()
                     .chain(ancestors.iter().copied())
                     .filter_map(|id| self.get_node(id))
                     .map(|n| n.label())
                     .collect();
                 lines.push(String::new());
                 lines.push(format!("  Process chain: {}", chain.join(" → ")));
+            }
+        }
+
+        // Phase 015: surface incident-specific signals when center is an Incident node.
+        if let Some(Node::Incident {
+            decision,
+            confidence,
+            false_positive,
+            ..
+        }) = self.get_node(center)
+        {
+            if *false_positive {
+                lines.push(String::new());
+                lines.push("  ⚠ This incident was previously marked as FALSE POSITIVE by an operator".to_string());
+            }
+            if let Some(action) = decision {
+                let conf = confidence.unwrap_or(0.0);
+                lines.push(String::new());
+                lines.push(format!(
+                    "  Prior decision: {} (confidence {:.0}%)",
+                    action,
+                    conf * 100.0
+                ));
             }
         }
 
