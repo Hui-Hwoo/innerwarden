@@ -1599,16 +1599,21 @@ async fn main() -> Result<()> {
                                     } = outcome
                                     {
                                         n_orphaned += 1;
-                                        // TODO(step2): route through notifications pipeline
-                                        // (Telegram/Slack/webhook). For now the WARN inside
-                                        // mark_revert_failed + Prometheus counter + dashboard
-                                        // visibility are the surface area.
+                                        // Surface is deliberately WARN log +
+                                        // Prometheus counter + dashboard state,
+                                        // not push notification. Orphaned means
+                                        // "local/kernel state drift" — that's an
+                                        // observability concern for a technical
+                                        // operator watching logs/metrics, not an
+                                        // interrupt-worthy pager event. Telegram
+                                        // and Slack pushes are reserved for
+                                        // incident-level signals.
                                         warn!(
                                             id = %revert.id,
                                             ?backend,
                                             %target,
                                             %last_error,
-                                            "response ORPHANED — rule may still be active; operator attention required"
+                                            "response ORPHANED — rule may still be active; check responses dashboard"
                                         );
                                     }
                                 }
