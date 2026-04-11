@@ -20,6 +20,41 @@ function getUnresolved() {
   return { total: confirmed, unresolved: unresolved, handled: responded };
 }
 
+// Human-readable labels for sensor collectors (spec 017 Change 6).
+// Home's Data Collection section renders these instead of raw slugs
+// so the primary operator sees "Network traffic" rather than
+// "tcp_stream". Unknown slugs fall back to humanLabel().
+var COLLECTOR_LABELS = {
+  tcp_stream:         'Network traffic',
+  http_capture:       'Web requests',
+  dns_capture:        'DNS lookups',
+  tls_fingerprint:    'TLS fingerprints',
+  auth_log:           'Login attempts',
+  auditd:             'System audit log',
+  journald:           'System journal',
+  docker:             'Docker events',
+  proc_maps:          'Process memory',
+  fanotify_watch:     'File changes',
+  kernel_integrity:   'Kernel integrity',
+  cgroup_abuse:       'Resource usage',
+  ebpf_syscall:       'Kernel system calls',
+  firmware_integrity: 'Firmware integrity',
+  nginx_access:       'Web server access',
+  nginx_error:        'Web server errors',
+  syslog_firewall:    'Firewall log',
+  falco_log:          'Falco events',
+  suricata_eve:       'Suricata alerts',
+  wazuh_alerts:       'Wazuh alerts',
+  osquery_log:        'osquery events',
+  macos_log:          'macOS log',
+  cloudtrail:         'AWS CloudTrail',
+  integrity:          'File integrity'
+};
+
+function collectorLabel(slug) {
+  return COLLECTOR_LABELS[slug] || humanLabel(slug);
+}
+
 var DETECTOR_LABELS = {
   ssh_bruteforce: 'SSH login attempts', credential_stuffing: 'Credential testing',
   host_drift: 'Unexpected process', execution_guard: 'Command monitoring',
@@ -112,7 +147,7 @@ function outcomeBadgeHtml(outcome) {
   if (outcome === 'blocked' || outcome === 'killed' || outcome === 'contained' || outcome === 'suspended')
     return '<span class="badge-contained">CONTAINED</span>';
   if (outcome === 'ignored') return '<span class="badge-noise">NOISE</span>';
-  if (outcome === 'open') return '<span class="badge-unresolved">OPEN</span>';
+  if (outcome === 'open') return '<span class="badge-unresolved">ACTIVE</span>';
   if (outcome === 'monitored') return '<span class="badge-monitor" style="font-size:0.62rem;padding:2px 7px;border-radius:4px">MONITORING</span>';
   if (outcome === 'honeypot') return '<span style="font-size:0.62rem;padding:2px 7px;border-radius:4px;background:rgba(255,140,66,0.12);color:var(--orange);font-weight:600">HONEYPOT</span>';
   return '';

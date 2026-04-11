@@ -72,24 +72,34 @@
 
   <!-- ── Home view ── -->
   <div class="report-view" id="viewHome" style="display:none">
-    <div class="status-hero safe" id="homeHero">
-      <div class="status-hero-icon" id="homeHeroIcon">✅</div>
+    <div class="status-hero alert-info" id="homeHero">
+      <div class="status-hero-icon" id="homeHeroIcon">🛡</div>
       <div class="status-hero-title" id="homeHeroTitle">Loading…</div>
       <div class="status-hero-sub" id="homeHeroSub"></div>
       <div class="home-status-meta" id="homeStatusMeta"></div>
     </div>
+    <section id="homeNow" class="home-section home-now">
+      <div class="home-section-title">Now</div>
+      <ul class="home-now-list">
+        <li id="homeNowWhat">Loading…</li>
+        <li id="homeNowDid"></li>
+      </ul>
+    </section>
     <div class="home-kpi-row">
-      <div class="home-kpi-big" onclick="showView('investigate')">
+      <div class="home-kpi-big" onclick="viewActivity()">
         <div class="kpi-value" id="homeKpiThreats" style="color:var(--accent)">0</div>
         <div class="kpi-label">Threats Detected</div>
+        <div class="kpi-window" id="homeKpiThreatsWindow">Today</div>
       </div>
       <div class="home-kpi-big" onclick="showContained()">
         <div class="kpi-value" id="homeKpiResponded" style="color:#27ae60">0</div>
         <div class="kpi-label">Contained</div>
+        <div class="kpi-window" id="homeKpiRespondedWindow">Today</div>
       </div>
       <div class="home-kpi-big" onclick="showView('sensors')">
         <div class="kpi-value" id="homeKpiEvents" style="color:var(--accent)">0</div>
-        <div class="kpi-label">Events Today</div>
+        <div class="kpi-label">Events</div>
+        <div class="kpi-window" id="homeKpiEventsWindow">Live (today)</div>
       </div>
     </div>
     <div class="home-section" id="briefingSection" style="display:none">
