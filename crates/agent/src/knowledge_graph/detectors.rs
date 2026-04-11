@@ -120,7 +120,17 @@ pub fn run_all(
     incidents.extend(detect_log_tampering(graph, state, host, now));
     incidents.extend(detect_crypto_miner(graph, state, host, now));
     incidents.extend(detect_sensitive_write(graph, state, host, now));
-    incidents.extend(detect_user_creation(graph, state, host, now));
+    // Spec 015: detect_user_creation was removed. It was a pure presence
+    // scan over `nodes_of_type(User)` that fired every 30min for every
+    // non-system User node in the graph. Because User nodes are permanent
+    // (graph.rs is_expired → `Node::User => false`), each attacker-supplied
+    // username from SSH brute-force stayed in the graph forever and fired
+    // the detector indefinitely — 3,954 false positives on prod snapshot
+    // 2026-04-11. Real user creation continues to be detected by the
+    // sensor-side `user_creation` detector (crates/sensor/src/detectors/
+    // user_creation.rs), whose incidents are ingested via ingest_incident()
+    // and still match the CL-012 "Multi-Persistence" correlation rule via
+    // the stage pattern contains("user_creation").
     incidents.extend(detect_docker_anomaly(graph, state, host, now));
     incidents.extend(detect_scanner_ua(graph, state, host, now));
     incidents.extend(detect_c2_beacon(graph, state, host, now));
@@ -858,17 +868,50 @@ fn detect_network_sniffing(
         "arpspoof",
         "mitmproxy",
     ];
+    // Spec 015: processes spawned by the agent itself must not trigger this
+    // detector. The dashboard pcap_capture module spawns tcpdump for ~60s
+    // bursts whenever a High/Critical incident fires, and the old presence
+    // scan was counting each of those bursts as a new sniffing event —
+    // contributing 67 graph_network_sniffing false positives on the prod
+    // snapshot from 2026-04-11.
+    let agent_ancestors = ["innerwarden-agent", "innerwarden-sensor"];
+
+    // Only consider processes that actually started recently. This matches
+    // the signal we care about ("someone just launched tcpdump") and stops
+    // the presence-scan behavior where a stale Process node kept firing the
+    // detector once per cooldown window forever.
+    let window = Duration::seconds(300);
 
     for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
-        let comm = match graph.get_node(pid_id) {
-            Some(Node::Process { comm, .. }) => comm.clone(),
+        let (pid, comm, start_ts) = match graph.get_node(pid_id) {
+            Some(Node::Process {
+                pid,
+                comm,
+                start_ts,
+                ..
+            }) => (*pid, comm.clone(), *start_ts),
             _ => continue,
         };
         if !sniffer_tools.iter().any(|t| comm == *t) {
             continue;
         }
+        if now - start_ts > window {
+            continue; // stale node — not a fresh launch
+        }
 
-        let key = format!("graph_sniff:{}", comm);
+        // Walk ancestors; if any is the agent/sensor itself, this sniffer
+        // was spawned by InnerWarden's own pcap_capture and is not an alert.
+        let spawned_by_agent = graph.ancestors(pid).iter().any(|&anc| {
+            matches!(
+                graph.get_node(anc),
+                Some(Node::Process { comm: ac, .. }) if agent_ancestors.iter().any(|a| ac == a)
+            )
+        });
+        if spawned_by_agent {
+            continue;
+        }
+
+        let key = format!("graph_sniff:{}:{}", comm, pid_id);
         if !state.check_and_set(&key, now, 600) {
             continue;
         }
@@ -2279,114 +2322,11 @@ fn detect_sudo_abuse(
 }
 
 // 15. User creation — new user accounts appearing (privilege escalation vector)
-fn detect_user_creation(
-    graph: &KnowledgeGraph,
-    state: &mut GraphDetectorState,
-    host: &str,
-    now: DateTime<Utc>,
-) -> Vec<Incident> {
-    let mut incidents = Vec::new();
-    let system_users = [
-        "root",
-        "daemon",
-        "bin",
-        "sys",
-        "sync",
-        "games",
-        "man",
-        "lp",
-        "mail",
-        "news",
-        "uucp",
-        "proxy",
-        "www-data",
-        "backup",
-        "list",
-        "irc",
-        "gnats",
-        "nobody",
-        "syslog",
-        "messagebus",
-        "sshd",
-        "ubuntu",
-        "systemd-resolve",
-        "systemd-timesync",
-        "ntp",
-        "_apt",
-        "pollinate",
-        "landscape",
-        "lxd",
-    ];
-
-    // Check all User nodes — alert on non-system users that appeared recently
-    for &uid in graph.nodes_of_type(NodeType::User).iter() {
-        let name = match graph.get_node(uid) {
-            Some(Node::User { name, .. }) => name.clone(),
-            _ => continue,
-        };
-        if system_users.iter().any(|s| name == *s) {
-            continue;
-        }
-
-        // Check if this user has an EscalatedTo or SudoAs edge (privilege)
-        let has_privilege = graph
-            .outgoing_edges(uid)
-            .iter()
-            .any(|e| matches!(e.relation, Relation::EscalatedTo | Relation::SudoAs))
-            || graph
-                .incoming_edges(uid)
-                .iter()
-                .any(|e| matches!(e.relation, Relation::EscalatedTo | Relation::SudoAs));
-
-        let key = format!("graph_user_create:{}", name);
-        if !state.check_and_set(&key, now, 1800) {
-            continue;
-        }
-
-        let severity = if has_privilege {
-            Severity::High
-        } else {
-            Severity::Medium
-        };
-        incidents.push(Incident {
-            ts: now,
-            host: host.to_string(),
-            incident_id: format!("graph_user_creation:{}:{}", name, now.timestamp()),
-            severity,
-            title: format!(
-                "New user account: {}{}",
-                name,
-                if has_privilege {
-                    " (with privileges)"
-                } else {
-                    ""
-                }
-            ),
-            summary: format!(
-                "User account '{}' detected in system.{}",
-                name,
-                if has_privilege {
-                    " User has elevated privileges (sudo/escalation)."
-                } else {
-                    ""
-                }
-            ),
-            evidence: serde_json::json!({
-                "source": "knowledge_graph",
-                "detector": "graph_user_creation",
-                "user": name,
-                "has_privilege": has_privilege,
-            }),
-            recommended_checks: vec![
-                format!("Verify user: id {}", name),
-                format!("Check sudo: sudo -l -U {}", name),
-            ],
-            tags: vec!["T1136.001".to_string()],
-            entities: vec![EntityRef::user(&name)],
-        });
-    }
-    incidents
-}
+// Spec 015: `detect_user_creation` was removed as a presence-scan
+// anti-pattern. See the comment in `run_all` above for the rationale.
+// Real user-creation signal is preserved via the sensor-side
+// `user_creation` detector, whose incidents reach the graph via
+// `ingest_incident` and continue to feed correlation rules.
 
 // 16. Docker anomaly — container rapid restarts or OOM kills
 fn detect_docker_anomaly(
@@ -2985,6 +2925,42 @@ mod tests {
     }
 
     #[test]
+    fn test_network_sniffing_skips_agent_spawned_tcpdump() {
+        // Spec 015: pcap_capture spawns tcpdump via the agent. Those
+        // invocations must not fire graph_network_sniffing.
+        let mut g = KnowledgeGraph::new();
+        let now = ts(100);
+        // agent → tcpdump chain
+        let agent = g.ensure_process(42, 1, "innerwarden-agent", 0, now);
+        let tcpdump = g.ensure_process(1234, 42, "tcpdump", 0, now);
+        g.add_edge(Edge::new(tcpdump, agent, Relation::SpawnedBy, now));
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_network_sniffing(&g, &mut state, "test", now);
+        assert!(
+            incidents.is_empty(),
+            "tcpdump spawned by the agent itself must not alert"
+        );
+    }
+
+    #[test]
+    fn test_network_sniffing_skips_stale_processes() {
+        // Spec 015: the pre-fix detector re-fired every 10 minutes for the
+        // lifetime of any Process node with comm=tcpdump, even after the
+        // process exited, because it was a pure presence scan. The fixed
+        // version only considers Process nodes started in the last 5min.
+        let mut g = KnowledgeGraph::new();
+        g.ensure_process(1234, 0, "tcpdump", 0, ts(0));
+
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_network_sniffing(&g, &mut state, "test", ts(1_000));
+        assert!(
+            incidents.is_empty(),
+            "stale tcpdump node (>5min old) must not fire the detector"
+        );
+    }
+
+    #[test]
     fn test_sensitive_write_detection() {
         let mut g = KnowledgeGraph::new();
         let now = ts(100);
@@ -3104,21 +3080,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_user_creation_detection() {
-        let mut g = KnowledgeGraph::new();
-        // Simulate a new user appearing in graph
-        g.ensure_user("hackerman");
-
-        let mut state = GraphDetectorState::new();
-        // user_creation checks user_index growth — on first run it learns baseline
-        let _ = detect_user_creation(&g, &mut state, "test", ts(10));
-        // Add another user and run again
-        g.ensure_user("backdoor_user");
-        let result = detect_user_creation(&g, &mut state, "test", ts(20));
-        // Should detect the new user
-        assert!(!result.is_empty(), "new user creation should trigger");
-    }
+    // Spec 015: test_user_creation_detection was removed alongside the
+    // detector. The anti-pattern it verified (emit per non-system User
+    // node) is precisely the behavior we deleted. Real user-creation
+    // coverage stays on the sensor side (crates/sensor/src/detectors/
+    // user_creation.rs tests) and the CL-012 correlation-rule path.
 
     #[test]
     fn test_scanner_ua_detection() {
