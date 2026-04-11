@@ -44,16 +44,80 @@ pub(crate) fn ingest_new_incidents(
                 chain.summary
             );
 
-            // Phase 014-C: Add CorrelatedWith edges between all incidents in this chain
-            let incident_ids: Vec<String> = chain
+            // Phase 014-C: Add CorrelatedWith edges between all incidents in this chain.
+            // Two paths:
+            // 1. Events with incident_id (narrative_incident_ingest path, killchain) —
+            //    link those incidents directly.
+            // 2. Events without incident_id (raw event chains like CL-008 file.read →
+            //    network.outbound) — find incidents that share the chain's entities
+            //    and link them. Without this, CL-008 chains would never produce edges
+            //    because classify_event always yields empty incident_id.
+            let mut incident_ids: Vec<String> = chain
                 .events
                 .iter()
                 .filter(|e| !e.incident_id.is_empty())
                 .map(|e| e.incident_id.clone())
                 .collect();
+
+            if incident_ids.len() < 2 {
+                // Collect entities from chain events and find incidents touching them.
+                let chain_entities: std::collections::HashSet<(String, String)> = chain
+                    .events
+                    .iter()
+                    .flat_map(|e| e.entities.iter())
+                    .map(|e| (format!("{:?}", e.r#type), e.value.clone()))
+                    .collect();
+                if !chain_entities.is_empty() {
+                    use crate::knowledge_graph::types::{Node, NodeType, Relation};
+                    let graph = state.knowledge_graph.read().unwrap();
+                    let chain_start = chain.start_ts;
+                    let chain_end = chain.last_ts;
+                    for id in graph.nodes_of_type(NodeType::Incident) {
+                        if let Some(Node::Incident {
+                            incident_id, ts, ..
+                        }) = graph.get_node(id)
+                        {
+                            // Time window: only incidents within or near the chain window
+                            if *ts < chain_start - chrono::Duration::seconds(60)
+                                || *ts > chain_end + chrono::Duration::seconds(60)
+                            {
+                                continue;
+                            }
+                            // Check if this incident shares any entity with the chain
+                            let shares = graph.outgoing_edges(id).iter().any(|e| {
+                                if e.relation != Relation::TriggeredBy {
+                                    return false;
+                                }
+                                match graph.get_node(e.to) {
+                                    Some(Node::Ip { addr, .. }) => {
+                                        chain_entities.contains(&("Ip".into(), addr.clone()))
+                                    }
+                                    Some(Node::User { name, .. }) => {
+                                        chain_entities.contains(&("User".into(), name.clone()))
+                                    }
+                                    Some(Node::File { path, .. }) => {
+                                        chain_entities.contains(&("Path".into(), path.clone()))
+                                    }
+                                    _ => false,
+                                }
+                            });
+                            if shares {
+                                incident_ids.push(incident_id.clone());
+                            }
+                        }
+                    }
+                    drop(graph);
+                }
+            }
+
             if incident_ids.len() >= 2 {
                 let mut graph = state.knowledge_graph.write().unwrap();
                 graph.link_correlated_incidents(&incident_ids, &chain.chain_id);
+                info!(
+                    chain_id = %chain.chain_id,
+                    incidents = incident_ids.len(),
+                    "CorrelatedWith edges created"
+                );
             }
 
             // Evaluate chain-triggered playbooks
