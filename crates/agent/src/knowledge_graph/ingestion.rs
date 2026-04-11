@@ -196,6 +196,9 @@ impl KnowledgeGraph {
             decision_target: None,
             auto_executed: false,
             is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
         });
 
         // Create TriggeredBy edges from Incident to each entity

@@ -140,7 +140,6 @@ pub(super) async fn api_incidents(
         .filter_map(|&id| {
             if let Some(Node::Incident {
                 incident_id,
-                detector: _,
                 severity,
                 title,
                 summary,
@@ -148,10 +147,8 @@ pub(super) async fn api_incidents(
                 mitre_ids,
                 decision,
                 confidence,
-                decision_reason: _,
-                decision_target: _,
-                auto_executed: _,
                 is_allowlisted,
+                ..
             }) = graph.get_node(id)
             {
                 // Collect entities from TriggeredBy edges

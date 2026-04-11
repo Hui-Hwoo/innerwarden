@@ -814,6 +814,67 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
     const WINDOW_SECS: i64 = 6 * 3600;
     let cutoff = Utc::now() - chrono::Duration::seconds(WINDOW_SECS);
 
+    // Phase 7 Gap 5: try graph snapshot for approximate 6h window.
+    // event_timeline uses 5-min buckets (HH:MM keys). Sum last 72 buckets.
+    if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, analyzed_date) {
+        if graph.metrics().node_count > 0 {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            let cutoff_key = cutoff.format("%H:%M").to_string();
+
+            // Sum events from timeline buckets in the window
+            let mut events: u64 = 0;
+            for (bucket, sources) in &graph.event_timeline {
+                if bucket.as_str() >= cutoff_key.as_str() {
+                    events += sources.values().sum::<usize>() as u64;
+                }
+            }
+
+            // Count incidents and decisions in window from Incident nodes
+            let mut incidents: u64 = 0;
+            let mut high_critical: u64 = 0;
+            let mut decisions: u64 = 0;
+            let mut decisions_by_action: BTreeMap<String, u64> = BTreeMap::new();
+            let mut latest_incident_ts = String::from("none");
+
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    ts, severity, decision, ..
+                }) = graph.get_node(id)
+                {
+                    if *ts >= cutoff {
+                        incidents += 1;
+                        let sev = severity.to_lowercase();
+                        if sev == "high" || sev == "critical" {
+                            high_critical += 1;
+                        }
+                        let ts_str = ts.to_rfc3339();
+                        if ts_str > latest_incident_ts || latest_incident_ts == "none" {
+                            latest_incident_ts = ts_str.clone();
+                        }
+                        if let Some(action) = decision {
+                            decisions += 1;
+                            *decisions_by_action.entry(action.clone()).or_default() += 1;
+                        }
+                    }
+                }
+            }
+
+            return RecentWindow {
+                window_secs: WINDOW_SECS as u64,
+                events,
+                incidents,
+                high_critical_incidents: high_critical,
+                decisions,
+                decisions_by_action,
+                latest_event_ts: "graph".to_string(),
+                latest_incident_ts,
+                latest_decision_ts: "graph".to_string(),
+                latest_telemetry_ts: "graph".to_string(),
+            };
+        }
+    }
+
+    // Fallback: JSONL scan
     // Determine which dates to scan (today + optionally yesterday)
     let dates_to_scan: Vec<String> = {
         let mut v = vec![analyzed_date.to_string()];

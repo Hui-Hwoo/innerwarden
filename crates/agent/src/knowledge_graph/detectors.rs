@@ -3040,6 +3040,9 @@ mod tests {
                 decision_target: None,
                 auto_executed: false,
                 is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
             });
             g.add_edge(Edge::new(inc_id, ip_id, Relation::TriggeredBy, ts(i as i64 * 30)));
         }

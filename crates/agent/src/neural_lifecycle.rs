@@ -937,12 +937,48 @@ impl AnomalyEngine {
 // FP report helpers
 // ---------------------------------------------------------------------------
 
-/// Read fp-reports-*.jsonl files from the last `days` days.
-/// Returns a HashSet of detector names that have confirmed FP reports.
+/// Read FP reports from the last `days` days.
+/// Phase 7 Gap 1: reads from graph snapshots (Incident nodes with false_positive=true),
+/// falls back to fp-reports-*.jsonl if no snapshots found.
 pub fn read_fp_report_detectors(data_dir: &Path, days: i64) -> HashSet<String> {
     let mut detectors = HashSet::new();
     let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
 
+    // Phase 7: try graph snapshots
+    let today = chrono::Local::now().date_naive();
+    let mut loaded_from_graph = false;
+    for d in 0..days {
+        let date = today - chrono::Duration::days(d);
+        let date_str = date.format("%Y-%m-%d").to_string();
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str) {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    detector,
+                    false_positive,
+                    fp_reported_at,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if *false_positive {
+                        if let Some(at) = fp_reported_at {
+                            if *at >= cutoff {
+                                detectors.insert(detector.clone());
+                            }
+                        } else {
+                            detectors.insert(detector.clone());
+                        }
+                    }
+                }
+            }
+            loaded_from_graph = true;
+        }
+    }
+    if loaded_from_graph {
+        return detectors;
+    }
+
+    // Fallback: fp-reports-*.jsonl
     let entries = match std::fs::read_dir(data_dir) {
         Ok(e) => e,
         Err(_) => return detectors,
@@ -954,7 +990,6 @@ pub fn read_fp_report_detectors(data_dir: &Path, days: i64) -> HashSet<String> {
         if !name.starts_with("fp-reports-") || !name.ends_with(".jsonl") {
             continue;
         }
-        // Extract date from filename: fp-reports-YYYY-MM-DD.jsonl
         let date_part = name
             .strip_prefix("fp-reports-")
             .and_then(|s| s.strip_suffix(".jsonl"))
@@ -981,13 +1016,51 @@ pub fn read_fp_report_detectors(data_dir: &Path, days: i64) -> HashSet<String> {
     detectors
 }
 
-/// Read fp-reports and return counts by (detector, entity) pair.
-/// Entity is the first IP or comm extracted from the incident_id field.
+/// Read FP counts by (detector, entity) pair.
+/// Phase 7 Gap 1: reads from graph snapshots, falls back to fp-reports-*.jsonl.
 pub fn read_fp_report_counts(data_dir: &Path, days: i64) -> Vec<(String, String, u32)> {
     let mut counts: std::collections::HashMap<(String, String), u32> =
         std::collections::HashMap::new();
     let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
 
+    // Phase 7: try graph snapshots
+    let today = chrono::Local::now().date_naive();
+    let mut loaded_from_graph = false;
+    for d in 0..days {
+        let date = today - chrono::Duration::days(d);
+        let date_str = date.format("%Y-%m-%d").to_string();
+        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str) {
+            use crate::knowledge_graph::types::{Node, NodeType};
+            for id in graph.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    incident_id,
+                    detector,
+                    false_positive,
+                    fp_reported_at,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if *false_positive {
+                        if let Some(at) = fp_reported_at {
+                            if *at < cutoff {
+                                continue;
+                            }
+                        }
+                        let entity = extract_entity_from_incident_id(incident_id);
+                        if !detector.is_empty() && !entity.is_empty() {
+                            *counts.entry((detector.clone(), entity)).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            loaded_from_graph = true;
+        }
+    }
+    if loaded_from_graph {
+        return counts.into_iter().map(|((d, e), c)| (d, e, c)).collect();
+    }
+
+    // Fallback: fp-reports-*.jsonl
     let entries = match std::fs::read_dir(data_dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),

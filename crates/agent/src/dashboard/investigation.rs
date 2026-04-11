@@ -844,7 +844,7 @@ pub(super) fn build_journey_from_graph(
             decision_reason,
             decision_target,
             auto_executed,
-            is_allowlisted: _,
+            ..
         }) = graph.get_node(inc_id)
         {
             has_incident = true;

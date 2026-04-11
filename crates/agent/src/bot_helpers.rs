@@ -548,6 +548,13 @@ pub(crate) fn handle_telegram_triage_action(
             }
             let detector = incident_id.split(':').next().unwrap_or("unknown");
             telegram::log_false_positive(data_dir, incident_id, detector, &result.operator_name);
+            // Phase 7 Gap 1: mark incident as FP in the knowledge graph
+            {
+                let mut graph = state.knowledge_graph.write().unwrap();
+                if let Some(node_id) = graph.find_by_incident(incident_id) {
+                    graph.mark_false_positive(node_id, &result.operator_name);
+                }
+            }
             write_telegram_triage_audit(
                 state,
                 incident_id,

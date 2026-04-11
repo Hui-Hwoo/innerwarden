@@ -356,6 +356,21 @@ impl KnowledgeGraph {
         self.system_node
     }
 
+    /// Phase 7 Gap 1: mark an Incident node as false positive.
+    pub fn mark_false_positive(&mut self, node_id: NodeId, reporter: &str) {
+        if let Some(Node::Incident {
+            false_positive,
+            fp_reporter,
+            fp_reported_at,
+            ..
+        }) = self.nodes.get_mut(&node_id)
+        {
+            *false_positive = true;
+            *fp_reporter = Some(reporter.to_string());
+            *fp_reported_at = Some(chrono::Utc::now());
+        }
+    }
+
     // ── Ensure helpers (find or create) ─────────────────────────────────
 
     pub fn ensure_process(

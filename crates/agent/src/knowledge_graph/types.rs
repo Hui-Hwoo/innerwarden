@@ -97,6 +97,15 @@ pub enum Node {
         auto_executed: bool,
         /// True if the source entity (IP/user) is in the allowlist.
         is_allowlisted: bool,
+        /// Phase 7 Gap 1: operator marked this incident as false positive.
+        #[serde(default)]
+        false_positive: bool,
+        /// Who reported the FP (operator name / Telegram username).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fp_reporter: Option<String>,
+        /// When the FP was reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fp_reported_at: Option<DateTime<Utc>>,
     },
     Campaign {
         campaign_id: String,
