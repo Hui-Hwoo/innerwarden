@@ -11,10 +11,10 @@ mod ai;
 mod allowlist;
 mod attacker_intel;
 mod baseline;
-mod briefing;
 mod bot_actions;
 mod bot_commands;
 mod bot_helpers;
+mod briefing;
 mod cloud_safelist;
 mod cloudflare;
 mod config;
@@ -1495,6 +1495,12 @@ async fn main() -> Result<()> {
                     persist_ip_reputations(&cli.data_dir, &state.ip_reputations);
 
                     // ── Safeguard: XDP TTL - expire old blocklist entries ──
+                    //
+                    // Only removes the local bookkeeping entry after the kernel
+                    // command succeeds (or confirms the entry was already gone).
+                    // Transient failures keep the local state so a subsequent
+                    // tick retries — preventing drift between `xdp_block_times`
+                    // and the actual blocklist BPF map.
                     {
                         let now_utc = chrono::Utc::now();
                         let expired_ips: Vec<String> = state.xdp_block_times
@@ -1506,19 +1512,55 @@ async fn main() -> Result<()> {
                             .map(|(ip, _)| ip.clone())
                             .collect();
                         for ip in &expired_ips {
-                            // Remove from XDP blocklist via bpftool
-                            if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
-                                let b = addr.octets();
-                                let _ = tokio::process::Command::new("sudo")
-                                    .args(["bpftool", "map", "delete", "pinned",
-                                        "/sys/fs/bpf/innerwarden/blocklist",
-                                        "key", &b[0].to_string(), &b[1].to_string(),
-                                        &b[2].to_string(), &b[3].to_string()])
-                                    .output().await;
-                                let ttl_secs = state.xdp_block_times.get(ip).map(|(_, t)| *t).unwrap_or(0);
-                                info!(ip, ttl_secs, "XDP adaptive TTL expired - removed from blocklist");
+                            let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
+                                // Not parseable — drop from state to avoid a
+                                // poison entry; can't act on kernel anyway.
+                                warn!(ip, "XDP cleanup: unparseable IP in xdp_block_times, dropping local entry");
+                                state.xdp_block_times.remove(ip);
+                                continue;
+                            };
+                            let b = addr.octets();
+                            let ttl_secs = state.xdp_block_times.get(ip).map(|(_, t)| *t).unwrap_or(0);
+                            let output = tokio::process::Command::new("sudo")
+                                .args(["bpftool", "map", "delete", "pinned",
+                                    "/sys/fs/bpf/innerwarden/blocklist",
+                                    "key", &b[0].to_string(), &b[1].to_string(),
+                                    &b[2].to_string(), &b[3].to_string()])
+                                .output().await;
+                            match output {
+                                Ok(out) if out.status.success() => {
+                                    state.xdp_block_times.remove(ip);
+                                    info!(ip, ttl_secs, "XDP adaptive TTL expired - removed from blocklist");
+                                }
+                                Ok(out) => {
+                                    let stderr = String::from_utf8_lossy(&out.stderr);
+                                    let lower = stderr.to_lowercase();
+                                    // Same classifier as response_lifecycle: if the
+                                    // entry is already gone, call it a success.
+                                    let already_absent = lower.contains("no such")
+                                        || lower.contains("not found")
+                                        || lower.contains("does not exist");
+                                    if already_absent {
+                                        state.xdp_block_times.remove(ip);
+                                        info!(ip, ttl_secs, "XDP cleanup: entry already absent in kernel map, local state cleared");
+                                    } else {
+                                        warn!(
+                                            ip,
+                                            ttl_secs,
+                                            status = ?out.status,
+                                            stderr = %stderr.trim(),
+                                            "XDP cleanup FAILED - keeping local state to retry next tick (kernel/local drift protection)"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        ip,
+                                        error = %e,
+                                        "XDP cleanup: bpftool spawn failed - keeping local state to retry next tick"
+                                    );
+                                }
                             }
-                            state.xdp_block_times.remove(ip);
                         }
                     }
 
@@ -1527,13 +1569,57 @@ async fn main() -> Result<()> {
                     // didn't have TTL before). XDP/container/nginx/sudo still use
                     // their existing cleanup above; the lifecycle tracks them for
                     // dashboard visibility.
+                    //
+                    // State machine: stage_pending_reverts transitions Active→RevertPending
+                    // (or restages RevertFailed with retry budget); we then execute each
+                    // revert and report back via mark_reverted / mark_revert_failed.
+                    // Entries are NEVER declared complete until the backend command has
+                    // confirmed success (or been classified as already_absent). Orphaned
+                    // entries — retries exhausted — are logged at WARN level; dashboards
+                    // and Prometheus surface the drift.
                     {
-                        let reverts = state.response_lifecycle.tick_cleanup();
+                        let reverts = state.response_lifecycle.stage_pending_reverts();
+                        let mut n_ok = 0usize;
+                        let mut n_orphaned = 0usize;
                         for revert in &reverts {
-                            response_lifecycle::execute_revert(revert, cfg.responder.dry_run).await;
+                            match response_lifecycle::execute_revert(revert, cfg.responder.dry_run).await {
+                                Ok(()) => {
+                                    state.response_lifecycle.mark_reverted(&revert.id, "expired");
+                                    n_ok += 1;
+                                }
+                                Err(err) => {
+                                    let outcome = state
+                                        .response_lifecycle
+                                        .mark_revert_failed(&revert.id, err.clone());
+                                    if let response_lifecycle::FailureOutcome::Orphaned {
+                                        backend,
+                                        target,
+                                        last_error,
+                                        ..
+                                    } = outcome
+                                    {
+                                        n_orphaned += 1;
+                                        // TODO(step2): route through notifications pipeline
+                                        // (Telegram/Slack/webhook). For now the WARN inside
+                                        // mark_revert_failed + Prometheus counter + dashboard
+                                        // visibility are the surface area.
+                                        warn!(
+                                            id = %revert.id,
+                                            ?backend,
+                                            %target,
+                                            %last_error,
+                                            "response ORPHANED — rule may still be active; operator attention required"
+                                        );
+                                    }
+                                }
+                            }
                         }
-                        if !reverts.is_empty() {
-                            info!(count = reverts.len(), "response lifecycle: reverted expired responses");
+                        if n_ok > 0 || n_orphaned > 0 {
+                            info!(
+                                reverted = n_ok,
+                                orphaned = n_orphaned,
+                                "response lifecycle tick"
+                            );
                         }
                         // Persist snapshot for dashboard /api/responses endpoint.
                         let json = state.response_lifecycle.to_json();
@@ -2219,7 +2305,11 @@ async fn process_incidents(
                 .unwrap_or("");
 
             // Phase 3D: if detector is in graph_only_detectors, always suppress sensor version
-            if cfg.graph_only_detectors.iter().any(|d| d == sensor_detector) {
+            if cfg
+                .graph_only_detectors
+                .iter()
+                .any(|d| d == sensor_detector)
+            {
                 tracing::debug!(
                     incident_id = %incident.incident_id,
                     "sensor incident suppressed: detector is graph-only"
@@ -2229,10 +2319,11 @@ async fn process_incidents(
             }
 
             // Otherwise, suppress if graph recently detected same entity
-            if state
-                .graph_detector_state
-                .should_suppress_sensor(sensor_detector, entity_value, chrono::Utc::now())
-            {
+            if state.graph_detector_state.should_suppress_sensor(
+                sensor_detector,
+                entity_value,
+                chrono::Utc::now(),
+            ) {
                 tracing::debug!(
                     incident_id = %incident.incident_id,
                     "sensor incident suppressed: graph already detected"
@@ -2407,23 +2498,17 @@ async fn process_incidents(
         // incident enrichment links incidents to processes), fall back to entity nodes.
         let graph_context = {
             let graph = state.knowledge_graph.read().unwrap();
-            let center_node = graph
-                .find_by_incident(&incident.incident_id)
-                .or_else(|| {
-                    incident.entities.iter().find_map(|e| match e.r#type {
-                        innerwarden_core::entities::EntityType::Ip => graph.find_by_ip(&e.value),
-                        innerwarden_core::entities::EntityType::User => {
-                            graph.find_by_user(&e.value)
-                        }
-                        innerwarden_core::entities::EntityType::Path => {
-                            graph.find_by_path(&e.value)
-                        }
-                        innerwarden_core::entities::EntityType::Container => {
-                            graph.find_by_container(&e.value)
-                        }
-                        _ => None,
-                    })
-                });
+            let center_node = graph.find_by_incident(&incident.incident_id).or_else(|| {
+                incident.entities.iter().find_map(|e| match e.r#type {
+                    innerwarden_core::entities::EntityType::Ip => graph.find_by_ip(&e.value),
+                    innerwarden_core::entities::EntityType::User => graph.find_by_user(&e.value),
+                    innerwarden_core::entities::EntityType::Path => graph.find_by_path(&e.value),
+                    innerwarden_core::entities::EntityType::Container => {
+                        graph.find_by_container(&e.value)
+                    }
+                    _ => None,
+                })
+            });
             center_node.map(|node| graph.attack_narrative(node, 3))
         };
 
