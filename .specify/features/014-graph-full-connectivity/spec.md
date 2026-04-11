@@ -2,9 +2,18 @@
 
 **Feature Branch**: `014-graph-full-connectivity`
 **Created**: 2026-04-11
-**Status**: Planned
+**Status**: Phase A + B complete (deployed 2026-04-11)
 **Priority**: P1 (force multiplier — unlocks correlation, narrative, AI triage quality)
 **Depends on**: 013-graph-single-source (Phase 7, complete)
+
+## Completion Status
+
+| Phase | Status | Result |
+|-------|--------|--------|
+| **A: tcp_stream → graph** | DONE | 98 ConnectedTo (deduped from 344K flows/day) |
+| **B: eBPF typed events** | DONE (rebuild only) | Sensor was missing `--features ebpf` flag. No code changes needed — all 30 hooks already emit typed Events. Rebuild + deploy unlocked: SpawnedBy(80), RedirectedFd(701), RunAs(313), ConnectedTo(98+) |
+| **C: Cross-entity edges** | Not started | |
+| **D: Incident enrichment** | Not started | |
 
 ## Problem
 
