@@ -86,20 +86,20 @@
       </ul>
     </section>
     <div class="home-kpi-row">
-      <div class="home-kpi-big" onclick="viewActivity()">
-        <div class="kpi-value" id="homeKpiThreats" style="color:var(--accent)">0</div>
-        <div class="kpi-label">Threats Detected</div>
+      <div class="home-kpi-big" onclick="showContained()">
+        <div class="kpi-value" id="homeKpiThreats" style="color:var(--ok)">0</div>
+        <div class="kpi-label">Blocked</div>
         <div class="kpi-window" id="homeKpiThreatsWindow">Today</div>
       </div>
-      <div class="home-kpi-big" onclick="showContained()">
-        <div class="kpi-value" id="homeKpiResponded" style="color:#27ae60">0</div>
-        <div class="kpi-label">Contained</div>
+      <div class="home-kpi-big" onclick="viewActivity()">
+        <div class="kpi-value" id="homeKpiResponded" style="color:var(--accent)">0</div>
+        <div class="kpi-label">Incidents</div>
         <div class="kpi-window" id="homeKpiRespondedWindow">Today</div>
       </div>
       <div class="home-kpi-big" onclick="showView('sensors')">
         <div class="kpi-value" id="homeKpiEvents" style="color:var(--accent)">0</div>
-        <div class="kpi-label">Events</div>
-        <div class="kpi-window" id="homeKpiEventsWindow">Live (today)</div>
+        <div class="kpi-label">Events Scanned</div>
+        <div class="kpi-window" id="homeKpiEventsWindow">Today</div>
       </div>
     </div>
     <div class="home-section" id="briefingSection" style="display:none">

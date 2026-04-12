@@ -18,6 +18,7 @@ async function loadHome() {
       loadJson('/api/responses').catch(function() { return {}; })
     ]);
     window._lastOverview = overview;
+    window._agentMode = status.mode || 'guard';
 
     // Filtered base matches what Recent Activity will render.
     var items = incidentList.items || [];
@@ -46,8 +47,13 @@ async function loadHome() {
       && telemetrySecs <= HOME_TELEMETRY_STALL_SECS);
 
     updateHomeBanner(status, homeState);
-    updateHomeNow(overview, activeHighCriticalList.length, softStale);
-    updateHomeKpis(overview);
+    // Total events scanned from sensors (trust signal: "3.3M scanned → 2 blocked")
+    var totalEventsScanned = 0;
+    (sensors.sources || []).forEach(function(s) { totalEventsScanned += s.count || 0; });
+    window._totalEventsScanned = totalEventsScanned;
+
+    updateHomeNow(overview, activeHighCriticalList.length, softStale, totalEventsScanned);
+    updateHomeKpis(overview, totalEventsScanned);
     buildHomeFeed(base);
     updateCollectorStrip(sensors);
     loadBriefing();
@@ -106,40 +112,48 @@ function computeHomeState(payload) {
     };
   }
 
-  // Priority 2: state 2 — AI Responding to Active Threats.
-  if (activeList.length > 0) {
-    var maxSev = maxSeverity(activeList);
-    var heroClass, heroTitle;
-    if (maxSev === 'critical') {
-      heroClass = 'status-hero alert-high';
-      heroTitle = 'AI Responding to Critical Activity';
-    } else if (maxSev === 'high') {
-      heroClass = 'status-hero alert-medium';
-      heroTitle = 'AI Responding to High-Severity Activity';
-    } else {
-      heroClass = 'status-hero alert-low';
-      heroTitle = 'AI Responding';
-    }
+  // Priority 2: state 2 — only triggers when the AI genuinely cannot
+  // handle something and needs the operator. With Guard ON, routine
+  // scanners and unresolved incidents are NOT "active threats" — the
+  // AI is processing them autonomously. State 2 only fires for future
+  // AI-escalated items (needs_attention field, not yet implemented).
+  //
+  // With Guard OFF (watch/read_only), ALL unresolved incidents become
+  // the operator's responsibility.
+  var isGuard = (status.mode || 'guard') === 'guard';
+
+  if (!isGuard && activeList.length > 0) {
+    // Guard OFF: operator must decide. Show alarm.
     var n = activeList.length;
     return {
       state: 'ai_responding',
-      maxSeverity: maxSev,
-      heroClass: heroClass,
-      heroIcon: '\u26A1',
-      heroTitle: heroTitle,
-      heroSub: 'Processing ' + n + ' active threat' + (n === 1 ? '' : 's') + '. No action from you.',
+      maxSeverity: maxSeverity(activeList),
+      heroClass: 'status-hero alert-high',
+      heroIcon: '\uD83D\uDC41',
+      heroTitle: 'Detection Mode',
+      heroSub: n + ' threat' + (n === 1 ? '' : 's') + ' detected. AI is watching only \u2014 enable Guard mode for automatic protection.',
       healthAlertReasons: []
     };
   }
 
-  // Priority 3: state 1 — AI Protection Active (baseline).
+  // Guard ON or no active threats: AI Protection Active.
+  // The operator sees confidence, not alarm.
+  var blocked = overview.ai_responded || 0;
+  var observing = activeList.length;
+  var subParts = [];
+  if (blocked > 0) subParts.push(blocked + ' blocked');
+  if (observing > 0) subParts.push(observing + ' observing');
+  var subText = subParts.length > 0
+    ? subParts.join(' \u00B7 ') + '. Everything handled automatically.'
+    : 'All systems monitoring. Nothing requires your attention.';
+
   return {
     state: 'protection_active',
     maxSeverity: 'info',
     heroClass: 'status-hero alert-info',
     heroIcon: '\uD83D\uDEE1',
     heroTitle: 'AI Protection Active',
-    heroSub: 'All systems monitoring. AI is watching.',
+    heroSub: subText,
     healthAlertReasons: []
   };
 }
@@ -186,52 +200,53 @@ function updateHomeBanner(status, homeState) {
 }
 
 // ── Now section (2 lines, always observational) ─────────────────────
-function updateHomeNow(overview, activeCount, softStale) {
+function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
   var whatEl = document.getElementById('homeNowWhat');
   var didEl  = document.getElementById('homeNowDid');
   if (!whatEl || !didEl) return;
 
-  var eventsCount = overview.events_count || 0;
-  var contained   = overview.ai_responded || 0;
-  var noise       = overview.ai_ignored || 0;
+  var contained = overview.ai_responded || 0;
+  var total = totalEventsScanned || overview.events_count || 0;
 
-  // Line 1 — What happened
+  // Line 1 — Trust signal: volume scanned
   var line1;
-  if (eventsCount === 0) {
+  if (total === 0) {
     line1 = 'No events detected in the last 24 hours.';
   } else {
-    line1 = eventsCount.toLocaleString() + ' events detected in the last 24 hours.';
+    line1 = total.toLocaleString() + ' events monitored today.';
   }
   if (softStale) {
     line1 = 'Telemetry is a few minutes behind. ' + line1;
   }
-
   whatEl.textContent = line1;
 
-  // Line 2 — What the system did
+  // Line 2 — Outcome summary
   var line2;
-  if (contained === 0 && noise === 0 && activeCount === 0) {
-    line2 = 'AI is monitoring. No actions taken yet.';
+  if (contained === 0 && activeCount === 0) {
+    line2 = 'Nothing suspicious found. All systems operating normally.';
+  } else if (contained > 0 && activeCount === 0) {
+    line2 = 'Blocked ' + contained + ' threat' + (contained > 1 ? 's' : '') + ' automatically. Nothing requires your attention.';
   } else {
-    line2 = 'AI contained ' + contained + ' automatically. ' +
-            'Filtered ' + noise + ' as noise. ' +
-            'Currently processing ' + activeCount + '.';
+    line2 = 'Blocked ' + contained + ' automatically. Observing ' + activeCount + ' more. No action needed.';
   }
   didEl.textContent = line2;
 }
 
 // ── KPIs with fixed temporal sub-labels ──────────────────────────────
-function updateHomeKpis(overview) {
-  var u = getUnresolved();
-
+function updateHomeKpis(overview, totalEventsScanned) {
   var el = document.getElementById('homeKpiThreats');
-  if (el) el.textContent = u.total || 0;
-
-  el = document.getElementById('homeKpiResponded');
   if (el) el.textContent = overview.ai_responded || 0;
 
+  el = document.getElementById('homeKpiResponded');
+  if (el) el.textContent = overview.incidents_count || 0;
+
   el = document.getElementById('homeKpiEvents');
-  if (el) el.textContent = (overview.events_count || 0).toLocaleString();
+  var total = totalEventsScanned || overview.events_count || 0;
+  if (el) el.textContent = total >= 1000000
+    ? (total / 1000000).toFixed(1) + 'M'
+    : total >= 1000
+      ? (total / 1000).toFixed(0) + 'K'
+      : total.toLocaleString();
 
   // Fixed sub-labels: Today / Today / Live (today)
   setKpiWindow('homeKpiThreatsWindow',   formatWindow('today'));
@@ -355,7 +370,12 @@ function buildHomeFeed(incidents) {
     else if (outcome === 'ignored') icon = '\u2796';
     else if (sev === 'critical' || sev === 'high') icon = '\u26A1';
 
-    var badge = outcomeBadgeHtml(outcome);
+    // Map raw outcome to AI-first model: open/active → OBSERVING with Guard ON
+    var mappedOutcome = outcome;
+    if ((outcome === 'open' || outcome === 'active') && (window._agentMode || status?.mode || 'guard') === 'guard') {
+      mappedOutcome = 'monitoring';
+    }
+    var badge = outcomeBadgeHtml(mappedOutcome);
 
     html += '<div class="' + rowClass + '" onclick="viewActivity();handleCardClickByValue(\'ip\',\'' + ipVal + '\')">' +
       '<span class="activity-icon">' + icon + '</span>' +

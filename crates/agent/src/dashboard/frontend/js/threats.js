@@ -44,8 +44,11 @@ function buildGroupedList(items) {
   // Filter by outcome if set (e.g. from Home CTA click)
   var titleEl = document.getElementById('entityTitle');
   if (state.filterOutcome === 'contained') {
-    items = items.filter(function(item) { return ['blocked','monitoring','honeypot'].includes(item.outcome || ''); });
-    if (titleEl) titleEl.innerHTML = 'AI Defense Log <span style="font-size:0.6rem;color:var(--muted);cursor:pointer;margin-left:6px" onclick="state.filterOutcome=null;refreshLeft(false)">\u2715 clear filter</span>';
+    items = items.filter(function(item) {
+      var o = (item.outcome || '').toLowerCase();
+      return o === 'blocked' || o === 'honeypot';
+    });
+    if (titleEl) titleEl.innerHTML = 'Blocked threats <span style="font-size:0.6rem;color:var(--muted);cursor:pointer;margin-left:6px" onclick="state.filterOutcome=null;refreshLeft(false)">\u2715 show all</span>';
   } else {
     if (titleEl) titleEl.textContent = 'AI Defense Log';
   }
