@@ -1440,6 +1440,11 @@ async fn main() -> Result<()> {
         // Boot self-test: verify self-awareness is working.
         boot_self_test();
 
+        // One-time backfill: reconcile JSONL decisions with the knowledge graph.
+        // Fixes historical incidents where auto-block gates wrote to JSONL but
+        // not to the graph (incident_obvious + incident_crowdsec before the fix).
+        backfill_graph_decisions(&cli.data_dir, &mut state);
+
         // Always-on honeypot: permanent SSH listener from startup.
         // A watch channel is used to signal shutdown on SIGTERM/SIGINT.
         let always_on_shutdown_tx = if cfg.honeypot.mode == "always_on" {
@@ -3648,6 +3653,81 @@ async fn process_narrative_tick(
 // ---------------------------------------------------------------------------
 // Boot self-test — verify self-awareness is working on startup
 // ---------------------------------------------------------------------------
+
+/// One-time reconciliation: read all decisions-*.jsonl files and write
+/// missing decisions to the knowledge graph. This fixes historical data
+/// where auto-block gates (obvious, CrowdSec) wrote decisions to JSONL
+/// but not to the graph.
+fn backfill_graph_decisions(data_dir: &std::path::Path, state: &mut AgentState) {
+    use std::io::BufRead;
+
+    let mut filled = 0usize;
+    let mut scanned = 0usize;
+
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(d) = serde_json::from_str::<decisions::DecisionEntry>(&line) else {
+                continue;
+            };
+            scanned += 1;
+
+            // Only backfill block_ip decisions that were auto-executed
+            if d.action_type != "block_ip" || !d.auto_executed || d.dry_run {
+                continue;
+            }
+
+            // Check if the graph incident node is missing a decision
+            let mut graph = state.knowledge_graph.write().unwrap();
+            let needs_backfill = graph
+                .find_by_incident(&d.incident_id)
+                .and_then(|nid| {
+                    if let Some(crate::knowledge_graph::types::Node::Incident {
+                        decision, ..
+                    }) = graph.get_node(nid)
+                    {
+                        Some(decision.is_none())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+
+            if needs_backfill {
+                graph.ingest_decision(
+                    &d.incident_id,
+                    &d.action_type,
+                    d.target_ip.as_deref(),
+                    d.confidence,
+                    &d.reason,
+                    true,
+                    d.ts,
+                );
+                filled += 1;
+            }
+        }
+    }
+
+    if filled > 0 {
+        info!(
+            filled,
+            scanned, "backfill: reconciled JSONL decisions with knowledge graph"
+        );
+    }
+}
 
 /// Quick validation at agent startup that the host inventory (own IPs,
 /// listening ports) was loaded correctly by the sensor, and cloud safelist
