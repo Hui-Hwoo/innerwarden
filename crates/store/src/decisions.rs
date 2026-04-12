@@ -148,9 +148,8 @@ impl Store {
     /// Read decisions with id > `after_id`, up to `limit`.
     pub fn decisions_since(&self, after_id: i64, limit: usize) -> Result<Vec<(i64, String)>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, data FROM decisions WHERE id > ?1 ORDER BY id LIMIT ?2",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT id, data FROM decisions WHERE id > ?1 ORDER BY id LIMIT ?2")?;
         let rows = stmt.query_map(params![after_id, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -165,9 +164,8 @@ impl Store {
     /// Read all decisions for a given incident_id.
     pub fn decisions_for_incident(&self, incident_id: &str) -> Result<Vec<String>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT data FROM decisions WHERE incident_id = ?1 ORDER BY id",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT data FROM decisions WHERE incident_id = ?1 ORDER BY id")?;
         let rows = stmt.query_map(params![incident_id], |row| row.get::<_, String>(0))?;
         let mut results = Vec::new();
         for row in rows {
@@ -179,8 +177,7 @@ impl Store {
     /// Count total decisions.
     pub fn decisions_count(&self) -> Result<u64> {
         let conn = self.conn()?;
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM decisions", [], |row| row.get(0))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM decisions", [], |row| row.get(0))?;
         Ok(count as u64)
     }
 }
@@ -259,11 +256,8 @@ mod tests {
         // Tamper with the first row's data
         {
             let conn = store.conn().unwrap();
-            conn.execute(
-                "UPDATE decisions SET data = 'tampered' WHERE id = 1",
-                [],
-            )
-            .unwrap();
+            conn.execute("UPDATE decisions SET data = 'tampered' WHERE id = 1", [])
+                .unwrap();
         }
 
         let result = store.verify_hash_chain().unwrap();

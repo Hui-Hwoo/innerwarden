@@ -165,9 +165,7 @@ mod tests {
         }
         assert_eq!(store.list_graph_snapshots().unwrap().len(), 10);
 
-        let deleted = store
-            .delete_graph_snapshots_before("2026-04-05")
-            .unwrap();
+        let deleted = store.delete_graph_snapshots_before("2026-04-05").unwrap();
         assert_eq!(deleted, 4); // days 01-04
         assert_eq!(store.list_graph_snapshots().unwrap().len(), 6);
     }

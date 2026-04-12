@@ -57,9 +57,8 @@ impl Store {
     /// Returns `(rowid, Event)` pairs for cursor tracking.
     pub fn events_since(&self, after_id: i64, limit: usize) -> Result<Vec<(i64, Event)>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, data FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT id, data FROM events WHERE id > ?1 ORDER BY id LIMIT ?2")?;
         let rows = stmt.query_map(params![after_id, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -87,20 +86,16 @@ impl Store {
     /// Delete events with ts < `before_ts` (ISO 8601). Returns rows deleted.
     pub fn delete_events_before(&self, before_ts: &str) -> Result<u64> {
         let conn = self.conn()?;
-        let deleted = conn.execute(
-            "DELETE FROM events WHERE ts < ?1",
-            params![before_ts],
-        )?;
+        let deleted = conn.execute("DELETE FROM events WHERE ts < ?1", params![before_ts])?;
         Ok(deleted as u64)
     }
 
     /// Get the maximum rowid in the events table (0 if empty).
     pub fn events_max_id(&self) -> Result<i64> {
         let conn = self.conn()?;
-        let max: i64 = conn
-            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
-                row.get(0)
-            })?;
+        let max: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+            row.get(0)
+        })?;
         Ok(max)
     }
 }
@@ -146,7 +141,9 @@ mod tests {
     #[test]
     fn test_batch_insert() {
         let store = Store::open_memory().unwrap();
-        let events: Vec<Event> = (0..100).map(|i| sample_event(&format!("kind_{i}"))).collect();
+        let events: Vec<Event> = (0..100)
+            .map(|i| sample_event(&format!("kind_{i}")))
+            .collect();
         store.insert_events_batch(&events).unwrap();
         assert_eq!(store.events_count().unwrap(), 100);
     }

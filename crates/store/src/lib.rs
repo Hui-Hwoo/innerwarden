@@ -52,7 +52,8 @@ impl Store {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o664));
+                    let _ =
+                        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o664));
                 }
             }
         }

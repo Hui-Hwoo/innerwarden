@@ -178,9 +178,7 @@ impl StateStore {
 
     pub fn get_block_count(&self, ip: &str) -> u32 {
         match self.store.kv_get(NS_BLOCK_COUNTS, ip) {
-            Ok(Some(bytes)) if bytes.len() == 4 => {
-                u32::from_le_bytes(bytes.try_into().unwrap())
-            }
+            Ok(Some(bytes)) if bytes.len() == 4 => u32::from_le_bytes(bytes.try_into().unwrap()),
             Ok(_) => 0,
             Err(e) => {
                 warn!(error = %e, "get_block_count failed");

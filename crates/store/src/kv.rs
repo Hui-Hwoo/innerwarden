@@ -81,9 +81,8 @@ impl Store {
     /// List all key-value pairs in a namespace.
     pub fn kv_list(&self, namespace: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT key, value FROM kv_state WHERE namespace = ?1 ORDER BY key",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT key, value FROM kv_state WHERE namespace = ?1 ORDER BY key")?;
         let rows = stmt.query_map(params![namespace], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
@@ -239,7 +238,9 @@ mod tests {
     fn test_kv_get_str() {
         let store = Store::open_memory().unwrap();
         let json = serde_json::json!({"risk_score": 85}).to_string();
-        store.kv_set("profiles", "1.2.3.4", json.as_bytes()).unwrap();
+        store
+            .kv_set("profiles", "1.2.3.4", json.as_bytes())
+            .unwrap();
 
         let val = store.kv_get_str("profiles", "1.2.3.4").unwrap().unwrap();
         assert!(val.contains("risk_score"));

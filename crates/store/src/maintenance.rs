@@ -60,8 +60,7 @@ impl Store {
     /// Run SQLite integrity check. Returns "ok" if healthy.
     pub fn integrity_check(&self) -> Result<String> {
         let conn = self.conn()?;
-        let result: String =
-            conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         if result != "ok" {
             warn!(result = %result, "integrity check failed");
         }
@@ -101,10 +100,7 @@ impl Store {
         if decisions_days > 0 {
             let cutoff = (now - chrono::Duration::days(decisions_days as i64)).to_rfc3339();
             let conn = self.conn()?;
-            let deleted = conn.execute(
-                "DELETE FROM decisions WHERE ts < ?1",
-                params![cutoff],
-            )?;
+            let deleted = conn.execute("DELETE FROM decisions WHERE ts < ?1", params![cutoff])?;
             result.decisions_deleted = deleted as u64;
         }
 
@@ -112,13 +108,10 @@ impl Store {
             let cutoff_date = (now - chrono::Duration::days(graph_snapshot_days as i64))
                 .format("%Y-%m-%d")
                 .to_string();
-            result.graph_snapshots_deleted =
-                self.delete_graph_snapshots_before(&cutoff_date)?;
+            result.graph_snapshots_deleted = self.delete_graph_snapshots_before(&cutoff_date)?;
         }
 
-        if result.events_deleted > 0
-            || result.incidents_deleted > 0
-            || result.decisions_deleted > 0
+        if result.events_deleted > 0 || result.incidents_deleted > 0 || result.decisions_deleted > 0
         {
             info!(
                 events = result.events_deleted,
@@ -204,6 +197,12 @@ pub struct MaintenanceScheduler {
     last_5min: std::time::Instant,
     last_hourly: std::time::Instant,
     last_daily: Option<chrono::NaiveDate>,
+}
+
+impl Default for MaintenanceScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MaintenanceScheduler {

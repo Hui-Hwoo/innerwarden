@@ -36,10 +36,7 @@ impl Store {
     /// Delete a named state blob. Returns true if it existed.
     pub fn delete_blob(&self, name: &str) -> Result<bool> {
         let conn = self.conn()?;
-        let deleted = conn.execute(
-            "DELETE FROM state_blobs WHERE name = ?1",
-            params![name],
-        )?;
+        let deleted = conn.execute("DELETE FROM state_blobs WHERE name = ?1", params![name])?;
         Ok(deleted > 0)
     }
 
@@ -72,7 +69,9 @@ mod tests {
         assert_eq!(val, json);
 
         // Upsert
-        store.set_blob("responses", r#"{"active_blocks": 10}"#).unwrap();
+        store
+            .set_blob("responses", r#"{"active_blocks": 10}"#)
+            .unwrap();
         let val = store.get_blob("responses").unwrap().unwrap();
         assert!(val.contains("10"));
     }

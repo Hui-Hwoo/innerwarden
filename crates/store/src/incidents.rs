@@ -39,9 +39,8 @@ impl Store {
     /// Read incidents with rowid > `after_id`, up to `limit`.
     pub fn incidents_since(&self, after_id: i64, limit: usize) -> Result<Vec<(i64, Incident)>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, data FROM incidents WHERE id > ?1 ORDER BY id LIMIT ?2",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT id, data FROM incidents WHERE id > ?1 ORDER BY id LIMIT ?2")?;
         let rows = stmt.query_map(params![after_id, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -62,9 +61,7 @@ impl Store {
     /// Look up a single incident by its `incident_id`.
     pub fn get_incident(&self, incident_id: &str) -> Result<Option<Incident>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT data FROM incidents WHERE incident_id = ?1",
-        )?;
+        let mut stmt = conn.prepare_cached("SELECT data FROM incidents WHERE incident_id = ?1")?;
         let result = stmt
             .query_row(params![incident_id], |row| row.get::<_, String>(0))
             .optional()?;
@@ -78,29 +75,23 @@ impl Store {
     /// Count total incidents.
     pub fn incidents_count(&self) -> Result<u64> {
         let conn = self.conn()?;
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM incidents", [], |row| row.get(0))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM incidents", [], |row| row.get(0))?;
         Ok(count as u64)
     }
 
     /// Delete incidents with ts < `before_ts`. Returns rows deleted.
     pub fn delete_incidents_before(&self, before_ts: &str) -> Result<u64> {
         let conn = self.conn()?;
-        let deleted = conn.execute(
-            "DELETE FROM incidents WHERE ts < ?1",
-            params![before_ts],
-        )?;
+        let deleted = conn.execute("DELETE FROM incidents WHERE ts < ?1", params![before_ts])?;
         Ok(deleted as u64)
     }
 
     /// Get the maximum rowid (0 if empty).
     pub fn incidents_max_id(&self) -> Result<i64> {
         let conn = self.conn()?;
-        let max: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM incidents",
-            [],
-            |row| row.get(0),
-        )?;
+        let max: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM incidents", [], |row| {
+            row.get(0)
+        })?;
         Ok(max)
     }
 }
@@ -163,9 +154,7 @@ mod tests {
             .insert_incident(&sample_incident("ssh:bruteforce:2026-04-12"))
             .unwrap();
 
-        let found = store
-            .get_incident("ssh:bruteforce:2026-04-12")
-            .unwrap();
+        let found = store.get_incident("ssh:bruteforce:2026-04-12").unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().title, "Test incident");
 

@@ -179,7 +179,10 @@ impl KnowledgeGraph {
 
     /// Save graph snapshot to the unified SQLite store.
     pub fn save_to_store(&self, store: &innerwarden_store::Store) -> anyhow::Result<()> {
-        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
         let snapshot = GraphSnapshot {
             nodes: self.nodes.clone(),
             edges: self.edges.clone(),
@@ -210,10 +213,9 @@ impl KnowledgeGraph {
 
     /// Delete SQLite graph snapshots older than `keep_days` days.
     pub fn cleanup_store_snapshots(store: &innerwarden_store::Store, keep_days: u32) {
-        let cutoff = (chrono::Local::now().date_naive()
-            - chrono::Duration::days(keep_days as i64))
-        .format("%Y-%m-%d")
-        .to_string();
+        let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(keep_days as i64))
+            .format("%Y-%m-%d")
+            .to_string();
         if let Err(e) = store.delete_graph_snapshots_before(&cutoff) {
             tracing::warn!("SQLite snapshot cleanup failed: {e:#}");
         }

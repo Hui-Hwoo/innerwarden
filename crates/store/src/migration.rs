@@ -152,7 +152,11 @@ fn migrate_incidents_jsonl(
 ) {
     let files = find_matching_files(data_dir, "incidents-", ".jsonl");
     for path in files {
-        let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let fname = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         match fs::File::open(&path) {
             Ok(file) => {
                 let reader = BufReader::new(file);
@@ -170,15 +174,13 @@ fn migrate_incidents_jsonl(
                         continue;
                     }
                     match serde_json::from_str::<innerwarden_core::incident::Incident>(line) {
-                        Ok(incident) => {
-                            match store.insert_incident(&incident) {
-                                Ok(_) => report.incidents_migrated += 1,
-                                Err(e) => {
-                                    warn!(file = %fname, line = line_num + 1, "insert error: {e}");
-                                    report.incidents_skipped += 1;
-                                }
+                        Ok(incident) => match store.insert_incident(&incident) {
+                            Ok(_) => report.incidents_migrated += 1,
+                            Err(e) => {
+                                warn!(file = %fname, line = line_num + 1, "insert error: {e}");
+                                report.incidents_skipped += 1;
                             }
-                        }
+                        },
                         Err(e) => {
                             warn!(file = %fname, line = line_num + 1, "parse error: {e}");
                             report.incidents_skipped += 1;
@@ -203,7 +205,11 @@ fn migrate_decisions_jsonl(
 ) {
     let files = find_matching_files(data_dir, "decisions-", ".jsonl");
     for path in files {
-        let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let fname = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         match fs::File::open(&path) {
             Ok(file) => {
                 let reader = BufReader::new(file);
@@ -295,7 +301,11 @@ fn migrate_graph_snapshots(
 ) {
     let files = find_matching_files(data_dir, "graph-snapshot-", ".json");
     for path in files {
-        let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let fname = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         // Extract date from filename: graph-snapshot-YYYY-MM-DD.json
         let date = fname
             .strip_prefix("graph-snapshot-")
@@ -331,13 +341,21 @@ fn count_graph_nodes_edges(bytes: &[u8]) -> (usize, usize) {
                 .get("nodes")
                 .and_then(|v| v.as_array())
                 .map(|a| a.len())
-                .or_else(|| val.get("nodes").and_then(|v| v.as_object()).map(|o| o.len()))
+                .or_else(|| {
+                    val.get("nodes")
+                        .and_then(|v| v.as_object())
+                        .map(|o| o.len())
+                })
                 .unwrap_or(0);
             let edges = val
                 .get("edges")
                 .and_then(|v| v.as_array())
                 .map(|a| a.len())
-                .or_else(|| val.get("edges").and_then(|v| v.as_object()).map(|o| o.len()))
+                .or_else(|| {
+                    val.get("edges")
+                        .and_then(|v| v.as_object())
+                        .map(|o| o.len())
+                })
                 .unwrap_or(0);
             (nodes, edges)
         }
@@ -392,11 +410,7 @@ fn migrate_state_blobs(
 }
 
 /// Move migrated files to legacy-archive/ directory.
-fn archive_files(
-    data_dir: &Path,
-    files: &[std::path::PathBuf],
-    report: &mut MigrationReport,
-) {
+fn archive_files(data_dir: &Path, files: &[std::path::PathBuf], report: &mut MigrationReport) {
     if files.is_empty() {
         return;
     }
@@ -479,11 +493,7 @@ mod tests {
             serde_json::to_string(&line1).unwrap(),
             serde_json::to_string(&line2).unwrap()
         );
-        fs::write(
-            dir.path().join("incidents-2026-04-12.jsonl"),
-            content,
-        )
-        .unwrap();
+        fs::write(dir.path().join("incidents-2026-04-12.jsonl"), content).unwrap();
 
         let report = store.migrate_from_legacy(dir.path()).unwrap();
         assert_eq!(report.incidents_migrated, 2);
@@ -506,11 +516,7 @@ mod tests {
             "reason": "test"
         });
         let content = format!("{}\n", serde_json::to_string(&line1).unwrap());
-        fs::write(
-            dir.path().join("decisions-2026-04-12.jsonl"),
-            content,
-        )
-        .unwrap();
+        fs::write(dir.path().join("decisions-2026-04-12.jsonl"), content).unwrap();
 
         let report = store.migrate_from_legacy(dir.path()).unwrap();
         assert_eq!(report.decisions_migrated, 1);
@@ -599,11 +605,7 @@ mod tests {
             "entities": []
         });
         let content = format!("{}\n", serde_json::to_string(&line).unwrap());
-        fs::write(
-            dir.path().join("incidents-2026-04-12.jsonl"),
-            &content,
-        )
-        .unwrap();
+        fs::write(dir.path().join("incidents-2026-04-12.jsonl"), &content).unwrap();
 
         // First migration
         let r1 = store.migrate_from_legacy(dir.path()).unwrap();

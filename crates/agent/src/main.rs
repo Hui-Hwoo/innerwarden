@@ -738,10 +738,17 @@ async fn main() -> Result<()> {
 
     // Open SQLite store early so the graph can try loading from it.
     // Wrapped in Arc so it can be shared with the dashboard task.
-    let sqlite_store: Option<Arc<innerwarden_store::Store>> = match innerwarden_store::Store::open(&cli.data_dir) {
-        Ok(s) => { info!(path = %cli.data_dir.join("innerwarden.db").display(), "sqlite store opened"); Some(Arc::new(s)) }
-        Err(e) => { warn!("sqlite store unavailable: {e:#}"); None }
-    };
+    let sqlite_store: Option<Arc<innerwarden_store::Store>> =
+        match innerwarden_store::Store::open(&cli.data_dir) {
+            Ok(s) => {
+                info!(path = %cli.data_dir.join("innerwarden.db").display(), "sqlite store opened");
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                warn!("sqlite store unavailable: {e:#}");
+                None
+            }
+        };
 
     // One-time migration from legacy files (JSONL + JSON → SQLite)
     if let Some(ref sq) = sqlite_store {
@@ -755,7 +762,8 @@ async fn main() -> Result<()> {
 
     // Shared knowledge graph: try SQLite store first, fall back to file-based dated snapshot.
     let shared_graph = std::sync::Arc::new(std::sync::RwLock::new({
-        let from_store = sqlite_store.as_deref()
+        let from_store = sqlite_store
+            .as_deref()
             .and_then(knowledge_graph::KnowledgeGraph::load_from_store);
         if let Some(g) = from_store {
             g
@@ -1244,7 +1252,10 @@ async fn main() -> Result<()> {
         },
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
-        response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(&cli.data_dir, sqlite_store.as_deref()),
+        response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(
+            &cli.data_dir,
+            sqlite_store.as_deref(),
+        ),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
         narrative_incidents_offset: 0,
@@ -1340,7 +1351,12 @@ async fn main() -> Result<()> {
                 feed_urls.len()
             );
         }
-        let client = threat_feeds::ThreatFeedClient::new(vt_key, feed_urls, &cli.data_dir, sqlite_store.as_deref());
+        let client = threat_feeds::ThreatFeedClient::new(
+            vt_key,
+            feed_urls,
+            &cli.data_dir,
+            sqlite_store.as_deref(),
+        );
         let feed_state = client.state();
         if feed_state.total_iocs > 0 {
             info!(
@@ -2403,19 +2419,30 @@ async fn process_incidents(
                 let max_id = rows.last().unwrap().0;
                 let entries = rows.into_iter().map(|(_, inc)| inc).collect();
                 let _ = sq.set_agent_cursor("incidents", max_id);
-                reader::ReadResult { entries, new_offset: 0 }
+                reader::ReadResult {
+                    entries,
+                    new_offset: 0,
+                }
             }
             _ => {
                 let p = data_dir.join(format!("incidents-{today}.jsonl"));
-                reader::read_new_entries(&p, cursor.incidents_offset(&today))
-                    .unwrap_or(reader::ReadResult { entries: vec![], new_offset: cursor.incidents_offset(&today) })
+                reader::read_new_entries(&p, cursor.incidents_offset(&today)).unwrap_or(
+                    reader::ReadResult {
+                        entries: vec![],
+                        new_offset: cursor.incidents_offset(&today),
+                    },
+                )
             }
         }
     } else {
         let p = data_dir.join(format!("incidents-{today}.jsonl"));
         match reader::read_new_entries(&p, cursor.incidents_offset(&today)) {
             Ok(r) => r,
-            Err(e) => { state.telemetry.observe_error("incident_reader"); warn!("incident reader: {e:#}"); return 0; }
+            Err(e) => {
+                state.telemetry.observe_error("incident_reader");
+                warn!("incident reader: {e:#}");
+                return 0;
+            }
         }
     };
 
@@ -2501,10 +2528,14 @@ async fn process_incidents(
     let (all_events, skill_infos, ai_provider, provider_name, already_blocked, mut blocked_set) =
         if ai_enabled {
             let events = if let Some(ref sq) = state.sqlite_store {
-                sq.events_since(0, 50_000).map(|rows| rows.into_iter().map(|(_, ev)| ev).collect()).unwrap_or_default()
+                sq.events_since(0, 50_000)
+                    .map(|rows| rows.into_iter().map(|(_, ev)| ev).collect())
+                    .unwrap_or_default()
             } else {
                 let events_path = data_dir.join(format!("events-{today}.jsonl"));
-                reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, 0).map(|r| r.entries).unwrap_or_default()
+                reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, 0)
+                    .map(|r| r.entries)
+                    .unwrap_or_default()
             };
             let infos = state.skill_registry.infos();
             // Clone the Arc - owned handle, no borrow of `state`
@@ -3383,8 +3414,13 @@ async fn process_narrative_tick(
             }
             _ => {
                 let events_path = data_dir.join(format!("events-{today}.jsonl"));
-                let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, cursor.events_offset(&today))
-                    .inspect_err(|_| { state.telemetry.observe_error("event_reader"); })?;
+                let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(
+                    &events_path,
+                    cursor.events_offset(&today),
+                )
+                .inspect_err(|_| {
+                    state.telemetry.observe_error("event_reader");
+                })?;
                 let count = new_events.entries.len();
                 cursor.set_events_offset(&today, new_events.new_offset);
                 (new_events.entries, count)
@@ -3417,8 +3453,13 @@ async fn process_narrative_tick(
             }
             _ => {
                 let events_path = data_dir.join(format!("events-{today}.jsonl"));
-                let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, cursor.events_offset(&today))
-                    .inspect_err(|_| { state.telemetry.observe_error("event_reader"); })?;
+                let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(
+                    &events_path,
+                    cursor.events_offset(&today),
+                )
+                .inspect_err(|_| {
+                    state.telemetry.observe_error("event_reader");
+                })?;
                 let count = new_events.entries.len();
                 cursor.set_events_offset(&today, new_events.new_offset);
                 (new_events.entries, count)
@@ -3426,8 +3467,13 @@ async fn process_narrative_tick(
         }
     } else {
         let events_path = data_dir.join(format!("events-{today}.jsonl"));
-        let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(&events_path, cursor.events_offset(&today))
-            .inspect_err(|_| { state.telemetry.observe_error("event_reader"); })?;
+        let new_events = reader::read_new_entries::<innerwarden_core::event::Event>(
+            &events_path,
+            cursor.events_offset(&today),
+        )
+        .inspect_err(|_| {
+            state.telemetry.observe_error("event_reader");
+        })?;
         let count = new_events.entries.len();
         cursor.set_events_offset(&today, new_events.new_offset);
         (new_events.entries, count)
