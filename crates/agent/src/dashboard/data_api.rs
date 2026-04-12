@@ -62,6 +62,7 @@ pub(super) async fn api_overview(
         if let Some(Node::Incident {
             detector,
             decision,
+            decision_target,
             severity,
             is_allowlisted,
             research_only,
@@ -89,13 +90,20 @@ pub(super) async fn api_overview(
                         safely_resolved += 1;
                     }
                     "request_confirmation" => {
-                        // awaiting human approval → unresolved
                         ai_confirmed += 1;
                         unresolved_count += 1;
                     }
                     _ => {
                         ai_confirmed += 1;
-                        ai_responded += 1;
+                        // Only count as "responded" if the target looks like
+                        // an IP. Pre-fix FPs like sandbox_evasion blocked a
+                        // PID (numeric string) which is not a real response.
+                        let target_is_ip = decision_target
+                            .as_ref()
+                            .is_some_and(|t| t.contains('.'));
+                        if target_is_ip {
+                            ai_responded += 1;
+                        }
                         safely_resolved += 1;
                     }
                 }
@@ -559,6 +567,7 @@ pub(super) fn compute_overview_from_graph(
         if let Some(Node::Incident {
             detector,
             decision,
+            decision_target,
             severity,
             is_allowlisted,
             research_only,
@@ -591,7 +600,12 @@ pub(super) fn compute_overview_from_graph(
                     }
                     _ => {
                         ai_confirmed += 1;
-                        ai_responded += 1;
+                        let target_is_ip = decision_target
+                            .as_ref()
+                            .is_some_and(|t| t.contains('.'));
+                        if target_is_ip {
+                            ai_responded += 1;
+                        }
                         safely_resolved += 1;
                     }
                 }
