@@ -366,7 +366,10 @@ pub fn compute_for_date_from_graph(
     populate_counters_from_graph(graph, &mut counters);
 
     // If SQLite DB exists, data files are present (JSONL no longer required)
-    let db_exists = data_dir.join("innerwarden.db").exists();
+    // Canonicalize data_dir to prevent path traversal (CodeQL: path-injection).
+    let db_exists = std::fs::canonicalize(data_dir)
+        .map(|d| d.join("innerwarden.db").exists())
+        .unwrap_or(false);
     let expected_files_present = db_exists || files.iter().all(|f| f.exists);
     let state_json_readable = state_info.exists && state_info.readable;
     let agent_state_json_readable = agent_state_info.exists && agent_state_info.readable;
@@ -501,7 +504,10 @@ pub fn compute_for_date(data_dir: &Path, date: Option<&str>) -> TrialReport {
     files.push(file_health_plain("agent-state", &agent_state_info));
 
     // If SQLite DB exists, data files are present (JSONL no longer required)
-    let db_exists = data_dir.join("innerwarden.db").exists();
+    // Canonicalize data_dir to prevent path traversal (CodeQL: path-injection).
+    let db_exists = std::fs::canonicalize(data_dir)
+        .map(|d| d.join("innerwarden.db").exists())
+        .unwrap_or(false);
     let expected_files_present = db_exists || files.iter().all(|f| f.exists);
     let state_json_readable = state_info.exists && state_info.readable;
     let agent_state_json_readable = agent_state_info.exists && agent_state_info.readable;

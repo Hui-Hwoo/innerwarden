@@ -41,6 +41,11 @@ impl Store {
     /// Runs schema migrations if needed. Configures WAL mode and
     /// performance-oriented PRAGMAs.
     pub fn open(data_dir: &Path) -> Result<Self> {
+        // Canonicalize data_dir to prevent path traversal attacks.
+        let data_dir = std::fs::canonicalize(data_dir).map_err(StoreError::Io)?;
+        if !data_dir.is_dir() {
+            return Err(StoreError::Other("data_dir is not a directory".into()));
+        }
         let db_path = data_dir.join("innerwarden.db");
 
         // Pre-create the DB file with group-writable permissions (0664) so that
@@ -73,10 +78,7 @@ impl Store {
 
         info!(path = %db_path.display(), "store opened (sqlite WAL)");
 
-        Ok(Self {
-            pool,
-            data_dir: data_dir.to_path_buf(),
-        })
+        Ok(Self { pool, data_dir })
     }
 
     /// Open an in-memory database (for testing).

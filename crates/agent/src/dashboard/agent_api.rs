@@ -433,7 +433,15 @@ pub(super) async fn api_prometheus_metrics(
         .sqlite_store
         .as_ref()
         .and_then(|sq| sq.get_blob("responses").ok().flatten())
-        .or_else(|| std::fs::read_to_string(state.data_dir.join("responses.json")).ok());
+        .or_else(|| {
+            // Canonicalize data_dir to prevent path traversal (CodeQL: path-injection).
+            let canonical = std::fs::canonicalize(&state.data_dir).ok()?;
+            let target = canonical.join("responses.json");
+            if !target.starts_with(&canonical) {
+                return None;
+            }
+            std::fs::read_to_string(target).ok()
+        });
     if let Some(data) = responses_data {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
             out.push_str("# HELP innerwarden_responses_active Currently active response actions\n");
@@ -475,7 +483,15 @@ pub(super) async fn api_responses(State(state): State<DashboardState>) -> axum::
         .sqlite_store
         .as_ref()
         .and_then(|sq| sq.get_blob("responses").ok().flatten())
-        .or_else(|| std::fs::read_to_string(state.data_dir.join("responses.json")).ok());
+        .or_else(|| {
+            // Canonicalize data_dir to prevent path traversal (CodeQL: path-injection).
+            let canonical = std::fs::canonicalize(&state.data_dir).ok()?;
+            let target = canonical.join("responses.json");
+            if !target.starts_with(&canonical) {
+                return None;
+            }
+            std::fs::read_to_string(target).ok()
+        });
     match data {
         Some(data) => axum::response::Response::builder()
             .header("content-type", "application/json")

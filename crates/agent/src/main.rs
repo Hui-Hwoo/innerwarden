@@ -597,6 +597,7 @@ fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
     );
     let removed_count = report.removed_user_names.len();
     if removed_count > 0 {
+        // CodeQL: count only, no PII — removed_count is .len(), names are never logged.
         println!("  removed users        : {removed_count} (names redacted)");
     }
     Ok(())
