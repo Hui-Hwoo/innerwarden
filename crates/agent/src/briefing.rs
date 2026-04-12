@@ -44,9 +44,16 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
             decision,
             decision_target,
             auto_executed,
+            research_only,
             ..
         }) = graph.get_node(id)
         {
+            // Skip research-only incidents — these are self-traffic (agent
+            // notifications, cloud metadata, CrowdSec polling) that pollute
+            // the briefing with false "threats" like Telegram API IPs.
+            if *research_only {
+                continue;
+            }
             *by_detector.entry(detector.clone()).or_default() += 1;
             *by_severity.entry(severity.to_lowercase()).or_default() += 1;
 
@@ -110,9 +117,13 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
             detector,
             decision,
             decision_target,
+            research_only,
             ..
         }) = graph.get_node(inc_id)
         {
+            if *research_only {
+                continue;
+            }
             for edge in graph.outgoing_edges(inc_id) {
                 if edge.relation != Relation::TriggeredBy {
                     continue;
@@ -123,7 +134,12 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
                 {
                     if *is_internal {
                         continue;
-                    } // Skip server's own IPs
+                    }
+                    // Skip self-traffic IPs (cloud providers, agent services,
+                    // local interfaces) — same filter as investigation.rs
+                    if crate::cloud_safelist::is_self_traffic_ip(addr) {
+                        continue;
+                    }
                     let entry = ip_data
                         .entry(addr.clone())
                         .or_insert((0, Vec::new(), false));
@@ -241,24 +257,28 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
 /// The LLM prompt for generating the briefing.
 pub fn briefing_prompt(context: &str) -> String {
     format!(
-        "You are a senior security analyst writing a daily briefing for a server operator.\n\
+        "You are the AI security agent writing a daily briefing for a non-technical server operator.\n\
+         \n\
+         This server is protected by InnerWarden — an autonomous AI security agent that blocks \
+         threats automatically. The operator does NOT need to take action on most items. \
+         SSH uses key-only authentication (password login disabled). Most activity from \
+         external IPs is routine internet scanning that fails at the protocol level.\n\
          \n\
          CRITICAL RULES:\n\
-         - Incidents marked CONTAINED are RESOLVED — do NOT treat them as active threats\n\
-         - Incidents marked IGNORED are confirmed noise — do NOT recommend action on them\n\
-         - Only UNRESOLVED incidents need attention\n\
-         - IPs marked [ALREADY BLOCKED] are handled — do NOT recommend blocking them again\n\
-         - Internal IPs (10.x, 192.168.x, 127.x) are the server itself — NOT attackers\n\
-         - The system AUTO-BLOCKS threats. Most detections are already handled.\n\
+         - CONTAINED/BLOCKED items are RESOLVED — present them as success, not active threats\n\
+         - IGNORED items are confirmed noise — do not mention them\n\
+         - UNRESOLVED items are being OBSERVED by the AI — only flag if genuinely dangerous\n\
+         - Routine scanners (SSH malformed strings, port probes) are NOT dangerous and NOT urgent\n\
+         - Do NOT recommend 'updating passwords' or generic security advice\n\
+         - Be reassuring when the server is safe. Be direct only when something is genuinely dangerous.\n\
+         - Write for someone who is NOT a security professional\n\
          \n\
-         Write a concise briefing with these sections:\n\
-         1. **THREAT LEVEL** — one word + one sentence. Base it on UNRESOLVED count, not total.\n\
-         2. **EXECUTIVE SUMMARY** — 2-3 sentences. Be accurate about what's resolved vs active.\n\
-         3. **WHAT WAS HANDLED** — bullet list of AI actions taken (blocks, kills, monitors)\n\
-         4. **NEEDS ATTENTION** — only UNRESOLVED high/critical threats with specific actions\n\
-         5. **RECOMMENDATIONS** — 2-3 actionable steps for TODAY\n\
+         Write a SHORT briefing (under 150 words) with:\n\
+         1. **STATUS** — one sentence: is the server safe right now?\n\
+         2. **WHAT THE AI DID** — 2-3 bullets of actions taken (blocks, monitoring)\n\
+         3. **NEEDS ATTENTION** — only if something genuinely requires human decision (rare)\n\
          \n\
-         Be accurate. Do not exaggerate. If most threats are contained, say so.\n\
+         Tone: calm, confident, specific. Like a trusted security guard giving a morning report.\n\
          \n\
          ---\n\
          \n\

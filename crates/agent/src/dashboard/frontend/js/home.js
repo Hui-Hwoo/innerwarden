@@ -140,12 +140,12 @@ function computeHomeState(payload) {
 
   // Guard ON or no active threats: AI Protection Active.
   // The operator sees confidence, not alarm.
-  // Count unique blocked IPs (same logic as KPI, not decision count)
   var blockedSet = new Set();
   (payload.allIncidents || []).forEach(function(inc) {
     if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
       (inc.entities || []).forEach(function(e) {
-        if ((e.type || '').toLowerCase() === 'ip' && e.value) blockedSet.add(e.value);
+        var s = typeof e === 'string' ? e : (e.value || '');
+        if (s.startsWith('ip:')) blockedSet.add(s.slice(3));
       });
     }
   });
@@ -216,16 +216,16 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
   var didEl  = document.getElementById('homeNowDid');
   if (!whatEl || !didEl) return;
 
-  // Use unique blocked IPs, not decision count (matches KPI + Threats)
   var blockedIpsNow = new Set();
   (window._lastIncidentList || []).forEach(function(inc) {
     if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
       (inc.entities || []).forEach(function(e) {
-        if ((e.type || '').toLowerCase() === 'ip' && e.value) blockedIpsNow.add(e.value);
+        var s = typeof e === 'string' ? e : (e.value || '');
+        if (s.startsWith('ip:')) blockedIpsNow.add(s.slice(3));
       });
     }
   });
-  var contained = blockedIpsNow.size || (overview.ai_responded || 0);
+  var contained = blockedIpsNow.size > 0 ? blockedIpsNow.size : (overview.ai_responded || 0);
   var total = totalEventsScanned || overview.events_count || 0;
 
   // Line 1 — Trust signal: volume scanned
@@ -254,18 +254,19 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
 
 // ── KPIs with fixed temporal sub-labels ──────────────────────────────
 function updateHomeKpis(overview, totalEventsScanned) {
-  // Count unique IPs with block decisions (matches Threats tab entity count)
+  // Count unique IPs with block decisions (matches Threats tab entity count).
+  // API entities are strings "ip:1.2.3.4", not {type,value} objects.
   var blockedIps = new Set();
-  var items = (window._lastIncidentList || []);
-  items.forEach(function(inc) {
+  (window._lastIncidentList || []).forEach(function(inc) {
     if (inc.outcome === 'blocked' || inc.outcome === 'contained') {
       (inc.entities || []).forEach(function(e) {
-        if ((e.type || '').toLowerCase() === 'ip' && e.value) blockedIps.add(e.value);
+        var s = typeof e === 'string' ? e : (e.value || '');
+        if (s.startsWith('ip:')) blockedIps.add(s.slice(3));
       });
     }
   });
   var el = document.getElementById('homeKpiThreats');
-  if (el) el.textContent = blockedIps.size || overview.ai_responded || 0;
+  if (el) el.textContent = blockedIps.size > 0 ? blockedIps.size : (overview.ai_responded || 0);
 
   el = document.getElementById('homeKpiResponded');
   if (el) el.textContent = overview.incidents_count || 0;

@@ -145,11 +145,12 @@ function aggregateIncidents(incidents) {
 
 function outcomeBadgeHtml(outcome) {
   if (outcome === 'blocked' || outcome === 'killed' || outcome === 'contained' || outcome === 'suspended')
-    return '<span class="badge-contained">CONTAINED</span>';
-  if (outcome === 'ignored') return '<span class="badge-noise">NOISE</span>';
-  if (outcome === 'open') return '<span class="badge-unresolved">ACTIVE</span>';
-  if (outcome === 'monitored') return '<span class="badge-monitor" style="font-size:0.62rem;padding:2px 7px;border-radius:4px">MONITORING</span>';
+    return '<span class="badge-contained">BLOCKED</span>';
+  if (outcome === 'ignored' || outcome === 'dismissed') return '<span class="badge-noise">DISMISSED</span>';
+  if (outcome === 'monitoring' || outcome === 'monitored' || outcome === 'open' || outcome === 'active')
+    return '<span class="badge-monitor" style="font-size:0.62rem;padding:2px 7px;border-radius:4px">OBSERVING</span>';
   if (outcome === 'honeypot') return '<span style="font-size:0.62rem;padding:2px 7px;border-radius:4px;background:rgba(255,140,66,0.12);color:var(--orange);font-weight:600">HONEYPOT</span>';
+  if (outcome === 'needs_attention') return '<span class="badge-unresolved">NEEDS ATTENTION</span>';
   return '';
 }
 
