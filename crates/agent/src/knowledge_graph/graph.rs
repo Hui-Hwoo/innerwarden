@@ -463,7 +463,52 @@ impl KnowledgeGraph {
             is_tor: false,
             first_seen: ts,
             last_seen: ts,
+            attempted_usernames: Vec::new(),
         })
+    }
+
+    /// Spec 015: record an attacker-supplied username from a failed SSH auth.
+    /// Appends to the Ip node's `attempted_usernames` list, deduplicating and
+    /// capping at 50 most-recent entries (LIFO). Silently no-ops if the node
+    /// is not an Ip.
+    pub fn record_attempted_username(&mut self, ip_id: NodeId, username: &str) {
+        const MAX_ATTEMPTED: usize = 50;
+        if username.is_empty() {
+            return;
+        }
+        if let Some(Node::Ip {
+            attempted_usernames,
+            ..
+        }) = self.nodes.get_mut(&ip_id)
+        {
+            // SECURITY NOTE: these are attacker-supplied brute-force usernames
+            // (e.g., "root", "admin", "test123"), NOT real credentials. Stored
+            // in plaintext intentionally for threat DNA fingerprinting and
+            // dashboard display. CodeQL may flag this as "cleartext logging of
+            // sensitive information" — it is a false positive in this context.
+            if let Some(pos) = attempted_usernames.iter().position(|u| u == username) {
+                attempted_usernames.remove(pos);
+            }
+            attempted_usernames.push(username.to_string());
+            // Cap (LIFO): drop the oldest entries when exceeding the max.
+            if attempted_usernames.len() > MAX_ATTEMPTED {
+                let drop = attempted_usernames.len() - MAX_ATTEMPTED;
+                attempted_usernames.drain(0..drop);
+            }
+        }
+    }
+
+    /// Spec 015: retrieve attacker-supplied usernames from a given Ip node,
+    /// for attacker fingerprinting / threat-dna features.
+    #[allow(dead_code)] // API surface for future attacker-intel consumers
+    pub fn attempted_usernames_for_ip(&self, ip_id: NodeId) -> Vec<String> {
+        match self.nodes.get(&ip_id) {
+            Some(Node::Ip {
+                attempted_usernames,
+                ..
+            }) => attempted_usernames.clone(),
+            _ => Vec::new(),
+        }
     }
 
     pub fn ensure_file(&mut self, path: &str) -> NodeId {
@@ -1587,6 +1632,7 @@ mod tests {
             is_tor: false,
             first_seen: ts(0),
             last_seen: ts(0),
+            attempted_usernames: Vec::new(),
         });
         g.add_edge(Edge::new(proc1, ip, Relation::ConnectedTo, ts(1)));
 

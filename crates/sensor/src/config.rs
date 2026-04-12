@@ -10,6 +10,9 @@ pub struct Config {
     pub collectors: CollectorsConfig,
     #[serde(default)]
     pub detectors: DetectorsConfig,
+    #[serde(default)]
+    #[allow(dead_code)] // Fields read at runtime when calibration is wired to detectors
+    pub calibration: CalibrationConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +213,16 @@ pub struct DetectorsConfig {
     pub credential_harvest: CredentialHarvestConfig,
     #[serde(default)]
     pub packet_flood: PacketFloodConfig,
+    #[serde(default)]
+    pub suspicious_login: SuspiciousLoginConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SuspiciousLoginConfig {
+    /// Enable time-of-day anomaly detection based on a 7-day user login baseline.
+    /// When true, logins outside a user's normal hours fire a Medium-severity incident.
+    #[serde(default)]
+    pub anomaly_hours_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1145,6 +1158,33 @@ fn default_integrity_alert_cooldown_seconds() -> u64 {
 
 fn default_log_tampering_cooldown_seconds() -> u64 {
     600
+}
+
+// ---------------------------------------------------------------------------
+// Calibration — operator-declared host inventory
+// ---------------------------------------------------------------------------
+
+/// Operator-declared expectations about what SHOULD be running on this host.
+/// Used by the sensor to suppress false positives from known services.
+///
+/// ```toml
+/// [calibration]
+/// expected_services = ["nginx", "postgres", "redis", "node"]
+/// expected_outbound = ["api.telegram.org", "api.openai.com", "abuseipdb.com"]
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+#[allow(dead_code)] // Fields reserved for detector wiring in next phase
+pub struct CalibrationConfig {
+    /// Services the operator expects to be running. Process names (comm).
+    /// Detectors use this to suppress FPs from known infrastructure.
+    #[serde(default)]
+    pub expected_services: Vec<String>,
+
+    /// Outbound destinations the operator expects. Domains or IPs.
+    /// DNS C2 and outbound anomaly detectors use this to avoid flagging
+    /// legitimate API calls.
+    #[serde(default)]
+    pub expected_outbound: Vec<String>,
 }
 
 pub fn load(path: &str) -> Result<Config> {

@@ -46,6 +46,13 @@ impl CidrRange {
 static CLOUD_RANGES: OnceLock<Vec<CidrRange>> = OnceLock::new();
 static CLOUD_PROVIDER_COUNT: OnceLock<usize> = OnceLock::new();
 
+/// Local interface IPs of the host the agent runs on (eth0, bond0, etc.).
+/// Populated at startup via `init_local_interface_ips()`. Traffic with
+/// src_ip == one of these is the host itself talking to the outside world,
+/// which in incidents like "Packet flood from 10.0.0.238" is the server's
+/// own VPC IP misclassified as an attacker.
+static LOCAL_INTERFACE_IPS: OnceLock<Vec<u32>> = OnceLock::new();
+
 /// Cloudflare IPv4 ranges (from https://www.cloudflare.com/ips-v4).
 /// Updated 2026-04-01. These rarely change.
 const CLOUDFLARE_RANGES: &[&str] = &[
@@ -63,6 +70,66 @@ const CLOUDFLARE_RANGES: &[&str] = &[
     "104.16.0.0/13",
     "104.24.0.0/14",
     "172.64.0.0/13",
+];
+
+/// Agent-owned service endpoints — IPs the agent itself talks to for its
+/// notification, enrichment, and threat-intel pipelines. Traffic to these
+/// destinations is *self-traffic* and MUST NOT fire data-exfil / C2-beacon
+/// style detectors in the operator view. Added after spec 015 surfaced the
+/// self-detection pattern (see the dashboard flood on 2026-04-11 where the
+/// agent was flagging its own Telegram calls as "Data Exfil → CRITICAL").
+const AGENT_SERVICE_RANGES: &[&str] = &[
+    // Telegram (Bot API + MTProto) — AS62041
+    "149.154.160.0/20",
+    "91.108.0.0/16",
+    "91.108.4.0/22",
+    "91.108.56.0/22",
+    "95.161.64.0/20",
+    // CrowdSec CAPI (cloud threat intelligence API) — hosted on AWS
+    // eu-west-1. The local CrowdSec agent (pid crowdsec, uid 0) polls
+    // these IPs for community blocklists and pushes local decisions.
+    // Observed 2026-04-12: 6 AWS eu-west-1 IPs appearing as
+    // "Cross-layer chain: Cryptominer Deployment Chain" because the
+    // correlation engine saw crowdsec outbound + CPU spike = CL-014 FP.
+    // CrowdSec uses an ELB that rotates across the /16, so we safelist
+    // the ranges that the eu-west-1 ELBs live in.
+    "52.48.0.0/14",  // AWS eu-west-1 ELB range (covers 52.48-51.x)
+    "63.32.0.0/14",  // AWS eu-west-1 ELB range (covers 63.32-35.x)
+    "18.200.0.0/14", // AWS eu-west-1 ELB range (covers 18.200-203.x)
+    "3.248.0.0/13",  // AWS eu-west-1 ELB range (covers 3.248-255.x)
+    // ip-api.com (GeoIP enrichment used by crate::geoip)
+    "208.95.112.0/24",
+    // Canonical / Ubuntu archive + snapcraft + livepatch
+    "185.125.188.0/23",
+    "91.189.88.0/21",
+    "162.213.32.0/22",
+];
+
+/// Oracle Cloud peer ranges not already covered by CLOUD_PROVIDER_RANGES.
+/// These are the infrastructure peers of OCI instances (metadata, NTP,
+/// internal DNS, OKE control plane, etc.) that an OCI-hosted agent will
+/// regularly connect to. Keeping them separate from the main cloud list
+/// makes it obvious *why* they're in the safelist — they're the agent's
+/// own home provider, not some random customer workload.
+const ORACLE_PEER_RANGES: &[&str] = &[
+    "138.1.16.0/22",    // OCI peer range
+    "140.91.0.0/16",    // OCI London peers
+    "147.154.224.0/19", // OCI peer /19 — covers gomon (147.154.245.65) + other OCI infra
+    "193.122.0.0/15",   // OCI EU-London
+];
+
+/// Link-local and cloud instance metadata ranges. Every major cloud uses
+/// 169.254.169.254 for instance metadata (IMDS); Oracle, AWS, GCP, Azure
+/// all share the convention. 169.254.0.0/16 is the IPv4 link-local range
+/// (RFC 3927). Traffic to any of these is self-infrastructure by definition
+/// — the operator never cares about "exfil to 169.254.169.254" or
+/// "slowloris on metadata endpoint". Observed 2026-04-11 as
+/// "Slow HTTP connection (possible slowloris)" FP fired by agent host
+/// polling the OCI metadata service.
+const LINK_LOCAL_RANGES: &[&str] = &[
+    "169.254.0.0/16", // IPv4 link-local (RFC 3927), includes all IMDS endpoints
+    "127.0.0.0/8",    // loopback — never operator-relevant as a remote dst
+    "224.0.0.0/4",    // multicast
 ];
 
 /// Major cloud provider CIDR ranges that should not be auto-blocked.
@@ -157,7 +224,13 @@ const CLOUD_PROVIDER_RANGES: &[&str] = &[
 pub fn init() {
     let mut ranges = Vec::new();
 
-    for cidr in CLOUDFLARE_RANGES.iter().chain(CLOUD_PROVIDER_RANGES.iter()) {
+    for cidr in CLOUDFLARE_RANGES
+        .iter()
+        .chain(CLOUD_PROVIDER_RANGES.iter())
+        .chain(AGENT_SERVICE_RANGES.iter())
+        .chain(ORACLE_PEER_RANGES.iter())
+        .chain(LINK_LOCAL_RANGES.iter())
+    {
         if let Some(r) = CidrRange::from_str(cidr) {
             ranges.push(r);
         }
@@ -167,6 +240,115 @@ pub fn init() {
     let _ = CLOUD_RANGES.set(ranges);
     let _ = CLOUD_PROVIDER_COUNT.set(count);
     info!(ranges = count, "Cloud provider safelist loaded");
+
+    // Best-effort: read the host's own IPv4 interface addresses so
+    // incidents with src/dst == own IP can be recognized as self-traffic.
+    // Falls back to an empty list if /proc/net/fib_trie is unreadable;
+    // that just means the own-IP detection is a no-op, not a crash.
+    init_local_interface_ips();
+}
+
+/// Populate `LOCAL_INTERFACE_IPS` from `/proc/net/fib_trie`. This file
+/// exposes every locally-bound IPv4 address (loopback, eth0, docker0, etc.)
+/// as `|-- <ip>` lines followed by `/32 host LOCAL`. Parsing is deliberately
+/// forgiving — any unexpected format just yields an empty list.
+fn init_local_interface_ips() {
+    let content = match std::fs::read_to_string("/proc/net/fib_trie") {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = LOCAL_INTERFACE_IPS.set(Vec::new());
+            return;
+        }
+    };
+
+    let mut ips: Vec<u32> = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        // Each local address appears as "|-- <ip>" with the next non-empty
+        // line containing "/32 host LOCAL". We accept any line whose next
+        // line mentions "host LOCAL" — the routing table can tag as
+        // "host BROADCAST" or "host LINK" too, which we ignore.
+        if let Some(rest) = trimmed.strip_prefix("|-- ") {
+            if let Some(next) = lines.get(i + 1) {
+                if next.contains("host LOCAL") {
+                    if let Ok(std::net::IpAddr::V4(v4)) = rest.trim().parse::<IpAddr>() {
+                        ips.push(u32::from(v4));
+                    }
+                }
+            }
+        }
+    }
+
+    ips.sort_unstable();
+    ips.dedup();
+    let n = ips.len();
+    let _ = LOCAL_INTERFACE_IPS.set(ips);
+    info!(
+        local_ips = n,
+        "Local interface IPs loaded for self-traffic detection"
+    );
+}
+
+/// Returns true if the IP should be treated as *self-traffic* — either a
+/// known cloud provider, the agent's own notification / enrichment
+/// endpoints (Telegram, GeoIP), the OCI peer ranges of the host the
+/// agent runs on, link-local / metadata IPs, OR one of the host's own
+/// IPv4 interface addresses.
+///
+/// Callers that generate operator-facing incidents should use this to
+/// flag the incident as `research_only` instead of surfacing it in the
+/// threats feed.
+pub fn is_self_traffic_ip(ip_str: &str) -> bool {
+    is_cloud_provider_ip(ip_str) || is_local_interface_ip(ip_str)
+}
+
+/// Number of local interface IPs loaded (for boot self-test).
+pub fn local_ip_count() -> usize {
+    LOCAL_INTERFACE_IPS.get().map_or(0, |v| v.len())
+}
+
+/// Number of cloud IP ranges loaded (for boot self-test).
+pub fn cloud_range_count() -> usize {
+    CLOUD_RANGES.get().map_or(0, |v| v.len())
+}
+
+/// Returns true if `ip_str` is one of the host's own locally-bound IPv4
+/// addresses (populated at startup from `/proc/net/fib_trie`). This
+/// catches the case where a sensor detector emits an incident whose
+/// only IP entity is the server's own VPC/eth0 address — observed
+/// 2026-04-11 as "Packet flood → 10.0.0.238" and "Slow HTTP from
+/// 10.0.0.238 → 169.254.169.254" FPs. Returns false if the local-IP
+/// list could not be loaded (best-effort).
+pub fn is_local_interface_ip(ip_str: &str) -> bool {
+    let Ok(ip) = ip_str.parse::<IpAddr>() else {
+        return false;
+    };
+    let ip_u32 = match ip {
+        IpAddr::V4(v4) => u32::from(v4),
+        _ => return false,
+    };
+    match LOCAL_INTERFACE_IPS.get() {
+        Some(list) => list.binary_search(&ip_u32).is_ok(),
+        None => false,
+    }
+}
+
+/// Returns true if `comm` is the agent itself or one of its spawned
+/// workers. Matches the graph detector convention (`detect_network_sniffing`)
+/// used in spec 015.
+#[allow(dead_code)] // reserved for future process-side self-filter unification
+pub fn is_agent_process(comm: &str) -> bool {
+    matches!(
+        comm,
+        "innerwarden-agent"
+            | "innerwarden-sensor"
+            | "innerwarden-watchdog"
+            | "tokio-rt-worker"
+            | "openclaw-gatewa"
+            | "crowdsec"
+            | "gomon"
+    )
 }
 
 /// Check if an IP belongs to a known cloud provider.
@@ -251,5 +433,63 @@ mod tests {
         assert_eq!(identify_provider("34.95.197.36"), Some("Google Cloud"));
         assert_eq!(identify_provider("52.1.1.1"), Some("AWS"));
         assert_eq!(identify_provider("20.12.41.6"), Some("Azure"));
+    }
+
+    #[test]
+    fn telegram_detected() {
+        // Spec 015 follow-up: Telegram Bot API must be recognized as
+        // self-traffic. Without this, 222+ false positives per day from
+        // the agent's own notification channel (149.154.166.110:443).
+        init();
+        assert!(is_self_traffic_ip("149.154.160.1"));
+        assert!(is_self_traffic_ip("149.154.166.110"));
+        assert!(is_self_traffic_ip("149.154.175.255"));
+        assert!(is_self_traffic_ip("91.108.4.200"));
+    }
+
+    #[test]
+    fn ip_api_com_detected() {
+        // GeoIP enrichment endpoint used by crate::geoip.
+        init();
+        assert!(is_self_traffic_ip("208.95.112.1"));
+    }
+
+    #[test]
+    fn canonical_detected() {
+        // Ubuntu apt archive + snapcraft + livepatch.
+        init();
+        assert!(is_self_traffic_ip("185.125.188.58"));
+        assert!(is_self_traffic_ip("91.189.88.1"));
+    }
+
+    #[test]
+    fn oracle_peer_range_detected() {
+        // OCI London peer ranges outside the main CLOUD_PROVIDER_RANGES
+        // list. These are the /20 the server peers with on its internal
+        // network, not random Oracle customer IPs.
+        init();
+        assert!(is_self_traffic_ip("147.154.225.94"));
+        assert!(is_self_traffic_ip("138.1.16.172"));
+        assert!(is_self_traffic_ip("140.91.26.100"));
+    }
+
+    #[test]
+    fn real_attacker_still_detected() {
+        // Safety net: random external IPs that are NOT cloud providers or
+        // agent services must still be reported to the operator.
+        init();
+        assert!(!is_self_traffic_ip("147.185.132.13")); // dashboard shows this as an attacker
+        assert!(!is_self_traffic_ip("198.235.24.154"));
+        assert!(!is_self_traffic_ip("185.113.139.51"));
+    }
+
+    #[test]
+    fn agent_process_recognition() {
+        assert!(is_agent_process("innerwarden-agent"));
+        assert!(is_agent_process("innerwarden-sensor"));
+        assert!(is_agent_process("tokio-rt-worker"));
+        assert!(is_agent_process("openclaw-gatewa"));
+        assert!(!is_agent_process("sshd"));
+        assert!(!is_agent_process("bash"));
     }
 }

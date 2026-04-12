@@ -41,6 +41,11 @@ pub enum Node {
         is_tor: bool,
         first_seen: DateTime<Utc>,
         last_seen: DateTime<Utc>,
+        /// Spec 015: attacker-supplied usernames from failed SSH auth.
+        /// Stored here (not as User nodes) so the User namespace only
+        /// contains real local users. Dedup + LIFO cap of 50.
+        #[serde(default)]
+        attempted_usernames: Vec<String>,
     },
     File {
         path: String,
@@ -106,6 +111,13 @@ pub enum Node {
         /// When the FP was reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fp_reported_at: Option<DateTime<Utc>>,
+        /// Spec 015 follow-up: incident is useful for AI research/training
+        /// but NOT for the operator (e.g. self-traffic to cloud providers,
+        /// the agent's own Telegram/GeoIP/Cloudflare calls, near-miss LSM
+        /// patterns). Dashboard operator views filter these out; neural
+        /// training and investigation views still see them.
+        #[serde(default)]
+        research_only: bool,
     },
     Campaign {
         campaign_id: String,

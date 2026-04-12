@@ -20,7 +20,7 @@ pub(crate) async fn try_handle_obvious_incident(
     let detector = incident_detector(&incident.incident_id);
     let is_obvious_detector = matches!(
         detector,
-        "ssh_bruteforce" | "credential_stuffing" | "packet_flood" | "port_scan"
+        "ssh_bruteforce" | "credential_stuffing" | "packet_flood" | "port_scan" | "threat_intel"
     );
     let is_high_or_critical = matches!(
         incident.severity,
@@ -100,6 +100,21 @@ pub(crate) async fn try_handle_obvious_incident(
         if let Err(e) = writer.write(&entry) {
             warn!("failed to write obvious-gate decision: {e:#}");
         }
+    }
+
+    // Write decision to knowledge graph so the dashboard shows "blocked".
+    {
+        let auto_executed = !execution_result.starts_with("skipped");
+        let mut graph = state.knowledge_graph.write().unwrap();
+        graph.ingest_decision(
+            &incident.incident_id,
+            "block_ip",
+            Some(ip),
+            auto_decision.confidence,
+            &auto_decision.reason,
+            auto_executed,
+            chrono::Utc::now(),
+        );
     }
 
     // Update IP reputation

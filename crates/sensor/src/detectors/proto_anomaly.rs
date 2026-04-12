@@ -110,6 +110,14 @@ impl ProtoAnomalyDetector {
             .unwrap_or_default();
         let now = event.ts;
 
+        // ── Self-traffic guard ──
+        // Traffic between the host's own IPs is infrastructure, not an attack.
+        // Only skip when BOTH src and dst are own IPs (loopback, inter-service).
+        // If only one side is own IP, it's real inbound/outbound traffic.
+        if super::is_own_ip(src_ip) && super::is_own_ip(dst_ip) {
+            return incidents;
+        }
+
         // ── Protocol mismatch detection ──
         // HTTP on non-HTTP port (C2 indicator)
         if app_proto == "http" && !is_http_port(dst_port) {
@@ -124,8 +132,9 @@ impl ProtoAnomalyDetector {
             }
         }
 
-        // SSH on non-standard port
-        if app_proto == "ssh" && dst_port != 22 {
+        // SSH on non-standard port — skip if we're listening on that port
+        // (operator deliberately configured SSH on a custom port)
+        if app_proto == "ssh" && dst_port != 22 && !super::is_own_listening_port(dst_port) {
             if let Some(inc) = self.emit(
                 AnomalyType::SshNonStandardPort,
                 &format!("SSH on port {dst_port}"),
@@ -246,7 +255,13 @@ impl ProtoAnomalyDetector {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            // Malformed SSH version
+            // Malformed SSH version — remote client sent an invalid protocol
+            // handshake. sshd rejects at TCP level before any auth attempt.
+            // Severity Low: the "attack" failed before it started — no
+            // credentials tested, no shell obtained, no data read.
+            // High/Critical is reserved for threats that got past the
+            // protocol handshake. Observed 2026-04-12: 15/day from random
+            // bots, all showing as "High — needs attention" for a non-event.
             if !client_version.is_empty()
                 && !client_version.starts_with("SSH-2.0-")
                 && !client_version.starts_with("SSH-1.")
@@ -254,9 +269,9 @@ impl ProtoAnomalyDetector {
                 if let Some(inc) = self.emit(
                     AnomalyType::SshVersionAnomaly,
                     "Malformed SSH version string",
-                    &format!("SSH client from {src_ip} sent malformed version: '{client_version}'. This may indicate a custom exploit tool or protocol fuzzer."),
+                    &format!("SSH client from {src_ip} sent malformed version: '{client_version}'. Scanner or exploit tool that failed at protocol level — no authentication attempted."),
                     src_ip, dst_ip, dst_port, now,
-                    Severity::High,
+                    Severity::Low,
                 ) {
                     incidents.push(inc);
                 }

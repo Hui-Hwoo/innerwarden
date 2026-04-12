@@ -356,6 +356,9 @@ async fn main() -> Result<()> {
     // Initialize test external IPs so is_internal_ip() respects overrides.
     detectors::init_test_external_ips(dynamic_allowlist.test_external_ips.clone());
 
+    // Initialize host self-awareness (own IPs, listening ports).
+    detectors::init_host_inventory();
+
     // Load blocked IPs from agent feedback file.
     let blocked_ips = load_blocked_ips(data_dir);
     if !blocked_ips.is_empty() {
@@ -383,8 +386,12 @@ async fn main() -> Result<()> {
         log_tampering: log_tampering_detector,
         distributed_ssh: distributed_ssh_detector,
         suspicious_login: cfg.detectors.ssh_bruteforce.enabled.then(|| {
-            info!("suspicious_login detector enabled");
-            SuspiciousLoginDetector::new(&cfg.agent.host_id, 300)
+            let anomaly_hours = cfg.detectors.suspicious_login.anomaly_hours_enabled;
+            info!(
+                anomaly_hours_enabled = anomaly_hours,
+                "suspicious_login detector enabled"
+            );
+            SuspiciousLoginDetector::new(&cfg.agent.host_id, 300, anomaly_hours)
         }),
         c2_callback: Some({
             info!("c2_callback detector enabled (eBPF network monitoring)");

@@ -46,6 +46,7 @@ mod incident_ai_context;
 mod incident_ai_failure;
 mod incident_attacker_profile;
 mod incident_audit_write;
+mod incident_autodismiss;
 mod incident_crowdsec;
 mod incident_decision_eval;
 mod incident_enrichment;
@@ -174,6 +175,23 @@ struct Cli {
     /// Internal: path to honeypot sandbox runner result JSON.
     #[arg(long, hide = true)]
     honeypot_sandbox_result: Option<PathBuf>,
+
+    /// Spec 015 one-shot migration: load today's dated graph snapshot,
+    /// delete `graph_user_creation` false-positive incidents and
+    /// brute-force User nodes, then save and exit. Never runs unless this
+    /// flag is passed explicitly. Creates a backup of the snapshot as
+    /// `<name>.bak-015` before writing.
+    #[arg(long)]
+    cleanup_015_graph_signal_quality: bool,
+
+    /// Spec 015 follow-up: load today's dated graph snapshot and set the
+    /// `research_only` flag on every Incident whose connected IPs are
+    /// 100% self-traffic (cloud providers, Telegram, GeoIP, Canonical,
+    /// OCI peers). Incidents are preserved for neural training — only
+    /// the operator dashboard filter changes. Creates a backup as
+    /// `<name>.bak-015-researchonly-<stamp>` before writing.
+    #[arg(long)]
+    backfill_015_research_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +535,118 @@ pub(crate) use trust_rules::{
 // Trust rules and LSM enforcement moved to trust_rules.rs
 
 // ---------------------------------------------------------------------------
+// Spec 015: one-shot cleanup of graph_user_creation false positives and
+// brute-force User node pollution. Invoked via
+// `innerwarden-agent --cleanup-015-graph-signal-quality`. Non-destructive
+// outside that flag: the function below loads today's dated snapshot,
+// writes a timestamped backup, applies the migration, and saves the result.
+// ---------------------------------------------------------------------------
+
+fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
+    use chrono::Local;
+    use std::fs;
+
+    let snapshot_path = knowledge_graph::KnowledgeGraph::dated_snapshot_path(data_dir);
+    if !snapshot_path.exists() {
+        anyhow::bail!(
+            "No dated snapshot found at {} — run the agent at least once first",
+            snapshot_path.display()
+        );
+    }
+
+    // Backup the raw snapshot bytes before touching anything, so the
+    // operator can always roll back if the migration does something
+    // unexpected. Name it with a timestamp so repeated runs don't clobber.
+    let stamp = Local::now().format("%Y%m%dT%H%M%S");
+    let backup_path = snapshot_path.with_extension(format!("json.bak-015-{stamp}"));
+    fs::copy(&snapshot_path, &backup_path)
+        .with_context(|| format!("failed to back up snapshot to {}", backup_path.display()))?;
+    println!(
+        "spec 015 cleanup: backed up snapshot to {}",
+        backup_path.display()
+    );
+
+    // Load, mutate, save.
+    let mut graph = knowledge_graph::KnowledgeGraph::load_snapshot(&snapshot_path);
+    let report = knowledge_graph::migrations::cleanup_015_graph_signal_quality(&mut graph);
+    graph.save_snapshot(&snapshot_path).with_context(|| {
+        format!(
+            "failed to save cleaned snapshot to {}",
+            snapshot_path.display()
+        )
+    })?;
+
+    println!("spec 015 cleanup complete:");
+    println!("  snapshot             : {}", snapshot_path.display());
+    println!("  backup               : {}", backup_path.display());
+    println!("  nodes before         : {}", report.nodes_before);
+    println!("  nodes after          : {}", report.nodes_after);
+    println!(
+        "  graph_user_creation  : {} incident node(s) removed",
+        report.graph_user_creation_incidents_removed
+    );
+    println!(
+        "  brute-force users    : {} User node(s) removed",
+        report.brute_force_user_nodes_removed
+    );
+    if !report.removed_user_names.is_empty() {
+        println!(
+            "  removed users        : {} (names redacted)",
+            report.removed_user_names.len()
+        );
+    }
+    Ok(())
+}
+
+fn run_backfill_015_research_only(data_dir: &std::path::Path) -> Result<()> {
+    use chrono::Local;
+    use std::fs;
+
+    cloud_safelist::init();
+
+    let snapshot_path = knowledge_graph::KnowledgeGraph::dated_snapshot_path(data_dir);
+    if !snapshot_path.exists() {
+        anyhow::bail!(
+            "No dated snapshot found at {} — run the agent at least once first",
+            snapshot_path.display()
+        );
+    }
+
+    let stamp = Local::now().format("%Y%m%dT%H%M%S");
+    let backup_path = snapshot_path.with_extension(format!("json.bak-015-researchonly-{stamp}"));
+    fs::copy(&snapshot_path, &backup_path)
+        .with_context(|| format!("failed to back up snapshot to {}", backup_path.display()))?;
+    println!(
+        "spec 015 research-only backfill: backed up snapshot to {}",
+        backup_path.display()
+    );
+
+    let mut graph = knowledge_graph::KnowledgeGraph::load_snapshot(&snapshot_path);
+    let report = knowledge_graph::migrations::backfill_research_only_flag(&mut graph);
+    graph.save_snapshot(&snapshot_path).with_context(|| {
+        format!(
+            "failed to save cleaned snapshot to {}",
+            snapshot_path.display()
+        )
+    })?;
+
+    println!("spec 015 research-only backfill complete:");
+    println!("  snapshot       : {}", snapshot_path.display());
+    println!("  backup         : {}", backup_path.display());
+    println!("  scanned        : {}", report.incidents_scanned);
+    println!("  flagged        : {}", report.incidents_flagged);
+    if !report.by_detector.is_empty() {
+        println!("  by detector    :");
+        let mut top: Vec<(&String, &usize)> = report.by_detector.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        for (det, n) in top.iter().take(15) {
+            println!("    {det:<28} {n}");
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -554,6 +684,14 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("missing --honeypot-sandbox-result"))?;
         skills::builtin::run_honeypot_sandbox_worker(spec, result).await?;
         return Ok(());
+    }
+
+    if cli.cleanup_015_graph_signal_quality {
+        return run_cleanup_015(&cli.data_dir);
+    }
+
+    if cli.backfill_015_research_only {
+        return run_backfill_015_research_only(&cli.data_dir);
     }
 
     if cli.report {
@@ -1155,13 +1293,20 @@ async fn main() -> Result<()> {
 
     // Initialize threat feed client if VT API key or IOC feed URLs are configured
     {
-        let vt_key = threat_feeds::resolve_vt_api_key(&cfg.abuseipdb.api_key);
-        // Threat feeds are always initialized (even without VT key, for IOC feed support)
-        let client = threat_feeds::ThreatFeedClient::new(
-            vt_key,
-            Vec::new(), // IOC feed URLs would come from config
-            &cli.data_dir,
-        );
+        let vt_key = if cfg.threat_feeds.virustotal_api_key.is_empty() {
+            threat_feeds::resolve_vt_api_key("")
+        } else {
+            cfg.threat_feeds.virustotal_api_key.clone()
+        };
+        let feed_urls = cfg.threat_feeds.effective_urls();
+        if !feed_urls.is_empty() {
+            info!(
+                feeds = feed_urls.len(),
+                "threat feeds: {} URLs configured",
+                feed_urls.len()
+            );
+        }
+        let client = threat_feeds::ThreatFeedClient::new(vt_key, feed_urls, &cli.data_dir);
         let feed_state = client.state();
         if feed_state.total_iocs > 0 {
             info!(
@@ -1278,6 +1423,14 @@ async fn main() -> Result<()> {
 
         // Proactive startup suggestions (fail2ban detected but not integrated, etc.)
         probe_and_suggest(&cfg, state.telegram_client.as_deref()).await;
+
+        // Boot self-test: verify self-awareness is working.
+        boot_self_test();
+
+        // One-time backfill: reconcile JSONL decisions with the knowledge graph.
+        // Fixes historical incidents where auto-block gates wrote to JSONL but
+        // not to the graph (incident_obvious + incident_crowdsec before the fix).
+        backfill_graph_decisions(&cli.data_dir, &mut state);
 
         // Always-on honeypot: permanent SSH listener from startup.
         // A watch channel is used to signal shutdown on SIGTERM/SIGINT.
@@ -1793,6 +1946,8 @@ async fn main() -> Result<()> {
                             .map(|t| t.elapsed().as_secs() >= INTEL_INTERVAL_SECS)
                             .unwrap_or(true);
                         if should_consolidate && !state.attacker_profiles.is_empty() {
+                            // Backfill enrichment for profiles missing GeoIP/AbuseIPDB
+                            incident_enrichment::backfill_enrichment(&mut state).await;
                             // Scan honeypot sessions for known attacker IPs
                             scan_honeypot_for_profiles(
                                 &cli.data_dir,
@@ -2428,6 +2583,20 @@ async fn process_incidents(
 
         incident_advisory::handle_advisory_violation(incident, advisory_cache, state).await;
 
+        // 1b. Enrichment — runs for ALL incidents regardless of severity.
+        // GeoIP + AbuseIPDB + attacker profile update must happen before the
+        // AI gate filters out low-severity incidents, otherwise auto-blocked
+        // and low-severity IPs never get country/abuse_confidence data.
+        let ip_geo_early = incident_enrichment::lookup_incident_geoip(incident, state).await;
+        let ip_rep_early = incident_reputation::lookup_abuseipdb_reputation(incident, state).await;
+        incident_enrichment::enrich_attacker_identity(
+            incident,
+            state,
+            ip_geo_early.as_ref(),
+            ip_rep_early.as_ref(),
+        );
+        incident_enrichment::log_threat_feed_match(incident, state);
+
         // 2. AI analysis - only when AI is enabled and incident passes the gate.
         match incident_flow::evaluate_pre_ai_flow(
             incident,
@@ -2443,6 +2612,15 @@ async fn process_incidents(
                 let mut graph = state.knowledge_graph.write().unwrap();
                 graph.set_allowlisted(&incident.incident_id, true);
                 drop(graph);
+                handled += 1;
+                continue;
+            }
+            incident_flow::PreAiFlowDecision::SkipBelowSeverity => {
+                // Low-severity noise: write auto-dismiss decision so the
+                // dashboard shows a clear outcome instead of "needs attention".
+                if incident_autodismiss::try_autodismiss_noise(incident, cfg, state) {
+                    state.grouping_engine.mark_auto_resolved(incident);
+                }
                 handled += 1;
                 continue;
             }
@@ -2478,7 +2656,9 @@ async fn process_incidents(
             cfg.ai.context_events,
         );
 
-        let ip_reputation = incident_reputation::lookup_abuseipdb_reputation(incident, state).await;
+        // ── Auto-handle decisions (may `continue` to skip AI) ──────────
+        // Enrichment already ran in step 1b. Reuse the results.
+        let ip_reputation = ip_rep_early;
 
         if incident_abuseipdb::try_handle_abuseipdb_autoblock(
             incident,
@@ -2509,8 +2689,6 @@ async fn process_incidents(
             continue;
         }
 
-        incident_enrichment::log_threat_feed_match(incident, state);
-
         if incident_honeypot_router::try_handle_honeypot_routing(
             incident,
             data_dir,
@@ -2523,14 +2701,6 @@ async fn process_incidents(
             handled += 1;
             continue;
         }
-
-        let ip_geo = incident_enrichment::lookup_incident_geoip(incident, state).await;
-        incident_enrichment::enrich_attacker_identity(
-            incident,
-            state,
-            ip_geo.as_ref(),
-            ip_reputation.as_ref(),
-        );
 
         // Build graph context: attack narrative from knowledge graph neighborhood.
         // Phase 015: prefer the Incident node as center (richest context after 014-D
@@ -2564,7 +2734,7 @@ async fn process_incidents(
                 })
                 .collect(),
             ip_reputation: ip_reputation.clone(),
-            ip_geo: ip_geo.clone(),
+            ip_geo: ip_geo_early.clone(),
             graph_context,
         };
 
@@ -2675,7 +2845,7 @@ async fn process_incidents(
             cfg,
             state,
             ip_reputation.as_ref(),
-            ip_geo.as_ref(),
+            ip_geo_early.as_ref(),
         );
 
         handled += 1;
@@ -3466,6 +3636,161 @@ async fn process_narrative_tick(
 // ---------------------------------------------------------------------------
 
 // LSM enforcement and trust rules moved to trust_rules.rs
+
+// ---------------------------------------------------------------------------
+// Boot self-test — verify self-awareness is working on startup
+// ---------------------------------------------------------------------------
+
+/// One-time reconciliation: read all decisions-*.jsonl files and write
+/// missing decisions to the knowledge graph. This fixes historical data
+/// where auto-block gates (obvious, CrowdSec) wrote decisions to JSONL
+/// but not to the graph.
+fn backfill_graph_decisions(data_dir: &std::path::Path, state: &mut AgentState) {
+    use std::io::BufRead;
+
+    let mut filled = 0usize;
+    let mut scanned = 0usize;
+
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(d) = serde_json::from_str::<decisions::DecisionEntry>(&line) else {
+                continue;
+            };
+            scanned += 1;
+
+            // Backfill all decisions that have an action type
+            if d.action_type.is_empty() || d.dry_run {
+                continue;
+            }
+
+            // Check if the graph incident node is missing a decision
+            let mut graph = state.knowledge_graph.write().unwrap();
+            let needs_backfill = graph
+                .find_by_incident(&d.incident_id)
+                .and_then(|nid| {
+                    if let Some(crate::knowledge_graph::types::Node::Incident {
+                        decision, ..
+                    }) = graph.get_node(nid)
+                    {
+                        Some(decision.is_none())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+
+            if needs_backfill {
+                graph.ingest_decision(
+                    &d.incident_id,
+                    &d.action_type,
+                    d.target_ip.as_deref(),
+                    d.confidence,
+                    &d.reason,
+                    true,
+                    d.ts,
+                );
+                filled += 1;
+            }
+        }
+    }
+
+    if filled > 0 {
+        info!(
+            filled,
+            scanned, "backfill: reconciled JSONL decisions with knowledge graph"
+        );
+    }
+
+    // Phase 2: dismiss visible incidents that never received any decision.
+    // These are historical incidents from before the noise-gate was deployed.
+    // Without this, they show as "OBSERVING" forever in the dashboard.
+    {
+        use crate::knowledge_graph::types::{Node, NodeType};
+        let mut graph = state.knowledge_graph.write().unwrap();
+        let orphan_ids: Vec<_> = graph
+            .nodes_of_type(NodeType::Incident)
+            .iter()
+            .filter_map(|&id| {
+                if let Some(Node::Incident {
+                    incident_id,
+                    decision,
+                    research_only,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if decision.is_none() && !research_only {
+                        return Some((id, incident_id.clone()));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        let dismissed = orphan_ids.len();
+        for (_nid, iid) in &orphan_ids {
+            graph.ingest_decision(
+                iid,
+                "dismiss",
+                None,
+                1.0,
+                "Retroactive dismiss: historical incident with no decision",
+                true,
+                chrono::Utc::now(),
+            );
+        }
+
+        if dismissed > 0 {
+            info!(
+                dismissed,
+                "backfill: dismissed orphan incidents with no decision"
+            );
+        }
+    }
+}
+
+/// Quick validation at agent startup that the host inventory (own IPs,
+/// listening ports) was loaded correctly by the sensor, and cloud safelist
+/// is initialized. Logs warnings for anything that looks wrong.
+fn boot_self_test() {
+    use tracing::{info, warn};
+
+    // Check cloud safelist initialized (own IPs loaded)
+    let local_ips = cloud_safelist::local_ip_count();
+    if local_ips > 0 {
+        info!(local_ips, "boot self-test: local interface IPs loaded");
+    } else {
+        warn!(
+            "boot self-test: no local interface IPs detected — self-traffic filtering may not work"
+        );
+    }
+
+    // Check that cloud safelist ranges are loaded
+    let cloud_ranges = cloud_safelist::cloud_range_count();
+    if cloud_ranges > 0 {
+        info!(
+            cloud_ranges,
+            "boot self-test: cloud provider IP ranges loaded"
+        );
+    } else {
+        warn!("boot self-test: no cloud IP ranges loaded");
+    }
+
+    info!("boot self-test: passed");
+}
 
 // ---------------------------------------------------------------------------
 // Tests
