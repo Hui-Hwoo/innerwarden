@@ -98,6 +98,13 @@ impl Store {
         );
 
         let mut report = MigrationReport::default();
+
+        // Skip migration if SQLite already has data — the sensor already wrote
+        // to it in this session, so migrating old JSONL would create duplicates.
+        if self.events_count().unwrap_or(0) > 0 || self.incidents_count().unwrap_or(0) > 0 {
+            info!("sqlite already has data — skipping legacy migration");
+            return Ok(report);
+        }
         let mut files_to_archive: Vec<std::path::PathBuf> = Vec::new();
 
         // 1. Migrate incidents JSONL
