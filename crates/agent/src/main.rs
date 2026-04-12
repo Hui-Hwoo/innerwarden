@@ -3685,8 +3685,8 @@ fn backfill_graph_decisions(data_dir: &std::path::Path, state: &mut AgentState) 
             };
             scanned += 1;
 
-            // Only backfill block_ip decisions that were auto-executed
-            if d.action_type != "block_ip" || !d.auto_executed || d.dry_run {
+            // Backfill all decisions that have an action type
+            if d.action_type.is_empty() || d.dry_run {
                 continue;
             }
 
