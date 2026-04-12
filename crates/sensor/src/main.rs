@@ -387,7 +387,10 @@ async fn main() -> Result<()> {
         distributed_ssh: distributed_ssh_detector,
         suspicious_login: cfg.detectors.ssh_bruteforce.enabled.then(|| {
             let anomaly_hours = cfg.detectors.suspicious_login.anomaly_hours_enabled;
-            info!(anomaly_hours_enabled = anomaly_hours, "suspicious_login detector enabled");
+            info!(
+                anomaly_hours_enabled = anomaly_hours,
+                "suspicious_login detector enabled"
+            );
             SuspiciousLoginDetector::new(&cfg.agent.host_id, 300, anomaly_hours)
         }),
         c2_callback: Some({
