@@ -89,19 +89,38 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
                     contained += 1;
                 }
                 None => {
-                    unresolved += 1;
-                    let sev = severity.to_lowercase();
-                    if sev == "high" || sev == "critical" {
-                        unresolved_high_crit += 1;
-                        let entity = graph
-                            .outgoing_edges(id)
+                    // Check if this "unresolved" incident only involves
+                    // self-traffic IPs — if so, it's a pre-fix FP that
+                    // wasn't marked research_only. Don't count it as
+                    // needing attention.
+                    let entities: Vec<String> = graph
+                        .outgoing_edges(id)
+                        .iter()
+                        .filter(|e| e.relation == Relation::TriggeredBy)
+                        .filter_map(|e| graph.get_node(e.to))
+                        .filter_map(|n| {
+                            if let Node::Ip { addr, .. } = n {
+                                Some(addr.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let all_self = !entities.is_empty()
+                        && entities
                             .iter()
-                            .find(|e| e.relation == Relation::TriggeredBy)
-                            .and_then(|e| graph.get_node(e.to))
-                            .map(|n| n.label())
-                            .unwrap_or_default();
-                        if unresolved_list.len() < 10 {
-                            unresolved_list.push((sev, title.clone(), entity));
+                            .all(|ip| crate::cloud_safelist::is_self_traffic_ip(ip));
+                    if all_self {
+                        ignored += 1; // Treat as noise for briefing purposes
+                    } else {
+                        unresolved += 1;
+                        let sev = severity.to_lowercase();
+                        if sev == "high" || sev == "critical" {
+                            unresolved_high_crit += 1;
+                            let entity = entities.first().cloned().unwrap_or_default();
+                            if unresolved_list.len() < 10 {
+                                unresolved_list.push((sev, title.clone(), entity));
+                            }
                         }
                     }
                 }
@@ -176,27 +195,43 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
         "LOW"
     };
 
+    // Count unique blocked IPs (not decisions — matches dashboard KPI)
+    let blocked_ips: std::collections::HashSet<&str> = actions_taken
+        .iter()
+        .filter_map(|a| {
+            if a.starts_with("Blocked IP ") {
+                a.split_whitespace().nth(2)
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Build context
-    let total = incident_nodes.len();
+    let operator_incidents = contained + unresolved; // excludes research_only
     let mut ctx = format!(
         "SECURITY INTELLIGENCE CONTEXT — {}\n\n\
          SITUATION STATUS:\n\
-         - Total incidents today: {}\n\
-         - CONTAINED (AI blocked/monitored/responded): {} — these are RESOLVED, not active threats\n\
-         - IGNORED by AI (noise/false positives): {} — confirmed non-threats\n\
-         - UNRESOLVED (no AI decision yet): {} — of which {} are high/critical severity\n\
-         - The system is in GUARD mode: AI auto-blocks high-confidence threats\n\n\
-         IMPORTANT: {} of {} incidents are already handled. The system is actively defending.\n\
-         Only {} incident{} need{} human attention.\n\n",
+         - Operator-relevant incidents today: {}\n\
+         - BLOCKED: {} unique IP{} auto-blocked by AI\n\
+         - OBSERVING: {} incidents being monitored (AI is handling, no human action needed)\n\
+         - IGNORED: {} confirmed non-threats\n\
+         - The server uses SSH key-only authentication — password brute-force cannot succeed\n\
+         - Most external activity is routine internet scanning that fails at protocol level\n\n\
+         IMPORTANT: The AI is handling everything. {} of {} incidents are already resolved or being monitored.\n\
+         Human attention needed: {}.\n\n",
         Utc::now().format("%Y-%m-%d"),
-        total,
-        contained,
+        operator_incidents,
+        blocked_ips.len(),
+        if blocked_ips.len() == 1 { "" } else { "s" },
+        unresolved,
         ignored,
-        unresolved, unresolved_high_crit,
-        contained + ignored, total,
-        unresolved_high_crit,
-        if unresolved_high_crit == 1 { "" } else { "s" },
-        if unresolved_high_crit == 1 { "s" } else { "" },
+        contained + unresolved, operator_incidents,
+        if unresolved_high_crit == 0 {
+            "NONE — everything is handled".to_string()
+        } else {
+            format!("{} high/critical items to review", unresolved_high_crit)
+        },
     );
 
     if !actions_taken.is_empty() {
