@@ -172,10 +172,7 @@ impl KernelModuleLoadDetector {
         // `Kernel module load detected: unknown`, which gives the operator
         // nothing actionable and is the signature of a substring-match FP
         // from the old `is_module_command`.
-        let module_name = match Self::extract_module_name(command) {
-            Some(name) => name,
-            None => return None,
-        };
+        let module_name = Self::extract_module_name(command)?;
 
         // Skip allowlisted modules
         if Self::is_allowed_module(module_name) {
