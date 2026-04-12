@@ -196,7 +196,7 @@ pub(super) fn determine_outcome(
         if d.action_type == "block_ip"
             && d.auto_executed
             && !d.dry_run
-            && d.execution_result.contains("ok")
+            && (d.execution_result.contains("ok") || d.execution_result.starts_with("Blocked"))
         {
             return "blocked".to_string();
         }

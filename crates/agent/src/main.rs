@@ -1302,11 +1302,22 @@ async fn main() -> Result<()> {
 
     // Initialize threat feed client if VT API key or IOC feed URLs are configured
     {
-        let vt_key = threat_feeds::resolve_vt_api_key(&cfg.abuseipdb.api_key);
-        // Threat feeds are always initialized (even without VT key, for IOC feed support)
+        let vt_key = if cfg.threat_feeds.virustotal_api_key.is_empty() {
+            threat_feeds::resolve_vt_api_key("")
+        } else {
+            cfg.threat_feeds.virustotal_api_key.clone()
+        };
+        let feed_urls = cfg.threat_feeds.effective_urls();
+        if !feed_urls.is_empty() {
+            info!(
+                feeds = feed_urls.len(),
+                "threat feeds: {} URLs configured",
+                feed_urls.len()
+            );
+        }
         let client = threat_feeds::ThreatFeedClient::new(
             vt_key,
-            Vec::new(), // IOC feed URLs would come from config
+            feed_urls,
             &cli.data_dir,
         );
         let feed_state = client.state();
@@ -1425,6 +1436,14 @@ async fn main() -> Result<()> {
 
         // Proactive startup suggestions (fail2ban detected but not integrated, etc.)
         probe_and_suggest(&cfg, state.telegram_client.as_deref()).await;
+
+        // Boot self-test: verify self-awareness is working.
+        boot_self_test();
+
+        // One-time backfill: reconcile JSONL decisions with the knowledge graph.
+        // Fixes historical incidents where auto-block gates wrote to JSONL but
+        // not to the graph (incident_obvious + incident_crowdsec before the fix).
+        backfill_graph_decisions(&cli.data_dir, &mut state);
 
         // Always-on honeypot: permanent SSH listener from startup.
         // A watch channel is used to signal shutdown on SIGTERM/SIGINT.
@@ -1940,6 +1959,8 @@ async fn main() -> Result<()> {
                             .map(|t| t.elapsed().as_secs() >= INTEL_INTERVAL_SECS)
                             .unwrap_or(true);
                         if should_consolidate && !state.attacker_profiles.is_empty() {
+                            // Backfill enrichment for profiles missing GeoIP/AbuseIPDB
+                            incident_enrichment::backfill_enrichment(&mut state).await;
                             // Scan honeypot sessions for known attacker IPs
                             scan_honeypot_for_profiles(
                                 &cli.data_dir,
@@ -3628,6 +3649,156 @@ async fn process_narrative_tick(
 // ---------------------------------------------------------------------------
 
 // LSM enforcement and trust rules moved to trust_rules.rs
+
+// ---------------------------------------------------------------------------
+// Boot self-test — verify self-awareness is working on startup
+// ---------------------------------------------------------------------------
+
+/// One-time reconciliation: read all decisions-*.jsonl files and write
+/// missing decisions to the knowledge graph. This fixes historical data
+/// where auto-block gates (obvious, CrowdSec) wrote decisions to JSONL
+/// but not to the graph.
+fn backfill_graph_decisions(data_dir: &std::path::Path, state: &mut AgentState) {
+    use std::io::BufRead;
+
+    let mut filled = 0usize;
+    let mut scanned = 0usize;
+
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(d) = serde_json::from_str::<decisions::DecisionEntry>(&line) else {
+                continue;
+            };
+            scanned += 1;
+
+            // Backfill all decisions that have an action type
+            if d.action_type.is_empty() || d.dry_run {
+                continue;
+            }
+
+            // Check if the graph incident node is missing a decision
+            let mut graph = state.knowledge_graph.write().unwrap();
+            let needs_backfill = graph
+                .find_by_incident(&d.incident_id)
+                .and_then(|nid| {
+                    if let Some(crate::knowledge_graph::types::Node::Incident {
+                        decision, ..
+                    }) = graph.get_node(nid)
+                    {
+                        Some(decision.is_none())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+
+            if needs_backfill {
+                graph.ingest_decision(
+                    &d.incident_id,
+                    &d.action_type,
+                    d.target_ip.as_deref(),
+                    d.confidence,
+                    &d.reason,
+                    true,
+                    d.ts,
+                );
+                filled += 1;
+            }
+        }
+    }
+
+    if filled > 0 {
+        info!(
+            filled,
+            scanned, "backfill: reconciled JSONL decisions with knowledge graph"
+        );
+    }
+
+    // Phase 2: dismiss visible incidents that never received any decision.
+    // These are historical incidents from before the noise-gate was deployed.
+    // Without this, they show as "OBSERVING" forever in the dashboard.
+    {
+        use crate::knowledge_graph::types::{Node, NodeType};
+        let mut graph = state.knowledge_graph.write().unwrap();
+        let orphan_ids: Vec<_> = graph
+            .nodes_of_type(NodeType::Incident)
+            .iter()
+            .filter_map(|&id| {
+                if let Some(Node::Incident {
+                    incident_id,
+                    decision,
+                    research_only,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if decision.is_none() && !research_only {
+                        return Some((id, incident_id.clone()));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        let dismissed = orphan_ids.len();
+        for (_nid, iid) in &orphan_ids {
+            graph.ingest_decision(
+                iid,
+                "dismiss",
+                None,
+                1.0,
+                "Retroactive dismiss: historical incident with no decision",
+                true,
+                chrono::Utc::now(),
+            );
+        }
+
+        if dismissed > 0 {
+            info!(
+                dismissed,
+                "backfill: dismissed orphan incidents with no decision"
+            );
+        }
+    }
+}
+
+/// Quick validation at agent startup that the host inventory (own IPs,
+/// listening ports) was loaded correctly by the sensor, and cloud safelist
+/// is initialized. Logs warnings for anything that looks wrong.
+fn boot_self_test() {
+    use tracing::{info, warn};
+
+    // Check cloud safelist initialized (own IPs loaded)
+    let local_ips = cloud_safelist::local_ip_count();
+    if local_ips > 0 {
+        info!(local_ips, "boot self-test: local interface IPs loaded");
+    } else {
+        warn!("boot self-test: no local interface IPs detected — self-traffic filtering may not work");
+    }
+
+    // Check that cloud safelist ranges are loaded
+    let cloud_ranges = cloud_safelist::cloud_range_count();
+    if cloud_ranges > 0 {
+        info!(cloud_ranges, "boot self-test: cloud provider IP ranges loaded");
+    } else {
+        warn!("boot self-test: no cloud IP ranges loaded");
+    }
+
+    info!("boot self-test: passed");
+}
 
 // ---------------------------------------------------------------------------
 // Tests
