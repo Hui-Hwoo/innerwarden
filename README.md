@@ -23,11 +23,13 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![eBPF Hooks](https://img.shields.io/badge/eBPF%20hooks-40-blueviolet)
 ![Detectors](https://img.shields.io/badge/detectors-49-blue)
 ![Correlation Rules](https://img.shields.io/badge/correlation%20rules-47-purple)
-![Tests](https://img.shields.io/badge/tests-2357-brightgreen)
+![Tests](https://img.shields.io/badge/tests-2556-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-65%20mappings-red)
 ![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-208-blueviolet)
-![Memory](https://img.shields.io/badge/memory-~150MB%20(full%20stack)-green)
+![Memory](https://img.shields.io/badge/memory-~250MB%20(full%20stack)-green)
 ![AI Optional](https://img.shields.io/badge/AI-optional-lightgrey)
+![Storage](https://img.shields.io/badge/storage-SQLite%20WAL-blue)
+![Graph](https://img.shields.io/badge/knowledge%20graph-11%20types%2C%2050%20relations-purple)
 
 ---
 
@@ -40,7 +42,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 ### How is this different?
 
-Inner Warden is a self-contained runtime defense stack: kernel-level telemetry, native network visibility, AI triage, and autonomous response in one system. No SIEM bundle, no external IDS/HIDS dependency, and no cloud control plane required.
+Inner Warden is a self-contained runtime defense stack: kernel-level telemetry, native network visibility, AI triage, and autonomous response in one system. Single SQLite database for all state — no scattered log files, no external database. No SIEM bundle, no external IDS/HIDS dependency, and no cloud control plane required.
 
 40 eBPF kernel hooks. 49 detectors. 22 collectors. 47 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. No cloud. No dependencies. Just two Rust daemons and a CLI.
 
@@ -124,16 +126,24 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │                          │                                        │
 │              ┌───────────▼───────────┐                            │
 │              │  events + incidents   │                            │
-│              │      (JSONL)          │                            │
+│              │     (SQLite WAL)      │                            │
 │              └───────────┬───────────┘                            │
 └──────────────────────────┼────────────────────────────────────────┘
                            │
 ┌──────────────────────────┼────────────────────────────────────────┐
 │                   AGENT  │                                        │
 │                          ▼                                        │
+│   ┌───────────────────────────────────────────────────────────┐   │
+│   │              Knowledge Graph (in-memory)                  │   │
+│   │  11 node types (Process, IP, File, User, Domain, ...)    │   │
+│   │  50 relation types | 27 graph detectors | 10 graph rules │   │
+│   │  Autoencoder anomaly scoring (58 features)               │   │
+│   └────────────────────────┬──────────────────────────────────┘   │
+│                            ▼                                      │
 │     ┌──────────────────────────────────────────────┐              │
 │     │  47 Cross-Layer Correlation Rules            │              │
 │     │  + Kill Chain Tracker (7 stages per entity)  │              │
+│     │  + Threat DNA behavioral fingerprinting      │              │
 │     └────────────────────┬─────────────────────────┘              │
 │                          ▼                                        │
 │                ┌──────────────────┐                               │
@@ -143,7 +153,7 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │              ┌────────────────────┐                               │
 │              │ Enrich: AbuseIPDB, │                               │
 │              │ GeoIP, CrowdSec    │                               │
-│              └────────┬──────── ──┘                               │
+│              └────────┬───────────┘                               │
 │                       ▼                                           │
 │              ┌─────────────────┐                                  │
 │              │ AI Triage (opt) │  OpenAI / Anthropic / Ollama     │
@@ -160,10 +170,16 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │                       │                                           │
 │          ┌────────────┼────────────┬──────────────┐               │
 │          ▼            ▼            ▼              ▼               │
-│   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐         │
-│   │ Telegram │ │  Slack   │ │ Webhook  │ │ Mesh Network │         │
-│   │   bot    │ │          │ │ (any)    │ │ peer defense │         │
-│   └──────────┘ └──────────┘ └──────────┘ └──────────────┘         │
+│   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐        │
+│   │ Telegram │ │  Slack   │ │ Webhook  │ │ Mesh Network │        │
+│   │   bot    │ │          │ │ (any)    │ │ peer defense │        │
+│   └──────────┘ └──────────┘ └──────────┘ └──────────────┘        │
+│                                                                   │
+│   ┌───────────────────────────────────────────────────────────┐   │
+│   │  innerwarden.db (SQLite WAL)                              │   │
+│   │  Events, incidents, decisions, graph snapshots, KV state, │   │
+│   │  attacker profiles, baselines | Hash chain audit trail    │   │
+│   └───────────────────────────────────────────────────────────┘   │
 │                                                                   │
 │   ┌───────────────────────────────────────────────────────────┐   │
 │   │ Dashboard: HUD, threats, investigation, attacker intel,   │   │
@@ -277,7 +293,7 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 
 ## How it works
 
-**Sensor**: deterministic signal collection. No AI, no HTTP. 22 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 40 kernel hooks, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, AWS CloudTrail). Events flow through JSONL files or Redis Streams to the agent. Syslog CEF output for SIEM integration.
+**Sensor**: deterministic signal collection. No AI, no HTTP. 22 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 40 kernel hooks, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration.
 
 **eBPF**: 40 kernel hooks running inside Linux (5.8+, CO-RE/BTF portable):
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
@@ -302,9 +318,9 @@ innerwarden config mesh add-peer https://peer-server:8790
 
 Container-aware via cgroup ID. Zero performance overhead.
 
-**Agent**: reads incidents from JSONL or Redis Streams. Fast loop (2s): algorithm gate → enrichment (AbuseIPDB, GeoIP, CrowdSec, threat feeds) → VirusTotal hash check on YARA matches → AI triage → playbook evaluation → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (47 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → monthly report generation → narrative summary.
+**Agent**: reads incidents from SQLite or Redis Streams. Fast loop (2s): algorithm gate → enrichment (AbuseIPDB, GeoIP, CrowdSec, threat feeds) → VirusTotal hash check on YARA matches → AI triage → playbook evaluation → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (47 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → monthly report generation → narrative summary.
 
-Two Rust daemons. No external dependencies. ~150 MB RAM with all features active (sensor 32MB + agent 89MB + DNA 11MB + shield 9MB + killchain 7MB). Dashboard with 10 views: Sensors HUD, Threats investigation, Report, Health, Honeypot, Compliance (ISO 27001), Intelligence (Profiles, Campaigns, Chains, Baseline, Playbooks), Monthly Report. Live SSE feed, MITRE ATT&CK mapping, 20 integration cards. Sleeps after 15 min of inactivity.
+Two Rust daemons. No external dependencies. ~250 MB RAM with all features active (sensor + agent + satellite modules, single SQLite database). Dashboard with 10 views: Sensors HUD, Threats investigation, Report, Health, Honeypot, Compliance (ISO 27001), Intelligence (Profiles, Campaigns, Chains, Baseline, Playbooks), Monthly Report. Live SSE feed, MITRE ATT&CK mapping, 20 integration cards. Sleeps after 15 min of inactivity.
 
 ---
 
@@ -314,7 +330,7 @@ Inner Warden detects and logs threats without any AI provider. Add AI when you w
 
 - **Confidence-scored recommendations**: not binary yes/no, but 0.0-1.0 scored decisions
 - **Policy-gated execution**: AI recommends, your policy decides if it runs
-- **Full transparency**: every AI decision recorded in append-only JSONL with reasoning
+- **Full transparency**: every AI decision recorded in append-only audit trail with reasoning
 - **Twelve providers**: OpenAI, Anthropic, Ollama (local), OpenRouter, Groq, Together, Mistral, DeepSeek, Fireworks, Cerebras, Google Gemini, xAI Grok
 
 AI is advisory unless you explicitly enable auto-execution. You set the confidence threshold.
@@ -343,7 +359,7 @@ Inner Warden ships with the safest possible posture. On first run, **nothing is 
 | `execution_guard` in observe mode | Detects suspicious commands, does not block. |
 | Shell audit opt-in | Requires explicit privacy consent. |
 | AI optional | Detection and logging work without any provider. |
-| Append-only audit trail | Every decision in `decisions-YYYY-MM-DD.jsonl`. |
+| Append-only audit trail | Every decision stored in SQLite with full reasoning. |
 
 You must explicitly change **two settings** before any response action can fire: enable the responder and disable dry-run. Neither happens automatically.
 
@@ -351,7 +367,7 @@ You must explicitly change **two settings** before any response action can fire:
 
 Before enabling automatic responses, run Inner Warden in observe-only mode for a period that makes sense for your environment (days to weeks). During this time:
 
-1. **Review the logs**: check `events-*.jsonl` and `incidents-*.jsonl` in your data directory to understand what the detectors are flagging.
+1. **Review the logs**: check the dashboard or query `innerwarden.db` in your data directory to understand what the detectors are flagging.
 2. **Check for false positives**: make sure legitimate traffic (CI/CD systems, monitoring probes, your own scripts) is not being misidentified.
 3. **Configure your allowlist**: add trusted IPs and users so they are never acted upon:
    ```bash
@@ -677,7 +693,7 @@ Pre-built binaries: `x86_64` and `aarch64` for both platforms.
 ## Build and test
 
 ```bash
-make test       # 1010+ tests
+make test       # 2556 tests
 make build      # debug build (sensor + agent + ctl)
 make replay-qa  # end-to-end integration test
 ```
