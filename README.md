@@ -135,9 +135,9 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │                          ▼                                        │
 │   ┌───────────────────────────────────────────────────────────┐   │
 │   │              Knowledge Graph (in-memory)                  │   │
-│   │  11 node types (Process, IP, File, User, Domain, ...)    │   │
-│   │  50 relation types | 27 graph detectors | 10 graph rules │   │
-│   │  Autoencoder anomaly scoring (58 features)               │   │
+│   │  11 node types (Process, IP, File, User, Domain, ...)     │   │
+│   │  50 relation types | 27 graph detectors | 10 graph rules  │   │
+│   │  Autoencoder anomaly scoring (58 features)                │   │
 │   └────────────────────────┬──────────────────────────────────┘   │
 │                            ▼                                      │
 │     ┌──────────────────────────────────────────────┐              │
@@ -170,10 +170,10 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │                       │                                           │
 │          ┌────────────┼────────────┬──────────────┐               │
 │          ▼            ▼            ▼              ▼               │
-│   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐        │
-│   │ Telegram │ │  Slack   │ │ Webhook  │ │ Mesh Network │        │
-│   │   bot    │ │          │ │ (any)    │ │ peer defense │        │
-│   └──────────┘ └──────────┘ └──────────┘ └──────────────┘        │
+│   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐         │
+│   │ Telegram │ │  Slack   │ │ Webhook  │ │ Mesh Network │         │
+│   │   bot    │ │          │ │ (any)    │ │ peer defense │         │
+│   └──────────┘ └──────────┘ └──────────┘ └──────────────┘         │
 │                                                                   │
 │   ┌───────────────────────────────────────────────────────────┐   │
 │   │  innerwarden.db (SQLite WAL)                              │   │
@@ -193,12 +193,12 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 
 ## What it does
 
-1. **Watches**: 20+ collectors across all layers — eBPF syscall tracing (40 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting — no Suricata needed), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, osquery, CloudTrail
+1. **Watches**: 20+ collectors across all layers — eBPF syscall tracing (40 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, CloudTrail
 2. **Detects**: 49 stateful detectors + 8 YARA malware rules + 8 Sigma log rules identify brute-force, credential stuffing, port scans, C2 callbacks, privilege escalation, container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID), timestomping, log tampering, discovery bursts, and more. **65 MITRE ATT&CK techniques covered** across 14 tactics.
-3. **Correlates**: 47 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP. Kill chain tracker follows 7 attack stages per entity (IP, user, container).
+3. **Correlates**: 47 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
 4. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
 5. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
-6. **Responds automatically**: 20 built-in playbooks covering every detector — ransomware, reverse shell, data exfil, malware, privilege escalation, kernel module load, process injection, persistence (SSH key, crontab, systemd), container escape, crypto miner, DNS tunneling, lateral movement, web shell, discovery burst, and more. Response sequences: kill process, block IP, suspend sudo, quarantine file, isolate network, capture forensics, pcap, notify, escalate
+6. **Responds automatically**: 20 built-in playbooks covering every detector — ransomware, reverse shell, data exfil, malware, privilege escalation, kernel module load, process injection, persistence (SSH key, crontab, systemd), container escape, crypto miner, DNS tunnelling, lateral movement, web shell, discovery burst, and more. Response sequences: kill process, block IP, suspend sudo, quarantine file, isolate network, capture forensics, pcap, notify, escalate
 7. **Fingerprints attackers**: behavioral DNA (SHA-256 of detectors + tools + targets + timing patterns), **cross-IP tracking** (same attacker detected across VPN/Tor rotations via fuzzy DNA matching — risk score and detector knowledge inherited automatically), campaign detection via IOC clustering, recurrence tracking, risk scoring 0-100, monthly threat reports with MITRE heatmap
 
 Everything is local, audited, and reversible.
@@ -298,7 +298,7 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 **eBPF**: 40 kernel hooks running inside Linux (5.8+, CO-RE/BTF portable):
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
 - **3 kprobes**: `commit_creds` (privilege escalation), `native_write_msr` (firmware MSR tampering), `acpi_evaluate_object` (ACPI rootkit detection)
-- **3 LSM hooks**: `bprm_check_security` (exec blocking + kill chain with 8 attack patterns), `file_open` (sensitive path write protection), `bpf` (eBPF weaponization / VoidLink defense)
+- **3 LSM hooks**: `bprm_check_security` (exec blocking + kill chain with 8 attack patterns), `file_open` (sensitive path write protection), `bpf` (eBPF weaponisation / VoidLink defence)
 - **4 kprobe/kretprobe pairs** (Trace of the Times): iterate_dir, filldir64, tcp4_seq_show, proc_pid_readdir — timing-based rootkit detection
 - **XDP program**: wire-speed IP blocking at the network driver (10M+ pps drop rate)
 - **Phase 2 firmware hooks**: MSR write guard (LSTAR/SMRR), I/O port access (SPI controller probing), ACPI method execution monitoring
@@ -309,7 +309,7 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 
 **DDoS defense**: 4-layer adaptive protection. XDP kernel drop (wire speed) + Shield module (dynamic rate limiting) + Cloudflare auto-failover (edge blocking) + Nginx rate limit. Rate limits tighten dynamically under attack.
 
-**Mesh network**: collaborative defense between nodes. Attack one server, all others block the IP automatically. Ed25519 signed signals, game-theory trust model (tit-for-tat), staging pool with TTL-based auto-reversal. No signal causes immediate action. Everything is scored and staged.
+**Mesh network**: collaborative defence between nodes. Attack one server, and all others block the IP automatically. Ed25519 signed signals, game-theory trust model (tit-for-tat), staging pool with TTL-based auto-reversal. No signal causes immediate action. Everything is scored and staged.
 
 ```bash
 innerwarden config mesh enable
@@ -330,7 +330,7 @@ Inner Warden detects and logs threats without any AI provider. Add AI when you w
 
 - **Confidence-scored recommendations**: not binary yes/no, but 0.0-1.0 scored decisions
 - **Policy-gated execution**: AI recommends, your policy decides if it runs
-- **Full transparency**: every AI decision recorded in append-only audit trail with reasoning
+- **Full transparency**: every AI decision is recorded in an append-only audit trail with reasoning
 - **Twelve providers**: OpenAI, Anthropic, Ollama (local), OpenRouter, Groq, Together, Mistral, DeepSeek, Fireworks, Cerebras, Google Gemini, xAI Grok
 
 AI is advisory unless you explicitly enable auto-execution. You set the confidence threshold.
@@ -455,7 +455,7 @@ curl -s "http://localhost:8787/api/agent/check-ip?ip=203.0.113.10"
 
 Your agent calls `check-command` before executing. If the recommendation is `deny`, it stops. No changes to the agent runtime needed, just an HTTP call.
 
-See [AI Agent Protection docs](modules/openclaw-protection/docs/README.md) for full integration guide.
+See [AI Agent Protection docs](modules/openclaw-protection/docs/README.md) for the full integration guide.
 
 ---
 
@@ -652,7 +652,7 @@ innerwarden upgrade --check  # check without installing
 ```bash
 innerwarden get status                              # services + today's activity
 innerwarden get incidents --days 2                  # recent threats
-innerwarden get decisions --action block_ip          # what was blocked and why
+innerwarden get decisions --action block_ip         # what was blocked and why
 innerwarden get report                              # daily security report
 
 innerwarden stream                                  # live event stream
@@ -661,22 +661,22 @@ innerwarden action block 203.0.113.10               # manual IP block
 innerwarden action unblock 203.0.113.10             # remove block
 
 innerwarden trust add --ip 10.0.0.0/8               # skip AI for trusted ranges
-innerwarden trust add --user deploy                  # skip AI for trusted users
+innerwarden trust add --user deploy                 # skip AI for trusted users
 
 innerwarden config ai                               # interactive AI provider setup (12 providers)
 innerwarden config responder --enable --dry-run false
-innerwarden config telegram                          # notification setup
-innerwarden config cloudflare --token YOUR_TOKEN     # edge blocking
+innerwarden config telegram                         # notification setup
+innerwarden config cloudflare --token YOUR_TOKEN    # edge blocking
 
-innerwarden system doctor                            # diagnostics with fix hints
-innerwarden system harden                            # security hardening advisor
-innerwarden system scan                              # detect + recommend modules
-innerwarden system test                              # verify full pipeline end-to-end
-innerwarden system backup                            # archive configs to tar.gz
-innerwarden system navigator                         # export MITRE ATT&CK coverage map
+innerwarden system doctor                           # diagnostics with fix hints
+innerwarden system harden                           # security hardening advisor
+innerwarden system scan                             # detect + recommend modules
+innerwarden system test                             # verify full pipeline end-to-end
+innerwarden system backup                           # archive configs to tar.gz
+innerwarden system navigator                        # export MITRE ATT&CK coverage map
 
-innerwarden module install <url>                     # SHA-256 verified community modules
-innerwarden agent connect                            # connect to running agents
+innerwarden module install <url>                    # SHA-256 verified community modules
+innerwarden agent connect                           # connect to running agents
 ```
 
 ---
@@ -709,7 +709,7 @@ make run-agent    # reads from ./data/
 ## FAQ
 
 **Is this an EDR?**
-No. It is a self-contained defense agent with bounded response skills and full audit trails. No cloud, no phone-home, runs entirely on your host.
+No. It is a self-contained defence agent with bounded response skills and full audit trails. No cloud, no phone-home, runs entirely on your host.
 
 **Does it block by default?**
 No. Starts in observe-only mode. You enable response skills and disable dry-run when ready.
@@ -718,10 +718,10 @@ No. Starts in observe-only mode. You enable response skills and disable dry-run 
 No. Detection, logging, dashboard, and reports all work without AI. AI adds confidence-scored triage for autonomous response and is entirely optional.
 
 **How is this different from Fail2ban?**
-Fail2ban blocks IPs based on regex patterns. Inner Warden has 36 detectors, 22 eBPF kernel hooks with kill chain enforcement, a collaborative defense mesh network, 10 response skills (including sudo suspension, process kill, container pause, honeypots, and traffic capture), twelve AI providers, 4-layer DDoS defense, Telegram bot, AbuseIPDB intelligence sharing, and a full investigation dashboard with MITRE ATT&CK mapping.
+Fail2ban blocks IPs based on regex patterns. Inner Warden has 36 detectors, 22 eBPF kernel hooks with kill chain enforcement, a collaborative defence mesh network, 10 response skills (including sudo suspension, process kill, container pause, honeypots, and traffic capture), twelve AI providers, 4-layer DDoS defence, Telegram bot, AbuseIPDB intelligence sharing, and a full investigation dashboard with MITRE ATT&CK mapping.
 
 **How is this different from other HIDS tools?**
-Most host intrusion detection systems only observe. They write alerts for a human to act on. Inner Warden observes AND blocks. LSM hooks stop reverse shells at the kernel's execve before the process runs. XDP drops attack traffic at wire speed. Kill chain detection blocks 7 generic exploit patterns without CVE signatures, catching zero-day exploits by behavior rather than known hashes.
+Most host intrusion detection systems only observe. They write alerts for a human to act on. Inner Warden observes AND blocks. LSM hooks stop reverse shells at the kernel's execve before the process runs. XDP drops attack traffic at wire speed. Kill chain detection blocks 7 generic exploit patterns without CVE signatures, catching zero-day exploits by behaviour rather than known hashes.
 
 **Can I add custom detectors or skills?**
 Yes. See [module authoring guide](https://github.com/InnerWarden/innerwarden/wiki/Module-Authoring).
