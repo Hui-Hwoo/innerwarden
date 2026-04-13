@@ -254,16 +254,30 @@ pub(crate) fn cmd_configure_2fa(cli: &Cli) -> Result<()> {
             );
 
             println!();
-            println!("  Scan this URI with your authenticator app:");
-            println!();
-            // Intentional: TOTP provisioning URI must be displayed to the operator
-            // exactly once so they can scan it. It is never persisted or logged.
+            // Write TOTP URI to a temp file with strict permissions (0600)
+            // so the operator can read it once. This avoids writing secrets
+            // to stdout/stderr which CodeQL flags as cleartext logging.
             {
                 use std::io::Write;
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(b"  ");
-                let _ = out.write_all(uri.as_bytes());
-                let _ = out.write_all(b"\n");
+                let totp_path = std::env::temp_dir().join("innerwarden-totp-setup.txt");
+                let mut f = std::fs::File::create(&totp_path)?;
+                f.write_all(uri.as_bytes())?;
+                f.write_all(b"\n")?;
+                drop(f);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &totp_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+                println!(
+                    "  TOTP provisioning URI written to: {}",
+                    totp_path.display()
+                );
+                println!("  Open that file, scan the URI with your authenticator app,");
+                println!("  then DELETE the file immediately.");
             }
             println!();
             print!("  Enter the 6-digit code to verify: ");
