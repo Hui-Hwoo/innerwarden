@@ -11,6 +11,43 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.0] - 2026-04-13
+
+### Added
+- **Unified SQLite Store** (Spec 016) — replaces 15 storage artifacts (JSONL files, redb, JSON snapshots) with a single `innerwarden.db` SQLite database. WAL mode for concurrent sensor+agent access.
+- **New crate `crates/store/`** — 12 modules, 49 tests. Events, incidents, decisions tables + namespaced KV + graph snapshots + state blobs + cursor tracking.
+- **Maintenance scheduler** — automated background tasks: WAL checkpoint (5min), incremental vacuum (hourly), retention cleanup, hash chain verification, integrity check (daily).
+- **Legacy migration** — one-shot import on first startup. JSONL/redb/JSON files migrated to SQLite, originals archived to `legacy-archive/`.
+- **TOTP QR code in terminal** — `innerwarden config 2fa` renders QR code as ASCII art. Secret never touches disk or logs.
+- **SMM + Hypervisor as CTL subcommands** — `innerwarden system smm` and `innerwarden system hypervisor` integrated into the CLI.
+- **Centered terminal screens** — install and welcome UX improvements.
+
+### Changed
+- **Sensor writes only to SQLite** — JSONL sink removed. No more daily file rotation, 1GB cap, or silent event drops.
+- **Agent reads only from SQLite** — JSONL parser and byte-offset cursor removed. Rowid-based cursor tracking.
+- **State store migrated from redb to SQLite KV** — 7 redb tables mapped to namespaced KV. Same public API, zero caller changes.
+- **Graph snapshots in SQLite** — replaces JSON file rotation with database table. Load/save via `save_to_store()`/`load_from_store()`.
+- **6 JSON state files migrated to SQLite blobs** — attacker profiles, campaigns, baseline, playbook log, threat feeds, responses.
+- **DB file pre-created with 0664 permissions** — sensor (root) and agent (innerwarden) both write without permission conflicts.
+
+### Removed
+- **redb dependency** — replaced entirely by SQLite KV.
+- **JsonlWriter** — replaced by SqliteWriter.
+- **JSONL reader/parser** — replaced by SQLite rowid-based queries.
+- **JSON snapshot rotation** — 3-backup rotation replaced by SQLite table with date-based retention.
+
+### Fixed
+- **Silent event drop compliance bug** (ISO 27001 A.12.4) — events at 1GB cap were silently dropped. Now returns explicit backpressure error.
+- **6 CodeQL security alerts** resolved — path traversal sanitization, cleartext logging fixes.
+- **Firewalld detection** — harden command now detects firewalld alongside UFW.
+- **io_uring property test** — bun/deno/node added to allowlist (legitimate io_uring users).
+
+### Security
+- **Path traversal prevention** — `Store::open()` canonicalizes data_dir before any file operations.
+- **TOTP secret handling** — QR code rendered in terminal only, never written to files or logs.
+
+---
+
 ## [0.10.0] - 2026-04-08
 
 ### Added

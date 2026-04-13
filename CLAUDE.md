@@ -43,7 +43,7 @@ make replay-qa    # validacao E2E
 - Branches: main = stable, develop = bleeding edge
 - CI: `make check` + `make test` + `make spec-check`
 - Licenca: Apache-2.0 (migrado de BUSL-1.1 em 2026-04-03)
-- Release atual: v0.10.0
+- Release atual: v0.11.0
 - CTL reestruturado: 8 grupos (get, stream, action, trust, config, system, module, agent)
 
 ## Convencoes
@@ -110,7 +110,7 @@ ADR: `docs/internal/adr/0001-project-taxonomy.md`
 | 010 | Detector Migration (Phase 3) | **3A-3C Done**: 27 graph detectors + 10 correlation rules + dedup + config flag. 3D partial (metrics deferred). 29 tests. |
 | 013 | Graph Single Source of Truth (Phase 7) | **COMPLETE** (Gaps 1,2,4,5 done). Daily dated snapshots, FP tracking in graph, monthly report from snapshots, 6h window from event_timeline. Gap 3 deferred (telemetry stays JSONL by design). |
 | 014 | Graph Full Connectivity | **COMPLETE** (Phases A-D + leftover). 8 → 18 active relations. tcp_stream/eBPF/memory/cgroup/incident-PID all ingested. Bug fixes: missing `--features ebpf` flag, filename/path field mismatch, 200MB JSONL cap dropping events. Edges 12K → 33K, Process nodes 411 → 4470. |
-| 016 | Unified SQLite Store | **Draft** P0 release blocker. Replaces JSONL + redb + JSON snapshots with single `innerwarden.db`. Fixes silent-drop compliance bug. 10-day work, 14 maintenance tasks, 5 long-running tests. Spec only, no plan/tasks yet. |
+| 016 | Unified SQLite Store | **COMPLETE** (v0.11.0). Single `innerwarden.db` replaces 15 storage artifacts. 8 phases + cleanup. redb removed, JSONL removed, 14 maintenance tasks, legacy migration. |
 | 017 | Dashboard Operator UX | **Draft** P1. Two personas (primary operator + technical fallback). 15 FRs covering state consistency, non-alarmist tone, mobile legibility, stale-data indicators. Spec validated, no plan yet. |
 
 ## Divida tecnica
