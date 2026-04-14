@@ -2,6 +2,8 @@ use tracing::{debug, info};
 
 use crate::{abuseipdb, attacker_intel, geoip, AgentState};
 
+/// Namespace for cached GeoIP results.
+const GEOIP_CACHE_NS: &str = "geoip_cache";
 /// Namespace for cached AbuseIPDB reputation results.
 const ABUSEIPDB_CACHE_NS: &str = "abuseipdb_cache";
 /// Namespace for daily API call counters.
@@ -181,8 +183,33 @@ pub(crate) async fn backfill_enrichment(state: &mut AgentState) {
 
     for (ip, needs_geo, needs_abuse) in &candidates {
         let geo = if *needs_geo {
-            if let Some(client) = &state.geoip_client {
-                client.lookup(ip).await
+            // Try SQLite cache first (survives restarts).
+            let cached_geo = state
+                .sqlite_store
+                .as_ref()
+                .and_then(|sq| sq.kv_get_str(GEOIP_CACHE_NS, ip).ok().flatten())
+                .and_then(|json| serde_json::from_str::<geoip::GeoInfo>(&json).ok());
+
+            if let Some(info) = cached_geo {
+                debug!(ip, "geoip: using cached result");
+                Some(info)
+            } else if let Some(client) = &state.geoip_client {
+                let result = client.lookup(ip).await;
+                // Cache successful result with 7-day TTL (geo rarely changes).
+                if let Some(ref info) = result {
+                    if let Some(ref sq) = state.sqlite_store {
+                        let expiry = (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339();
+                        if let Ok(json) = serde_json::to_string(info) {
+                            let _ = sq.kv_set_with_expiry(
+                                GEOIP_CACHE_NS,
+                                ip,
+                                json.as_bytes(),
+                                Some(&expiry),
+                            );
+                        }
+                    }
+                }
+                result
             } else {
                 None
             }
