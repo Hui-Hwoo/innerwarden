@@ -495,14 +495,15 @@ async function loadMitreCoverage() {
           const bg = tech.active ? 'rgba(0,200,0,0.15)' : 'rgba(128,128,128,0.1)';
           const fg = tech.active ? 'var(--ok)' : 'var(--dim)';
           const border = tech.active ? 'rgba(0,200,0,0.3)' : 'var(--border)';
-          const title = `${tech.technique_name}\nDetectors: ${tech.detectors.join(', ')}`;
-          html += `<span title="${esc(title)}" style="font-size:0.7rem;padding:2px 6px;border-radius:3px;background:${bg};color:${fg};border:1px solid ${border};cursor:help;">${esc(tech.technique_id)}</span>`;
+          const status = tech.active ? 'Enabled' : 'Disabled';
+          const detList = tech.detectors.join(', ');
+          html += `<span title="${esc(tech.technique_name)} (${esc(tech.technique_id)})\nStatus: ${status}\nDetectors: ${esc(detList)}" style="font-size:0.7rem;padding:2px 6px;border-radius:3px;background:${bg};color:${fg};border:1px solid ${border};cursor:help;">${esc(tech.technique_id)}</span>`;
         }
         html += '</div></div>';
       }
     }
 
-    // Recommendations
+    // Recommendations or success message
     if (data.recommendations && data.recommendations.length) {
       html += '<div style="margin-top:16px;border:1px solid var(--warn);border-radius:6px;padding:12px;">';
       html += '<strong style="font-size:0.85rem;">Recommendations to improve coverage</strong>';
@@ -515,6 +516,10 @@ async function loadMitreCoverage() {
         html += `</div>`;
       }
       html += '</div></div>';
+    } else if (pct >= 90) {
+      html += '<div style="margin-top:16px;border:1px solid var(--ok);border-radius:6px;padding:12px;text-align:center;">';
+      html += '<strong style="color:var(--ok);">All detectors enabled — maximum coverage achieved</strong>';
+      html += '</div>';
     }
 
     content.innerHTML = html;

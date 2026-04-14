@@ -2,6 +2,63 @@
 
 use super::*;
 
+/// Read sensor config.toml to find detectors with `enabled = false`.
+/// Returns a set of detector names that are explicitly disabled.
+/// Falls back to empty set if config can't be read or parsed.
+fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static str> {
+    let mut disabled = std::collections::HashSet::new();
+
+    // Try common config paths
+    let paths = [
+        "/etc/innerwarden/config.toml",
+        "/etc/innerwarden/sensor.toml",
+    ];
+
+    let content = paths
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
+    if content.is_empty() {
+        return disabled;
+    }
+
+    // Parse TOML and check [detectors.X] enabled = false
+    let table: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(_) => return disabled,
+    };
+
+    let detectors_table = match table.get("detectors").and_then(|d| d.as_table()) {
+        Some(t) => t,
+        None => return disabled,
+    };
+
+    // Map config names to detector names (they match 1:1)
+    let all_names: &[&str] = &[
+        "ssh_bruteforce", "credential_stuffing", "distributed_ssh", "credential_harvest",
+        "suspicious_login", "port_scan", "web_scan", "user_agent_scanner", "search_abuse",
+        "crypto_miner", "outbound_anomaly", "ransomware", "execution_guard", "reverse_shell",
+        "process_tree", "docker_anomaly", "fileless", "integrity_alert", "log_tampering",
+        "rootkit", "process_injection", "web_shell", "ssh_key_injection", "kernel_module_load",
+        "crontab_persistence", "systemd_persistence", "user_creation", "container_escape",
+        "privesc", "sudo_abuse", "c2_callback", "dns_tunneling", "data_exfiltration",
+        "lateral_movement", "sensitive_write", "packet_flood", "data_exfil_ebpf",
+    ];
+
+    for &name in all_names {
+        if let Some(det_config) = detectors_table.get(name).and_then(|d| d.as_table()) {
+            if let Some(enabled) = det_config.get("enabled").and_then(|e| e.as_bool()) {
+                if !enabled {
+                    disabled.insert(name);
+                }
+            }
+        }
+    }
+
+    disabled
+}
+
 // ---------------------------------------------------------------------------
 // Agent API - security context for AI agents (OpenClaw, n8n, etc.)
 // ---------------------------------------------------------------------------
@@ -537,19 +594,31 @@ pub(super) async fn api_mitre_coverage(
 ) -> axum::response::Response {
     use crate::knowledge_graph::types::{Node, NodeType};
 
-    // All detectors InnerWarden ships with — enabled by default.
-    let all_shipped: std::collections::HashSet<String> = [
-        "ssh_bruteforce", "credential_stuffing", "distributed_ssh", "credential_harvest",
-        "suspicious_login", "port_scan", "web_scan", "user_agent_scanner", "search_abuse",
-        "crypto_miner", "outbound_anomaly", "ransomware", "execution_guard", "reverse_shell",
-        "process_tree", "docker_anomaly", "fileless", "integrity_alert", "log_tampering",
-        "rootkit", "process_injection", "web_shell", "ssh_key_injection", "kernel_module_load",
-        "crontab_persistence", "systemd_persistence", "user_creation", "container_escape",
-        "privesc", "sudo_abuse", "c2_callback", "dns_tunneling", "data_exfiltration",
-        "lateral_movement", "sensitive_write", "at_job_persist", "file_permission_mod",
-        "hidden_artifact", "remote_access_tool", "service_stop", "system_shutdown",
-        "network_sniffing", "masquerading", "data_archive", "proxy_tunnel", "data_exfil_ebpf",
-    ].iter().map(|s| s.to_string()).collect();
+    // Read sensor config to determine which detectors are actually enabled.
+    // Falls back to "all enabled" if config can't be read.
+    let enabled_detectors: std::collections::HashSet<String> = {
+        let all_shipped = vec![
+            "ssh_bruteforce", "credential_stuffing", "distributed_ssh", "credential_harvest",
+            "suspicious_login", "port_scan", "web_scan", "user_agent_scanner", "search_abuse",
+            "crypto_miner", "outbound_anomaly", "ransomware", "execution_guard", "reverse_shell",
+            "process_tree", "docker_anomaly", "fileless", "integrity_alert", "log_tampering",
+            "rootkit", "process_injection", "web_shell", "ssh_key_injection", "kernel_module_load",
+            "crontab_persistence", "systemd_persistence", "user_creation", "container_escape",
+            "privesc", "sudo_abuse", "c2_callback", "dns_tunneling", "data_exfiltration",
+            "lateral_movement", "sensitive_write", "at_job_persist", "file_permission_mod",
+            "hidden_artifact", "remote_access_tool", "service_stop", "system_shutdown",
+            "network_sniffing", "masquerading", "data_archive", "proxy_tunnel", "data_exfil_ebpf",
+        ];
+
+        // Try reading sensor config to find disabled detectors.
+        let disabled = read_disabled_detectors_from_config();
+
+        all_shipped
+            .into_iter()
+            .filter(|d| !disabled.contains(*d))
+            .map(|s| s.to_string())
+            .collect()
+    };
 
     // Detectors that actually fired today (from knowledge graph).
     let fired_detectors: std::collections::HashSet<String> = {
@@ -565,8 +634,8 @@ pub(super) async fn api_mitre_coverage(
     };
 
     let all_ids = crate::mitre::all_technique_ids();
-    // Coverage uses all shipped detectors (enabled by default).
-    let (tactics, recommendations) = crate::mitre::coverage_by_tactic(&all_shipped);
+    // Coverage uses detectors enabled in sensor config.
+    let (tactics, recommendations) = crate::mitre::coverage_by_tactic(&enabled_detectors);
 
     let total_techniques = all_ids.len();
     let active_techniques: usize = tactics
@@ -581,7 +650,7 @@ pub(super) async fn api_mitre_coverage(
         "coverage_pct": if total_techniques > 0 {
             (active_techniques as f64 / total_techniques as f64 * 100.0).round() as u32
         } else { 0 },
-        "enabled_detectors": all_shipped.len(),
+        "enabled_detectors": enabled_detectors.len(),
         "fired_today": fired_detectors.len(),
         "tactics": tactics,
         "recommendations": recommendations,
