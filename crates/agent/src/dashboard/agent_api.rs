@@ -526,15 +526,47 @@ pub(super) async fn api_mitre_navigator() -> axum::response::Response {
         .into_response()
 }
 
-/// GET /api/mitre/coverage — summary of MITRE ATT&CK coverage.
-pub(super) async fn api_mitre_coverage() -> axum::response::Response {
-    let ids = crate::mitre::all_technique_ids();
-    let layer = crate::mitre::generate_navigator_layer();
-    let techniques = layer["techniques"].as_array().map(|a| a.len()).unwrap_or(0);
+/// GET /api/mitre/coverage — detailed per-tactic coverage with active status.
+///
+/// Uses the knowledge graph to determine which detectors have actually fired,
+/// then returns per-tactic breakdown and actionable recommendations.
+pub(super) async fn api_mitre_coverage(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
+    use crate::knowledge_graph::types::{Node, NodeType};
+
+    // Collect detectors that have actually fired from the knowledge graph
+    let active_detectors: std::collections::HashSet<String> = {
+        let graph = state.knowledge_graph.read().unwrap();
+        let incident_nodes = graph.nodes_of_type(NodeType::Incident);
+        let mut detectors = std::collections::HashSet::new();
+        for &id in &incident_nodes {
+            if let Some(Node::Incident { detector, .. }) = graph.get_node(id) {
+                detectors.insert(detector.clone());
+            }
+        }
+        detectors
+    };
+
+    let all_ids = crate::mitre::all_technique_ids();
+    let (tactics, recommendations) = crate::mitre::coverage_by_tactic(&active_detectors);
+
+    let total_techniques = all_ids.len();
+    let active_techniques: usize = tactics
+        .iter()
+        .flat_map(|t| &t.techniques)
+        .filter(|t| t.active)
+        .count();
 
     let summary = serde_json::json!({
-        "total_techniques": techniques,
-        "technique_ids": ids,
+        "total_techniques": total_techniques,
+        "active_techniques": active_techniques,
+        "coverage_pct": if total_techniques > 0 {
+            (active_techniques as f64 / total_techniques as f64 * 100.0).round() as u32
+        } else { 0 },
+        "active_detectors": active_detectors.len(),
+        "tactics": tactics,
+        "recommendations": recommendations,
         "navigator_url": "/api/mitre/navigator",
     });
 
