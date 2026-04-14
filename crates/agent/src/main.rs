@@ -3501,11 +3501,16 @@ async fn process_narrative_tick(
                 .and_then(|id| graph.get_node(id))
                 .map(|n| n.label())
                 .unwrap_or_else(|| "unknown".to_string());
-            let incidents = knowledge_graph::detectors::run_all(
+            let calibration_ctx = knowledge_graph::detectors::CalibrationContext {
+                is_cloud: state.environment_profile.is_cloud(),
+                human_uids: state.environment_profile.human_uids.clone(),
+            };
+            let incidents = knowledge_graph::detectors::run_all_with_calibration(
                 &graph,
                 &mut state.graph_detector_state,
                 &host,
                 chrono::Utc::now(),
+                &calibration_ctx,
             );
             (incidents, host)
         };
