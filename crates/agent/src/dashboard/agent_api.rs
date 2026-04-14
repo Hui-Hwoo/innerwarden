@@ -528,15 +528,31 @@ pub(super) async fn api_mitre_navigator() -> axum::response::Response {
 
 /// GET /api/mitre/coverage — detailed per-tactic coverage with active status.
 ///
-/// Uses the knowledge graph to determine which detectors have actually fired,
-/// then returns per-tactic breakdown and actionable recommendations.
+/// Two layers: "enabled" detectors (all that InnerWarden ships with, since all
+/// are on by default) and "fired" detectors (those that generated incidents
+/// today). The coverage view shows enabled status — the operator cares about
+/// what their server CAN detect, not just what happened today.
 pub(super) async fn api_mitre_coverage(
     State(state): State<DashboardState>,
 ) -> axum::response::Response {
     use crate::knowledge_graph::types::{Node, NodeType};
 
-    // Collect detectors that have actually fired from the knowledge graph
-    let active_detectors: std::collections::HashSet<String> = {
+    // All detectors InnerWarden ships with — enabled by default.
+    let all_shipped: std::collections::HashSet<String> = [
+        "ssh_bruteforce", "credential_stuffing", "distributed_ssh", "credential_harvest",
+        "suspicious_login", "port_scan", "web_scan", "user_agent_scanner", "search_abuse",
+        "crypto_miner", "outbound_anomaly", "ransomware", "execution_guard", "reverse_shell",
+        "process_tree", "docker_anomaly", "fileless", "integrity_alert", "log_tampering",
+        "rootkit", "process_injection", "web_shell", "ssh_key_injection", "kernel_module_load",
+        "crontab_persistence", "systemd_persistence", "user_creation", "container_escape",
+        "privesc", "sudo_abuse", "c2_callback", "dns_tunneling", "data_exfiltration",
+        "lateral_movement", "sensitive_write", "at_job_persist", "file_permission_mod",
+        "hidden_artifact", "remote_access_tool", "service_stop", "system_shutdown",
+        "network_sniffing", "masquerading", "data_archive", "proxy_tunnel", "data_exfil_ebpf",
+    ].iter().map(|s| s.to_string()).collect();
+
+    // Detectors that actually fired today (from knowledge graph).
+    let fired_detectors: std::collections::HashSet<String> = {
         let graph = state.knowledge_graph.read().unwrap();
         let incident_nodes = graph.nodes_of_type(NodeType::Incident);
         let mut detectors = std::collections::HashSet::new();
@@ -549,7 +565,8 @@ pub(super) async fn api_mitre_coverage(
     };
 
     let all_ids = crate::mitre::all_technique_ids();
-    let (tactics, recommendations) = crate::mitre::coverage_by_tactic(&active_detectors);
+    // Coverage uses all shipped detectors (enabled by default).
+    let (tactics, recommendations) = crate::mitre::coverage_by_tactic(&all_shipped);
 
     let total_techniques = all_ids.len();
     let active_techniques: usize = tactics
@@ -564,7 +581,8 @@ pub(super) async fn api_mitre_coverage(
         "coverage_pct": if total_techniques > 0 {
             (active_techniques as f64 / total_techniques as f64 * 100.0).round() as u32
         } else { 0 },
-        "active_detectors": active_detectors.len(),
+        "enabled_detectors": all_shipped.len(),
+        "fired_today": fired_detectors.len(),
         "tactics": tactics,
         "recommendations": recommendations,
         "navigator_url": "/api/mitre/navigator",

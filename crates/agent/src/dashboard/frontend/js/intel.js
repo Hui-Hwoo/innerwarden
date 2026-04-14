@@ -465,13 +465,14 @@ async function loadMitreCoverage() {
     const pctColor = pct >= 70 ? 'var(--ok)' : pct >= 40 ? 'var(--warn)' : 'var(--danger)';
 
     let html = `<div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:16px;">
-      <div class="kpi-card"><div class="kpi-value" style="color:${pctColor}">${pct}%</div><div class="kpi-label">Active Coverage</div></div>
+      <div class="kpi-card"><div class="kpi-value" style="color:${pctColor}">${pct}%</div><div class="kpi-label">Coverage</div></div>
       <div class="kpi-card"><div class="kpi-value">${data.active_techniques}/${data.total_techniques}</div><div class="kpi-label">Techniques</div></div>
-      <div class="kpi-card"><div class="kpi-value">${data.active_detectors}</div><div class="kpi-label">Active Detectors</div></div>
-      <div class="kpi-card"><div class="kpi-value"><a href="/api/mitre/navigator" style="color:var(--accent);text-decoration:none;">Download</a></div><div class="kpi-label">Navigator JSON</div></div>
+      <div class="kpi-card"><div class="kpi-value">${data.enabled_detectors || data.active_detectors}</div><div class="kpi-label">Enabled Detectors</div></div>
+      <div class="kpi-card"><div class="kpi-value">${data.fired_today || 0}</div><div class="kpi-label">Fired Today</div></div>
+      <div class="kpi-card"><div class="kpi-value"><a href="/api/mitre/navigator" style="color:var(--accent);text-decoration:none;">Export</a></div><div class="kpi-label">Navigator JSON</div></div>
     </div>`;
 
-    html += '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:12px;">Green = detector active (fired today). Grey = detector available but inactive. Coverage reflects your server\'s real detection state.</div>';
+    html += '<div style="font-size:0.75rem;color:var(--dim);margin-bottom:12px;">Green = detector enabled and covering this technique. Coverage shows what your server CAN detect with its current configuration.</div>';
 
     // Tactic breakdown
     if (data.tactics && data.tactics.length) {
