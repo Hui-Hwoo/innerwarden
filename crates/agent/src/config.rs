@@ -1646,7 +1646,7 @@ fn default_context_events() -> usize {
 }
 
 fn default_confidence_threshold() -> f32 {
-    0.8
+    0.85
 }
 
 fn default_incident_poll_secs() -> u64 {

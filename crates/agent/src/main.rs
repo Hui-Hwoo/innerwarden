@@ -20,6 +20,7 @@ mod cloudflare;
 mod config;
 mod correlation;
 mod correlation_engine;
+mod correlation_response;
 mod crowdsec;
 mod dashboard;
 mod data_retention;
@@ -3707,6 +3708,10 @@ async fn process_narrative_tick(
             }
         }
     }
+
+    // Layer 2: Correlation-driven escalation (spec 018 Phase B).
+    // Drains completed attack chains and checks repeat offenders / multi-technique.
+    correlation_response::process_correlation_escalations(data_dir, cfg, state).await;
 
     narrative_anomaly::process_anomalies(data_dir, &today, &events_entries, state);
 
