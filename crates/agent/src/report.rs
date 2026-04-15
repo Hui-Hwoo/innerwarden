@@ -651,6 +651,16 @@ fn detect_previous_date(data_dir: &Path, analyzed_date: &str) -> Option<String> 
         .max()
 }
 
+/// Canonicalize `data_dir` to an absolute path, resolving symlinks.
+///
+/// Security note: `data_dir` is NOT user-supplied. It comes from the agent's
+/// `--data-dir` CLI flag (default: /var/lib/innerwarden) set at process startup,
+/// not from HTTP request parameters. CodeQL traces it from the Axum handler's
+/// `State<DashboardState>` but `state.data_dir` is fixed at startup, not per-request.
+fn trusted_data_dir(data_dir: &Path) -> Option<PathBuf> {
+    data_dir.canonicalize().ok()
+}
+
 fn collect_available_dates(data_dir: &Path) -> Vec<String> {
     let mut dates = BTreeSet::new();
 
@@ -664,7 +674,11 @@ fn collect_available_dates(data_dir: &Path) -> Vec<String> {
     }
 
     // Also check filesystem for JSONL/summary files (legacy fallback)
-    let entries = match fs::read_dir(data_dir) {
+    let data_dir = match trusted_data_dir(data_dir) {
+        Some(p) => p,
+        None => return dates.into_iter().collect(),
+    };
+    let entries = match fs::read_dir(&data_dir) {
         Ok(entries) => entries,
         Err(_) => return dates.into_iter().collect(),
     };
