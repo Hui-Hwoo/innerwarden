@@ -1039,6 +1039,12 @@ pub struct ResponderConfig {
     /// Example: ["block-ip-ufw", "monitor-ip"]
     #[serde(default = "default_allowed_skills")]
     pub allowed_skills: Vec<String>,
+
+    /// Enable deterministic auto-response rules (Layer 1).
+    /// These block obvious threats (SSH brute-force, port scan, etc.) without AI.
+    /// Respects dry_run and allowlist.
+    #[serde(default = "default_true")]
+    pub auto_rules_enabled: bool,
 }
 
 impl Default for ResponderConfig {
@@ -1048,6 +1054,7 @@ impl Default for ResponderConfig {
             dry_run: true,
             block_backend: default_block_backend(),
             allowed_skills: default_allowed_skills(),
+            auto_rules_enabled: true,
         }
     }
 }
