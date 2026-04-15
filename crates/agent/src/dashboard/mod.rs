@@ -544,9 +544,8 @@ async fn build_tls_config(
     if let (Some(cert), Some(key)) = (cert_path, key_path) {
         // Use operator-provided cert/key
         info!(cert = %cert, key = %key, "loading TLS certificate");
-        let rt = tokio::runtime::Handle::current();
-        let config = rt
-            .block_on(RustlsConfig::from_pem_file(&cert, &key))
+        let config = RustlsConfig::from_pem_file(&cert, &key)
+            .await
             .with_context(|| format!("failed to load TLS cert={cert} key={key}"))?;
         Ok(config)
     } else {

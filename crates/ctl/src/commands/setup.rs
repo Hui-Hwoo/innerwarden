@@ -1372,7 +1372,7 @@ mod tests {
         assert_eq!(key, None);
         assert_eq!(url, None);
 
-        let (model, key, url) = ai_provider_defaults("unknown_provider");
+        let (model, key, _url) = ai_provider_defaults("unknown_provider");
         assert_eq!(model, "gpt-4o-mini");
         assert_eq!(key, Some("UNKNOWN_PROVIDER_API_KEY".to_string()));
     }

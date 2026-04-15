@@ -281,7 +281,7 @@ pub fn build_entry(
         AiAction::Ignore { .. } => ("ignore".to_string(), None, None, None),
     };
 
-     DecisionEntry {
+    DecisionEntry {
         ts: Utc::now(),
         incident_id: incident_id.to_string(),
         host: host.to_string(),

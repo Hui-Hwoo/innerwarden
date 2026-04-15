@@ -18,7 +18,11 @@ pub(crate) async fn execute_block_ip_decision(
     cfg: &config::AgentConfig,
     state: &mut AgentState,
 ) -> (String, bool) {
-// Safeguard: pure eligibility checks (empty IP, operator session, rate limit).
+    // Purge stale entries BEFORE eligibility check so rate limit uses accurate count.
+    let now_utc = chrono::Utc::now();
+    state.recent_blocks.retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
+
+    // Safeguard: pure eligibility checks (empty IP, operator session, rate limit).
     if let Err(reason) = check_block_eligibility(
         ip,
         &state.operator_ips,
@@ -32,10 +36,7 @@ pub(crate) async fn execute_block_ip_decision(
         }
         return (reason, false);
     }
-    
-    // Register the current block in rate limit tracking.
-    let now_utc = chrono::Utc::now();
-    state.recent_blocks.retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
+
     state.recent_blocks.push_back(now_utc);
 
     // Adaptive TTL: use local IP reputation to escalate block duration.

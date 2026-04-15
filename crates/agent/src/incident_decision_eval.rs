@@ -116,7 +116,7 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
         let features = build_brain_features(incident, state);
         if let Some(suggestion) = state.defender_brain.suggest(&features) {
             let ai_action_str = format!("{:?}", decision.action);
-            let brain_agrees = is_brain_agreeing_with_ai(&suggestion.action_name, &ai_action_str);
+            let brain_agrees = is_brain_agreeing_with_ai(suggestion.action_name, &ai_action_str);
 
             info!(
                 incident_id = %incident.incident_id,

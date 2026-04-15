@@ -295,7 +295,7 @@ pub(crate) fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use innerwarden_core::entities::{EntityRef, EntityType};
+    use innerwarden_core::entities::EntityRef;
     use innerwarden_core::event::Severity;
     use innerwarden_core::incident::Incident;
     use crate::ai::{AiDecision, AiAction};
