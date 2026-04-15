@@ -1,274 +1,233 @@
-# Feature Specification: Test Coverage Gaps
+# Feature Specification: Test Coverage Gaps — Full Plan
 
 **Feature Branch**: `019-test-coverage-gaps`
 **Created**: 2026-04-15
-**Status**: Draft
-**Priority**: P1 (blocks CI confidence — 42.85% coverage, agent crate is the primary gap)
-**Depends on**: nothing (independent work)
+**Status**: Batch 1 delivered (PR #110, 19 tests). Batches 2-7 pending.
+**Priority**: P1 (42.85% coverage → target 55%+)
+**Depends on**: nothing
 
-## Problem
+## Current state (post PR #110)
 
-Codecov reports 42.85% line coverage. The agent crate has 75K lines but only 581 tests — the largest gap. The ctl crate has 24K lines with 217 tests but 78% of its code (18K lines) has zero tests. Many critical code paths (decision pipeline, auto-rules, setup wizard) are completely untested.
-
-## Audit summary
-
-### Agent crate (75K lines, 581 tests)
-
-| Module group | Lines | Tests | Coverage | Priority |
+| Crate | Lines | Tests | Coverage | Notes |
 |---|---|---|---|---|
-| **Decision pipeline** (6 files) | 1,175 | 0 | 0% | **P0** |
-| **Auto-rules** (3 files) | 326 | 0 | 0% | **P0** |
-| **Config** | 2,654 | 9 | minimal | P1 |
-| **Dashboard** (16 files) | 9,660 | 24 | 0.25% | P2 (HTTP-heavy) |
-| **Skills/builtin** (12 files) | 3,400 | 12 | minimal | P1 |
-| **Skills/honeypot** (5 files) | 5,308 | 44 | 0.8% | P2 |
-| **Telegram** | 3,360 | 45 | 1.3% | P2 |
-| **Bot commands/helpers/actions** | 2,437 | 0 | 0% | P2 |
-| **Inline modules** (dna, shield, killchain, hypervisor, firmware) | 1,504 | 0 | 0% | P1 |
-| **Incident pipeline** (enrichment, notifications, decision_eval, autodismiss, obvious) | 1,109 | 0 | 0% | P0 |
-| **Narrative** (daily_summary, incident_ingest, autofp) | 487 | 0 | 0% | P1 |
-| **Briefing** | 332 | 0 | 0% | P2 |
-
-#### Top 20 largest untested agent modules
-
-| File | Lines | What it does |
-|---|---|---|
-| `bot_commands.rs` | 1,042 | Telegram bot command handlers |
-| `bot_helpers.rs` | 938 | Telegram formatting/helpers |
-| `bot_actions.rs` | 457 | Telegram action execution |
-| `dna_inline.rs` | 349 | Threat DNA inline integration |
-| `shield_inline.rs` | 335 | Shield inline integration |
-| `incident_decision_eval.rs` | 335 | Incident decision evaluation |
-| `briefing.rs` | 332 | Briefing generation |
-| `hypervisor_tick.rs` | 320 | Hypervisor periodic check |
-| `incident_enrichment.rs` | 305 | Incident enrichment pipeline |
-| `decisions.rs` | 301 | Decision orchestrator |
-| `firmware_tick.rs` | 295 | Firmware periodic check |
-| `decision_cooldown.rs` | 293 | Decision cooldown logic |
-| `honeypot_post_session.rs` | 280 | Honeypot session post-processing |
-| `decision_block_ip.rs` | 247 | IP blocking decision |
-| `incident_abuseipdb.rs` | 219 | AbuseIPDB enrichment |
-| `incident_notifications.rs` | 214 | Notification dispatch |
-| `killchain_inline.rs` | 205 | Kill chain inline integration |
-| `narrative_daily_summary.rs` | 192 | Daily narrative summary |
-| `narrative_incident_ingest.rs` | 186 | Narrative incident ingestion |
-| `incident_obvious.rs` | 168 | Obvious incident classification |
-
-### CTL crate (24K lines, 217 tests)
-
-| Module group | Lines | Tests | Priority |
-|---|---|---|---|
-| **Setup wizard** (`setup.rs`) | 1,352 | 0 | **P0** |
-| **Ops** (`ops.rs`) | 2,144 | 0 | P1 |
-| **Notify** (`notify.rs`) | 1,152 | 0 | P1 |
-| **Module lifecycle** (`module.rs`) | 1,110 | 0 | P1 |
-| **History** (`history.rs`) | 902 | 0 | P2 |
-| **Status** (`status.rs`) | 573 | 0 | P2 |
-| **AI setup** (`ai.rs`) | 510 | 0 | P2 |
-| **Agent control** (`agent.rs`) | 489 | 0 | P2 |
-| **Response** (`response.rs`) | 443 | 0 | P2 |
-| **Integrations** (`integrations.rs`) | 378 | 0 | P2 |
-| **Firmware** (`firmware.rs`) | 328 | 0 | P2 |
-| **Update** (`update.rs`) | 313 | 0 | P2 |
-| **Watchdog** (`watchdog.rs`) | 303 | 0 | P2 |
-| **Calibrate** (`calibrate.rs`) | 217 | 0 | P2 |
-| **Helpers** (`helpers.rs`) | 189 | 0 | P2 |
-| **Welcome** (`welcome.rs`) | 152 | 0 | P2 |
-
-#### Already tested (good coverage)
-
-| Module | Lines | Tests |
-|---|---|---|
-| `module_validator.rs` | 882 | 23 |
-| `module_manifest.rs` | 806 | 22 |
-| `upgrade.rs` | 753 | 27 |
-| `config_editor.rs` | 490 | 19 |
-| `scan.rs` | 2,021 | 15 |
-| `main.rs` | 2,930 | 30 |
-| All 5 capabilities | 2,045 | 45 |
-
-## Scope
-
-### In scope — Phase 1 (P0, testable without mocks of external systems)
-
-**Agent — Decision pipeline** (1,175 lines, 0 tests):
-- `decisions.rs` — orchestration logic, decision routing
-- `decision_cooldown.rs` — cooldown window tracking, expiry, duplicate prevention
-- `decision_block_ip.rs` — IP block decision with allowlist checks
-- `decision_honeypot.rs` — honeypot routing decisions
-- `decision_confirmation.rs` — confirmation flow logic
-- `decision_skill_actions.rs` — skill action dispatch
-
-**Agent — Auto-rules** (326 lines, 0 tests):
-- `narrative_autofp.rs` — auto false-positive detection
-- `incident_autodismiss.rs` — auto-dismiss logic
-- `trust_rules.rs` — trust rule evaluation
-
-**Agent — Incident pipeline** (1,109 lines, 0 tests):
-- `incident_decision_eval.rs` — decision evaluation for incidents
-- `incident_obvious.rs` — obvious incident classification
-- `incident_enrichment.rs` — enrichment pipeline (mockable parts)
-
-**CTL — Setup wizard** (1,352 lines, 0 tests):
-- `setup.rs` — pure functions: `ai_provider_defaults`, `count_failed_setup_checks`, `setup_verdict`, `setup_remediation_command`, struct construction
-
-### In scope — Phase 2 (P1, needs some test infrastructure)
-
-**Agent — Config** (2,654 lines, 9 tests):
-- Config parsing, validation, defaults, merge logic
-
-**Agent — Skills/builtin** (3,400 lines, 12 tests):
-- `kill_chain_response.rs` — 457 lines, 0 tests
-- `block_ip_nftables.rs`, `block_ip_iptables.rs`, `block_ip_ufw.rs`, `block_ip_xdp.rs` — firewall command construction (testable without root)
-
-**Agent — Inline modules** (1,504 lines, 0 tests):
-- `dna_inline.rs`, `shield_inline.rs`, `killchain_inline.rs` — integration wrappers
-- `hypervisor_tick.rs`, `firmware_tick.rs` — periodic check logic
-
-**Agent — Narrative** (487 lines, 0 tests):
-- `narrative_daily_summary.rs`, `narrative_incident_ingest.rs`, `narrative_autofp.rs`
-
-**CTL — Ops** (2,144 lines, 0 tests):
-- Pure logic: sensitivity tuning calculation, config validation, diagnostic checks
-
-**CTL — Notify** (1,152 lines, 0 tests):
-- Config construction, validation, channel routing logic
-
-### Out of scope (P2 — hard to test unitarily, deferred)
-
-- **Dashboard** (9,660 lines) — HTTP handlers, HTML/JS responses. Needs integration test harness.
-- **Telegram** (3,360 lines) — API integration, already at 45 tests.
-- **Bot commands/helpers/actions** (2,437 lines) — Telegram API dependent.
-- **Briefing** (332 lines) — text generation, low risk.
-- **CTL interactive commands** — `dialoguer` dependent (stdin prompts).
-- **CTL commands that call systemd/sudo** — need real system.
+| agent | 75,054 | 596 | ~35% | Biggest gap. 71 files with 0 tests. |
+| sensor | 48,460 | 762 | ~55% | Reasonable. Detectors covered. |
+| ctl | 24,433 | 221 | ~22% | 31 modules with 0 tests. |
+| shield | 5,492 | 93 | ~50% | OK |
+| smm | 5,796 | 76 | ~45% | OK |
+| dna | 3,801 | 55 | ~45% | OK |
+| killchain | 2,184 | 58 | ~60% | Good |
+| store | 2,863 | 49 | ~55% | Good |
+| agent-guard | 2,558 | 50 | ~55% | Good |
+| hypervisor | 2,848 | 25 | ~30% | Small, low priority |
+| core | 388 | 3 | ~25% | Small, low priority |
+| **Total** | **177,877** | **1,988** | **42.85%** | |
 
 ## Principles
 
-1. **Test logic, not I/O.** Extract pure functions from modules that mix logic with HTTP/filesystem/network calls. Test the extracted logic.
-2. **No mocking frameworks.** Use Rust's built-in `#[cfg(test)]` modules with hand-built test structs where needed.
-3. **Test the contract, not the implementation.** Decision pipeline tests verify "given these inputs, this decision is produced" — not internal state transitions.
-4. **Each test file self-contained.** Tests go in `#[cfg(test)] mod tests` at the bottom of each source file, following existing project convention.
-5. **No test-only refactoring.** If a function is untestable because it's entangled with I/O, add tests for the parts that ARE testable. Refactoring to make things testable is a separate spec.
+1. **Test logic, not I/O.** Extract pure functions. Test inputs → outputs.
+2. **No mocking frameworks.** `#[cfg(test)] mod tests` with hand-built structs.
+3. **Each batch is a standalone PR on its own branch.** Independent, mergeable alone.
+4. **Tests go at the bottom of each source file**, following existing convention.
+5. **No test-only refactoring** beyond extracting pure functions from async flows.
+6. **Every test must run without network, root, or external services.**
 
-## Proposed changes
+---
 
-### Change 1 — Decision pipeline tests (~30 tests)
+## Batch plan
 
-**Where**: `crates/agent/src/decision_*.rs` (6 files)
+Each batch is designed to be given to ONE AI in ONE session. Branches named `019-batch-N`. All branch from `development`.
 
-Tests for:
-- `decision_cooldown.rs`: cooldown window creation, expiry check, duplicate detection, window overlap
-- `decision_block_ip.rs`: allowlist bypass, private IP skip, duplicate block prevention, severity threshold
-- `decision_honeypot.rs`: honeypot eligibility check, port mapping
-- `decision_confirmation.rs`: confirmation required vs auto-approve logic
-- `decision_skill_actions.rs`: skill dispatch routing, parameter validation
-- `decisions.rs`: end-to-end decision routing (incident → correct decision type)
+---
 
-### Change 2 — Auto-rules and incident pipeline tests (~20 tests)
+### Batch 1 — Decision pipeline + auto-rules + setup wizard ✅ DONE
 
-**Where**: `crates/agent/src/narrative_autofp.rs`, `incident_autodismiss.rs`, `trust_rules.rs`, `incident_decision_eval.rs`, `incident_obvious.rs`
+**Branch**: `019-test-coverage-gaps` (PR #110)
+**Tests added**: 19
+**Status**: Merged/ready to merge
 
-Tests for:
-- Auto-FP: pattern matching, confidence threshold, repeated-source detection
-- Auto-dismiss: severity filter, age check, source reputation
-- Trust rules: trust score computation, rule evaluation
-- Decision eval: severity-to-action mapping, override logic
-- Obvious classification: known-benign patterns, known-attack patterns
+Covered: `decision_block_ip`, `decision_cooldown`, `decision_skill_actions`, `decisions`, `incident_autodismiss`, `incident_decision_eval`, `incident_obvious`, `narrative_autofp`, `trust_rules`, `setup.rs` pure functions.
 
-### Change 3 — Setup wizard pure function tests (~15 tests)
+---
 
-**Where**: `crates/ctl/src/commands/setup.rs`
+### Batch 2 — Decision pipeline remainder + incident enrichment
 
-Tests for:
-- `ai_provider_defaults`: all 10+ providers return valid defaults
-- `count_failed_setup_checks`: edge cases (0, all pass, all fail, mixed)
-- `setup_verdict`: threshold logic (0 failures = pass, 1+ = fail, critical vs warning)
-- `setup_remediation_command`: correct command generation per check type and OS
+**Branch**: `019-batch-2`
+**Target**: ~20 tests
+**Crate**: agent
 
-### Change 4 — Config validation tests (~15 tests)
+| File | Lines | What to test |
+|---|---|---|
+| `decision_honeypot.rs` | 101 | Honeypot eligibility: port mapping, IP check, protocol match, max concurrent sessions |
+| `decision_confirmation.rs` | 67 | Confirmation required vs auto-approve: severity threshold, trust rules match, dry_run bypass |
+| `incident_enrichment.rs` | 305 | Enrichment logic: GeoIP lookup result parsing, AbuseIPDB score interpretation, enrichment merge. Extract pure functions from async flow. |
+| `incident_notifications.rs` | 214 | Notification routing: severity-to-channel mapping, cooldown check, batch grouping logic |
+| `incident_abuseipdb.rs` | 219 | Score threshold parsing, confidence calculation, report count interpretation |
+| `honeypot_post_session.rs` | 280 | Session analysis: command classification, credential extraction, attacker fingerprint building |
 
-**Where**: `crates/agent/src/config.rs`
+**Instructions for AI**:
+1. Read each file. Identify pure logic entangled with async/IO.
+2. Extract testable functions (like Batch 1 did with `check_block_eligibility`, `is_obvious_attack`, etc.).
+3. Add `#[cfg(test)] mod tests` at bottom of each file.
+4. `cargo clippy --workspace -- -D warnings` must pass.
+5. `cargo fmt` must pass.
+6. `cargo test -p innerwarden-agent` must pass.
 
-Tests for:
-- Default values for all config sections
-- Invalid value rejection (negative intervals, empty strings, out-of-range ports)
-- Config merge logic (file + env + defaults)
-- Feature flag interactions
+---
 
-### Change 5 — Skills builtin command construction tests (~15 tests)
+### Batch 3 — Config validation + narrative
 
-**Where**: `crates/agent/src/skills/builtin/`
+**Branch**: `019-batch-3`
+**Target**: ~25 tests
+**Crate**: agent
 
-Tests for:
-- `kill_chain_response.rs`: response action selection per chain type
-- `block_ip_*.rs`: correct iptables/nftables/ufw/pf command string generation
-- Parameter validation (valid IP, valid port range)
+| File | Lines | What to test |
+|---|---|---|
+| `config.rs` | 2,654 | Default values for all sections. Invalid value rejection (negative intervals, empty strings, out-of-range ports, invalid URLs). Config merge: file + env + defaults. Feature flag interactions. Sensitivity level mapping. |
+| `narrative_daily_summary.rs` | 192 | Summary text generation: empty day, single incident, multiple incidents, severity breakdown, top attackers formatting |
+| `narrative_incident_ingest.rs` | 186 | Incident narrative text building: entity formatting, evidence summarization, MITRE technique description |
+| `briefing.rs` | 332 | Briefing content assembly: threat level calculation, active threats count, system status aggregation |
 
-### Change 6 — Inline module integration tests (~10 tests)
+**Instructions for AI**:
+1. `config.rs` is the highest-value target. It has 2,654 lines but only 9 tests. Focus on validation/defaults.
+2. For narrative files, test text generation functions — they're usually pure (input incident → output string).
+3. Same quality bar: clippy clean, fmt clean, all tests pass.
 
-**Where**: `crates/agent/src/*_inline.rs`, `*_tick.rs`
+---
 
-Tests for:
-- `dna_inline.rs`: atom extraction, DNA hash computation
-- `killchain_inline.rs`: bitmask operations, pattern matching
-- `hypervisor_tick.rs`: probe result interpretation
-- `firmware_tick.rs`: check result classification
+### Batch 4 — Skills builtin + kill chain response
 
-## Execution plan
+**Branch**: `019-batch-4`
+**Target**: ~25 tests
+**Crate**: agent
 
-Multi-session work. Each phase is independently deployable.
+| File | Lines | What to test |
+|---|---|---|
+| `skills/builtin/kill_chain_response.rs` | 457 | Response action selection per chain type (reverse_shell, bind_shell, code_inject, etc.). Severity escalation. Multi-step response sequencing. |
+| `skills/builtin/block_ip_nftables.rs` | 96 | nftables command string generation. Set name construction. TTL formatting. |
+| `skills/builtin/block_ip_iptables.rs` | 96 | iptables command construction. Chain selection. Duration-to-timeout conversion. |
+| `skills/builtin/block_ip_ufw.rs` | 87 | ufw command construction. Rule formatting. |
+| `skills/builtin/block_ip_xdp.rs` | 216 | XDP map key construction. IP-to-bytes conversion. TTL encoding. |
+| `skills/builtin/block_ip_pf.rs` | 154 | pf table command construction (macOS/BSD). |
+| `skills/builtin/suspend_user_sudo.rs` | 367 | sudoers line construction. User validation. Duration formatting. Has 1 test — add more edge cases. |
+| `skills/builtin/kill_process.rs` | 247 | Signal selection per process type. PID validation. Has 1 test — add more. |
+| `skills/builtin/block_container.rs` | 341 | Docker/podman command construction. Container ID validation. Has 1 test — add more. |
 
-### Session 1 — Phase 1 (P0)
-1. Decision pipeline tests (Change 1) — ~30 tests
-2. Auto-rules + incident pipeline tests (Change 2) — ~20 tests
-3. Setup wizard tests (Change 3) — ~15 tests
-4. `make test` — all pass
-5. Commit on branch `019-test-coverage-gaps`
+**Instructions for AI**:
+1. Skills construct shell commands. Test the COMMAND STRINGS, not execution. Extract command-building into pure functions.
+2. **Critical**: these commands run as root. Malformed commands = security risk. Test edge cases: empty IPs, IPv6, special characters, very long TTLs.
+3. DO NOT test functions that call `Command::new()` — test the argument construction.
 
-### Session 2 — Phase 2 (P1)
-1. Config tests (Change 4) — ~15 tests
-2. Skills tests (Change 5) — ~15 tests
-3. Inline module tests (Change 6) — ~10 tests
-4. CTL ops/notify pure logic tests — ~10 tests
-5. `make test` — all pass
+---
 
-### Target
-- Phase 1: +65 tests → ~2540 total
-- Phase 2: +50 tests → ~2590 total
-- Estimated coverage lift: 42.85% → ~48-50%
+### Batch 5 — Inline modules + ticks
+
+**Branch**: `019-batch-5`
+**Target**: ~20 tests
+**Crate**: agent
+
+| File | Lines | What to test |
+|---|---|---|
+| `dna_inline.rs` | 349 | Atom extraction from incidents. DNA hash computation. Fuzzy match scoring. Feature vector building. |
+| `shield_inline.rs` | 335 | Rate calculation. SYN ratio computation. Escalation state transitions. Threshold comparison. |
+| `killchain_inline.rs` | 205 | Bitmask operations: set stage, check pattern match, extract matched pattern name. PID tracking. |
+| `hypervisor_tick.rs` | 320 | Probe result interpretation: CPUID anomaly detection, timing deviation threshold, DMI string matching. |
+| `firmware_tick.rs` | 295 | Check result classification: MSR value validation, SPI flash hash comparison, UEFI variable parsing. |
+
+**Instructions for AI**:
+1. These are integration wrappers. They call into library crates (dna, killchain, etc.) but have their own logic.
+2. Test the WRAPPER logic, not the library. Example: `dna_inline.rs` builds features from `Incident` — test that mapping.
+3. Same quality bar.
+
+---
+
+### Batch 6 — CTL commands (pure logic extraction)
+
+**Branch**: `019-batch-6`
+**Target**: ~30 tests
+**Crate**: ctl
+
+| File | Lines | What to test |
+|---|---|---|
+| `commands/ops.rs` | 2,144 | Sensitivity tuning calculation (level → config values). Fail2ban config generation (jail.local template). Doctor diagnostic checks (parse results). Backup path construction. |
+| `commands/notify.rs` | 1,152 | Channel config construction. Validation (empty token, invalid URL, missing chat_id). Digest interval parsing. Alert level filtering. |
+| `commands/module.rs` | 1,110 | Module path resolution. Manifest merging. Enable/disable toggle logic. Search filtering. |
+| `commands/history.rs` | 902 | Query construction. Time range parsing ("24h", "7d", "30d"). Severity filtering. Output formatting. |
+| `commands/status.rs` | 573 | Status aggregation. Service state interpretation. Uptime calculation. |
+| `commands/ai.rs` | 510 | Provider validation. Model name normalization. API key env var name construction. |
+| `commands/agent.rs` | 489 | Agent state parsing. PID file reading. Config path resolution. |
+| `calibrate.rs` | 217 | Calibration score computation. Threshold adjustment. Sensitivity mapping. |
+| `helpers.rs` | 189 | Path construction. Size formatting. Duration formatting. |
+
+**Instructions for AI**:
+1. Most of these are CLI commands with heavy I/O (file reads, systemd calls, dialoguer prompts).
+2. **Only test pure logic.** Extract calculation/formatting/validation functions.
+3. `helpers.rs` and `calibrate.rs` should be the easiest — likely already pure.
+4. For `ops.rs` (2,144 lines), focus on sensitivity tuning and fail2ban config generation — those are the most impactful.
+
+---
+
+### Batch 7 — Honeypot + bot commands (stretch)
+
+**Branch**: `019-batch-7`
+**Target**: ~20 tests
+**Crate**: agent
+
+| File | Lines | What to test |
+|---|---|---|
+| `skills/honeypot/mod.rs` | 3,157 | Session state machine: connection → interaction → classification. Port service mapping. Banner generation. Has 13 tests — add state transition edge cases. |
+| `skills/honeypot/ssh_interact.rs` | 801 | Command parsing. Response generation for fake shell commands. Credential logging. Has 3 tests — add more commands. |
+| `skills/honeypot/custom_responses.rs` | 192 | Custom response matching. Template substitution. Has 2 tests — add edge cases. |
+| `bot_commands.rs` | 1,042 | Command parsing: extract command name and args from Telegram message text. Help text generation. Permission check. |
+| `bot_helpers.rs` | 938 | HTML escaping. Message truncation. Keyboard construction. Status emoji mapping. Severity-to-color mapping. |
+| `bot_actions.rs` | 457 | Action dispatch: callback data parsing, action validation, response formatting. |
+
+**Instructions for AI**:
+1. Honeypot files already have some tests. Read existing tests first, then add missing edge cases.
+2. Bot files are Telegram-dependent but have pure formatting logic. Test the formatting, not the API calls.
+3. `bot_helpers.rs` (938 lines of formatting) should yield easy high-value tests.
+
+---
+
+## Summary table
+
+| Batch | Branch | Crate | Files | Target tests | Estimated coverage lift |
+|---|---|---|---|---|---|
+| 1 ✅ | `019-test-coverage-gaps` | agent + ctl | 11 | 19 | +0.5% |
+| 2 | `019-batch-2` | agent | 6 | ~20 | +0.8% |
+| 3 | `019-batch-3` | agent | 4 | ~25 | +1.5% |
+| 4 | `019-batch-4` | agent | 9 | ~25 | +1.2% |
+| 5 | `019-batch-5` | agent | 5 | ~20 | +0.8% |
+| 6 | `019-batch-6` | ctl | 9 | ~30 | +1.5% |
+| 7 | `019-batch-7` | agent | 6 | ~20 | +1.0% |
+| **Total** | | | **50** | **~160** | **42.85% → ~50%** |
+
+## Execution rules (for any AI working on a batch)
+
+1. **Branch from `development`**, not from another batch branch.
+2. **`cargo clippy --workspace -- -D warnings`** must be clean. CI uses `-D warnings`.
+3. **`cargo fmt`** must be run before commit. CI checks formatting.
+4. **No changes to non-test code** except extracting pure functions (like Batch 1 did).
+5. **PR title format**: `test(crate): batch N — description`
+6. **PR base**: `development` (NOT `main`).
+7. **Each test must have a comment** explaining what code path it exercises.
+8. **No `unwrap()` in test setup** — use proper construction or `panic!` with message.
+9. **Check existing tests first** — some files already have a few tests. Don't duplicate.
+10. **Read the file before writing tests** — understand the function's contract.
 
 ## Acceptance criteria
 
-### Phase 1
-- [ ] All 6 decision pipeline files have `#[cfg(test)] mod tests` with meaningful tests
-- [ ] All 3 auto-rule files have tests
-- [ ] `incident_decision_eval.rs` and `incident_obvious.rs` have tests
-- [ ] `setup.rs` pure functions have tests
-- [ ] `make test` passes with 0 failures
+- [ ] All 7 batches merged
+- [ ] `make test` passes (~2150+ tests)
+- [ ] Codecov shows 48%+ (stretch: 50%+)
+- [ ] Zero clippy warnings
 - [ ] No test requires network, root, or external services
+- [ ] Every previously-untested P0/P1 module has at least one meaningful test
 
-### Phase 2
-- [ ] `config.rs` has validation and default tests
-- [ ] Skills builtin command construction tested
-- [ ] Inline module logic tested
-- [ ] CTL ops/notify pure logic tested
-- [ ] `make test` passes with 0 failures
-- [ ] Coverage reaches ~48%+
+## Out of scope
 
-## Risks
-
-### Risk — Tests couple to internal implementation
-**Mitigation**: test public contract (inputs → outputs), not internal state. If a refactor breaks tests, the tests were too tight.
-
-### Risk — Some modules are untestable without refactoring
-**Mitigation**: Phase 1 targets only modules with extractable pure logic. Entangled modules are Phase 2 or out of scope. No test-driven refactoring in this spec.
-
-### Risk — Test count inflation without real coverage
-**Mitigation**: each test must exercise a distinct code path or edge case. No trivial "assert true" tests. Codecov delta must show line coverage improvement.
-
-## Related work
-
-- **Spec 018** — Autonomy Gap (agent detects but never acts). Test coverage for decision pipeline directly validates the fix path.
-- **Spec 015** — Graph Signal Quality. Detector tests already exist (29 tests). This spec does not add more detector tests.
-- **Spec 016** — SQLite Store. Store crate already at 49 tests (good coverage). Not in scope.
+- **Dashboard** (9,660 lines) — needs HTTP test harness. Separate spec.
+- **Telegram API integration tests** — needs mock server. Separate spec.
+- **sensor-ebpf** (3,276 lines) — `#![no_std]`, eBPF bytecode. Cannot run standard tests.
+- **Sensor detectors** — already at 762 tests, reasonable coverage.
+- **Satellite crates with 45%+ coverage** — shield, smm, dna, killchain, store, agent-guard.
