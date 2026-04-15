@@ -48,7 +48,7 @@ hmac = "0.12"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 serde_yaml = "0.9"
-russh = "0.59"
+russh = "0.60"
 regex = "1"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
 aes-gcm = "0.10"
