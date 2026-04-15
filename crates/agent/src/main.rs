@@ -56,6 +56,7 @@ mod incident_forensics;
 mod incident_honeypot_router;
 mod incident_honeypot_suggestion;
 mod incident_notifications;
+mod incident_auto_rules;
 mod incident_obvious;
 mod incident_playbook;
 mod incident_post_decision;
@@ -2677,7 +2678,15 @@ async fn process_incidents(
         );
         incident_enrichment::log_threat_feed_match(incident, state);
 
-        // 2. AI analysis - only when AI is enabled and incident passes the gate.
+        // 2. Auto-response rules (Layer 1) — deterministic, no AI needed.
+        //    Runs BEFORE noise-gate so it sees ALL incidents regardless of severity.
+        if incident_auto_rules::try_handle_auto_rule(incident, data_dir, cfg, state).await {
+            state.grouping_engine.mark_auto_resolved(incident);
+            handled += 1;
+            continue;
+        }
+
+        // 3. AI analysis - only when AI is enabled and incident passes the gate.
         match incident_flow::evaluate_pre_ai_flow(
             incident,
             cfg,
@@ -4312,6 +4321,7 @@ mod tests {
                 dry_run: true,
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
+                auto_rules_enabled: false,
             },
             ..config::AgentConfig::default()
         };
@@ -4491,6 +4501,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 // Only ufw is allowed; AI picks iptables - should fall back silently
                 allowed_skills: vec!["block-ip-ufw".to_string()],
+                auto_rules_enabled: false,
             },
             ..config::AgentConfig::default()
         };
@@ -4650,6 +4661,7 @@ mod tests {
                 dry_run: true,
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
+                auto_rules_enabled: false,
             },
             ..config::AgentConfig::default()
         };
@@ -4962,6 +4974,7 @@ mod tests {
                 dry_run: true,
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["honeypot".to_string()],
+                auto_rules_enabled: false,
             },
             ..config::AgentConfig::default()
         };
@@ -5115,6 +5128,7 @@ mod tests {
                 dry_run: true,
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
+                auto_rules_enabled: false,
             },
             ..config::AgentConfig::default()
         };
