@@ -28,7 +28,7 @@ jobs:
         run: cargo tarpaulin --workspace --timeout 300 --out xml --skip-clean
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67ab1f95a6683b5 # v5
+        uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5
         with:
           files: cobertura.xml
           fail_ci_if_error: false
