@@ -1133,9 +1133,9 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     }
     if !pending_channels.is_empty() {
         println!(
-            "  {:<16} {}",
+            "  {:<16} {} guided setup after apply",
             bold.apply_to("Next"),
-            format!("{} guided setup after apply", pending_channels.join(", "))
+            pending_channels.join(", ")
         );
     }
     println!("  {}", dim.apply_to("─".repeat(40)));

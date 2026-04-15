@@ -432,7 +432,8 @@ pub fn coverage_by_tactic(
     ];
 
     // Build: tactic -> technique_id -> (technique_name, [detectors], any_active)
-    let mut tactic_map: BTreeMap<&str, BTreeMap<&str, (&str, Vec<&str>, bool)>> = BTreeMap::new();
+    type TechniqueInfo<'a> = (&'a str, Vec<&'a str>, bool);
+    let mut tactic_map: BTreeMap<&str, BTreeMap<&str, TechniqueInfo<'_>>> = BTreeMap::new();
 
     for &det in all_detectors {
         let det_active = active_detectors.contains(det);
