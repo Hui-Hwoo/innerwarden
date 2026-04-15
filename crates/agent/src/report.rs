@@ -651,11 +651,13 @@ fn detect_previous_date(data_dir: &Path, analyzed_date: &str) -> Option<String> 
         .max()
 }
 
-/// Canonicalize `data_dir` to resolve symlinks and relative path components.
-/// Returns None if the path does not exist on disk.
+/// Canonicalize `data_dir` to an absolute path, resolving symlinks.
+///
+/// Security note: `data_dir` is NOT user-supplied. It comes from the agent's
+/// `--data-dir` CLI flag (default: /var/lib/innerwarden) set at process startup,
+/// not from HTTP request parameters. CodeQL traces it from the Axum handler's
+/// `State<DashboardState>` but `state.data_dir` is fixed at startup, not per-request.
 fn trusted_data_dir(data_dir: &Path) -> Option<PathBuf> {
-    // Canonicalize resolves symlinks and ".." — the returned path is absolute
-    // and verified to exist, preventing path traversal.
     data_dir.canonicalize().ok()
 }
 
