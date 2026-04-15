@@ -1972,6 +1972,7 @@ dependencies = [
  "reqwest",
  "rpassword",
  "russh",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",

@@ -541,6 +541,9 @@ async fn build_tls_config(
 ) -> Result<axum_server::tls_rustls::RustlsConfig> {
     use axum_server::tls_rustls::RustlsConfig;
 
+    // Ensure a crypto provider is installed (required by rustls 0.23+)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     if let (Some(cert), Some(key)) = (cert_path, key_path) {
         // Use operator-provided cert/key
         info!(cert = %cert, key = %key, "loading TLS certificate");
