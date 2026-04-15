@@ -664,7 +664,11 @@ fn collect_available_dates(data_dir: &Path) -> Vec<String> {
     }
 
     // Also check filesystem for JSONL/summary files (legacy fallback)
-    let entries = match fs::read_dir(data_dir) {
+    let data_dir = match data_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return dates.into_iter().collect(),
+    };
+    let entries = match fs::read_dir(&data_dir) {
         Ok(entries) => entries,
         Err(_) => return dates.into_iter().collect(),
     };

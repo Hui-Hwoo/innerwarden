@@ -481,8 +481,9 @@ impl KnowledgeGraph {
             ..
         }) = self.nodes.get_mut(&ip_id)
         {
-            // These are attacker-supplied brute-force login names (e.g. "root",
-            // "admin"), NOT real credentials. Stored for threat DNA fingerprinting.
+            // lgtm[rust/cleartext-logging] — these are attacker-supplied brute-force
+            // login names (e.g. "root", "admin"), NOT real credentials.
+            // Stored for threat DNA fingerprinting.
             if let Some(pos) = attempted_usernames.iter().position(|u| u == attacker_login) {
                 attempted_usernames.remove(pos);
             }
