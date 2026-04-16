@@ -1174,16 +1174,15 @@ async fn main() -> Result<()> {
         } else {
             None
         },
-        decision_writer: if cfg.ai.enabled {
-            match decisions::DecisionWriter::new(&cli.data_dir) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    warn!("failed to create decision writer: {e:#}");
-                    None
-                }
+        // Decision writer is always created — Layer 1/2 decisions are written
+        // even without AI. Previously gated on cfg.ai.enabled which caused
+        // zero audit trail when AI was disabled or during agent restarts.
+        decision_writer: match decisions::DecisionWriter::new(&cli.data_dir) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                warn!("failed to create decision writer: {e:#}");
+                None
             }
-        } else {
-            None
         },
         last_narrative_at: load_last_narrative_instant(&cli.data_dir),
         last_daily_summary_telegram: None,
