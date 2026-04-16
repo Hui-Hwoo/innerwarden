@@ -3144,6 +3144,12 @@ pub(crate) fn honeypot_runtime(cfg: &config::AgentConfig) -> skills::HoneypotRun
     let mode = cfg.honeypot.mode.trim().to_ascii_lowercase();
     let normalized_mode = match mode.as_str() {
         "demo" | "listener" => mode,
+        // `always_on` keeps a permanent listener running from startup (handled
+        // separately in `main`). When a skill-level honeypot action is
+        // requested, it should behave like `listener` — a real listener, not
+        // the demo text response — since that is the semantic the operator
+        // opted into by enabling always-on mode.
+        "always_on" => "listener".to_string(),
         other => {
             warn!(mode = other, "unknown honeypot mode; falling back to demo");
             "demo".to_string()
@@ -3693,7 +3699,11 @@ async fn process_narrative_tick(
             &kc_events,
             &mut state.correlation_engine,
         );
-        killchain_inline::write_incidents(data_dir, &kc_incidents);
+        killchain_inline::write_incidents(
+            data_dir,
+            state.sqlite_store.as_deref(),
+            &kc_incidents,
+        );
         killchain_inline::notify_telegram(
             &state.telegram_client,
             &kc_incidents,
@@ -5460,6 +5470,40 @@ mod tests {
             cfg3.honeypot.mode != "always_on",
             "listener should not match always_on"
         );
+    }
+
+    // `honeypot_runtime` must accept `always_on` without warning and map it
+    // to `listener`, since the skill-level honeypot should behave as a real
+    // listener when the operator has opted into always-on mode.
+    #[test]
+    fn honeypot_runtime_accepts_always_on_as_listener() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "always_on".to_string();
+        let runtime = honeypot_runtime(&cfg);
+        assert_eq!(runtime.mode, "listener");
+    }
+
+    #[test]
+    fn honeypot_runtime_preserves_demo_and_listener() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "demo".to_string();
+        assert_eq!(honeypot_runtime(&cfg).mode, "demo");
+        cfg.honeypot.mode = "listener".to_string();
+        assert_eq!(honeypot_runtime(&cfg).mode, "listener");
+    }
+
+    #[test]
+    fn honeypot_runtime_case_insensitive() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "  ALWAYS_ON  ".to_string();
+        assert_eq!(honeypot_runtime(&cfg).mode, "listener");
+    }
+
+    #[test]
+    fn honeypot_runtime_unknown_mode_falls_back_to_demo() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "totally-made-up".to_string();
+        assert_eq!(honeypot_runtime(&cfg).mode, "demo");
     }
 
     // ── Memory safety: NarrativeAccumulator tests ────────────────────

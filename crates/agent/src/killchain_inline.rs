@@ -75,8 +75,16 @@ pub(crate) fn process_events(
     all_incidents
 }
 
-/// Write kill chain incidents to the daily JSONL file.
-pub(crate) fn write_incidents(data_dir: &Path, incidents: &[serde_json::Value]) {
+/// Write kill chain incidents to the daily JSONL file **and** the unified
+/// SQLite store (when available). The JSONL path is retained for legacy
+/// consumers; SQLite is the source of truth for dashboard queries, attacker
+/// intel, and monthly reports, so missing sqlite writes make kill chain
+/// detections invisible to the rest of the agent.
+pub(crate) fn write_incidents(
+    data_dir: &Path,
+    sqlite_store: Option<&innerwarden_store::Store>,
+    incidents: &[serde_json::Value],
+) {
     if incidents.is_empty() {
         return;
     }
@@ -98,6 +106,27 @@ pub(crate) fn write_incidents(data_dir: &Path, incidents: &[serde_json::Value]) 
             info!(count = incidents.len(), "killchain: emitted incidents");
         }
         Err(e) => warn!(error = %e, "killchain: failed to write incidents"),
+    }
+
+    if let Some(store) = sqlite_store {
+        let mut persisted = 0usize;
+        for inc in incidents {
+            match serde_json::from_value::<innerwarden_core::incident::Incident>(inc.clone()) {
+                Ok(parsed) => {
+                    if let Err(e) = store.insert_incident(&parsed) {
+                        warn!(error = %e, "killchain: sqlite insert_incident failed");
+                    } else {
+                        persisted += 1;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "killchain: incident JSON did not match Incident schema");
+                }
+            }
+        }
+        if persisted > 0 {
+            info!(persisted, "killchain: incidents persisted to sqlite");
+        }
     }
 }
 
@@ -317,6 +346,118 @@ mod tests {
         assert!(tracker.process_event(&connect).is_empty());
         assert!(tracker.process_event(&read).is_empty());
         assert_eq!(tracker.stats(), (0, 0, 0));
+    }
+
+    // write_incidents must persist a conforming incident to the sqlite store
+    // when one is provided, *and* to the JSONL file (unchanged legacy path).
+    #[test]
+    fn write_incidents_persists_to_sqlite_when_store_provided() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(tmp.path()).expect("open sqlite");
+
+        let incident = serde_json::json!({
+            "ts": "2026-04-16T15:52:02.428033127+00:00",
+            "host": "testhost",
+            "incident_id": "kill_chain:detected:DATA_EXFIL:999:2026-04-16T15:52Z",
+            "severity": "critical",
+            "title": "Kill chain detected: DATA_EXFIL (PID 999, attacker)",
+            "summary": "PID 999 (attacker) completed DATA_EXFIL pattern.",
+            "evidence": [{"pattern": "DATA_EXFIL"}],
+            "recommended_checks": [],
+            "tags": ["kill_chain", "detected", "data_exfil"],
+            "entities": []
+        });
+
+        write_incidents(tmp.path(), Some(&store), &[incident]);
+
+        assert_eq!(store.incidents_count().unwrap(), 1);
+        let found = store
+            .get_incident("kill_chain:detected:DATA_EXFIL:999:2026-04-16T15:52Z")
+            .unwrap();
+        assert!(found.is_some(), "incident must be queryable by incident_id");
+
+        let jsonl = std::fs::read_to_string(
+            tmp.path()
+                .join(format!(
+                    "incidents-{}.jsonl",
+                    chrono::Local::now().date_naive().format("%Y-%m-%d")
+                )),
+        )
+        .expect("jsonl written");
+        assert!(jsonl.contains("DATA_EXFIL"));
+    }
+
+    // write_incidents without a store must still write JSONL and not panic.
+    #[test]
+    fn write_incidents_without_store_still_writes_jsonl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let incident = serde_json::json!({
+            "ts": "2026-04-16T15:52:02.428033127+00:00",
+            "host": "testhost",
+            "incident_id": "kill_chain:detected:REVERSE_SHELL:42:2026-04-16T15:52Z",
+            "severity": "critical",
+            "title": "t",
+            "summary": "s",
+            "evidence": [],
+            "recommended_checks": [],
+            "tags": [],
+            "entities": []
+        });
+        write_incidents(tmp.path(), None, &[incident]);
+        let jsonl = std::fs::read_to_string(
+            tmp.path()
+                .join(format!(
+                    "incidents-{}.jsonl",
+                    chrono::Local::now().date_naive().format("%Y-%m-%d")
+                )),
+        )
+        .expect("jsonl written");
+        assert!(jsonl.contains("REVERSE_SHELL"));
+    }
+
+    // A malformed incident (missing required fields) must not corrupt sqlite
+    // and must be skipped with a warning — the rest of the batch still writes.
+    #[test]
+    fn write_incidents_skips_malformed_and_persists_valid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(tmp.path()).expect("open sqlite");
+
+        let bad = serde_json::json!({"not_an_incident": true});
+        let good = serde_json::json!({
+            "ts": "2026-04-16T15:52:02.428033127+00:00",
+            "host": "h",
+            "incident_id": "kill_chain:detected:DATA_EXFIL:1:2026-04-16T15:52Z",
+            "severity": "critical",
+            "title": "t",
+            "summary": "s",
+            "evidence": [],
+            "recommended_checks": [],
+            "tags": [],
+            "entities": []
+        });
+
+        write_incidents(tmp.path(), Some(&store), &[bad, good]);
+
+        assert_eq!(store.incidents_count().unwrap(), 1);
+    }
+
+    // An empty incident slice must be a cheap no-op — no JSONL file created,
+    // no sqlite write attempted.
+    #[test]
+    fn write_incidents_empty_is_noop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(tmp.path()).expect("open sqlite");
+        write_incidents(tmp.path(), Some(&store), &[]);
+        assert_eq!(store.incidents_count().unwrap(), 0);
+
+        let expected_jsonl = tmp.path().join(format!(
+            "incidents-{}.jsonl",
+            chrono::Local::now().date_naive().format("%Y-%m-%d")
+        ));
+        assert!(
+            !expected_jsonl.exists(),
+            "no JSONL file should be created for empty input"
+        );
     }
 
     // KILLCHAIN_COMM_ALLOWLIST prevents notification for known service processes
