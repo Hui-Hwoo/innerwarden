@@ -452,13 +452,11 @@ pub struct ObservationConfig {
     /// Maximum score to auto-escalate without AI (default: 40).
     #[serde(default = "default_escalate_threshold")]
     pub auto_escalate_threshold: u8,
-    /// Use AI for ambiguous items (default: true). Used by Phase C.
+    /// Use AI for ambiguous items (default: true).
     #[serde(default = "default_true")]
-    #[allow(dead_code)] // Phase C reads this
     pub ai_verification: bool,
-    /// Maximum items per AI batch call (default: 10). Used by Phase C.
+    /// Maximum items per AI batch call (default: 10).
     #[serde(default = "default_ai_batch_size")]
-    #[allow(dead_code)] // Phase C reads this
     pub ai_batch_size: usize,
     /// Maintenance windows (HH:MM-HH:MM format). Items during these get +10 context.
     #[serde(default)]
@@ -536,6 +534,118 @@ fn parse_hhmm(s: &str) -> Option<u32> {
         return None;
     }
     Some(h * 60 + m)
+}
+
+// ── AI Batch Verification (Phase C) ─────────────────────────────────────
+
+/// AI verdict for a single ambiguous item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiVerdict {
+    pub item_index: usize,
+    pub verdict: AiVerdictKind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AiVerdictKind {
+    Normal,
+    Suspicious,
+}
+
+/// Data for a single item in the AI verification batch.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiBatchItem {
+    pub index: usize,
+    pub incident_id: String,
+    pub score: u8,
+    pub process: String,
+    pub event_summary: String,
+    pub binary_path: String,
+    pub parent_chain: String,
+    pub detector: String,
+}
+
+/// Build the system prompt for AI batch verification.
+pub fn ai_verify_system_prompt(host_profile: &str) -> String {
+    format!(
+        "You are a security analyst reviewing items in the observation queue of a Linux server.\n\n\
+         Host profile:\n{host_profile}\n\n\
+         For each item below, answer with a JSON array. Each element must have:\n\
+         - \"item\": the item number (integer)\n\
+         - \"verdict\": \"NORMAL\" or \"SUSPICIOUS\"\n\
+         - \"reason\": one-line explanation\n\n\
+         Respond ONLY with the JSON array, no other text."
+    )
+}
+
+/// Build the user message listing all ambiguous items for AI verification.
+pub fn ai_verify_user_message(items: &[AiBatchItem]) -> String {
+    let mut msg = String::from("Items in observation:\n\n");
+    for item in items {
+        msg.push_str(&format!(
+            "{}. Process: {} (detector: {})\n   \
+             Event: {}\n   \
+             Binary: {} (behaviour score: {}/100)\n   \
+             Parent: {}\n\n",
+            item.index,
+            item.process,
+            item.detector,
+            item.event_summary,
+            item.binary_path,
+            item.score,
+            item.parent_chain,
+        ));
+    }
+    msg
+}
+
+/// Parse the AI response into verdicts.
+///
+/// Expects a JSON array of objects with `item`, `verdict`, `reason` fields.
+/// Tolerant: extracts the JSON array even if the AI wraps it in markdown
+/// code fences or adds surrounding text.
+pub fn parse_ai_verdicts(response: &str) -> Vec<AiVerdict> {
+    // Try to find a JSON array in the response
+    let trimmed = response.trim();
+
+    // Strip markdown code fences if present
+    let json_str = if let Some(start) = trimmed.find('[') {
+        if let Some(end) = trimmed.rfind(']') {
+            &trimmed[start..=end]
+        } else {
+            return Vec::new();
+        }
+    } else {
+        return Vec::new();
+    };
+
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .filter_map(|v| {
+            let item_index = v.get("item")?.as_u64()? as usize;
+            let verdict_str = v.get("verdict")?.as_str()?;
+            let reason = v
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let verdict = match verdict_str.to_ascii_uppercase().as_str() {
+                "NORMAL" => AiVerdictKind::Normal,
+                "SUSPICIOUS" => AiVerdictKind::Suspicious,
+                _ => return None,
+            };
+
+            Some(AiVerdict {
+                item_index,
+                verdict,
+                reason,
+            })
+        })
+        .collect()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1080,5 +1190,168 @@ mod tests {
         assert_eq!(cfg.auto_escalate_threshold, 30);
         assert_eq!(cfg.ai_batch_size, 5);
         assert_eq!(cfg.maintenance_windows.len(), 2);
+    }
+
+    // ── AI batch verification tests ─────────────────────────────────────
+
+    // ── parse_ai_verdicts: happy path ───────────────────────────────────
+
+    #[test]
+    fn parse_ai_verdicts_valid_json() {
+        let response = r#"[
+            {"item": 1, "verdict": "NORMAL", "reason": "OpenClaw connecting to Telegram API"},
+            {"item": 2, "verdict": "SUSPICIOUS", "reason": "Unknown binary on unusual port"}
+        ]"#;
+        let verdicts = parse_ai_verdicts(response);
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0].item_index, 1);
+        assert_eq!(verdicts[0].verdict, AiVerdictKind::Normal);
+        assert!(verdicts[0].reason.contains("Telegram"));
+        assert_eq!(verdicts[1].verdict, AiVerdictKind::Suspicious);
+    }
+
+    // ── parse_ai_verdicts: edge cases ───────────────────────────────────
+
+    #[test]
+    fn parse_ai_verdicts_with_markdown_fences() {
+        let response =
+            "```json\n[\n  {\"item\": 1, \"verdict\": \"NORMAL\", \"reason\": \"safe\"}\n]\n```";
+        let verdicts = parse_ai_verdicts(response);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].verdict, AiVerdictKind::Normal);
+    }
+
+    #[test]
+    fn parse_ai_verdicts_with_surrounding_text() {
+        let response = "Here is my analysis:\n\n[{\"item\": 1, \"verdict\": \"SUSPICIOUS\", \"reason\": \"bad\"}]\n\nLet me know if you need more.";
+        let verdicts = parse_ai_verdicts(response);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].verdict, AiVerdictKind::Suspicious);
+    }
+
+    #[test]
+    fn parse_ai_verdicts_case_insensitive_verdict() {
+        let response = r#"[{"item": 1, "verdict": "normal", "reason": "ok"}]"#;
+        let verdicts = parse_ai_verdicts(response);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].verdict, AiVerdictKind::Normal);
+    }
+
+    // ── parse_ai_verdicts: error cases ──────────────────────────────────
+
+    #[test]
+    fn parse_ai_verdicts_empty_response() {
+        assert!(parse_ai_verdicts("").is_empty());
+    }
+
+    #[test]
+    fn parse_ai_verdicts_invalid_json() {
+        assert!(parse_ai_verdicts("not json at all").is_empty());
+    }
+
+    #[test]
+    fn parse_ai_verdicts_missing_fields() {
+        let response = r#"[{"item": 1}]"#;
+        // Missing verdict field → filtered out
+        assert!(parse_ai_verdicts(response).is_empty());
+    }
+
+    #[test]
+    fn parse_ai_verdicts_unknown_verdict() {
+        let response = r#"[{"item": 1, "verdict": "MAYBE", "reason": "unsure"}]"#;
+        // "MAYBE" is not NORMAL or SUSPICIOUS → filtered out
+        assert!(parse_ai_verdicts(response).is_empty());
+    }
+
+    #[test]
+    fn parse_ai_verdicts_partial_valid() {
+        let response = r#"[
+            {"item": 1, "verdict": "NORMAL", "reason": "ok"},
+            {"item": 2, "verdict": "UNKNOWN", "reason": "bad verdict"},
+            {"item": 3, "verdict": "SUSPICIOUS", "reason": "bad"}
+        ]"#;
+        let verdicts = parse_ai_verdicts(response);
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0].item_index, 1);
+        assert_eq!(verdicts[1].item_index, 3);
+    }
+
+    // ── ai_verify_system_prompt tests ───────────────────────────────────
+
+    #[test]
+    fn system_prompt_includes_host_profile() {
+        let prompt = ai_verify_system_prompt("Ubuntu 24.04 on Oracle Cloud");
+        assert!(prompt.contains("Ubuntu 24.04"));
+        assert!(prompt.contains("JSON array"));
+    }
+
+    #[test]
+    fn system_prompt_empty_profile() {
+        let prompt = ai_verify_system_prompt("");
+        assert!(prompt.contains("NORMAL"));
+        assert!(prompt.contains("SUSPICIOUS"));
+    }
+
+    #[test]
+    fn system_prompt_has_response_format_instructions() {
+        let prompt = ai_verify_system_prompt("test");
+        assert!(prompt.contains("ONLY with the JSON array"));
+    }
+
+    // ── ai_verify_user_message tests ────────────────────────────────────
+
+    #[test]
+    fn user_message_formats_items() {
+        let items = vec![AiBatchItem {
+            index: 1,
+            incident_id: "inc-1".to_string(),
+            score: 55,
+            process: "openclaw-gatewa".to_string(),
+            event_summary: "outbound connection to 149.154.166.110:443".to_string(),
+            binary_path: "/home/ubuntu/openclaw/bin/openclaw-gateway".to_string(),
+            parent_chain: "systemd → openclaw-gatewa".to_string(),
+            detector: "data_exfiltration".to_string(),
+        }];
+        let msg = ai_verify_user_message(&items);
+        assert!(msg.contains("openclaw-gatewa"));
+        assert!(msg.contains("55/100"));
+        assert!(msg.contains("149.154.166.110"));
+    }
+
+    #[test]
+    fn user_message_multiple_items() {
+        let items = vec![
+            AiBatchItem {
+                index: 1,
+                incident_id: "a".to_string(),
+                score: 45,
+                process: "curl".to_string(),
+                event_summary: "connect".to_string(),
+                binary_path: "/usr/bin/curl".to_string(),
+                parent_chain: "bash".to_string(),
+                detector: "outbound".to_string(),
+            },
+            AiBatchItem {
+                index: 2,
+                incident_id: "b".to_string(),
+                score: 60,
+                process: "node".to_string(),
+                event_summary: "listen".to_string(),
+                binary_path: "/usr/bin/node".to_string(),
+                parent_chain: "systemd".to_string(),
+                detector: "network".to_string(),
+            },
+        ];
+        let msg = ai_verify_user_message(&items);
+        assert!(msg.contains("1. Process: curl"));
+        assert!(msg.contains("2. Process: node"));
+    }
+
+    #[test]
+    fn user_message_empty_items() {
+        let msg = ai_verify_user_message(&[]);
+        assert!(msg.contains("Items in observation"));
+        // No items listed
+        assert!(!msg.contains("1."));
     }
 }
