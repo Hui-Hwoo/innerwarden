@@ -83,6 +83,8 @@ mod narrative_incident_ingest;
 mod neural_lifecycle;
 mod notification_gate;
 mod notification_pipeline;
+#[allow(dead_code)]
+mod observation_verify;
 mod pcap_capture;
 mod playbook;
 #[allow(dead_code)]
