@@ -316,8 +316,8 @@ mod tests {
     // attributed to the agent's tokio worker pool.
     #[test]
     fn tracker_configured_with_self_exclusions_drops_tokio_rt_worker() {
-        let mut tracker = PidTracker::new()
-            .with_excluded_comms(KILLCHAIN_SELF_EXCLUDED_COMMS.iter().copied());
+        let mut tracker =
+            PidTracker::new().with_excluded_comms(KILLCHAIN_SELF_EXCLUDED_COMMS.iter().copied());
 
         let connect = serde_json::json!({
             "kind": "network.outbound_connect",
@@ -376,13 +376,10 @@ mod tests {
             .unwrap();
         assert!(found.is_some(), "incident must be queryable by incident_id");
 
-        let jsonl = std::fs::read_to_string(
-            tmp.path()
-                .join(format!(
-                    "incidents-{}.jsonl",
-                    chrono::Local::now().date_naive().format("%Y-%m-%d")
-                )),
-        )
+        let jsonl = std::fs::read_to_string(tmp.path().join(format!(
+            "incidents-{}.jsonl",
+            chrono::Local::now().date_naive().format("%Y-%m-%d")
+        )))
         .expect("jsonl written");
         assert!(jsonl.contains("DATA_EXFIL"));
     }
@@ -404,13 +401,10 @@ mod tests {
             "entities": []
         });
         write_incidents(tmp.path(), None, &[incident]);
-        let jsonl = std::fs::read_to_string(
-            tmp.path()
-                .join(format!(
-                    "incidents-{}.jsonl",
-                    chrono::Local::now().date_naive().format("%Y-%m-%d")
-                )),
-        )
+        let jsonl = std::fs::read_to_string(tmp.path().join(format!(
+            "incidents-{}.jsonl",
+            chrono::Local::now().date_naive().format("%Y-%m-%d")
+        )))
         .expect("jsonl written");
         assert!(jsonl.contains("REVERSE_SHELL"));
     }

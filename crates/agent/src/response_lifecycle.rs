@@ -1437,8 +1437,8 @@ mod tests {
     // hour later when revert fails.
     #[test]
     fn test_rehydrate_drops_invalid_ip_targets() {
-        let tmp = std::env::temp_dir()
-            .join(format!("innerwarden-test-invalid-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("innerwarden-test-invalid-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let snap = serde_json::json!({
             "active": [
@@ -1488,7 +1488,11 @@ mod tests {
             .iter()
             .map(|r| r.target.as_str())
             .collect();
-        assert_eq!(targets.len(), 2, "exactly one entry should have been pruned");
+        assert_eq!(
+            targets.len(),
+            2,
+            "exactly one entry should have been pruned"
+        );
         assert!(targets.contains(&"1.2.3.4"));
         assert!(targets.contains(&"136.216.0.0/16"));
         assert!(!targets.contains(&"129.950.5.0"));

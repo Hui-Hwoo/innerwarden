@@ -944,7 +944,10 @@ mod tests {
         );
         tracker.process_event(&connect);
         let incidents = tracker.process_event(&dup);
-        assert!(incidents.is_empty(), "excluded comm must suppress pre-chain");
+        assert!(
+            incidents.is_empty(),
+            "excluded comm must suppress pre-chain"
+        );
     }
 
     #[test]

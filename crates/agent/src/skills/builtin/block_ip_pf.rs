@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use tracing::{info, warn};
 
-use super::firewall_target::is_valid_firewall_target;
+use super::firewall_target::{format_skill_outcome, is_valid_firewall_target};
 use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
 pub struct BlockIpPf;
@@ -48,7 +48,10 @@ impl ResponseSkill for BlockIpPf {
             };
 
             if !is_valid_firewall_target(&ip) {
-                warn!(ip, "block-ip-pf: rejecting invalid target before invoking pfctl");
+                warn!(
+                    ip,
+                    "block-ip-pf: rejecting invalid target before invoking pfctl"
+                );
                 return SkillResult {
                     success: false,
                     message: format!("block-ip-pf: {ip} is not a valid IP/CIDR"),
@@ -71,30 +74,13 @@ impl ResponseSkill for BlockIpPf {
                 .output()
                 .await;
 
-            match output {
-                Ok(out) if out.status.success() => {
-                    info!(ip, "blocked via pf");
-                    SkillResult {
-                        success: true,
-                        message: format!("Blocked {ip} via pf"),
-                    }
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(ip, stderr = %stderr, "pf block command failed");
-                    SkillResult {
-                        success: false,
-                        message: format!("pf block failed for {ip}: {stderr}"),
-                    }
-                }
-                Err(e) => {
-                    warn!(ip, error = %e, "failed to spawn pfctl command");
-                    SkillResult {
-                        success: false,
-                        message: format!("failed to run pfctl: {e}"),
-                    }
-                }
+            let result = format_skill_outcome("pf", &ip, output);
+            if result.success {
+                info!(ip, "blocked via pf");
+            } else {
+                warn!(ip, message = %result.message, "pf block command failed");
             }
+            result
         })
     }
 }

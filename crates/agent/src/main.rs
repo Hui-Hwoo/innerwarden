@@ -1,3 +1,10 @@
+// Clippy 1.95 promotes `unnecessary_sort_by` to a default-deny lint, but
+// `sort_by_key(|x| Reverse(...))` is less readable than the explicit
+// `sort_by(|a, b| b.x.cmp(&a.x))` pattern used throughout the agent for
+// reverse-sort leaderboards (threat report, attacker intel, MITRE heatmap).
+// Keep the existing style workspace-wide for this crate.
+#![allow(clippy::unnecessary_sort_by)]
+
 // Use jemalloc on Linux - the default glibc allocator fragments memory and
 // never returns it to the OS, causing apparent "leaks" under sustained load.
 // jemalloc aggressively returns unused pages via madvise(MADV_DONTNEED).
@@ -253,19 +260,17 @@ impl NarrativeAccumulator {
             *self.events_by_kind.entry(ev.kind.clone()).or_insert(0) += 1;
             for entity in &ev.entities {
                 match entity.r#type {
-                    innerwarden_core::entities::EntityType::Ip => {
-                        if self.ip_counts.contains_key(&entity.value)
-                            || self.ip_counts.len() < Self::MAX_ENTITY_ENTRIES
-                        {
-                            *self.ip_counts.entry(entity.value.clone()).or_insert(0) += 1;
-                        }
+                    innerwarden_core::entities::EntityType::Ip
+                        if (self.ip_counts.contains_key(&entity.value)
+                            || self.ip_counts.len() < Self::MAX_ENTITY_ENTRIES) =>
+                    {
+                        *self.ip_counts.entry(entity.value.clone()).or_insert(0) += 1;
                     }
-                    innerwarden_core::entities::EntityType::User => {
-                        if self.user_counts.contains_key(&entity.value)
-                            || self.user_counts.len() < Self::MAX_ENTITY_ENTRIES
-                        {
-                            *self.user_counts.entry(entity.value.clone()).or_insert(0) += 1;
-                        }
+                    innerwarden_core::entities::EntityType::User
+                        if (self.user_counts.contains_key(&entity.value)
+                            || self.user_counts.len() < Self::MAX_ENTITY_ENTRIES) =>
+                    {
+                        *self.user_counts.entry(entity.value.clone()).or_insert(0) += 1;
                     }
                     _ => {}
                 }
@@ -3699,11 +3704,7 @@ async fn process_narrative_tick(
             &kc_events,
             &mut state.correlation_engine,
         );
-        killchain_inline::write_incidents(
-            data_dir,
-            state.sqlite_store.as_deref(),
-            &kc_incidents,
-        );
+        killchain_inline::write_incidents(data_dir, state.sqlite_store.as_deref(), &kc_incidents);
         killchain_inline::notify_telegram(
             &state.telegram_client,
             &kc_incidents,

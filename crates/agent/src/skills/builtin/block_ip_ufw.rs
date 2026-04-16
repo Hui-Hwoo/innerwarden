@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
-use super::firewall_target::is_valid_firewall_target;
+use super::firewall_target::{format_skill_outcome, is_valid_firewall_target};
 
 pub struct BlockIpUfw;
 
@@ -50,7 +50,10 @@ impl ResponseSkill for BlockIpUfw {
             // junk on add and then rejects revert, which manifests as an
             // orphaned-response alert on the dashboard.
             if !is_valid_firewall_target(&ip) {
-                warn!(ip, "block-ip-ufw: rejecting invalid target before invoking ufw");
+                warn!(
+                    ip,
+                    "block-ip-ufw: rejecting invalid target before invoking ufw"
+                );
                 return SkillResult {
                     success: false,
                     message: format!("block-ip-ufw: {ip} is not a valid IP/CIDR"),
@@ -73,30 +76,13 @@ impl ResponseSkill for BlockIpUfw {
                 .output()
                 .await;
 
-            match output {
-                Ok(out) if out.status.success() => {
-                    info!(ip, "blocked via ufw");
-                    SkillResult {
-                        success: true,
-                        message: format!("Blocked {ip} via ufw"),
-                    }
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(ip, stderr = %stderr, "ufw block command failed");
-                    SkillResult {
-                        success: false,
-                        message: format!("ufw block failed for {ip}: {stderr}"),
-                    }
-                }
-                Err(e) => {
-                    warn!(ip, error = %e, "failed to spawn ufw command");
-                    SkillResult {
-                        success: false,
-                        message: format!("failed to run ufw: {e}"),
-                    }
-                }
+            let result = format_skill_outcome("ufw", &ip, output);
+            if result.success {
+                info!(ip, "blocked via ufw");
+            } else {
+                warn!(ip, message = %result.message, "ufw block command failed");
             }
+            result
         })
     }
 }
@@ -179,7 +165,11 @@ mod tests {
     async fn dry_run_accepts_valid_cidr() {
         let ctx = make_ctx(Some("10.0.0.0/24"));
         let result = BlockIpUfw.execute(&ctx, true).await;
-        assert!(result.success, "CIDR /24 must be accepted: {:?}", result.message);
+        assert!(
+            result.success,
+            "CIDR /24 must be accepted: {:?}",
+            result.message
+        );
     }
 
     #[test]

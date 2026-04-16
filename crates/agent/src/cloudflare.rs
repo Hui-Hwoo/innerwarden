@@ -286,7 +286,9 @@ mod tests {
 
     #[test]
     fn classify_duplicate_ignores_empty_errors() {
-        assert!(!classify_non_2xx_as_duplicate(r#"{"success": false, "errors": []}"#));
+        assert!(!classify_non_2xx_as_duplicate(
+            r#"{"success": false, "errors": []}"#
+        ));
     }
 
     #[test]

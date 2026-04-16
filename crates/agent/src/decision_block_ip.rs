@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn is_valid_block_target_rejects_short_and_long_ipv4() {
-        assert!(!is_valid_block_target("137.274.6"));  // 3 octets
+        assert!(!is_valid_block_target("137.274.6")); // 3 octets
         assert!(!is_valid_block_target("1.2.3"));
         assert!(!is_valid_block_target("1.2.3.4.5"));
     }
@@ -434,11 +434,11 @@ mod tests {
     #[test]
     fn is_valid_block_target_rejects_invalid_cidr() {
         assert!(!is_valid_block_target("129.950.5.0/24")); // bad IP
-        assert!(!is_valid_block_target("10.0.0.0/33"));    // prefix > 32 on v4
+        assert!(!is_valid_block_target("10.0.0.0/33")); // prefix > 32 on v4
         assert!(!is_valid_block_target("2001:db8::/129")); // prefix > 128 on v6
-        assert!(!is_valid_block_target("10.0.0.0/"));      // empty prefix
-        assert!(!is_valid_block_target("10.0.0.0/-1"));    // negative prefix
-        assert!(!is_valid_block_target("10.0.0.0/abc"));   // non-numeric
-        assert!(!is_valid_block_target("/16"));            // empty IP
+        assert!(!is_valid_block_target("10.0.0.0/")); // empty prefix
+        assert!(!is_valid_block_target("10.0.0.0/-1")); // negative prefix
+        assert!(!is_valid_block_target("10.0.0.0/abc")); // non-numeric
+        assert!(!is_valid_block_target("/16")); // empty IP
     }
 }

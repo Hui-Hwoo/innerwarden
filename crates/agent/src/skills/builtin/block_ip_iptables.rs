@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use tracing::{info, warn};
 
-use super::firewall_target::is_valid_firewall_target;
+use super::firewall_target::{format_skill_outcome, is_valid_firewall_target};
 use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
 pub struct BlockIpIptables;
@@ -44,7 +44,10 @@ impl ResponseSkill for BlockIpIptables {
             };
 
             if !is_valid_firewall_target(&ip) {
-                warn!(ip, "block-ip-iptables: rejecting invalid target before invoking iptables");
+                warn!(
+                    ip,
+                    "block-ip-iptables: rejecting invalid target before invoking iptables"
+                );
                 return SkillResult {
                     success: false,
                     message: format!("block-ip-iptables: {ip} is not a valid IP/CIDR"),
@@ -76,30 +79,13 @@ impl ResponseSkill for BlockIpIptables {
                 .output()
                 .await;
 
-            match output {
-                Ok(out) if out.status.success() => {
-                    info!(ip, "blocked via iptables");
-                    SkillResult {
-                        success: true,
-                        message: format!("Blocked {ip} via iptables"),
-                    }
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(ip, stderr = %stderr, "iptables block command failed");
-                    SkillResult {
-                        success: false,
-                        message: format!("iptables block failed for {ip}: {stderr}"),
-                    }
-                }
-                Err(e) => {
-                    warn!(ip, error = %e, "failed to spawn iptables command");
-                    SkillResult {
-                        success: false,
-                        message: format!("failed to run iptables: {e}"),
-                    }
-                }
+            let result = format_skill_outcome("iptables", &ip, output);
+            if result.success {
+                info!(ip, "blocked via iptables");
+            } else {
+                warn!(ip, message = %result.message, "iptables block command failed");
             }
+            result
         })
     }
 }
