@@ -650,3 +650,74 @@ pub(super) struct GeoIpResult {
 // All endpoints that read JSON files from data_dir MUST use this helper.
 // It canonicalizes both base and target paths and verifies the target
 // stays within the data directory, preventing path traversal attacks.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_live_feed_title_formatting_rules() {
+        assert_eq!(
+            live_feed_title("ssh_bruteforce", &Severity::Critical),
+            "Brute force in progress. Tracking attempt count and origin."
+        );
+        assert_eq!(
+            live_feed_title("container_escape", &Severity::High),
+            "Container escape attempt blocked."
+        );
+        assert_eq!(
+            live_feed_title("unknown_detector", &Severity::Critical),
+            "Critical threat detected and handled."
+        );
+        assert_eq!(
+            live_feed_title("unknown_detector", &Severity::Low),
+            "Suspicious activity detected and logged."
+        );
+    }
+
+    #[test]
+    fn test_live_feed_reason_formatting_rules() {
+        assert_eq!(
+            live_feed_reason("ssh_bruteforce", "block_ip"),
+            "Brute force detected and blocked. IP blocked."
+        );
+        assert_eq!(
+            live_feed_reason("ransomware", "kill_process"),
+            "Ransomware killed before encryption. Process terminated."
+        );
+        assert_eq!(
+            live_feed_reason("unknown_detector", "monitor"),
+            "Monitoring."
+        );
+    }
+
+    #[test]
+    fn test_live_feed_item_serialization() {
+        let mitre = LiveFeedMitre {
+            tactic: "T0000".to_string(),
+            technique_id: "T1234".to_string(),
+            technique_name: "Magic Attack".to_string(),
+        };
+
+        let item = LiveFeedItem {
+            ts: "2023-01-01T00:00:00Z".to_string(),
+            severity: "high".to_string(),
+            title: "Threat".to_string(),
+            ip: Some("1.2.3.4".to_string()),
+            action: Some("monitor".to_string()),
+            outcome: Some("monitored".to_string()),
+            confidence: Some(0.9),
+            reason: Some("Monitoring.".to_string()),
+            reputation: None,
+            mitre: Some(mitre),
+            detector: Some("magic_detector".to_string()),
+        };
+
+        let val = serde_json::to_value(&item).unwrap();
+        assert_eq!(val["severity"], "high");
+        assert_eq!(val["ip"], "1.2.3.4");
+        assert_eq!(val["outcome"], "monitored");
+        assert!(val.get("reputation").is_none()); // skip serialization if none
+        assert_eq!(val["mitre"]["tactic"], "T0000");
+    }
+}

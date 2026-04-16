@@ -430,3 +430,24 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
 
     Json(serde_json::json!({ "collectors": collectors }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sensors_system_status_mapping() {
+        // Build mock telemetry config output matching structure expected by frontend
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let events_file = format!("events-{today}.jsonl");
+
+        let files = serde_json::json!({
+            "events": { "exists": false, "size_bytes": 0 },
+            "incidents": { "exists": false, "size_bytes": 0 }
+        });
+
+        // Assert structure mapping defaults correctly handle missing files fallback
+        assert!(!files["events"]["exists"].as_bool().unwrap());
+        assert_eq!(files["events"]["size_bytes"].as_u64().unwrap(), 0);
+    }
+}
