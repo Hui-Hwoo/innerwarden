@@ -3769,8 +3769,9 @@ async fn process_narrative_tick(
 
     // Spec 021 — Observation verification (Fase 3).
     // Score undecided incidents and auto-dismiss/escalate clear-cut cases.
-    // Ambiguous items are collected for AI batch verification (Phase C).
-    let _ambiguous_items = narrative_observation_verify::verify_observing_incidents(cfg, state);
+    // Ambiguous items go to AI batch verification.
+    let ambiguous_items = narrative_observation_verify::verify_observing_incidents(cfg, state);
+    narrative_observation_verify::ai_verify_ambiguous(ambiguous_items, cfg, state).await;
 
     narrative_daily_summary::maybe_write_daily_summary_and_digest(
         data_dir,

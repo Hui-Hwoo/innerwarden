@@ -260,6 +260,146 @@ fn find_process_comm_by_pid(graph: &KnowledgeGraph, pid: u32) -> Option<String> 
     None
 }
 
+/// AI batch verification for ambiguous items (spec 021 Phase C).
+///
+/// Takes the ambiguous items collected by `verify_observing_incidents`,
+/// builds a prompt, sends to the AI provider, parses verdicts, and
+/// applies dismiss/escalate decisions to the knowledge graph.
+pub(crate) async fn ai_verify_ambiguous(
+    items: Vec<AmbiguousItem>,
+    cfg: &crate::config::AgentConfig,
+    state: &mut AgentState,
+) {
+    if items.is_empty() || !cfg.observation.ai_verification {
+        return;
+    }
+
+    let ai = match &state.ai_provider {
+        Some(ai) => ai.clone(),
+        None => return,
+    };
+
+    // Build host profile from environment
+    let host_profile = build_host_profile(state);
+
+    // Process in batches
+    let batch_size = cfg.observation.ai_batch_size.max(1);
+    for chunk in items.chunks(batch_size) {
+        let batch_items: Vec<observation_verify::AiBatchItem> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, item)| observation_verify::AiBatchItem {
+                index: i + 1,
+                incident_id: item.incident_id.clone(),
+                score: item.score,
+                process: item
+                    .evidence
+                    .get("comm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                event_summary: item
+                    .evidence
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                binary_path: item
+                    .evidence
+                    .get("binary_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                parent_chain: item
+                    .evidence
+                    .get("ppid_comm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                detector: item.detector.clone(),
+            })
+            .collect();
+
+        let system_prompt = observation_verify::ai_verify_system_prompt(&host_profile);
+        let user_message = observation_verify::ai_verify_user_message(&batch_items);
+
+        let response = match ai.chat(&system_prompt, &user_message).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("observation-verify AI batch failed: {e:#}");
+                continue;
+            }
+        };
+
+        let verdicts = observation_verify::parse_ai_verdicts(&response);
+
+        let mut ai_dismissed = 0u32;
+        let mut ai_escalated = 0u32;
+
+        for verdict in &verdicts {
+            // Map 1-based index back to the chunk item
+            let Some(item) = chunk.get(verdict.item_index.saturating_sub(1)) else {
+                continue;
+            };
+
+            let mut graph = state.knowledge_graph.write().unwrap();
+            match verdict.verdict {
+                observation_verify::AiVerdictKind::Normal => {
+                    graph.ingest_decision(
+                        &item.incident_id,
+                        "dismiss",
+                        None,
+                        0.9,
+                        &format!("obs-verify AI: NORMAL — {}", verdict.reason),
+                        true,
+                        chrono::Utc::now(),
+                    );
+                    ai_dismissed += 1;
+                }
+                observation_verify::AiVerdictKind::Suspicious => {
+                    graph.ingest_decision(
+                        &item.incident_id,
+                        "escalate",
+                        None,
+                        0.85,
+                        &format!("obs-verify AI: SUSPICIOUS — {}", verdict.reason),
+                        true,
+                        chrono::Utc::now(),
+                    );
+                    ai_escalated += 1;
+                }
+            }
+        }
+
+        if ai_dismissed > 0 || ai_escalated > 0 {
+            info!(
+                ai_dismissed,
+                ai_escalated,
+                batch_size = chunk.len(),
+                "observation-verify: AI batch complete"
+            );
+        }
+    }
+}
+
+/// Build a host profile string from the agent's environment profile.
+fn build_host_profile(state: &AgentState) -> String {
+    build_host_profile_from_env(&state.environment_profile)
+}
+
+/// Pure helper: build host profile string from an EnvironmentProfile.
+fn build_host_profile_from_env(env: &crate::environment_profile::EnvironmentProfile) -> String {
+    let services = if env.services.is_empty() {
+        "unknown".to_string()
+    } else {
+        env.services.join(", ")
+    };
+    format!(
+        "Platform: {} ({})\nServices: {}",
+        env.platform, env.provider, services,
+    )
+}
+
 /// Store the score breakdown for dashboard display (Phase D stub).
 fn store_breakdown(_breakdown: &ScoreBreakdown) {
     // Phase D will implement dashboard display of score breakdowns.
@@ -549,5 +689,45 @@ mod tests {
         enrich_evidence_from_node(&mut evidence, &node, &graph);
         assert_eq!(evidence["existing_key"], "existing_value");
         assert_eq!(evidence["dst_ip"], "1.2.3.4");
+    }
+
+    // ── build_host_profile_from_env: 3 tests ──────────────────────────
+
+    #[test]
+    fn host_profile_with_services() {
+        use crate::environment_profile::EnvironmentProfile;
+        let env = EnvironmentProfile {
+            platform: "cloud_vps".into(),
+            provider: "oracle".into(),
+            services: vec!["nginx".into(), "postgres".into()],
+            ..Default::default()
+        };
+        let profile = build_host_profile_from_env(&env);
+        assert!(profile.contains("cloud_vps"));
+        assert!(profile.contains("oracle"));
+        assert!(profile.contains("nginx"));
+        assert!(profile.contains("postgres"));
+    }
+
+    #[test]
+    fn host_profile_no_services() {
+        use crate::environment_profile::EnvironmentProfile;
+        let env = EnvironmentProfile::default();
+        let profile = build_host_profile_from_env(&env);
+        assert!(profile.contains("unknown"));
+    }
+
+    #[test]
+    fn host_profile_bare_metal() {
+        use crate::environment_profile::EnvironmentProfile;
+        let env = EnvironmentProfile {
+            platform: "bare_metal".into(),
+            provider: "none".into(),
+            services: vec!["sshd".into()],
+            ..Default::default()
+        };
+        let profile = build_host_profile_from_env(&env);
+        assert!(profile.contains("bare_metal"));
+        assert!(profile.contains("sshd"));
     }
 }
