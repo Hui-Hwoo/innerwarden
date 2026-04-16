@@ -205,23 +205,16 @@ pub async fn serve(
     insecure_no_tls: bool,
 ) -> Result<()> {
     // SEC-005: Reject non-loopback bind without authentication.
-    let is_loopback_bind =
-        bind.starts_with("127.0.0.1") || bind.starts_with("[::1]") || bind.starts_with("localhost");
-    if auth.is_none() {
-        if is_loopback_bind {
-            warn!(
-                "dashboard is running WITHOUT authentication (loopback only) - \
-                 set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH \
-                 in agent.env to require a login"
-            );
-        } else {
-            anyhow::bail!(
-                "dashboard bound to non-loopback address {} without authentication. \
-                 Set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH, \
-                 or bind to 127.0.0.1 for unauthenticated local access.",
-                bind
-            );
-        }
+    let is_loopback_bind = is_loopback_address(&bind);
+    if let Err(e) = validate_bind_auth(&bind, auth.is_some()) {
+        anyhow::bail!("{}", e);
+    }
+    if auth.is_none() && is_loopback_bind {
+        warn!(
+            "dashboard is running WITHOUT authentication (loopback only) - \
+             set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH \
+             in agent.env to require a login"
+        );
     }
 
     // HTTPS warning: credentials sent in plaintext over non-localhost HTTP
@@ -728,6 +721,29 @@ const JS_SSE: &str = include_str!("frontend/js/sse.js");
 
 // ---------------------------------------------------------------------------
 // Tests
+// ---------------------------------------------------------------------------
+// SEC-005: Pure helpers for bind address validation (testable).
+// ---------------------------------------------------------------------------
+
+/// Check if a bind address is a loopback address.
+pub(crate) fn is_loopback_address(bind: &str) -> bool {
+    bind.starts_with("127.0.0.1") || bind.starts_with("[::1]") || bind.starts_with("localhost")
+}
+
+/// Validate bind address + auth combination.
+/// Returns Err if non-loopback bind has no auth configured.
+pub(crate) fn validate_bind_auth(bind: &str, has_auth: bool) -> Result<(), String> {
+    if !has_auth && !is_loopback_address(bind) {
+        return Err(format!(
+            "dashboard bound to non-loopback address {} without authentication. \
+             Set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH, \
+             or bind to 127.0.0.1 for unauthenticated local access.",
+            bind
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1661,5 +1677,44 @@ mod tests {
 
         let second: Vec<Event> = read_jsonl(&path);
         assert_eq!(second.len(), 2);
+    }
+
+    // ── SEC-005: bind address validation tests ──────────────────────────
+
+    #[test]
+    fn is_loopback_localhost() {
+        assert!(is_loopback_address("127.0.0.1:8787"));
+        assert!(is_loopback_address("[::1]:8787"));
+        assert!(is_loopback_address("localhost:8787"));
+    }
+
+    #[test]
+    fn is_not_loopback_external() {
+        assert!(!is_loopback_address("0.0.0.0:8787"));
+        assert!(!is_loopback_address("192.168.1.1:8787"));
+        assert!(!is_loopback_address("10.0.0.1:8787"));
+    }
+
+    #[test]
+    fn validate_bind_auth_loopback_no_auth_ok() {
+        assert!(validate_bind_auth("127.0.0.1:8787", false).is_ok());
+        assert!(validate_bind_auth("localhost:8787", false).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_auth_external_no_auth_rejected() {
+        let result = validate_bind_auth("0.0.0.0:8787", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("without authentication"));
+    }
+
+    #[test]
+    fn validate_bind_auth_external_with_auth_ok() {
+        assert!(validate_bind_auth("0.0.0.0:8787", true).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_auth_loopback_with_auth_ok() {
+        assert!(validate_bind_auth("127.0.0.1:8787", true).is_ok());
     }
 }

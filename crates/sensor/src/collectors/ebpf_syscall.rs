@@ -2745,4 +2745,18 @@ mod tests {
             assert!(resolve_container_id(1).is_none());
         }
     }
+
+    // SEC-001: eBPF availability tests
+    #[test]
+    fn ebpf_availability_non_linux_returns_false() {
+        // On macOS (CI/dev), should always return false
+        if cfg!(not(target_os = "linux")) {
+            assert!(!is_ebpf_available());
+        }
+    }
+
+    #[test]
+    fn ebpf_obj_paths_are_absolute() {
+        assert!(EBPF_OBJ_PATH.starts_with('/'));
+    }
 }

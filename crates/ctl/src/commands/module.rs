@@ -1116,3 +1116,58 @@ pub(crate) fn cmd_module_update_all(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SEC-009: Unknown preflight kind fails closed.
+    #[test]
+    fn preflight_unknown_kind_fails() {
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "magic_check".into(),
+            value: "anything".into(),
+            reason: "test".into(),
+        };
+        let (passed, msg) = run_module_preflight(&pf);
+        assert!(!passed, "unknown preflight kind should fail");
+        assert!(msg.contains("unknown preflight kind"));
+    }
+
+    #[test]
+    fn preflight_binary_exists_known_path() {
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "binary_exists".into(),
+            value: "/usr/bin/env".into(),
+            reason: "test".into(),
+        };
+        let (passed, _) = run_module_preflight(&pf);
+        // /usr/bin/env exists on all Unix systems
+        if cfg!(unix) {
+            assert!(passed);
+        }
+    }
+
+    #[test]
+    fn preflight_binary_exists_missing() {
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "binary_exists".into(),
+            value: "/nonexistent/binary/xyz".into(),
+            reason: "test".into(),
+        };
+        let (passed, msg) = run_module_preflight(&pf);
+        assert!(!passed);
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn preflight_directory_exists_missing() {
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "directory_exists".into(),
+            value: "/nonexistent/dir/xyz".into(),
+            reason: "test".into(),
+        };
+        let (passed, _) = run_module_preflight(&pf);
+        assert!(!passed);
+    }
+}
