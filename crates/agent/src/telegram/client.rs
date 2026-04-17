@@ -1,0 +1,1720 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use innerwarden_core::incident::Incident;
+use serde::Deserialize;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use super::explain_detector;
+use super::formatting::{
+    callback_data, country_flag_emoji, enforce_length, entity_summary, escape_html,
+    first_ip_entity, format_incident_message, format_simple_message, parse_callback, plain_action,
+    reputation_score_bar, sanitize_url, severity_label, source_icon, strip_bot_suffix,
+};
+use super::{ApprovalResult, GuardianMode};
+
+/// Maximum automated alert messages per hour (excludes bot command responses).
+const MAX_ALERTS_PER_HOUR: u32 = 10;
+
+pub struct TelegramClient {
+    bot_token: String,
+    chat_id: String,
+    dashboard_url: Option<String>,
+    /// Dev mode: adds "Check FP" button to every notification.
+    pub dev_mode: bool,
+    http: reqwest::Client,
+    /// Rate limiter: tracks last send time to stay within Telegram's 30 msg/sec limit.
+    last_send: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    /// Hourly alert counter to prevent notification floods.
+    alerts_this_hour: Arc<std::sync::atomic::AtomicU32>,
+    /// Hour when the alert counter was last reset.
+    alert_counter_hour: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl TelegramClient {
+    pub fn new(
+        bot_token: impl Into<String>,
+        chat_id: impl Into<String>,
+        dashboard_url: Option<String>,
+    ) -> Result<Self> {
+        // Long-poll timeout is 25 s; give a 10 s buffer so the HTTP layer
+        // never fires before the Telegram timeout parameter expires.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(35))
+            .build()
+            .context("failed to build Telegram HTTP client")?;
+        Ok(Self {
+            bot_token: bot_token.into(),
+            chat_id: chat_id.into(),
+            dashboard_url,
+            dev_mode: false,
+            http,
+            last_send: Arc::new(tokio::sync::Mutex::new(
+                tokio::time::Instant::now() - Duration::from_secs(1),
+            )),
+            alerts_this_hour: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            alert_counter_hour: Arc::new(std::sync::atomic::AtomicU32::new(
+                chrono::Utc::now()
+                    .format("%H")
+                    .to_string()
+                    .parse()
+                    .unwrap_or(0),
+            )),
+        })
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
+    }
+
+    // -----------------------------------------------------------------------
+    // T.1 - Incident notification
+    // -----------------------------------------------------------------------
+
+    /// Send a notification message for a High/Critical incident.
+    /// In GUARD mode the alert is compact - no action buttons, the agent will
+    /// act and follow up with send_action_report(). In WATCH/DryRun mode the
+    /// alert includes Block/Ignore quick-action buttons.
+    /// When `is_simple` is true, uses plain language (no IPs, no detector names).
+    /// Failures are logged as warnings and never propagate - fail-open.
+    pub async fn send_incident_alert(
+        &self,
+        incident: &Incident,
+        mode: GuardianMode,
+        is_simple: bool,
+    ) -> Result<()> {
+        let text = if is_simple {
+            format_simple_message(incident, self.dashboard_url.as_deref(), mode)
+        } else {
+            format_incident_message(incident, self.dashboard_url.as_deref(), mode)
+        };
+
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+
+        // Build inline keyboard based on mode.
+        // Guard: compact — just "Not a threat" + "Investigate".
+        // Watch/DryRun: operator decides — Block + Ignore + Investigate + "Not a threat".
+        {
+            let fp_label = if is_simple {
+                "Not a threat"
+            } else {
+                "Report FP"
+            };
+            let fp_btn = serde_json::json!({
+                "text": format!("\u{1f4dd} {fp_label}"),
+                "callback_data": callback_data("fp:", &incident.incident_id)
+            });
+
+            match mode {
+                GuardianMode::Guard => {
+                    let mut row = vec![fp_btn];
+                    if let Some(ip) = first_ip_entity(incident) {
+                        if let Some(ref base_url) = self.dashboard_url {
+                            let link = format!(
+                                "{base_url}/?subject_type=ip&subject={ip}&date={}",
+                                incident.ts.format("%Y-%m-%d")
+                            );
+                            row.push(serde_json::json!({
+                                "text": "🔍 Investigate",
+                                "url": link
+                            }));
+                        }
+                    }
+                    body["reply_markup"] = serde_json::json!({ "inline_keyboard": [row] });
+                }
+                GuardianMode::Watch | GuardianMode::DryRun => {
+                    let mut keyboard: Vec<Vec<serde_json::Value>> = Vec::new();
+
+                    if let Some(ip) = first_ip_entity(incident) {
+                        keyboard.push(vec![
+                            serde_json::json!({
+                                "text": format!("🛡 Block {ip}"),
+                                "callback_data": format!("quick:block:{ip}")
+                            }),
+                            serde_json::json!({
+                                "text": "🙈 Ignore",
+                                "callback_data": "quick:ignore"
+                            }),
+                        ]);
+
+                        if let Some(ref base_url) = self.dashboard_url {
+                            let link = format!(
+                                "{base_url}/?subject_type=ip&subject={ip}&date={}",
+                                incident.ts.format("%Y-%m-%d")
+                            );
+                            keyboard.push(vec![serde_json::json!({
+                                "text": "🔍 Investigate in dashboard",
+                                "url": link
+                            })]);
+                        }
+                    } else if let Some(ref base_url) = self.dashboard_url {
+                        let link = format!("{base_url}/?date={}", incident.ts.format("%Y-%m-%d"));
+                        keyboard.push(vec![serde_json::json!({
+                            "text": "🔍 Investigate in dashboard",
+                            "url": link
+                        })]);
+                    }
+
+                    keyboard.push(vec![fp_btn]);
+                    body["reply_markup"] = serde_json::json!({ "inline_keyboard": keyboard });
+                }
+            }
+        }
+
+        self.post_json("sendMessage", &body).await
+    }
+
+    /// Send a post-execution report when the agent autonomously acted on a threat.
+    /// Called in GUARD mode after execute_decision succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_action_report(
+        &self,
+        action_label: &str,
+        target: &str,
+        incident_title: &str,
+        confidence: f32,
+        _host: &str,
+        dry_run: bool,
+        reputation: Option<&crate::abuseipdb::IpReputation>,
+        geo: Option<&crate::geoip::GeoInfo>,
+        cloudflare_pushed: bool,
+    ) -> Result<()> {
+        let pct = (confidence * 100.0) as u32;
+
+        // Build optional enrichment block
+        let mut enrichment = String::new();
+        if let Some(rep) = reputation {
+            let bar = reputation_score_bar(rep.confidence_score);
+            let country_part = geo
+                .map(|g| {
+                    let flag = country_flag_emoji(&g.country_code);
+                    format!(" · {flag} {} · {}", g.country, g.isp)
+                })
+                .unwrap_or_default();
+            enrichment = format!(
+                "\n📊 AbuseIPDB: <b>{}/100</b> {bar}{country_part}",
+                rep.confidence_score
+            );
+        } else if let Some(g) = geo {
+            let flag = country_flag_emoji(&g.country_code);
+            enrichment = format!("\n🌐 {flag} {} · {}", g.country, escape_html(&g.isp));
+        }
+
+        let cf_line = if cloudflare_pushed {
+            "\n☁️ Pushed to Cloudflare edge too - blocked before they even reach your server."
+        } else {
+            ""
+        };
+
+        let text = if dry_run {
+            format!(
+                "\u{1f9ea} <b>Simulation</b>\n\
+                 \n\
+                 Would have {action_label} <code>{target}</code>\n\
+                 {enrichment}\n\
+                 <i>{incident_title}</i>\n\
+                 \n\
+                 Confidence: {pct}% \u{2014} dry-run, no real action.\n\
+                 <i>Enable live mode to let me handle these.</i>",
+                target = escape_html(target),
+                incident_title = escape_html(incident_title),
+            )
+        } else if action_label.to_lowercase().contains("ignore") {
+            format!(
+                "\u{2705} <b>Analyzed &amp; cleared</b>\n\
+                 \n\
+                 <i>{incident_title}</i>{enrichment}\n\
+                 \n\
+                 Confidence: {pct}% \u{2014} no action needed.",
+                incident_title = escape_html(incident_title),
+            )
+        } else {
+            let kill_quip = match pct {
+                95..=100 => "Definitive match.",
+                85..=94 => "High-confidence containment.",
+                70..=84 => "Solid confidence. Monitoring for follow-up.",
+                _ => "Contained. Keeping watch.",
+            };
+            format!(
+                "\u{1f6e1}\u{fe0f} <b>Threat neutralized</b>\n\
+                 \n\
+                 {action_label} <code>{target}</code>{enrichment}\n\
+                 <i>{incident_title}</i>\n\
+                 \n\
+                 Confidence: {pct}% \u{2014} {kill_quip}{cf_line}",
+                target = escape_html(target),
+                incident_title = escape_html(incident_title),
+            )
+        };
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+        self.post_json("sendMessage", &body).await
+    }
+
+    /// Send a raw HTML message (no formatting helpers).
+    /// Used for mesh network notifications and other custom messages.
+    /// Send an automated alert with hourly rate limiting.
+    /// Use this for all automated notifications (not bot command responses).
+    /// Returns Ok(()) silently if the hourly cap is reached.
+    pub async fn send_alert_html(&self, html: &str) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let current_hour: u32 = chrono::Utc::now()
+            .format("%H")
+            .to_string()
+            .parse()
+            .unwrap_or(0);
+        let stored_hour = self.alert_counter_hour.load(Ordering::Relaxed);
+        if current_hour != stored_hour {
+            self.alerts_this_hour.store(0, Ordering::Relaxed);
+            self.alert_counter_hour
+                .store(current_hour, Ordering::Relaxed);
+        }
+        let count = self.alerts_this_hour.fetch_add(1, Ordering::Relaxed);
+        if count >= MAX_ALERTS_PER_HOUR {
+            if count == MAX_ALERTS_PER_HOUR {
+                // Send one final warning, then stop
+                let warning = format!(
+                    "\u{26a0}\u{fe0f} <b>Alert flood detected</b>\n\n\
+                     {} alerts this hour — pausing automated notifications.\n\
+                     Check the dashboard for details. Alerts resume next hour.",
+                    count
+                );
+                self.send_raw_html(&warning).await.ok();
+            }
+            return Ok(());
+        }
+        self.send_raw_html(html).await
+    }
+
+    pub async fn send_raw_html(&self, html: &str) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+        self.post_json("sendMessage", &body).await
+    }
+
+    /// Send an agent-guard snitch alert when an AI agent attempts something dangerous.
+    pub async fn send_agent_guard_alert(
+        &self,
+        alert: &crate::dashboard::AgentGuardAlert,
+    ) -> Result<()> {
+        let sev_emoji = match alert.severity.as_str() {
+            "high" => "\u{1f534}",   // 🔴
+            "medium" => "\u{1f7e0}", // 🟠
+            _ => "\u{1f7e1}",        // 🟡
+        };
+        let rec_label = match alert.recommendation.as_str() {
+            "deny" => "DENIED",
+            "review" => "REVIEW",
+            _ => &alert.recommendation,
+        };
+        let cmd_preview = if alert.command.len() > 120 {
+            format!("{}…", &alert.command[..120])
+        } else {
+            alert.command.clone()
+        };
+        let signals_str = if alert.signals.is_empty() {
+            "—".to_string()
+        } else {
+            alert.signals.join(", ")
+        };
+        let atr_line = if alert.atr_rule_ids.is_empty() {
+            String::new()
+        } else {
+            format!("\n<b>ATR rules:</b> {}", alert.atr_rule_ids.join(", "))
+        };
+
+        let html = format!(
+            "\u{1f916} <b>Agent Guard Alert</b>\n\n\
+             {sev_emoji} <b>{}</b> — {rec_label}\n\n\
+             <b>Agent:</b> {}\n\
+             <b>Command:</b> <code>{}</code>\n\
+             <b>Risk:</b> {}/100\n\
+             <b>Signals:</b> {}{}\n\n\
+             InnerWarden flagged this action by your AI agent.",
+            alert.severity.to_uppercase(),
+            escape_html(&alert.agent_name),
+            escape_html(&cmd_preview),
+            alert.risk_score,
+            escape_html(&signals_str),
+            atr_line,
+        );
+        self.send_alert_html(&html).await
+    }
+
+    /// Send the onboarding/welcome message when the operator opens the bot.
+    /// Shows current mode, today's stats, and quick-action buttons.
+    pub async fn send_onboarding(
+        &self,
+        host: &str,
+        incident_count: usize,
+        decision_count: usize,
+        mode: GuardianMode,
+    ) -> Result<()> {
+        let mode_label = mode.label();
+        let mode_desc = mode.description();
+
+        let today_line = if incident_count == 0 {
+            "Perimeter's clean - no threat actors in the logs today.".to_string()
+        } else {
+            format!(
+                "<b>{incident_count}</b> intrusion attempt{} logged, <b>{decision_count}</b> neutralized.",
+                if incident_count == 1 { "" } else { "s" },
+            )
+        };
+
+        let text = format!(
+            "🛡 <b>InnerWarden</b> - protecting <b>{host}</b>\n\
+             \n\
+             {today_line}\n\
+             \n\
+             Mode: <b>{mode_label}</b>\n\
+             <i>{mode_desc}</i>",
+            host = escape_html(host),
+        );
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        { "text": "📊 Status",    "callback_data": "menu:status"    },
+                        { "text": "🚨 Threats",   "callback_data": "menu:threats"   },
+                        { "text": "⚖️ Decisions", "callback_data": "menu:decisions" }
+                    ],
+                    [
+                        { "text": "🔇 Quiet",   "callback_data": "sensitivity:quiet"   },
+                        { "text": "🔔 Normal",  "callback_data": "sensitivity:normal"  },
+                        { "text": "🔊 Verbose", "callback_data": "sensitivity:verbose" }
+                    ],
+                    [
+                        { "text": "\u{1f5d1}\u{fe0f} Undo allowlist", "callback_data": "menu:undo"  },
+                        { "text": "❓ All commands",  "callback_data": "menu:help"      }
+                    ]
+                ]
+            }
+        });
+        self.post_json("sendMessage", &body).await
+    }
+
+    // -----------------------------------------------------------------------
+    // T.2 - Confirmation request (inline keyboard: Approve / Reject)
+    // -----------------------------------------------------------------------
+
+    /// Send a confirmation-request message with Approve/Reject inline keyboard.
+    /// Returns the Telegram message ID so the caller can track the pending approval.
+    pub async fn send_confirmation_request(
+        &self,
+        incident: &Incident,
+        action_description: &str,
+        action_name: &str,
+        confidence: f32,
+        expires_secs: u64,
+    ) -> Result<i64> {
+        let sev = severity_label(incident);
+        let source_icon = source_icon(&incident.tags);
+        let entity_line = entity_summary(incident);
+        let pct = (confidence * 100.0) as u32;
+
+        let confidence_phrase = match pct {
+            90..=100 => "High confidence - this is a real threat",
+            75..=89 => "Strong signal - TTPs check out",
+            60..=74 => "Moderate confidence - worth acting on",
+            _ => "Low signal - could be noise, could be legit",
+        };
+        let action_plain = plain_action(action_description);
+        let expires_min = expires_secs / 60;
+        let expires_label = if expires_min >= 1 {
+            format!("{expires_min} min")
+        } else {
+            format!("{expires_secs}s")
+        };
+
+        let text = format!(
+            "{source_icon} {sev}\n\
+             <b>{title}</b>\n\
+             {entity_line}\n\
+             \n\
+             🤖 {confidence_phrase} ({pct}%). Recommended action:\n\
+             <code>{action_plain}</code>\n\
+             \n\
+             Your call, operator - {expires_label} to respond.",
+            title = escape_html(&incident.title),
+            action_plain = escape_html(&action_plain),
+            entity_line = entity_line,
+            sev = sev,
+            source_icon = source_icon,
+            confidence_phrase = confidence_phrase,
+            expires_label = expires_label,
+            pct = pct,
+        );
+
+        let id = &incident.incident_id;
+        let always_label = format!("🔁 Always {action_name}");
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    { "text": "✅ Approve", "callback_data": format!("approve:{id}") },
+                    { "text": always_label, "callback_data": format!("always:{id}") },
+                    { "text": "❌ Reject", "callback_data": format!("reject:{id}") }
+                ]]
+            }
+        });
+
+        let resp = self.post_json_with_response("sendMessage", &body).await?;
+        let msg_id = resp["result"]["message_id"]
+            .as_i64()
+            .context("Telegram sendMessage returned no message_id")?;
+        Ok(msg_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Honeypot operator-in-the-loop suggestion
+    // -----------------------------------------------------------------------
+
+    /// Send a honeypot suggestion message with a 4-button choice keyboard.
+    ///
+    /// Sent when the AI recommends `Honeypot` (or when `block_ip` is decided and honeypot
+    /// is an allowed skill) so the operator can choose what to do with the attacker.
+    ///
+    /// Returns the Telegram `message_id` for pending-choice tracking.
+    pub async fn send_honeypot_suggestion(
+        &self,
+        incident: &Incident,
+        ip: &str,
+        ai_reason: &str,
+        ai_confidence: f32,
+        ai_suggested: &str, // "honeypot" | "block" | "monitor"
+    ) -> Result<i64> {
+        let pct = (ai_confidence * 100.0) as u32;
+
+        let text = format!(
+            "🎯 <b>Honeypot candidate detected</b>\n\
+             \n\
+             <b>IP:</b> <code>{ip}</code>\n\
+             <b>Incident:</b> {title}\n\
+             <b>AI read:</b> {reason} ({pct}% confidence)\n\
+             \n\
+             Redirect to honeypot for analysis, or block immediately?",
+            ip = escape_html(ip),
+            title = escape_html(&incident.title),
+            reason = escape_html(ai_reason),
+            pct = pct,
+        );
+
+        // Add ✓ checkmark to the AI-suggested action
+        let honeypot_label = if ai_suggested == "honeypot" {
+            "🍯 Honeypot ✓"
+        } else {
+            "🍯 Honeypot"
+        };
+        let block_label = if ai_suggested == "block" {
+            "🚫 Block ✓"
+        } else {
+            "🚫 Block"
+        };
+        let monitor_label = if ai_suggested == "monitor" {
+            "👁 Monitor ✓"
+        } else {
+            "👁 Monitor"
+        };
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        { "text": honeypot_label, "callback_data": format!("hpot:honeypot:{ip}") },
+                        { "text": block_label,    "callback_data": format!("hpot:block:{ip}")    }
+                    ],
+                    [
+                        { "text": monitor_label,  "callback_data": format!("hpot:monitor:{ip}")  },
+                        { "text": "❌ Ignore",    "callback_data": format!("hpot:ignore:{ip}")   }
+                    ]
+                ]
+            }
+        });
+
+        let resp = self.post_json_with_response("sendMessage", &body).await?;
+        let msg_id = resp["result"]["message_id"]
+            .as_i64()
+            .context("Telegram sendMessage returned no message_id")?;
+        Ok(msg_id)
+    }
+
+    /// Edit a confirmation message to show the final outcome (removes the keyboard).
+    pub async fn resolve_confirmation(
+        &self,
+        message_id: i64,
+        approved: bool,
+        always: bool,
+        operator: &str,
+    ) -> Result<()> {
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "reply_markup": { "inline_keyboard": [] }
+        });
+        // Remove inline keyboard
+        let _ = self.post_json("editMessageReplyMarkup", &body).await;
+
+        // Send follow-up result message with hacker personality
+        let text = if always {
+            format!(
+                "🔁 Trust rule saved, {operator}. This TTP is now auto-contained - no need to ping you next time.",
+                operator = escape_html(operator)
+            )
+        } else if approved {
+            format!(
+                "✅ Executed. {operator} called the shot - threat actor has been neutralized.",
+                operator = escape_html(operator)
+            )
+        } else {
+            format!(
+                "❌ Standing down on {operator}'s call. Logging the IOC, keeping eyes on it.",
+                operator = escape_html(operator)
+            )
+        };
+        let body2 = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "reply_to_message_id": message_id,
+        });
+        self.post_json("sendMessage", &body2).await
+    }
+
+    // -----------------------------------------------------------------------
+    // T.5 - Post-session honeypot report
+    // -----------------------------------------------------------------------
+
+    /// T.5 - Post-session report sent after a honeypot session ends.
+    /// Summarizes commands, extracted IOCs, AI verdict, and offers a Block action.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_honeypot_session_report(
+        &self,
+        ip: &str,
+        session_id: &str,
+        duration_secs: u64,
+        commands: &[String],
+        credentials: &[(String, Option<String>)], // (username, password)
+        iocs: &crate::ioc::ExtractedIocs,
+        ai_verdict: &str,
+        auto_blocked: bool,
+    ) -> Result<()> {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "🍯 <b>Honeypot debrief</b> - session over\n\n\
+             <b>Attacker:</b> <code>{ip}</code>\n\
+             <b>Session:</b> <code>{session_id}</code>\n\
+             <b>Duration:</b> {duration_secs}s | <b>Commands captured:</b> {}",
+            commands.len(),
+            ip = escape_html(ip),
+            session_id = escape_html(session_id),
+        ));
+
+        // Credentials tried
+        if !credentials.is_empty() {
+            let mut cred_block = "\n<b>Credentials tried:</b>\n".to_string();
+            for (user, pass) in credentials.iter().take(10) {
+                let pass_display = pass
+                    .as_deref()
+                    .map(|p| {
+                        if p.len() > 20 {
+                            format!("{}...", &p[..20])
+                        } else {
+                            p.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "(key auth)".to_string());
+                cred_block.push_str(&format!(
+                    "  <code>{}</code> / <code>{}</code>\n",
+                    escape_html(user),
+                    escape_html(&pass_display)
+                ));
+            }
+            if credentials.len() > 10 {
+                cred_block.push_str(&format!("  ... +{} more\n", credentials.len() - 10));
+            }
+            lines.push(cred_block.trim_end().to_string());
+        }
+
+        if !commands.is_empty() {
+            let mut cmd_block = "\n<b>Their playbook:</b>\n".to_string();
+            for cmd in commands.iter().take(8) {
+                cmd_block.push_str(&format!("  $ <code>{}</code>\n", escape_html(cmd)));
+            }
+            lines.push(cmd_block.trim_end().to_string());
+        }
+
+        if credentials.is_empty() && commands.is_empty() {
+            lines.push(
+                "\nℹ️ Probe-only session: no auth attempts or shell commands captured.".to_string(),
+            );
+        }
+
+        if !iocs.is_empty() {
+            let ioc_text = iocs.format_telegram();
+            if !ioc_text.is_empty() {
+                lines.push(format!("\n<b>Extracted IOCs:</b>\n{ioc_text}"));
+            }
+        }
+
+        lines.push(format!("\n<b>AI verdict:</b> {}", escape_html(ai_verdict)));
+
+        if auto_blocked {
+            lines.push("\n✅ IP auto-blocked - they walked right into it.".to_string());
+        }
+
+        let text = lines.join("\n");
+
+        // Build inline keyboard
+        let mut keyboard_rows: Vec<Vec<serde_json::Value>> = vec![];
+
+        if !auto_blocked {
+            keyboard_rows.push(vec![serde_json::json!({
+                "text": "🚫 Block now",
+                "callback_data": format!("hpot:block:{ip}")
+            })]);
+        }
+
+        if let Some(ref dash_url) = self.dashboard_url {
+            keyboard_rows.push(vec![serde_json::json!({
+                "text": "📊 View in dashboard",
+                "url": dash_url
+            })]);
+        }
+
+        let body = if keyboard_rows.is_empty() {
+            serde_json::json!({
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true,
+            })
+        } else {
+            serde_json::json!({
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true,
+                "reply_markup": {
+                    "inline_keyboard": keyboard_rows
+                }
+            })
+        };
+
+        self.post_json("sendMessage", &body).await
+    }
+
+    // -----------------------------------------------------------------------
+    // AbuseIPDB auto-block notification
+    // -----------------------------------------------------------------------
+
+    /// Notify operator when an IP is auto-blocked via AbuseIPDB threshold
+    /// (no AI call was made - pure reputation gate).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_abuseipdb_autoblock(
+        &self,
+        ip: &str,
+        score: u8,
+        threshold: u8,
+        total_reports: u32,
+        country: Option<&str>,
+        isp: Option<&str>,
+        incident_title: &str,
+        dry_run: bool,
+        dashboard_url: Option<&str>,
+    ) -> Result<()> {
+        let country_flag = country
+            .map(|c| format!(" {} ·", country_flag_emoji(c)))
+            .unwrap_or_default();
+        let isp_line = isp
+            .map(|i| format!(" · <i>{}</i>", escape_html(i)))
+            .unwrap_or_default();
+        let reports_line = if total_reports > 0 {
+            format!(" · {} reports worldwide", total_reports)
+        } else {
+            String::new()
+        };
+
+        let (action_line, header) = if dry_run {
+            (
+                format!(
+                    "Would've dropped <code>{}</code> - dry-run, standing down.",
+                    escape_html(ip)
+                ),
+                "🧪 <b>Dry-run</b> - known bad actor flagged",
+            )
+        } else {
+            (
+                format!(
+                    "Blocked <code>{}</code> - known threat from reputation database.",
+                    escape_html(ip)
+                ),
+                "🛡 <b>Instant kill</b> - AbuseIPDB reputation gate",
+            )
+        };
+
+        let score_bar = reputation_score_bar(score);
+
+        let text = format!(
+            "{header}\n\
+             \n\
+             🌐{country_flag} <code>{ip}</code>{isp_line}\n\
+             📊 Score: <b>{score}/100</b> {score_bar}{reports_line}\n\
+             🔍 <i>{incident_title}</i>\n\
+             \n\
+             {action_line}\n\
+             <i>Score ≥ {threshold} - handled before AI analysis.</i>",
+            ip = escape_html(ip),
+            incident_title = escape_html(incident_title),
+        );
+
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+
+        // Deep-link to dashboard journey for this IP
+        if let Some(base_url) = dashboard_url {
+            let today = chrono::Utc::now().format("%Y-%m-%d");
+            body["reply_markup"] = serde_json::json!({
+                "inline_keyboard": [[{
+                    "text": "🔍 View threat timeline",
+                    "url": format!("{base_url}/?subject_type=ip&subject={ip}&date={today}", ip = ip)
+                }]]
+            });
+        }
+
+        self.post_json("sendMessage", &body).await
+    }
+
+    // T.3 - Daily digest
+    // -----------------------------------------------------------------------
+
+    /// Send a plain HTML text message (used for daily digest).
+    pub async fn send_text_message(&self, text: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+        self.post_json("sendMessage", &body).await
+    }
+
+    /// Send an HTML message with an inline keyboard.
+    pub async fn send_text_with_keyboard(
+        &self,
+        text: &str,
+        keyboard: serde_json::Value,
+    ) -> Result<()> {
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "reply_markup": { "inline_keyboard": keyboard },
+        });
+        self.post_json("sendMessage", &body).await
+    }
+
+    /// Send the interactive menu with inline keyboard buttons.
+    pub async fn send_menu(&self, is_simple: bool) -> Result<()> {
+        let profile_btn = if is_simple {
+            serde_json::json!({ "text": "🔧 Switch to Technical", "callback_data": "profile:technical" })
+        } else {
+            serde_json::json!({ "text": "✨ Switch to Simple", "callback_data": "profile:simple" })
+        };
+
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": "👾 <b>InnerWarden</b> - what do you need?",
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        { "text": "📊 Status",    "callback_data": "menu:status"    },
+                        { "text": "🚨 Threats",   "callback_data": "menu:threats"   }
+                    ],
+                    [
+                        { "text": "⚖️ Decisions", "callback_data": "menu:decisions" },
+                        { "text": "\u{1f5d1}\u{fe0f} Undo", "callback_data": "menu:undo" }
+                    ],
+                    [
+                        { "text": "❓ Help",       "callback_data": "menu:help"      }
+                    ],
+                    [ profile_btn ]
+                ]
+            }
+        });
+        self.post_json("sendMessage", &body).await
+    }
+
+    /// React to a message with 👀 (processing indicator).
+    pub async fn react_eyes(&self, chat_id: i64, message_id: i64) {
+        self.react(chat_id, message_id, "👀").await;
+    }
+
+    /// React to a message with an arbitrary emoji.
+    pub async fn react(&self, chat_id: i64, message_id: i64, emoji: &str) {
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [{ "type": "emoji", "emoji": emoji }]
+        });
+        let _ = self.post_json("setMessageReaction", &body).await;
+    }
+
+    /// Show "typing..." indicator in the chat.
+    pub async fn send_typing(&self) {
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "action": "typing"
+        });
+        let _ = self.post_json("sendChatAction", &body).await;
+    }
+
+    /// Register the bot's persistent command menu (shown in the text input).
+    /// Called once at startup.
+    pub async fn set_commands(&self) {
+        let body = serde_json::json!({
+            "commands": [
+                { "command": "status",       "description": "Guardian status - mode, AI, threat intel" },
+                { "command": "threats",      "description": "Recent intrusion attempts" },
+                { "command": "decisions",    "description": "Actions I've taken" },
+                { "command": "blocked",      "description": "Threat actors currently contained" },
+                { "command": "capabilities", "description": "List all capabilities and their status" },
+                { "command": "enable",       "description": "Enable a capability - /enable block-ip" },
+                { "command": "disable",      "description": "Disable a capability - /disable ai" },
+                { "command": "doctor",       "description": "Full health check with fix hints" },
+                { "command": "guard",        "description": "Activate auto-defend mode" },
+                { "command": "watch",        "description": "Switch to passive monitor mode" },
+                { "command": "ask",          "description": "Ask me anything - I know my config" },
+                { "command": "undo",         "description": "Undo recent allowlist additions" },
+                { "command": "help",         "description": "Operator command playbook" }
+            ]
+        });
+        let _ = self.post_json("setMyCommands", &body).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Polling loop (background task)
+    // -----------------------------------------------------------------------
+
+    /// Polls Telegram for updates and sends ApprovalResults to `approval_tx`.
+    /// Designed to run as a background tokio task - exits when `approval_tx` is closed.
+    ///
+    /// Uses long-polling (timeout=25s) so this blocks for up to 25s between updates.
+    /// Any errors are logged and the loop continues.
+    pub async fn run_polling(
+        self: std::sync::Arc<Self>,
+        approval_tx: mpsc::Sender<ApprovalResult>,
+    ) {
+        let mut offset: i64 = 0;
+
+        loop {
+            if approval_tx.is_closed() {
+                break;
+            }
+
+            match self.get_updates(offset).await {
+                Ok(updates) => {
+                    if !updates.is_empty() {
+                        info!(count = updates.len(), offset, "Telegram: received updates");
+                    }
+                    for update in updates {
+                        offset = update.update_id + 1;
+
+                        if let Some(callback) = update.callback_query {
+                            let operator = callback
+                                .from
+                                .first_name
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string());
+
+                            // Extract chat_id + message_id for emoji reactions
+                            let cb_chat_id = callback
+                                .message
+                                .as_ref()
+                                .and_then(|m| m.chat.as_ref())
+                                .map(|c| c.id)
+                                .unwrap_or(0);
+                            let cb_msg_id =
+                                callback.message.as_ref().map(|m| m.message_id).unwrap_or(0);
+
+                            if let Some(data) = &callback.data {
+                                if let Some(incident_id) = data.strip_prefix("fp:check:") {
+                                    // Dev mode: log incident as potential false positive
+                                    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+                                    let entry = format!(
+                                        "{{\"ts\":\"{ts}\",\"incident_id\":\"{incident_id}\",\"operator\":\"{operator}\",\"action\":\"check_fp\"}}\n"
+                                    );
+                                    // Write to false-positive review log
+                                    // Write to data dir or fallback to /tmp
+                                    let fp_path = {
+                                        let primary = std::path::PathBuf::from(
+                                            "/var/lib/innerwarden/fp-review.jsonl",
+                                        );
+                                        if primary.parent().map(|p| p.exists()).unwrap_or(false) {
+                                            primary
+                                        } else {
+                                            std::path::PathBuf::from(
+                                                "/tmp/innerwarden-fp-review.jsonl",
+                                            )
+                                        }
+                                    };
+                                    match std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&fp_path)
+                                    {
+                                        Ok(mut f) => {
+                                            use std::io::Write;
+                                            let _ = f.write_all(entry.as_bytes());
+                                            info!(incident_id, operator = %operator, path = %fp_path.display(), "FP review: incident flagged for review");
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "FP review: failed to write log")
+                                        }
+                                    }
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            &format!(
+                                                "\u{1f52c} Flagged for FP review: {}",
+                                                &incident_id[..incident_id.len().min(40)]
+                                            ),
+                                        )
+                                        .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f4dd}").await;
+                                    }
+                                } else if let Some(detector) = data.strip_prefix("explain:") {
+                                    // Simple profile: send a longer explanation of the detector
+                                    let explanation = explain_detector(detector);
+                                    let _ = self.answer_callback(&callback.id).await;
+                                    let _ = self.send_raw_html(&explanation).await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f4a1}").await;
+                                    }
+                                } else if data == "quick:ignore" {
+                                    // Just ack with toast - no further action needed
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            "👍 Logged as false positive. Keeping eyes on it.",
+                                        )
+                                        .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f44d}").await;
+                                    }
+                                } else if let Some(ip_str) = data.strip_prefix("quick:block:") {
+                                    // Validate IP format before processing
+                                    if ip_str.parse::<std::net::IpAddr>().is_ok() {
+                                        let ip = ip_str.to_string();
+                                        let _ = self
+                                            .answer_callback_toast(
+                                                &callback.id,
+                                                &format!("🛡 Dropping {ip} at the firewall..."),
+                                            )
+                                            .await;
+                                        if cb_chat_id != 0 {
+                                            self.react(cb_chat_id, cb_msg_id, "\u{1f6e1}\u{fe0f}")
+                                                .await;
+                                        }
+                                        let result = ApprovalResult {
+                                            incident_id: format!("__quick_block__:{ip}"),
+                                            approved: true,
+                                            always: false,
+                                            operator_name: operator.clone(),
+                                            chosen_action: String::new(),
+                                        };
+                                        if approval_tx.send(result).await.is_err() {
+                                            return;
+                                        }
+                                    } else {
+                                        warn!(callback_data = %data, "invalid IP in Telegram callback, ignoring");
+                                    }
+                                } else if let Some(rest) = data.strip_prefix("hpot:") {
+                                    // Honeypot operator-in-the-loop choice
+                                    // format: "hpot:{action}:{ip}"
+                                    let parts: Vec<&str> = rest.splitn(2, ':').collect();
+                                    if parts.len() == 2 {
+                                        let action = parts[0];
+                                        let ip = parts[1];
+                                        let toast = match action {
+                                            "honeypot" => {
+                                                format!("🍯 Routing {ip} to honeypot - let them think they're in...")
+                                            }
+                                            "block" => {
+                                                format!("🚫 Dropping {ip} at the firewall...")
+                                            }
+                                            "monitor" => {
+                                                format!("👁 Silent monitoring on {ip} - collecting intel...")
+                                            }
+                                            _ => "👍 Logged.".to_string(),
+                                        };
+                                        let _ =
+                                            self.answer_callback_toast(&callback.id, &toast).await;
+                                        if cb_chat_id != 0 {
+                                            let emoji = match action {
+                                                "honeypot" => "\u{1f36f}",
+                                                "block" => "\u{1f6ab}",
+                                                "monitor" => "\u{1f441}\u{fe0f}",
+                                                _ => "\u{1f44d}",
+                                            };
+                                            self.react(cb_chat_id, cb_msg_id, emoji).await;
+                                        }
+                                        let result = ApprovalResult {
+                                            incident_id: format!("__hpot__:{ip}"),
+                                            approved: action != "ignore",
+                                            always: false,
+                                            operator_name: operator.clone(),
+                                            chosen_action: action.to_string(),
+                                        };
+                                        if approval_tx.send(result).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                } else if let Some(rest) = data.strip_prefix("allow:proc:") {
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            &format!("\u{2705} Adding {} to allowlist...", rest),
+                                        )
+                                        .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{2705}").await;
+                                    }
+                                    let result = ApprovalResult {
+                                        incident_id: format!("__allow_proc__:{rest}"),
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator.clone(),
+                                        chosen_action: String::new(),
+                                    };
+                                    if approval_tx.send(result).await.is_err() {
+                                        return;
+                                    }
+                                } else if let Some(rest) = data.strip_prefix("allow:ip:") {
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            &format!("\u{2705} Adding {} to allowlist...", rest),
+                                        )
+                                        .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{2705}").await;
+                                    }
+                                    let result = ApprovalResult {
+                                        incident_id: format!("__allow_ip__:{rest}"),
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator.clone(),
+                                        chosen_action: String::new(),
+                                    };
+                                    if approval_tx.send(result).await.is_err() {
+                                        return;
+                                    }
+                                } else if !data.starts_with("fp:check:") && data.starts_with("fp:")
+                                {
+                                    // Triage FP report (not the dev-mode fp:check: handler)
+                                    let rest = &data[3..];
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            "\u{1f4dd} Reported as false positive. Thanks!",
+                                        )
+                                        .await;
+                                    if cb_chat_id != 0 {
+                                        self.react(cb_chat_id, cb_msg_id, "\u{1f4dd}").await;
+                                    }
+                                    let result = ApprovalResult {
+                                        incident_id: format!("__fp__:{rest}"),
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator.clone(),
+                                        chosen_action: String::new(),
+                                    };
+                                    if approval_tx.send(result).await.is_err() {
+                                        return;
+                                    }
+                                } else if let Some(rest) = data.strip_prefix("autofp:") {
+                                    // Auto-FP suggestion: "autofp:yes:proc:name" or "autofp:no:name"
+                                    let toast = if rest.starts_with("yes:") {
+                                        "\u{2705} Adding to allowlist..."
+                                    } else {
+                                        "\u{1f440} OK, will keep monitoring."
+                                    };
+                                    let _ = self.answer_callback_toast(&callback.id, toast).await;
+                                    let result = ApprovalResult {
+                                        incident_id: format!("__autofp__:{rest}"),
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator.clone(),
+                                        chosen_action: String::new(),
+                                    };
+                                    if approval_tx.send(result).await.is_err() {
+                                        return;
+                                    }
+                                } else if let Some(rest) = data.strip_prefix("undo:") {
+                                    // Undo allowlist: "undo:proc:key" or "undo:ip:key"
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            "\u{1f5d1}\u{fe0f} Removing from allowlist...",
+                                        )
+                                        .await;
+                                    let result = ApprovalResult {
+                                        incident_id: format!("__undo__:{rest}"),
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator.clone(),
+                                        chosen_action: String::new(),
+                                    };
+                                    if approval_tx.send(result).await.is_err() {
+                                        return;
+                                    }
+                                } else if data == "enable2fa" {
+                                    let _ = self
+                                        .answer_callback_toast(
+                                            &callback.id,
+                                            "\u{1f510} 2FA setup instructions sent.",
+                                        )
+                                        .await;
+                                    let result = ApprovalResult {
+                                        incident_id: "__enable2fa__".to_string(),
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator.clone(),
+                                        chosen_action: String::new(),
+                                    };
+                                    if approval_tx.send(result).await.is_err() {
+                                        return;
+                                    }
+                                } else if data == "dismiss2fa" {
+                                    let _ = self
+                                        .answer_callback_toast(&callback.id, "\u{1f44d} Dismissed.")
+                                        .await;
+                                    // No routing needed, just ack
+                                } else {
+                                    // Answer the callback immediately to remove the spinner
+                                    let _ = self.answer_callback(&callback.id).await;
+                                    if let Some(result) = parse_callback(data, &operator) {
+                                        if approval_tx.send(result).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Handle text commands and free-form messages
+                        if let Some(msg) = update.message {
+                            if let Some(raw_text) = &msg.text {
+                                // Strip @BotUsername suffix that Telegram appends
+                                // (e.g. "/help@InnerWardenBot" → "/help")
+                                let text = strip_bot_suffix(raw_text.trim());
+                                let operator = msg
+                                    .from
+                                    .as_ref()
+                                    .and_then(|f| f.first_name.clone())
+                                    .unwrap_or_default();
+                                info!(text = %text, operator = %operator, "Telegram: text message received");
+
+                                // Visual feedback: react with 👀 and show typing
+                                let chat_id = msg.chat.as_ref().map(|c| c.id).unwrap_or(0);
+                                if chat_id != 0 {
+                                    self.react_eyes(chat_id, msg.message_id).await;
+                                }
+                                self.send_typing().await;
+
+                                let incident_id = if text == "/status"
+                                    || text.starts_with("/status ")
+                                {
+                                    info!("Telegram: routing /status command");
+                                    "__status__".to_string()
+                                } else if text == "/help" || text.starts_with("/help ") {
+                                    "__help__".to_string()
+                                } else if text == "/menu" || text.starts_with("/menu ") {
+                                    "__menu__".to_string()
+                                } else if text == "/incidents"
+                                    || text.starts_with("/incidents ")
+                                    || text == "/threats"
+                                    || text.starts_with("/threats ")
+                                {
+                                    "__threats__".to_string()
+                                } else if text == "/decisions" || text.starts_with("/decisions ") {
+                                    "__decisions__".to_string()
+                                } else if text == "/blocked" || text.starts_with("/blocked ") {
+                                    "__blocked__".to_string()
+                                } else if text == "/guard" || text.starts_with("/guard ") {
+                                    "__guard__".to_string()
+                                } else if text == "/watch" || text.starts_with("/watch ") {
+                                    "__watch__".to_string()
+                                } else if text == "/doctor" || text.starts_with("/doctor ") {
+                                    "__doctor__".to_string()
+                                } else if text == "/capabilities"
+                                    || text.starts_with("/capabilities ")
+                                    || text == "/list"
+                                    || text.starts_with("/list ")
+                                {
+                                    "__capabilities__".to_string()
+                                } else if let Some(cap) = text.strip_prefix("/enable ") {
+                                    format!("__enable__:{cap}")
+                                } else if let Some(cap) = text.strip_prefix("/disable ") {
+                                    format!("__disable__:{cap}")
+                                } else if text == "/undo" || text.starts_with("/undo ") {
+                                    "__undo__".to_string()
+                                } else if text == "/start" || text.starts_with("/start ") {
+                                    // Telegram sends /start when user first opens the bot
+                                    "__start__".to_string()
+                                } else if !text.starts_with('/') || text.starts_with("/ask ") {
+                                    // Free-form text or /ask <question> - route to AI
+                                    let question =
+                                        text.strip_prefix("/ask ").unwrap_or(&text).to_string();
+                                    format!("__ask__:{question}")
+                                } else {
+                                    // Unknown command - send help hint
+                                    "__unknown_cmd__".to_string()
+                                };
+
+                                let _ = approval_tx
+                                    .send(ApprovalResult {
+                                        incident_id,
+                                        approved: true,
+                                        always: false,
+                                        operator_name: operator,
+                                        chosen_action: String::new(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Telegram poll error: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Low-level API calls
+    // -----------------------------------------------------------------------
+
+    async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
+        let url = self.api_url("getUpdates");
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("offset", offset.to_string()),
+                ("timeout", "25".to_string()),
+                (
+                    "allowed_updates",
+                    r#"["message","callback_query"]"#.to_string(),
+                ),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("getUpdates request failed ({})", sanitize_url(&url)))?
+            .json::<serde_json::Value>()
+            .await
+            .with_context(|| format!("getUpdates JSON parse failed ({})", sanitize_url(&url)))?;
+
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let desc = resp["description"].as_str().unwrap_or("unknown error");
+            warn!("Telegram getUpdates error: {desc}");
+            return Ok(vec![]);
+        }
+
+        let raw_result = resp["result"].clone();
+        let result_count = raw_result.as_array().map(|a| a.len()).unwrap_or(0);
+        let updates: Vec<Update> = match serde_json::from_value(raw_result) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(error = %e, raw_count = result_count, "Telegram: failed to deserialize updates");
+                vec![]
+            }
+        };
+        Ok(updates)
+    }
+
+    async fn answer_callback(&self, callback_query_id: &str) -> Result<()> {
+        let body = serde_json::json!({ "callback_query_id": callback_query_id });
+        self.post_json("answerCallbackQuery", &body).await
+    }
+
+    async fn answer_callback_toast(&self, callback_query_id: &str, text: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "callback_query_id": callback_query_id,
+            "text": text,
+            "show_alert": false
+        });
+        self.post_json("answerCallbackQuery", &body).await
+    }
+
+    async fn post_json(&self, method: &str, body: &serde_json::Value) -> Result<()> {
+        self.post_json_with_response(method, body).await?;
+        Ok(())
+    }
+
+    async fn post_json_with_response(
+        &self,
+        method: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        // Audit log: record every outgoing Telegram message for debugging notification noise.
+        if method == "sendMessage" {
+            let text_preview = body["text"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>()
+                .replace('\n', " ");
+            info!(
+                target: "telegram_audit",
+                method = method,
+                text_preview = %text_preview,
+                "Telegram outgoing message"
+            );
+        }
+
+        // Enforce message length limit on outgoing text
+        let body = if let Some(text) = body["text"].as_str() {
+            let safe_text = enforce_length(text);
+            let mut patched = body.clone();
+            patched["text"] = serde_json::Value::String(safe_text);
+            patched
+        } else {
+            body.clone()
+        };
+
+        // Rate limiter: ~20 msg/sec, well within Telegram's 30/sec limit
+        {
+            let mut last = self.last_send.lock().await;
+            let elapsed = last.elapsed();
+            if elapsed < Duration::from_millis(50) {
+                tokio::time::sleep(Duration::from_millis(50) - elapsed).await;
+            }
+            *last = tokio::time::Instant::now();
+        }
+
+        let url = self.api_url(method);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Telegram {method} failed ({})", sanitize_url(&url)))?
+            .json::<serde_json::Value>()
+            .await
+            .with_context(|| {
+                format!(
+                    "Telegram {method} JSON parse failed ({})",
+                    sanitize_url(&url)
+                )
+            })?;
+
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let desc = resp["description"]
+                .as_str()
+                .unwrap_or("unknown Telegram error");
+            warn!(method, url = %sanitize_url(&url), "Telegram API error: {desc}");
+        }
+
+        Ok(resp)
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Update {
+    update_id: i64,
+    #[serde(default)]
+    message: Option<Message>,
+    #[serde(default)]
+    callback_query: Option<CallbackQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Message {
+    #[serde(default)]
+    message_id: i64,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    from: Option<User>,
+    #[serde(default)]
+    chat: Option<Chat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Chat {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CallbackQuery {
+    id: String,
+    from: User,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    message: Option<CallbackMessage>,
+}
+
+/// Minimal representation of the message attached to a callback query.
+#[derive(Debug, Deserialize)]
+struct CallbackMessage {
+    message_id: i64,
+    #[serde(default)]
+    chat: Option<Chat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct User {
+    #[serde(default)]
+    first_name: Option<String>,
+}
+
+/// Append an entry to the allowlist TOML file.
+///
+/// Creates the file if it does not exist. Each call appends a new
+/// `[section]` header followed by the key-value pair so the sensor
+/// picks it up on its next reload (every 60 s).
+pub fn append_to_allowlist(
+    allowlist_path: &std::path::Path,
+    section: &str,
+    key: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    use fs2::FileExt;
+    use std::io::Write;
+
+    fn toml_escape(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ")
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(allowlist_path)?;
+    file.lock_exclusive()?;
+    let escaped_key = toml_escape(key);
+    let escaped_reason = toml_escape(reason);
+    writeln!(file, "\n[{section}]")?;
+    writeln!(file, "\"{}\" = \"{}\"", escaped_key, escaped_reason)?;
+    file.flush()?;
+    file.unlock()?;
+    Ok(())
+}
+
+/// Log an allowlist change (add or remove) to allowlist-history.jsonl.
+pub fn log_allowlist_change(
+    data_dir: &std::path::Path,
+    key: &str,
+    section: &str,
+    operator: &str,
+    action: &str,
+) {
+    let path = data_dir.join("allowlist-history.jsonl");
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "key": key,
+        "section": section,
+        "operator": operator,
+        "action": action,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", entry);
+    }
+}
+
+/// Read allowlist history and return last N "add" entries without matching "remove".
+pub fn read_undoable_allowlist_entries(
+    data_dir: &std::path::Path,
+    max_entries: usize,
+) -> Vec<(String, String, String, String)> {
+    // Returns Vec<(key, section, operator, ts)>
+    let path = data_dir.join("allowlist-history.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut adds: Vec<(String, String, String, String)> = Vec::new();
+    let mut removed_keys: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
+    // Parse all entries
+    for line in content.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let key = v
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let section = v
+                .get("section")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let operator = v
+                .get("operator")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ts = v
+                .get("ts")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let action = v
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if action == "add" {
+                adds.push((key, section, operator, ts));
+            } else if action == "remove" {
+                removed_keys.insert((key, section));
+            }
+        }
+    }
+
+    // Filter out entries that have been removed, take last N
+    adds.into_iter()
+        .rev()
+        .filter(|(key, section, _, _)| !removed_keys.contains(&(key.clone(), section.clone())))
+        .take(max_entries)
+        .collect()
+}
+
+/// Remove a key from allowlist.toml atomically.
+/// Reads the file, removes lines containing the key in the appropriate section,
+/// writes to a temp file, and renames over the original.
+pub fn remove_from_allowlist(
+    allowlist_path: &std::path::Path,
+    section: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    use fs2::FileExt;
+
+    let content = std::fs::read_to_string(allowlist_path).unwrap_or_default();
+
+    let mut result_lines: Vec<String> = Vec::new();
+    let mut in_target_section = false;
+    let escaped_key = key.replace('\\', "\\\\").replace('"', "\\\"");
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Track section headers
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let sec = &trimmed[1..trimmed.len() - 1];
+            in_target_section = sec == section;
+            result_lines.push(line.to_string());
+            continue;
+        }
+
+        // If in the target section, skip lines containing the key
+        if in_target_section
+            && (trimmed.contains(&format!("\"{}\"", escaped_key))
+                || trimmed.contains(&format!("\"{}\"", key)))
+        {
+            continue;
+        }
+
+        result_lines.push(line.to_string());
+    }
+
+    // Remove trailing empty lines and consecutive empty section headers
+    let output = result_lines.join("\n");
+
+    // Write atomically: temp file + rename
+    let temp_path = allowlist_path.with_extension("toml.tmp");
+    {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        file.lock_exclusive()?;
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(&file);
+        writer.write_all(output.as_bytes())?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        file.unlock()?;
+    }
+    std::fs::rename(&temp_path, allowlist_path)?;
+
+    Ok(())
+}
+
+/// Log an incident as a false positive to a daily JSONL file.
+///
+/// Used for training data collection and FP-rate tracking.  The file
+/// is created if missing and each entry is one JSON line.
+pub fn log_false_positive(
+    data_dir: &std::path::Path,
+    incident_id: &str,
+    detector: &str,
+    reporter: &str,
+) {
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    let path = data_dir.join(format!("fp-reports-{today}.jsonl"));
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "incident_id": incident_id,
+        "detector": detector,
+        "reporter": reporter,
+        "action": "reported_fp"
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", entry);
+    }
+}
