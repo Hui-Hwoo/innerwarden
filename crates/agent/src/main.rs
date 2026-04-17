@@ -401,6 +401,8 @@ struct AgentState {
     grouping_engine: notification_pipeline::GroupingEngine,
     /// Environment profile — cloud/VM detection, human UIDs, services.
     environment_profile: environment_profile::EnvironmentProfile,
+    /// Last time the periodic env census ran. Spec 005 Phase 6.
+    last_env_census_at: Option<std::time::Instant>,
     /// Neural autoencoder anomaly engine — learns "normal" and flags novel patterns.
     anomaly_engine: neural_lifecycle::AnomalyEngine,
     /// Neural incidents pending processing — buffered here because the agent
@@ -538,6 +540,10 @@ struct AgentState {
     redis_reader: Option<redis_reader::RedisStreamReader>,
     /// Notification gate burst tracker — counts contained threats for burst summary.
     notification_burst_tracker: notification_gate::BurstTracker,
+    /// Spec 005 Phase 7 — implicit operator feedback (ignore-driven demotion).
+    feedback_tracker: notification_pipeline::FeedbackTracker,
+    /// Last time the feedback tracker ticked 24h-old pendings into ignores.
+    last_feedback_tick_at: Option<std::time::Instant>,
 }
 
 /// Tracks a deferred honeypot-or-block decision waiting for operator input via Telegram.

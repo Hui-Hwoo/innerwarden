@@ -584,6 +584,24 @@ pub struct AiConfig {
     /// "low" = all incidents go to AI (expensive, not recommended).
     #[serde(default = "default_ai_min_severity")]
     pub min_severity: String,
+
+    /// Spec 005 Phase 8 — batch all closed groups into one AI prompt per window
+    /// instead of one AI call per incident. Reduces API spend on noisy hosts.
+    /// Disabled by default.
+    #[serde(default)]
+    pub batch_triage: bool,
+
+    /// Window size for batch triage, in seconds. Default 3600 (1h) aligns with
+    /// the notification_pipeline group window. Reserved for future harness
+    /// revisions that pace batch triage independently from the tick loop;
+    /// today the slow loop runs triage on every grouping tick.
+    #[serde(default = "default_batch_window_secs")]
+    #[allow(dead_code)]
+    pub batch_window_secs: u64,
+}
+
+fn default_batch_window_secs() -> u64 {
+    3600
 }
 
 fn default_ai_min_severity() -> String {
@@ -606,6 +624,8 @@ impl Default for AiConfig {
             circuit_breaker_cooldown_secs: default_circuit_breaker_cooldown_secs(),
             protected_ips: default_protected_ips(),
             min_severity: default_ai_min_severity(),
+            batch_triage: false,
+            batch_window_secs: default_batch_window_secs(),
         }
     }
 }

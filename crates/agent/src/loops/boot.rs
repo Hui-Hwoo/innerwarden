@@ -413,6 +413,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         bl
     };
 
+    let telemetry_telegram_sent_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let telemetry_gate_suppressed_counter =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Build Telegram client (None when disabled or misconfigured)
     let telegram_client: Option<Arc<telegram::TelegramClient>> = if cfg.telegram.enabled {
         let token = cfg.telegram.resolved_bot_token();
@@ -428,6 +432,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             };
             match telegram::TelegramClient::new(token, chat_id, dashboard_url) {
                 Ok(mut c) => {
+                    c.set_telegram_sent_counter(telemetry_telegram_sent_counter.clone());
                     if cfg.telegram.dev_mode {
                         c.dev_mode = true;
                         info!("Telegram dev mode ON — FP review button on every notification");
@@ -585,7 +590,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         skill_registry: skills::SkillRegistry::default_builtin(),
         blocklist: startup_blocklist,
         correlator: correlation::TemporalCorrelator::new(cfg.correlation.window_seconds, 4096),
-        telemetry: telemetry::TelemetryState::default(),
+        telemetry: telemetry::TelemetryState::with_external_counters(
+            telemetry_telegram_sent_counter.clone(),
+            telemetry_gate_suppressed_counter.clone(),
+        ),
         telemetry_writer: if cfg.telemetry.enabled {
             match telemetry::TelemetryWriter::new(&cli.data_dir) {
                 Ok(w) => Some(w),
@@ -631,6 +639,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             &cli.data_dir,
             &cfg.environment,
         ),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(neural_lifecycle::AnomalyConfig {
             data_dir: cli.data_dir.clone(),
             ..Default::default()
@@ -785,7 +794,27 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     };
+
+    // Spec 005 Phase 7: replay persisted feedback so demotions survive
+    // restarts. Events older than IGNORE_WINDOW_SECS still contribute to
+    // the ignore tally; only the `pending` projection is freshness-filtered.
+    {
+        let replay_now = chrono::Utc::now();
+        let events = notification_pipeline::feedback_store::load(&cli.data_dir);
+        for event in &events {
+            state.feedback_tracker.replay_event(event, replay_now);
+        }
+        if !events.is_empty() {
+            info!(
+                count = events.len(),
+                pending = state.feedback_tracker.pending_count(),
+                "notification feedback replayed"
+            );
+        }
+    }
 
     // Seed operator IPs from active SSH sessions (who -i).
     // Only publickey SSH sessions from trusted_users are considered operators.
@@ -953,6 +982,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             let abuseipdb_threshold = cfg.abuseipdb.auto_block_threshold;
             let ai_clone = state.ai_provider.clone();
             let tg_clone = state.telegram_client.clone();
+            let gate_counter = state.telemetry.gate_suppressed_counter();
             let data_dir_clone = cli.data_dir.clone();
             let responder_enabled = cfg.responder.enabled;
             let dry_run = cfg.responder.dry_run;
@@ -968,6 +998,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     filter_bl,
                     ai_clone,
                     tg_clone,
+                    gate_counter,
                     abuseipdb_client,
                     abuseipdb_threshold,
                     data_dir_clone,
@@ -1053,12 +1084,44 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     {
                         let summaries = state.grouping_engine.tick();
                         if !summaries.is_empty() {
+                            // Spec 005 Phase 8 — optional AI batch triage.
+                            // When enabled, one AI call classifies every
+                            // summary (URGENT / INFO / SUPPRESS); URGENT
+                            // always gets through, SUPPRESS always drops,
+                            // INFO falls back to the per-channel filter. On
+                            // AI failure, classifications stay unset and the
+                            // normal filter path runs — spec § fallback.
+                            let batch_classes: Option<Vec<notification_pipeline::BatchClassification>> =
+                                if cfg.ai.batch_triage {
+                                    if let Some(provider) = state.ai_provider.as_ref() {
+                                        notification_pipeline::run_batch_triage(
+                                            provider.as_ref(),
+                                            &summaries,
+                                        )
+                                        .await
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
                             let tg_level = cfg.telegram.channel_notifications.notification_level;
                             let tg_summaries: Vec<String> = summaries
                                 .iter()
-                                .filter(|s| notification_pipeline::should_notify_summary(s, tg_level))
-                                .filter(|s| notification_pipeline::is_immediate_threat_summary(s))
-                                .map(|s| s.format_html())
+                                .enumerate()
+                                .filter(|(idx, s)| {
+                                    use notification_pipeline::BatchClassification;
+                                    match batch_classes.as_ref().and_then(|v| v.get(*idx)) {
+                                        Some(BatchClassification::Urgent) => true,
+                                        Some(BatchClassification::Suppress) => false,
+                                        // Info or no triage: defer to normal filter.
+                                        _ => {
+                                            notification_pipeline::should_notify_summary(s, tg_level)
+                                                && notification_pipeline::is_immediate_threat_summary(s)
+                                        }
+                                    }
+                                })
+                                .map(|(_, s)| s.format_html())
                                 .collect();
                             if !tg_summaries.is_empty() {
                                 if let Some(ref tg) = state.telegram_client {
@@ -1068,6 +1131,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                     }
                                 }
                             }
+                        }
+                        // Spec 005 T017: snapshot active groups to disk so the
+                        // dashboard can serve /api/incident-groups without
+                        // holding a lock on AgentState. Best-effort — failures
+                        // are logged and never break the tick.
+                        let snap = state.grouping_engine.snapshot_json();
+                        let path = cli.data_dir.join("incident-groups.json");
+                        if let Err(e) = std::fs::write(
+                            &path,
+                            serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
+                        ) {
+                            warn!(path = %path.display(), "incident-groups snapshot failed: {e}");
                         }
                     }
 
@@ -1496,6 +1571,81 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             state.last_intel_consolidation_at = Some(Instant::now());
                         }
 
+                        // ── Feedback tracker tick (spec 005 Phase 7) ──
+                        //
+                        // Once per hour: any pending notification that has
+                        // aged past 24h converts into an ignore event. Once
+                        // a (detector, entity_type) key accumulates 3 ignores,
+                        // future non-critical notifications are demoted.
+                        {
+                            let feedback_interval = std::time::Duration::from_secs(3_600);
+                            let due = state
+                                .last_feedback_tick_at
+                                .map(|t| t.elapsed() >= feedback_interval)
+                                .unwrap_or(true);
+                            if due {
+                                let events =
+                                    state.feedback_tracker.tick(chrono::Utc::now());
+                                if !events.is_empty() {
+                                    if let Err(e) =
+                                        notification_pipeline::feedback_store::append_many(
+                                            &cli.data_dir,
+                                            &events,
+                                        )
+                                    {
+                                        warn!("feedback tick persist failed: {e:#}");
+                                    }
+                                }
+                                state.last_feedback_tick_at = Some(Instant::now());
+                            }
+                        }
+
+                        // ── Environment periodic census (spec 005 Phase 6) ──
+                        //
+                        // Re-profiles the environment every
+                        // `census_interval_hours`, diffs against the stored
+                        // profile, appends diffs to census-YYYY-MM-DD.jsonl, and
+                        // emits incidents for suspicious additions (new human
+                        // UID, new cron). Service drift is audit-only.
+                        {
+                            let interval = std::time::Duration::from_secs(
+                                cfg.environment.census_interval_hours.saturating_mul(3600),
+                            );
+                            let due = state
+                                .last_env_census_at
+                                .map(|t| t.elapsed() >= interval)
+                                .unwrap_or(true);
+                            if due && cfg.environment.auto_profile && interval.as_secs() > 0 {
+                                let host = std::env::var("HOSTNAME")
+                                    .or_else(|_| {
+                                        std::fs::read_to_string("/etc/hostname")
+                                            .map(|s| s.trim().to_string())
+                                    })
+                                    .unwrap_or_else(|_| "unknown".to_string());
+                                let outcome = environment_profile::run_census(
+                                    &cli.data_dir,
+                                    &cfg.environment,
+                                    &state.environment_profile,
+                                    &host,
+                                );
+                                if let Some(new_profile) = outcome.new_profile {
+                                    state.environment_profile = new_profile;
+                                }
+                                if !outcome.incidents.is_empty() {
+                                    if let Some(store) = state.sqlite_store.as_ref() {
+                                        for inc in &outcome.incidents {
+                                            if let Err(e) = store.insert_incident(inc) {
+                                                warn!(
+                                                    "census incident persist failed: {e:#}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                state.last_env_census_at = Some(Instant::now());
+                            }
+                        }
+
                         // Cap attacker profiles to 10,000 by risk score
                         const MAX_ATTACKER_PROFILES: usize = 10_000;
                         if state.attacker_profiles.len() > MAX_ATTACKER_PROFILES {
@@ -1589,7 +1739,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             state.blocklist.insert(ip.clone());
                             // Mesh blocks are always contained -> daily briefing only.
                             let ctx = notification_gate::NotificationContext::for_mesh_block();
-                            let verdict = notification_gate::should_notify(&ctx);
+                            let gate_counter = state.telemetry.gate_suppressed_counter();
+                            let verdict = notification_gate::should_notify_with_counter(
+                                &ctx,
+                                gate_counter.as_ref(),
+                            );
                             match verdict {
                                 notification_gate::NotificationVerdict::SendNow => {
                                     if let Some(ref tg) = state.telegram_client {

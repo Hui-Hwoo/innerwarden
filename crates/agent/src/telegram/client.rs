@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,32 @@ pub struct TelegramClient {
     alerts_this_hour: Arc<std::sync::atomic::AtomicU32>,
     /// Hour when the alert counter was last reset.
     alert_counter_hour: Arc<std::sync::atomic::AtomicU32>,
+    /// Spec 024: when set via `INNERWARDEN_MOCK_TELEGRAM=1`, every outbound
+    /// HTTP call is intercepted and appended as a JSONL line to this path
+    /// instead of hitting api.telegram.org. Used by `scripts/scenario_qa.sh`
+    /// so deterministic scenario runs never touch the real Telegram API and
+    /// the outbox file becomes the authoritative record for envelope
+    /// assertions. Path override via `INNERWARDEN_MOCK_TELEGRAM_PATH`.
+    mock_outbox: Option<PathBuf>,
+    /// Cumulative count of successful sendMessage calls in real API mode.
+    /// This is wired to telemetry snapshots for spec-024 drift metrics.
+    telegram_sent_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+/// Returns the mock outbox path iff the process is running in mock telegram
+/// mode. Exposed so tests and the scenario runner can locate the JSONL file
+/// without duplicating the env var handling.
+pub fn mock_outbox_from_env() -> Option<PathBuf> {
+    let enabled = std::env::var("INNERWARDEN_MOCK_TELEGRAM")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True" | "yes"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let path = std::env::var("INNERWARDEN_MOCK_TELEGRAM_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/telegram-outbox.jsonl"));
+    Some(path)
 }
 
 impl TelegramClient {
@@ -45,6 +72,10 @@ impl TelegramClient {
             .timeout(Duration::from_secs(35))
             .build()
             .context("failed to build Telegram HTTP client")?;
+        let mock_outbox = mock_outbox_from_env();
+        if let Some(path) = &mock_outbox {
+            info!(path = %path.display(), "telegram client running in mock mode (spec 024)");
+        }
         Ok(Self {
             bot_token: bot_token.into(),
             chat_id: chat_id.into(),
@@ -62,7 +93,20 @@ impl TelegramClient {
                     .parse()
                     .unwrap_or(0),
             )),
+            mock_outbox,
+            telegram_sent_counter: None,
         })
+    }
+
+    /// Returns true when this client is intercepting outbound HTTP to a mock
+    /// JSONL outbox (spec 024 scenario harness). Primarily a hint for tests.
+    #[allow(dead_code)]
+    pub fn is_mock(&self) -> bool {
+        self.mock_outbox.is_some()
+    }
+
+    pub fn set_telegram_sent_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.telegram_sent_counter = Some(counter);
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -1331,6 +1375,13 @@ impl TelegramClient {
     // -----------------------------------------------------------------------
 
     async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
+        // Spec 024 mock path: scenario runs must never long-poll real Telegram.
+        // Sleep briefly so the caller's loop doesn't spin, then return empty.
+        if self.mock_outbox.is_some() {
+            let _ = offset;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return Ok(Vec::new());
+        }
         let url = self.api_url("getUpdates");
         let resp = self
             .http
@@ -1419,6 +1470,41 @@ impl TelegramClient {
             body.clone()
         };
 
+        // Spec 024 mock path: when the env-gated outbox is set, persist the
+        // call as a JSONL line and return a stubbed success response instead
+        // of performing any HTTP work. No rate limiter, no network — the
+        // scenario harness treats this file as the authoritative record of
+        // everything the agent would have sent.
+        if let Some(outbox) = &self.mock_outbox {
+            let text_snapshot = body["text"].as_str().unwrap_or("").to_string();
+            let record = serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "method": method,
+                "text": text_snapshot,
+                "body": body,
+            });
+            let line = record.to_string();
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(outbox)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    if let Err(e) = writeln!(f, "{line}") {
+                        warn!(path = %outbox.display(), "mock telegram outbox write failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!(path = %outbox.display(), "mock telegram outbox open failed: {e}");
+                }
+            }
+            return Ok(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            }));
+        }
+
         // Rate limiter: ~20 msg/sec, well within Telegram's 30/sec limit
         {
             let mut last = self.last_send.lock().await;
@@ -1451,6 +1537,10 @@ impl TelegramClient {
                 .as_str()
                 .unwrap_or("unknown Telegram error");
             warn!(method, url = %sanitize_url(&url), "Telegram API error: {desc}");
+        } else if method == "sendMessage" {
+            if let Some(counter) = &self.telegram_sent_counter {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         Ok(resp)
@@ -1682,6 +1772,8 @@ mod tests {
             )),
             alerts_this_hour: Arc::new(AtomicU32::new(0)),
             alert_counter_hour: Arc::new(AtomicU32::new(current_hour)),
+            mock_outbox: None,
+            telegram_sent_counter: None,
         })
     }
 
@@ -1786,6 +1878,22 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("Recommended action"));
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_message_increments_counter_in_real_api_mode() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let (_state, server, port, cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let mut client = build_test_client(port, cert_dir.path())?;
+        let sent_counter = Arc::new(AtomicU64::new(0));
+        client.set_telegram_sent_counter(sent_counter.clone());
+
+        client.send_text_message("counter-check").await?;
+        assert_eq!(sent_counter.load(Ordering::Relaxed), 1);
 
         server.abort();
         Ok(())
@@ -2677,7 +2785,7 @@ mod tests {
 
         let client = Arc::new(build_test_client(65001, cert_dir.path())?);
         let (tx, rx) = mpsc::channel::<ApprovalResult>(1);
-        let mut task = tokio::spawn(client.run_polling(tx));
+        let task = tokio::spawn(client.run_polling(tx));
 
         tokio::time::sleep(Duration::from_millis(250)).await;
         drop(rx);
@@ -2697,5 +2805,126 @@ mod tests {
 
         server.abort();
         Ok(())
+    }
+
+    // ─── Spec 024: mock-telegram env gate ───────────────────────────────
+    //
+    // These tests are serialized via a mutex because they mutate process-wide
+    // env vars (std::env::set_var is !Send-safe across parallel test cases).
+    // Guard rails: every test restores the prior env value before returning.
+    mod mock_env_tests {
+        use super::super::*;
+        use std::sync::Mutex;
+
+        // Serialize the whole mock-env block. `once_cell` is not needed —
+        // std::sync::Mutex::new is const since 1.63.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        fn with_env<F: FnOnce()>(enabled: Option<&str>, path: Option<&str>, body: F) {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_enabled = std::env::var("INNERWARDEN_MOCK_TELEGRAM").ok();
+            let prev_path = std::env::var("INNERWARDEN_MOCK_TELEGRAM_PATH").ok();
+            match enabled {
+                Some(v) => std::env::set_var("INNERWARDEN_MOCK_TELEGRAM", v),
+                None => std::env::remove_var("INNERWARDEN_MOCK_TELEGRAM"),
+            }
+            match path {
+                Some(v) => std::env::set_var("INNERWARDEN_MOCK_TELEGRAM_PATH", v),
+                None => std::env::remove_var("INNERWARDEN_MOCK_TELEGRAM_PATH"),
+            }
+            body();
+            match prev_enabled {
+                Some(v) => std::env::set_var("INNERWARDEN_MOCK_TELEGRAM", v),
+                None => std::env::remove_var("INNERWARDEN_MOCK_TELEGRAM"),
+            }
+            match prev_path {
+                Some(v) => std::env::set_var("INNERWARDEN_MOCK_TELEGRAM_PATH", v),
+                None => std::env::remove_var("INNERWARDEN_MOCK_TELEGRAM_PATH"),
+            }
+            drop(guard);
+        }
+
+        #[test]
+        fn mock_outbox_from_env_honors_flag_and_path() {
+            with_env(Some("1"), Some("/tmp/spec-024-outbox.jsonl"), || {
+                let path = mock_outbox_from_env().expect("mock mode enabled");
+                assert_eq!(path, std::path::PathBuf::from("/tmp/spec-024-outbox.jsonl"));
+            });
+        }
+
+        #[test]
+        fn mock_outbox_from_env_default_path_when_unset() {
+            with_env(Some("1"), None, || {
+                let path = mock_outbox_from_env().expect("mock mode enabled");
+                assert_eq!(path, std::path::PathBuf::from("/tmp/telegram-outbox.jsonl"));
+            });
+        }
+
+        #[test]
+        fn mock_outbox_from_env_returns_none_when_disabled() {
+            with_env(None, None, || {
+                assert!(mock_outbox_from_env().is_none());
+            });
+            with_env(Some("0"), None, || {
+                assert!(mock_outbox_from_env().is_none());
+            });
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn send_alert_html_writes_jsonl_line_in_mock_mode() -> anyhow::Result<()> {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::Arc;
+
+            let tmp = tempfile::tempdir()?;
+            let outbox = tmp.path().join("telegram-outbox.jsonl");
+            let outbox_str = outbox.to_string_lossy().to_string();
+            let sent_counter = Arc::new(AtomicU64::new(0));
+
+            // Build client under env lock, then drop env before awaiting — the
+            // client captures the outbox into its own field on construction.
+            let mut client = {
+                let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let prev_enabled = std::env::var("INNERWARDEN_MOCK_TELEGRAM").ok();
+                let prev_path = std::env::var("INNERWARDEN_MOCK_TELEGRAM_PATH").ok();
+                std::env::set_var("INNERWARDEN_MOCK_TELEGRAM", "1");
+                std::env::set_var("INNERWARDEN_MOCK_TELEGRAM_PATH", &outbox_str);
+                let c = TelegramClient::new("token-fake", "chat-fake", None)?;
+                match prev_enabled {
+                    Some(v) => std::env::set_var("INNERWARDEN_MOCK_TELEGRAM", v),
+                    None => std::env::remove_var("INNERWARDEN_MOCK_TELEGRAM"),
+                }
+                match prev_path {
+                    Some(v) => std::env::set_var("INNERWARDEN_MOCK_TELEGRAM_PATH", v),
+                    None => std::env::remove_var("INNERWARDEN_MOCK_TELEGRAM_PATH"),
+                }
+                c
+            };
+
+            assert!(client.is_mock());
+            client.set_telegram_sent_counter(sent_counter.clone());
+            client.send_raw_html("<b>spec-024</b>").await?;
+            client.send_text_message("payload").await?;
+            assert_eq!(
+                sent_counter.load(Ordering::Relaxed),
+                0,
+                "mock mode must not affect real-api telemetry counter"
+            );
+
+            let contents = std::fs::read_to_string(&outbox)?;
+            let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+            assert_eq!(lines.len(), 2, "one JSONL line per send_* call");
+            for line in &lines {
+                let v: serde_json::Value = serde_json::from_str(line)?;
+                assert_eq!(v["method"], "sendMessage");
+                assert!(v["ts"].as_str().is_some());
+                assert!(v["body"].is_object());
+            }
+            let first: serde_json::Value = serde_json::from_str(lines[0])?;
+            assert!(first["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("spec-024"));
+            Ok(())
+        }
     }
 }
