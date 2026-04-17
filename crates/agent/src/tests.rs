@@ -77,7 +77,7 @@ impl ai::AiProvider for CorrelationInspectingMockAiProvider {
 }
 
 /// Create a test incident (ssh brute-force from an external IP).
-fn test_incident(ip: &str) -> innerwarden_core::incident::Incident {
+pub(crate) fn test_incident(ip: &str) -> innerwarden_core::incident::Incident {
     innerwarden_core::incident::Incident {
         ts: chrono::Utc::now(),
         host: "test-host".to_string(),
@@ -92,7 +92,10 @@ fn test_incident(ip: &str) -> innerwarden_core::incident::Incident {
     }
 }
 
-fn test_incident_with_kind(ip: &str, kind: &str) -> innerwarden_core::incident::Incident {
+pub(crate) fn test_incident_with_kind(
+    ip: &str,
+    kind: &str,
+) -> innerwarden_core::incident::Incident {
     innerwarden_core::incident::Incident {
         ts: chrono::Utc::now(),
         host: "test-host".to_string(),
@@ -108,25 +111,50 @@ fn test_incident_with_kind(ip: &str, kind: &str) -> innerwarden_core::incident::
 }
 
 /// Write a minimal Incident JSON line (kept for backcompat with tests that need JSONL).
-fn incident_line(ip: &str) -> String {
+pub(crate) fn incident_line(ip: &str) -> String {
     serde_json::to_string(&test_incident(ip)).unwrap()
 }
 
-fn incident_line_with_kind(ip: &str, kind: &str) -> String {
+pub(crate) fn incident_line_with_kind(ip: &str, kind: &str) -> String {
     serde_json::to_string(&test_incident_with_kind(ip, kind)).unwrap()
 }
 
 /// Open a SQLite store in the temp dir and return it wrapped in Arc.
-fn test_sqlite_store(dir: &std::path::Path) -> Arc<innerwarden_store::Store> {
+pub(crate) fn test_sqlite_store(dir: &std::path::Path) -> Arc<innerwarden_store::Store> {
     Arc::new(innerwarden_store::Store::open(dir).unwrap())
 }
 
 /// Insert an incident into the SQLite store.
-fn insert_test_incident(
+pub(crate) fn insert_test_incident(
     store: &innerwarden_store::Store,
     incident: &innerwarden_core::incident::Incident,
 ) {
     store.insert_incident(incident).unwrap();
+}
+
+pub(crate) fn test_event(
+    kind: &str,
+    severity: innerwarden_core::event::Severity,
+    details: serde_json::Value,
+) -> innerwarden_core::event::Event {
+    innerwarden_core::event::Event {
+        ts: chrono::Utc::now(),
+        host: "test-host".to_string(),
+        source: "unit-test".to_string(),
+        kind: kind.to_string(),
+        severity,
+        summary: format!("test event: {kind}"),
+        details,
+        tags: vec![],
+        entities: vec![],
+    }
+}
+
+pub(crate) fn insert_test_event(
+    store: &innerwarden_store::Store,
+    event: &innerwarden_core::event::Event,
+) {
+    store.insert_event(event).unwrap();
 }
 
 fn sha256_hex_for_test(data: &str) -> String {
@@ -135,7 +163,7 @@ fn sha256_hex_for_test(data: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn triage_approval(incident_id: &str, operator: &str) -> telegram::ApprovalResult {
+pub(crate) fn triage_approval(incident_id: &str, operator: &str) -> telegram::ApprovalResult {
     telegram::ApprovalResult {
         incident_id: incident_id.to_string(),
         approved: true,
@@ -145,7 +173,7 @@ fn triage_approval(incident_id: &str, operator: &str) -> telegram::ApprovalResul
     }
 }
 
-fn triage_test_state(data_dir: &Path) -> AgentState {
+pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
     AgentState {
         skill_registry: skills::SkillRegistry::default_builtin(),
         blocklist: skills::Blocklist::default(),

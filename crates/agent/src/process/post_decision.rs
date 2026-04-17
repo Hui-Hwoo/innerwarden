@@ -370,6 +370,18 @@ pub(crate) async fn append_honeypot_marker_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn test_decision(action: ai::AiAction) -> ai::AiDecision {
+        ai::AiDecision {
+            action,
+            confidence: 0.9,
+            auto_execute: true,
+            reason: "unit test".to_string(),
+            alternatives: vec![],
+            estimated_threat: "high".to_string(),
+        }
+    }
 
     #[test]
     fn honeypot_runtime_maps_always_on_to_listener() {
@@ -393,5 +405,78 @@ mod tests {
         cfg.honeypot.mode = "unknown_mode".to_string();
         let runtime = honeypot_runtime(&cfg);
         assert_eq!(runtime.mode, "demo");
+    }
+
+    #[tokio::test]
+    async fn append_honeypot_marker_event_writes_demo_marker() {
+        let dir = TempDir::new().expect("tempdir");
+        let incident = crate::tests::test_incident("198.51.100.77");
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "demo".to_string();
+        let runtime = honeypot_runtime(&cfg);
+
+        let path =
+            append_honeypot_marker_event(dir.path(), &incident, "198.51.100.77", false, &runtime)
+                .await
+                .expect("marker append");
+        let contents = std::fs::read_to_string(path).expect("read events file");
+        assert!(contents.contains("\"kind\":\"honeypot.demo_decoy_hit\""));
+        assert!(contents.contains("\"simulation\":true"));
+    }
+
+    #[tokio::test]
+    async fn append_honeypot_marker_event_writes_listener_marker_when_live() {
+        let dir = TempDir::new().expect("tempdir");
+        let incident = crate::tests::test_incident("203.0.113.88");
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "listener".to_string();
+        cfg.honeypot.services = vec!["ssh".to_string(), "http".to_string()];
+        let runtime = honeypot_runtime(&cfg);
+
+        let path =
+            append_honeypot_marker_event(dir.path(), &incident, "203.0.113.88", false, &runtime)
+                .await
+                .expect("marker append");
+        let contents = std::fs::read_to_string(path).expect("read events file");
+        assert!(contents.contains("\"kind\":\"honeypot.listener_session_started\""));
+        assert!(contents.contains("\"simulation\":false"));
+    }
+
+    #[tokio::test]
+    async fn execute_decision_skips_suspend_user_when_skill_not_allowed() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident("203.0.113.12");
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.allowed_skills.clear();
+        let decision = test_decision(ai::AiAction::SuspendUserSudo {
+            user: "ubuntu".to_string(),
+            duration_secs: 300,
+        });
+
+        let (message, cloudflare_pushed) =
+            execute_decision(&decision, &incident, dir.path(), &cfg, &mut state).await;
+
+        assert!(message.contains("not in allowed_skills"));
+        assert!(!cloudflare_pushed);
+    }
+
+    #[tokio::test]
+    async fn execute_decision_skips_container_block_when_skill_not_allowed() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident("203.0.113.13");
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.allowed_skills.clear();
+        let decision = test_decision(ai::AiAction::BlockContainer {
+            container_id: "container-1".to_string(),
+            action: "pause".to_string(),
+        });
+
+        let (message, cloudflare_pushed) =
+            execute_decision(&decision, &incident, dir.path(), &cfg, &mut state).await;
+
+        assert!(message.contains("not in allowed_skills"));
+        assert!(!cloudflare_pushed);
     }
 }

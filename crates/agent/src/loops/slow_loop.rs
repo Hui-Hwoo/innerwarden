@@ -710,3 +710,145 @@ pub(crate) fn operator_ips_from_who_output(
     }
     active_ips
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::knowledge_graph::types::Node;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    #[test]
+    fn operator_ips_from_who_output_filters_and_strips_parentheses() {
+        let now = std::time::Instant::now();
+        let trusted = vec!["ubuntu".to_string(), "ops".to_string()];
+        let who = "\
+ubuntu pts/0 2026-04-17 10:00 (198.51.100.42)
+guest pts/1 2026-04-17 10:01 (198.51.100.43)
+ops pts/2 2026-04-17 10:02 (:)
+ops pts/3 2026-04-17 10:03 (203.0.113.8)
+";
+
+        let ips = operator_ips_from_who_output(who, &trusted, now);
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains_key("198.51.100.42"));
+        assert!(ips.contains_key("203.0.113.8"));
+        assert!(!ips.contains_key("198.51.100.43"));
+    }
+
+    #[test]
+    fn proc_status_helpers_parse_expected_fields() {
+        let status = "Name:\tagent\nTgid:\t4242\nPPid:\t7\n";
+        assert_eq!(status_tgid(status), Some(4242));
+        assert_eq!(status_ppid(status), Some(7));
+        assert_eq!(status_field_u32(status, "Pid:"), None);
+    }
+
+    #[test]
+    fn backfill_graph_decisions_ingests_missing_decision_and_dismisses_orphans() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let incident_with_jsonl = crate::tests::test_incident("198.51.100.50");
+        let orphan_incident = crate::tests::test_incident_with_kind("198.51.100.51", "orphan");
+        {
+            let mut graph = state.knowledge_graph.write().expect("graph write");
+            graph.ingest_incident(&incident_with_jsonl);
+            graph.ingest_incident(&orphan_incident);
+        }
+
+        let entry = crate::decisions::DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: incident_with_jsonl.incident_id.clone(),
+            host: incident_with_jsonl.host.clone(),
+            ai_provider: "mock".to_string(),
+            action_type: "block_ip".to_string(),
+            target_ip: Some("198.51.100.50".to_string()),
+            target_user: None,
+            skill_id: Some("block-ip-ufw".to_string()),
+            confidence: 0.97,
+            auto_executed: true,
+            dry_run: false,
+            reason: "unit test".to_string(),
+            estimated_threat: "high".to_string(),
+            execution_result: "ok".to_string(),
+            prev_hash: None,
+        };
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let decisions_path = dir.path().join(format!("decisions-{today}.jsonl"));
+        let line = serde_json::to_string(&entry).expect("serialize decision");
+        std::fs::write(&decisions_path, format!("{line}\n")).expect("write decisions file");
+
+        backfill_graph_decisions(dir.path(), &mut state);
+
+        let graph = state.knowledge_graph.read().expect("graph read");
+        let id1 = graph
+            .find_by_incident(&incident_with_jsonl.incident_id)
+            .expect("incident present");
+        let id2 = graph
+            .find_by_incident(&orphan_incident.incident_id)
+            .expect("orphan present");
+        match graph.get_node(id1) {
+            Some(Node::Incident {
+                decision: Some(decision),
+                ..
+            }) => assert_eq!(decision, "block_ip"),
+            other => panic!("expected incident decision to be backfilled, got {other:?}"),
+        }
+        match graph.get_node(id2) {
+            Some(Node::Incident {
+                decision: Some(decision),
+                ..
+            }) => assert_eq!(decision, "dismiss"),
+            other => panic!("expected orphan incident to be dismissed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_narrative_tick_reads_sqlite_events_and_updates_operator_ips() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let event = crate::tests::test_event(
+            "ssh.login_success",
+            innerwarden_core::event::Severity::Info,
+            serde_json::json!({
+                "method": "publickey",
+                "ip": "198.51.100.99",
+                "user": "ubuntu",
+                "pid": std::process::id(),
+                "comm": "innerwarden-agent",
+            }),
+        );
+        crate::tests::insert_test_event(&store, &event);
+        state.sqlite_store = Some(store);
+        state.last_graph_snapshot = std::time::Instant::now() - Duration::from_secs(90);
+        state.last_dna_save = std::time::Instant::now() - Duration::from_secs(360);
+        state.last_killchain_cleanup = std::time::Instant::now() - Duration::from_secs(90);
+        state.deep_security_snapshot = Some(std::sync::Arc::new(std::sync::RwLock::new(
+            crate::dashboard::DeepSecuritySnapshot::default(),
+        )));
+        let cfg = config::AgentConfig::default();
+        let mut cursor = reader::AgentCursor::default();
+
+        let count = process_narrative_tick(dir.path(), &mut cursor, &cfg, &mut state)
+            .await
+            .expect("narrative tick");
+
+        assert_eq!(count, 1);
+        assert!(state.operator_ips.contains_key("198.51.100.99"));
+    }
+
+    #[tokio::test]
+    async fn process_narrative_tick_returns_zero_without_sqlite_store() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+        let mut cursor = reader::AgentCursor::default();
+
+        let count = process_narrative_tick(dir.path(), &mut cursor, &cfg, &mut state)
+            .await
+            .expect("narrative tick");
+
+        assert_eq!(count, 0);
+    }
+}

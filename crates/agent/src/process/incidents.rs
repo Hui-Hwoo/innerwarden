@@ -631,3 +631,107 @@ pub(crate) async fn process_incidents(
 
     handled
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn advisory_cache() -> Arc<RwLock<VecDeque<AdvisoryEntry>>> {
+        Arc::new(RwLock::new(VecDeque::new()))
+    }
+
+    #[tokio::test]
+    async fn process_incidents_returns_zero_without_sqlite_store() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cursor = reader::AgentCursor::default();
+        let cfg = config::AgentConfig::default();
+
+        let handled =
+            process_incidents(dir.path(), &mut cursor, &cfg, &mut state, &advisory_cache()).await;
+
+        assert_eq!(handled, 0);
+    }
+
+    #[tokio::test]
+    async fn process_incidents_prunes_expired_pending_entries_without_new_incidents() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        state.sqlite_store = Some(store);
+        state.pending_confirmations.insert(
+            "expired".to_string(),
+            (
+                crate::telegram::PendingConfirmation {
+                    incident_id: "inc-1".to_string(),
+                    telegram_message_id: 1,
+                    action_description: "test".to_string(),
+                    created_at: chrono::Utc::now() - chrono::Duration::minutes(10),
+                    expires_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+                    detector: "ssh_bruteforce".to_string(),
+                    action_name: "block_ip".to_string(),
+                },
+                crate::ai::AiDecision::ignore("test pending confirmation"),
+                crate::tests::test_incident("198.51.100.10"),
+            ),
+        );
+        state.pending_honeypot_choices.insert(
+            "198.51.100.10".to_string(),
+            crate::PendingHoneypotChoice {
+                ip: "198.51.100.10".to_string(),
+                incident_id: "inc-2".to_string(),
+                incident: crate::tests::test_incident("198.51.100.10"),
+                expires_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+            },
+        );
+        let mut cursor = reader::AgentCursor::default();
+        let cfg = config::AgentConfig::default();
+
+        let handled =
+            process_incidents(dir.path(), &mut cursor, &cfg, &mut state, &advisory_cache()).await;
+
+        assert_eq!(handled, 0);
+        assert!(state.pending_confirmations.is_empty());
+        assert!(state.pending_honeypot_choices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_incidents_trips_circuit_breaker_on_burst() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        crate::tests::insert_test_incident(&store, &crate::tests::test_incident("203.0.113.20"));
+        state.sqlite_store = Some(store);
+        let mut cfg = config::AgentConfig::default();
+        cfg.ai.enabled = false;
+        cfg.ai.circuit_breaker_threshold = 1;
+        cfg.ai.circuit_breaker_cooldown_secs = 30;
+        let mut cursor = reader::AgentCursor::default();
+
+        let handled =
+            process_incidents(dir.path(), &mut cursor, &cfg, &mut state, &advisory_cache()).await;
+
+        assert!(handled >= 1);
+        assert!(state.circuit_breaker_until.is_some());
+    }
+
+    #[tokio::test]
+    async fn process_incidents_suppresses_graph_only_detector_incident() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        let incident = crate::tests::test_incident_with_kind("203.0.113.21", "graph_only_signal");
+        crate::tests::insert_test_incident(&store, &incident);
+        state.sqlite_store = Some(store);
+        let mut cfg = config::AgentConfig::default();
+        cfg.ai.enabled = false;
+        cfg.graph_only_detectors = vec!["graph_only_signal".to_string()];
+        let mut cursor = reader::AgentCursor::default();
+
+        let handled =
+            process_incidents(dir.path(), &mut cursor, &cfg, &mut state, &advisory_cache()).await;
+
+        assert_eq!(handled, 1);
+    }
+}

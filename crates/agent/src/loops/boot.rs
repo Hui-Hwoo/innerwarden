@@ -1802,6 +1802,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::TempDir;
 
     fn once_cli(data_dir: std::path::PathBuf) -> crate::Cli {
@@ -1843,11 +1844,165 @@ mod tests {
         assert!(msg.contains("No dated snapshot found"));
     }
 
+    #[test]
+    fn cleanup_015_creates_timestamped_backup_when_snapshot_exists() {
+        let dir = TempDir::new().expect("tempdir");
+        let snapshot_path = knowledge_graph::KnowledgeGraph::dated_snapshot_path(dir.path());
+        let graph = knowledge_graph::KnowledgeGraph::new();
+        graph
+            .save_snapshot(&snapshot_path)
+            .expect("save baseline snapshot");
+
+        run_cleanup_015(dir.path()).expect("cleanup should succeed");
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            entries.iter().any(|name| name.contains(".bak-015-")),
+            "cleanup should create a .bak-015-* backup"
+        );
+    }
+
+    #[test]
+    fn backfill_015_creates_timestamped_backup_when_snapshot_exists() {
+        let dir = TempDir::new().expect("tempdir");
+        let snapshot_path = knowledge_graph::KnowledgeGraph::dated_snapshot_path(dir.path());
+        let graph = knowledge_graph::KnowledgeGraph::new();
+        graph
+            .save_snapshot(&snapshot_path)
+            .expect("save baseline snapshot");
+
+        run_backfill_015_research_only(dir.path()).expect("backfill should succeed");
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.contains(".bak-015-researchonly-")),
+            "backfill should create a .bak-015-researchonly-* backup"
+        );
+    }
+
     #[tokio::test]
     async fn run_agent_once_boots_with_empty_data_dir() {
         let dir = TempDir::new().expect("tempdir");
         let cli = once_cli(dir.path().to_path_buf());
         let result = run_agent(cli).await;
         assert!(result.is_ok(), "run_agent once-mode failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn run_agent_report_mode_generates_trial_report_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut cli = once_cli(dir.path().to_path_buf());
+        cli.report = true;
+        cli.once = false;
+
+        let result = run_agent(cli).await;
+        assert!(result.is_ok(), "run_agent report-mode failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn run_agent_once_with_dashboard_enabled() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut cli = once_cli(dir.path().to_path_buf());
+        cli.dashboard = true;
+        cli.dashboard_bind = "127.0.0.1:0".to_string();
+
+        let result = run_agent(cli).await;
+        assert!(
+            result.is_ok(),
+            "run_agent dashboard once-mode failed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_once_with_feature_rich_config_exercises_optional_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg_path = dir.path().join("agent.toml");
+        let mut cfg_file = std::fs::File::create(&cfg_path).expect("create config");
+        writeln!(
+            cfg_file,
+            r#"
+[ai]
+enabled = true
+provider = "ollama"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434"
+
+[responder]
+enabled = true
+dry_run = true
+block_backend = "ufw"
+allowed_skills = ["block-ip-ufw", "honeypot", "suspend-user-sudo", "kill-process", "block-container"]
+
+[telegram]
+enabled = true
+bot_token = "bot-token"
+chat_id = "1234"
+dev_mode = true
+
+[slack]
+enabled = true
+webhook_url = ""
+
+[cloudflare]
+enabled = true
+api_token = ""
+zone_id = ""
+
+[abuseipdb]
+enabled = true
+api_key = ""
+
+[crowdsec]
+enabled = true
+
+[geoip]
+enabled = true
+
+[fail2ban]
+enabled = true
+
+[mesh]
+enabled = true
+bind = "127.0.0.1:0"
+peers = []
+
+[threat_feeds]
+ioc_feed_urls = ["https://example.invalid/ioc-feed.txt"]
+
+[webhook]
+enabled = true
+url = "http://127.0.0.1:9/hooks"
+"#
+        )
+        .expect("write config");
+
+        let mut cli = once_cli(dir.path().to_path_buf());
+        cli.config = Some(cfg_path);
+
+        let result = run_agent(cli).await;
+        assert!(
+            result.is_ok(),
+            "run_agent feature-rich config failed: {result:?}"
+        );
     }
 }
