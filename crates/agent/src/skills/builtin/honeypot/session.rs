@@ -11,7 +11,7 @@ use super::{http_interact, ssh_interact};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -19,9 +19,15 @@ use tracing::{info, warn};
 
 use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
-const SSH_BANNER: &[u8] = b"SSH-2.0-OpenSSH_9.2p1 Ubuntu-4ubuntu0.5\r\n";
-const HTTP_BANNER: &[u8] =
-    b"HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+use super::audit::{
+    bytes_to_hex, guess_protocol, sanitize_transcript, sha256_hex, truncate_preview,
+};
+pub(crate) use super::banner::normalize_interaction;
+use super::banner::{banner_for_service, is_loopback_bind, normalize_isolation_profile};
+#[cfg(test)]
+use super::banner::{HTTP_BANNER, SSH_BANNER};
+use super::containment::{build_jail_command, build_namespace_command};
+
 const PAYLOAD_READ_TIMEOUT_MS: u64 = 700;
 const DEFAULT_LOCK_FILE: &str = "listener-active.lock";
 const SANDBOX_GRACE_SECS: u64 = 30;
@@ -1355,29 +1361,6 @@ async fn run_pcap_handoff(
     status
 }
 
-fn build_namespace_command(
-    namespace_runner: &str,
-    namespace_args: &[String],
-    runner: &Path,
-) -> Command {
-    let mut namespace_cmd = Command::new(namespace_runner);
-    namespace_cmd
-        .args(namespace_args)
-        .arg(runner)
-        .arg("--honeypot-sandbox-runner");
-    namespace_cmd
-}
-
-fn build_jail_command(jail_runner: &str, jail_args: &[String], runner: &Path) -> Command {
-    let mut jail_cmd = Command::new(jail_runner);
-    jail_cmd.args(jail_args);
-    if !jail_args.iter().any(|arg| arg == "--") {
-        jail_cmd.arg("--");
-    }
-    jail_cmd.arg(runner).arg("--honeypot-sandbox-runner");
-    jail_cmd
-}
-
 async fn collect_artifact_lifecycle(
     metadata_path: &Path,
     evidence_path: &Path,
@@ -1885,19 +1868,6 @@ fn is_command_allowed(command: &str, allowed_commands: &[String]) -> bool {
     })
 }
 
-fn truncate_preview(value: &str, max_chars: usize) -> String {
-    let mut out = value.chars().take(max_chars).collect::<String>();
-    if value.chars().count() > max_chars {
-        out.push_str("...");
-    }
-    out
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    bytes_to_hex(digest.as_slice())
-}
-
 async fn run_listener(
     endpoint: DecoyEndpoint,
     listener: TcpListener,
@@ -2194,55 +2164,6 @@ async fn capture_payload(
     }
 }
 
-fn bytes_to_hex(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len() * 2);
-    for b in data {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{b:02x}");
-    }
-    out
-}
-
-fn sanitize_transcript(data: &[u8], preview_limit: usize) -> String {
-    let mut out = String::new();
-    for &b in data.iter().take(preview_limit) {
-        match b {
-            b'\r' => out.push_str("\\r"),
-            b'\n' => out.push_str("\\n"),
-            b'\t' => out.push_str("\\t"),
-            0x20..=0x7e => out.push(char::from(b)),
-            _ => out.push('.'),
-        }
-    }
-    out
-}
-
-fn guess_protocol(data: &[u8]) -> String {
-    if data.is_empty() {
-        return "none".to_string();
-    }
-    if data.starts_with(b"SSH-") {
-        return "ssh".to_string();
-    }
-    if data.starts_with(b"GET ")
-        || data.starts_with(b"POST ")
-        || data.starts_with(b"HEAD ")
-        || data.windows(5).any(|w| w == b"HTTP/")
-    {
-        return "http".to_string();
-    }
-
-    let printable = data
-        .iter()
-        .filter(|&&b| matches!(b, 0x20..=0x7e | b'\r' | b'\n' | b'\t'))
-        .count();
-    if printable * 100 / data.len().max(1) >= 70 {
-        "text".to_string()
-    } else {
-        "binary".to_string()
-    }
-}
-
 fn build_endpoints(
     runtime: &crate::skills::HoneypotRuntimeConfig,
     bind_addr: &str,
@@ -2299,41 +2220,6 @@ fn build_endpoints(
     }
 
     Ok(endpoints)
-}
-
-fn banner_for_service(service: &str) -> Result<&'static [u8], String> {
-    match service.to_ascii_lowercase().as_str() {
-        "ssh" => Ok(SSH_BANNER),
-        "http" => Ok(HTTP_BANNER),
-        other => Err(format!(
-            "unsupported service '{other}' (supported: ssh, http)"
-        )),
-    }
-}
-
-fn is_loopback_bind(bind_addr: &str) -> bool {
-    bind_addr
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
-}
-
-fn normalize_isolation_profile(profile: &str) -> &'static str {
-    if profile.eq_ignore_ascii_case("standard") {
-        "standard"
-    } else {
-        "strict_local"
-    }
-}
-
-pub(crate) fn normalize_interaction(level: &str) -> String {
-    if level.eq_ignore_ascii_case("medium") {
-        "medium".to_string()
-    } else if level.eq_ignore_ascii_case("llm_shell") {
-        "llm_shell".to_string()
-    } else {
-        "banner".to_string()
-    }
 }
 
 fn normalize_containment_mode(mode: &str) -> &'static str {
