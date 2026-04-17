@@ -295,7 +295,12 @@ fn telemetry_path_for_date(data_dir: &Path, date: &str) -> Option<std::path::Pat
     // Validate date format strictly - reject anything that isn't YYYY-MM-DD.
     let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
     let safe_date = parsed.format("%Y-%m-%d").to_string();
-    Some(data_dir.join(format!("telemetry-{safe_date}.jsonl")))
+    let canonical = std::fs::canonicalize(data_dir).ok()?;
+    let target = canonical.join(format!("telemetry-{safe_date}.jsonl"));
+    if !target.starts_with(&canonical) {
+        return None;
+    }
+    Some(target)
 }
 
 #[cfg(test)]
