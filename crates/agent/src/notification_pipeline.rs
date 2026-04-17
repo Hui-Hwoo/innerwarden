@@ -753,6 +753,114 @@ pub(crate) mod feedback_store {
 }
 
 // ---------------------------------------------------------------------------
+// Spec 005 Phase 8 — AI Batch Triage
+// ---------------------------------------------------------------------------
+//
+// At window close, batch every closed-group summary into a single prompt and
+// ask the AI to classify each as URGENT / INFO / SUPPRESS. The result drives
+// the Telegram dispatch for ambiguous cases: URGENT is forwarded even when
+// the per-group ChannelFilter would have deferred, SUPPRESS downgrades an
+// otherwise-actionable summary to daily-briefing, INFO is the default.
+//
+// Disabled by default (spec 005 §Phase 8, `[ai].batch_triage`). On AI API
+// failure the caller MUST fall back to per-group classification — this
+// module never hides errors from the caller.
+
+/// Per-group classification from the batched AI call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchClassification {
+    Urgent,
+    Info,
+    Suppress,
+}
+
+/// Build a batched prompt from a slice of GroupSummary. The prompt is a
+/// plain-text list numbered for easy parsing, plus an instruction block.
+/// Each line includes detector, entity, severity, count, and auto-resolved
+/// status. Returns None when there is nothing to triage.
+pub(crate) fn build_batch_prompt(summaries: &[GroupSummary]) -> Option<String> {
+    if summaries.is_empty() {
+        return None;
+    }
+    let mut prompt = String::from(
+        "You are a security operator classifying incident groups. For each \
+         line below, respond with one of:\n\
+         - URGENT: immediate operator attention needed\n\
+         - INFO:   informational, include in briefing only\n\
+         - SUPPRESS: routine noise, drop entirely\n\n\
+         Respond with one line per group in the format `N: URGENT` where N \
+         is the group index. Do not include any other text.\n\n\
+         Groups:\n",
+    );
+    for (idx, s) in summaries.iter().enumerate() {
+        prompt.push_str(&format!(
+            "{idx}: detector={} entity_type={:?} entity={} count={} severity={:?} auto_resolved={}\n",
+            s.detector, s.entity_type, s.entity_value, s.count, s.severity_max, s.auto_resolved
+        ));
+    }
+    Some(prompt)
+}
+
+/// Parse the AI response text into (index, classification) pairs. Lines that
+/// don't match the expected format are skipped. Indexes may be out of order;
+/// the caller is responsible for aligning them to the original slice.
+pub(crate) fn parse_batch_response(text: &str) -> Vec<(usize, BatchClassification)> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // `3: URGENT` | `3:URGENT` | `3 URGENT` | `3 - URGENT` — tolerate
+        // common AI-response shapes.
+        let (idx_part, class_part) = match line.find(|c: char| !c.is_ascii_digit()) {
+            Some(i) => (&line[..i], line[i..].trim_start_matches([':', '-', ' ', '\t'])),
+            None => continue,
+        };
+        let Ok(idx) = idx_part.parse::<usize>() else {
+            continue;
+        };
+        let up = class_part.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let class = match up.as_str() {
+            "URGENT" => BatchClassification::Urgent,
+            "INFO" => BatchClassification::Info,
+            "SUPPRESS" => BatchClassification::Suppress,
+            _ => continue,
+        };
+        out.push((idx, class));
+    }
+    out
+}
+
+/// Run the AI chat provider with the batch prompt, parse the response, and
+/// return the classifications aligned 1:1 with the input slice. On failure,
+/// returns None so the caller can fall back to per-group classification.
+///
+/// Used by the slow loop when `ai.batch_triage = true`.
+pub(crate) async fn run_batch_triage(
+    provider: &dyn crate::ai::AiProvider,
+    summaries: &[GroupSummary],
+) -> Option<Vec<BatchClassification>> {
+    let prompt = build_batch_prompt(summaries)?;
+    let system = "You are a terse incident classifier. Output one line per group, no prose.";
+    let response = match provider.chat(system, &prompt).await {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!("batch triage AI call failed: {e:#}");
+            return None;
+        }
+    };
+    let parsed = parse_batch_response(&response);
+    let mut out = vec![BatchClassification::Info; summaries.len()];
+    for (idx, class) in parsed {
+        if idx < out.len() {
+            out[idx] = class;
+        }
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // Digest Stats — accumulated from closed groups
 // ---------------------------------------------------------------------------
 
@@ -1527,6 +1635,65 @@ mod tests {
         };
         t.replay_event(&action, Utc::now());
         assert!(!t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+    }
+
+    // ─── Spec 005 Phase 8 — AI batch triage tests ────────────────────
+
+    fn summary(detector: &str, entity: &str, count: u32, auto: bool) -> GroupSummary {
+        GroupSummary {
+            detector: detector.into(),
+            entity_type: EntityType::Ip,
+            entity_value: entity.into(),
+            count,
+            severity_max: Severity::High,
+            auto_resolved: auto,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn build_batch_prompt_is_none_when_empty() {
+        assert!(build_batch_prompt(&[]).is_none());
+    }
+
+    #[test]
+    fn build_batch_prompt_lists_each_group_on_its_own_line() {
+        let s1 = summary("ssh_bruteforce", "1.2.3.4", 42, true);
+        let s2 = summary("port_scan", "5.6.7.8", 3, false);
+        let prompt = build_batch_prompt(&[s1, s2]).unwrap();
+        assert!(prompt.contains("URGENT"));
+        assert!(prompt.contains("INFO"));
+        assert!(prompt.contains("SUPPRESS"));
+        assert!(prompt.contains("detector=ssh_bruteforce"));
+        assert!(prompt.contains("entity=5.6.7.8"));
+        // Each group is on its own numbered line.
+        assert!(prompt.contains("\n0: "));
+        assert!(prompt.contains("\n1: "));
+    }
+
+    #[test]
+    fn parse_batch_response_understands_common_shapes() {
+        let text = "0: URGENT\n1:INFO\n2 - SUPPRESS\n3 urgent\n";
+        let out = parse_batch_response(text);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], (0, BatchClassification::Urgent));
+        assert_eq!(out[1], (1, BatchClassification::Info));
+        assert_eq!(out[2], (2, BatchClassification::Suppress));
+        assert_eq!(out[3], (3, BatchClassification::Urgent));
+    }
+
+    #[test]
+    fn parse_batch_response_skips_garbage_lines() {
+        let text = "Sure, here are my classifications:\n\
+                    0: URGENT\n\
+                    (I'm not entirely sure about the second one)\n\
+                    1: SUPPRESS\n\
+                    Let me know if you want me to revise.\n";
+        let out = parse_batch_response(text);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], (0, BatchClassification::Urgent));
+        assert_eq!(out[1], (1, BatchClassification::Suppress));
     }
 
     #[test]

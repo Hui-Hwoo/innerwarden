@@ -1074,12 +1074,44 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     {
                         let summaries = state.grouping_engine.tick();
                         if !summaries.is_empty() {
+                            // Spec 005 Phase 8 — optional AI batch triage.
+                            // When enabled, one AI call classifies every
+                            // summary (URGENT / INFO / SUPPRESS); URGENT
+                            // always gets through, SUPPRESS always drops,
+                            // INFO falls back to the per-channel filter. On
+                            // AI failure, classifications stay unset and the
+                            // normal filter path runs — spec § fallback.
+                            let batch_classes: Option<Vec<notification_pipeline::BatchClassification>> =
+                                if cfg.ai.batch_triage {
+                                    if let Some(provider) = state.ai_provider.as_ref() {
+                                        notification_pipeline::run_batch_triage(
+                                            provider.as_ref(),
+                                            &summaries,
+                                        )
+                                        .await
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
                             let tg_level = cfg.telegram.channel_notifications.notification_level;
                             let tg_summaries: Vec<String> = summaries
                                 .iter()
-                                .filter(|s| notification_pipeline::should_notify_summary(s, tg_level))
-                                .filter(|s| notification_pipeline::is_immediate_threat_summary(s))
-                                .map(|s| s.format_html())
+                                .enumerate()
+                                .filter(|(idx, s)| {
+                                    use notification_pipeline::BatchClassification;
+                                    match batch_classes.as_ref().and_then(|v| v.get(*idx)) {
+                                        Some(BatchClassification::Urgent) => true,
+                                        Some(BatchClassification::Suppress) => false,
+                                        // Info or no triage: defer to normal filter.
+                                        _ => {
+                                            notification_pipeline::should_notify_summary(s, tg_level)
+                                                && notification_pipeline::is_immediate_threat_summary(s)
+                                        }
+                                    }
+                                })
+                                .map(|(_, s)| s.format_html())
                                 .collect();
                             if !tg_summaries.is_empty() {
                                 if let Some(ref tg) = state.telegram_client {
