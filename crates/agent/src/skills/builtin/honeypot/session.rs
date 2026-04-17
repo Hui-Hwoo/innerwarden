@@ -3200,4 +3200,292 @@ mod tests {
         append_unique_args(&mut target, &extras);
         assert_eq!(target, vec!["--foo", "--bar", "--baz"]);
     }
+
+    #[test]
+    fn banner_lookup_is_case_insensitive_and_rejects_unknown_services() {
+        let ssh = banner_for_service("SSH").expect("ssh banner should exist");
+        let http = banner_for_service("Http").expect("http banner should exist");
+        let err = banner_for_service("smtp").expect_err("smtp should be rejected");
+
+        assert_eq!(ssh, SSH_BANNER);
+        assert_eq!(http, HTTP_BANNER);
+        assert!(err.contains("unsupported service"));
+    }
+
+    #[test]
+    fn build_endpoints_defaults_and_dedups_services() {
+        let default_runtime = HoneypotRuntimeConfig {
+            services: vec![],
+            ..HoneypotRuntimeConfig::default()
+        };
+        let default_endpoints = build_endpoints(&default_runtime, "127.0.0.1")
+            .expect("default endpoints should be valid");
+        assert_eq!(default_endpoints.len(), 1);
+        assert_eq!(default_endpoints[0].service, "ssh");
+
+        let dedup_runtime = HoneypotRuntimeConfig {
+            services: vec![
+                "ssh".to_string(),
+                "ssh".to_string(),
+                "http".to_string(),
+                "http".to_string(),
+            ],
+            ..HoneypotRuntimeConfig::default()
+        };
+        let dedup_endpoints =
+            build_endpoints(&dedup_runtime, "127.0.0.1").expect("dedup endpoints should be valid");
+        assert_eq!(dedup_endpoints.len(), 2);
+    }
+
+    #[test]
+    fn build_endpoints_rejects_invalid_ports() {
+        let zero_port_runtime = HoneypotRuntimeConfig {
+            services: vec!["ssh".to_string()],
+            port: 0,
+            ..HoneypotRuntimeConfig::default()
+        };
+        let zero_err =
+            build_endpoints(&zero_port_runtime, "127.0.0.1").expect_err("port 0 must be rejected");
+        assert!(zero_err.contains("invalid port 0"));
+
+        let duplicate_port_runtime = HoneypotRuntimeConfig {
+            services: vec!["ssh".to_string(), "http".to_string()],
+            port: 2222,
+            http_port: 2222,
+            ..HoneypotRuntimeConfig::default()
+        };
+        let dup_err = build_endpoints(&duplicate_port_runtime, "127.0.0.1")
+            .expect_err("duplicate ports must be rejected");
+        assert!(dup_err.contains("duplicate listener port"));
+    }
+
+    #[test]
+    fn isolation_and_bind_guards_cover_non_loopback_and_invalid_ip() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("not-an-ip"));
+
+        assert_eq!(normalize_isolation_profile("standard"), "standard");
+        assert_eq!(normalize_isolation_profile("STANDARD"), "standard");
+        assert_eq!(normalize_isolation_profile("anything-else"), "strict_local");
+    }
+
+    #[test]
+    fn preview_redirect_commands_respects_flags_and_backend() {
+        let endpoints = vec![
+            DecoyEndpoint {
+                service: "ssh".to_string(),
+                bind_addr: "127.0.0.1".to_string(),
+                listen_port: 2222,
+                redirect_from_port: 22,
+                banner: SSH_BANNER,
+            },
+            DecoyEndpoint {
+                service: "http".to_string(),
+                bind_addr: "127.0.0.1".to_string(),
+                listen_port: 8080,
+                redirect_from_port: 80,
+                banner: HTTP_BANNER,
+            },
+        ];
+        let ip = "1.2.3.4".parse::<IpAddr>().expect("IP should parse");
+
+        assert!(preview_redirect_commands(&endpoints, ip, false, "iptables").is_empty());
+        assert!(preview_redirect_commands(&endpoints, ip, true, "nftables").is_empty());
+
+        let commands = preview_redirect_commands(&endpoints, ip, true, "iptables");
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].contains("--dport 22"));
+        assert!(commands[1].contains("--dport 80"));
+    }
+
+    #[test]
+    fn redirect_rule_args_changes_operation_flag() {
+        let rule = RedirectRuleStatus {
+            service: "ssh".to_string(),
+            target_ip: "1.2.3.4".to_string(),
+            from_port: 22,
+            to_port: 2222,
+            add_command: String::new(),
+            remove_command: String::new(),
+            applied: true,
+            apply_error: None,
+            cleanup_ok: None,
+            cleanup_error: None,
+            cleanup_verified_absent: None,
+        };
+        let delete_args = redirect_rule_args(&rule, "D");
+        let check_args = redirect_rule_args(&rule, "C");
+        assert!(delete_args.iter().any(|arg| arg == "-D"));
+        assert!(check_args.iter().any(|arg| arg == "-C"));
+    }
+
+    #[test]
+    fn protocol_guess_handles_text_and_binary_payloads() {
+        assert_eq!(guess_protocol(b"hello world\n"), "text");
+        assert_eq!(guess_protocol(&[0, 159, 146, 150]), "binary");
+    }
+
+    #[test]
+    fn transcript_and_preview_helpers_cover_control_characters() {
+        let transcript = sanitize_transcript(b"a\tb\rc\n\x01", 16);
+        assert!(transcript.contains("\\t"));
+        assert!(transcript.contains("\\r"));
+        assert!(transcript.contains("\\n"));
+        assert!(transcript.contains('.'));
+
+        assert_eq!(truncate_preview("abc", 8), "abc");
+        assert_eq!(truncate_preview("123456789", 5), "12345...");
+    }
+
+    #[test]
+    fn attestation_defaults_and_parser_failures_are_handled() {
+        assert_eq!(
+            normalize_attestation_key_env(""),
+            "INNERWARDEN_HANDOFF_ATTESTATION_KEY"
+        );
+        assert_eq!(
+            normalize_attestation_key_env("  CUSTOM_KEY  "),
+            "CUSTOM_KEY"
+        );
+        assert_eq!(normalize_attestation_prefix(""), "IW_ATTEST");
+        assert_eq!(normalize_attestation_prefix("  IW2  "), "IW2");
+
+        assert!(parse_attestation_line("IW_ATTEST:only-two-parts", "IW_ATTEST").is_none());
+        assert!(parse_attestation_line("WRONG:receiver:challenge:hmac", "IW_ATTEST").is_none());
+    }
+
+    #[test]
+    fn verify_attestation_output_covers_error_branches() {
+        let runtime = SessionRuntime {
+            session_id: "s1".to_string(),
+            target_ip: "1.2.3.4".parse().expect("IP should parse"),
+            strict_target_only: true,
+            duration_secs: 30,
+            max_connections: 8,
+            max_payload_bytes: 128,
+            transcript_preview_bytes: 64,
+            isolation_profile: "strict_local".to_string(),
+            evidence_path: PathBuf::from("/tmp/evidence.jsonl"),
+            interaction: "banner".to_string(),
+            ssh_max_auth_attempts: 6,
+            http_max_requests: 10,
+            ai_provider: None,
+        };
+        let challenge = "challenge-1";
+        let payload = format!(
+            "{}:{}:{}:{}",
+            "receiver-a", challenge, runtime.session_id, runtime.target_ip
+        );
+        let hmac =
+            hmac_sha256_hex(b"attest-key", payload.as_bytes()).expect("hmac should be generated");
+        let good_line = format!("IW_ATTEST:receiver-a:{challenge}:{hmac}");
+
+        let missing_line = verify_attestation_output(
+            "no attestation here",
+            "",
+            "IW_ATTEST",
+            None,
+            challenge,
+            "attest-key",
+            &runtime,
+        )
+        .expect_err("missing attestation line should fail");
+        assert!(missing_line.contains("missing attestation line"));
+
+        let mismatch = verify_attestation_output(
+            &good_line,
+            "",
+            "IW_ATTEST",
+            None,
+            "other-challenge",
+            "attest-key",
+            &runtime,
+        )
+        .expect_err("challenge mismatch should fail");
+        assert!(mismatch.contains("challenge mismatch"));
+
+        let bad_hmac = verify_attestation_output(
+            "IW_ATTEST:receiver-a:challenge-1:deadbeef",
+            "",
+            "IW_ATTEST",
+            None,
+            challenge,
+            "attest-key",
+            &runtime,
+        )
+        .expect_err("HMAC mismatch should fail");
+        assert!(bad_hmac.contains("HMAC mismatch"));
+    }
+
+    #[test]
+    fn fallback_reason_and_binary_resolution_helpers() {
+        let mut reason = None;
+        push_fallback_reason(&mut reason, "first".to_string());
+        push_fallback_reason(&mut reason, "second".to_string());
+        assert_eq!(reason.as_deref(), Some("first; second"));
+
+        let ls_path = if std::path::Path::new("/bin/ls").exists() {
+            "/bin/ls"
+        } else {
+            "/usr/bin/ls"
+        };
+        assert!(binary_exists(ls_path));
+        assert!(!binary_exists("innerwarden-nonexistent-binary"));
+    }
+
+    #[test]
+    fn artifact_date_parser_rejects_invalid_names() {
+        assert!(extract_listener_artifact_date("listener-session-invalid.json").is_none());
+        assert!(extract_listener_artifact_date("other-prefix-20260313T162200Z.json").is_none());
+    }
+
+    #[tokio::test]
+    async fn file_size_and_artifact_lifecycle_checks_work() {
+        let dir = tempdir().expect("tempdir should be created");
+        let metadata = dir.path().join("meta.json");
+        let evidence = dir.path().join("evidence.jsonl");
+        let pcap = dir.path().join("capture.pcap");
+        tokio::fs::write(&metadata, b"{\"ok\":true}\n")
+            .await
+            .expect("metadata should be written");
+        tokio::fs::write(&evidence, b"{\"line\":1}\n")
+            .await
+            .expect("evidence should be written");
+        tokio::fs::write(&pcap, b"pcap")
+            .await
+            .expect("pcap should be written");
+
+        let (exists_meta, meta_size) = file_exists_with_size(&metadata).await;
+        assert!(exists_meta);
+        assert!(meta_size > 0);
+
+        let lifecycle =
+            collect_artifact_lifecycle(&metadata, &evidence, Some(pcap.to_string_lossy().as_ref()))
+                .await;
+        assert!(lifecycle.metadata_exists);
+        assert!(lifecycle.evidence_exists);
+        assert_eq!(lifecycle.pcap_exists, Some(true));
+        assert!(lifecycle.metadata_bytes > 0);
+        assert!(lifecycle.evidence_bytes > 0);
+        assert!(lifecycle.pcap_bytes.unwrap_or_default() > 0);
+    }
+
+    #[tokio::test]
+    async fn run_pcap_handoff_skips_when_limits_are_zero() {
+        let dir = tempdir().expect("tempdir should be created");
+        let status = run_pcap_handoff(
+            dir.path(),
+            "session-test",
+            "1.2.3.4".parse().expect("IP should parse"),
+            0,
+            0,
+        )
+        .await;
+
+        assert!(status.enabled);
+        assert!(!status.attempted);
+        assert!(!status.success);
+        assert!(status.error.is_some());
+    }
 }
