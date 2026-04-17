@@ -401,6 +401,8 @@ struct AgentState {
     grouping_engine: notification_pipeline::GroupingEngine,
     /// Environment profile — cloud/VM detection, human UIDs, services.
     environment_profile: environment_profile::EnvironmentProfile,
+    /// Last time the periodic env census ran. Spec 005 Phase 6.
+    last_env_census_at: Option<std::time::Instant>,
     /// Neural autoencoder anomaly engine — learns "normal" and flags novel patterns.
     anomaly_engine: neural_lifecycle::AnomalyEngine,
     /// Neural incidents pending processing — buffered here because the agent

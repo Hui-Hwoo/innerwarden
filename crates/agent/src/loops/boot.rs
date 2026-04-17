@@ -631,6 +631,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             &cli.data_dir,
             &cfg.environment,
         ),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(neural_lifecycle::AnomalyConfig {
             data_dir: cli.data_dir.clone(),
             ..Default::default()
@@ -1506,6 +1507,52 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 state.sqlite_store.as_deref(),
                             );
                             state.last_intel_consolidation_at = Some(Instant::now());
+                        }
+
+                        // ── Environment periodic census (spec 005 Phase 6) ──
+                        //
+                        // Re-profiles the environment every
+                        // `census_interval_hours`, diffs against the stored
+                        // profile, appends diffs to census-YYYY-MM-DD.jsonl, and
+                        // emits incidents for suspicious additions (new human
+                        // UID, new cron). Service drift is audit-only.
+                        {
+                            let interval = std::time::Duration::from_secs(
+                                cfg.environment.census_interval_hours.saturating_mul(3600),
+                            );
+                            let due = state
+                                .last_env_census_at
+                                .map(|t| t.elapsed() >= interval)
+                                .unwrap_or(true);
+                            if due && cfg.environment.auto_profile && interval.as_secs() > 0 {
+                                let host = std::env::var("HOSTNAME")
+                                    .or_else(|_| {
+                                        std::fs::read_to_string("/etc/hostname")
+                                            .map(|s| s.trim().to_string())
+                                    })
+                                    .unwrap_or_else(|_| "unknown".to_string());
+                                let outcome = environment_profile::run_census(
+                                    &cli.data_dir,
+                                    &cfg.environment,
+                                    &state.environment_profile,
+                                    &host,
+                                );
+                                if let Some(new_profile) = outcome.new_profile {
+                                    state.environment_profile = new_profile;
+                                }
+                                if !outcome.incidents.is_empty() {
+                                    if let Some(store) = state.sqlite_store.as_ref() {
+                                        for inc in &outcome.incidents {
+                                            if let Err(e) = store.insert_incident(inc) {
+                                                warn!(
+                                                    "census incident persist failed: {e:#}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                state.last_env_census_at = Some(Instant::now());
+                            }
                         }
 
                         // Cap attacker profiles to 10,000 by risk score
