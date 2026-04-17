@@ -122,7 +122,7 @@ Ordenado por numero. ✅ merged, 🚧 in-progress, 📝 draft/planned, ⏸ defer
 | 021 | Observation Verification | ✅ Phases A-D. Score engine + integracao no agent loop + AI batch verification + dashboard score display. Active FP clearing funcional. |
 | 022 | Dashboard Test Coverage | ✅ 6 batches merged + 2 expansoes. Cobertura do dashboard de 0% pra ~30%+. HTML escape, auth, investigation, sensors, actions — tudo testado. |
 | 023 | Coverage Closeout (project-wide) | **In progress** — Batches 1..11 done, awaiting codecov refresh |
-| 024 | Regression Safety Net | 🚧 P0. Scenario volume tests (`make scenario-qa`) + `/metrics` drift + contract tests. Motivation: coverage alone doesn't prevent "fix A → break B" whack-a-mole. Phases A+B planned, C blocks on spec 005. |
+| 024 | Regression Safety Net | ✅ Phases A+B done. `make scenario-qa` (6 canonical scenarios + mock telegram + stub AI), 18 contract tests across 5 boundary subsystems, `/metrics` surfaces all 10 drift metrics, `docs/prometheus-alerts.yaml` + Health tab drift section. Phase C aguarda spec 005 (Intelligent Notifications). |
 | 025 | Structured AI Prompt | 📝 Draft P1. Bench mostrou qwen2.5:3b: 53%→73% accuracy (prose→JSON subgraph). Implementacao: 2 AI sessions. Bench em `innerwarden-test/ai-grounding/`. |
 | 026 | Decomposition for Testability | ✅ Phases A-C. main.rs split, honeypot split, telegram split. Agent crate +10.98pp coverage. replay-qa diff zero. |
 
