@@ -149,6 +149,7 @@ mod tests {
             ip_reputation: None,
             ip_geo: None,
             graph_context: None,
+            graph_subgraph: None,
         };
         decide_for_incident(&ctx)
     }
@@ -198,6 +199,7 @@ mod tests {
             }),
             ip_geo: None,
             graph_context: None,
+            graph_subgraph: None,
         };
         let d = decide_for_incident(&ctx);
         assert!(matches!(d.action, AiAction::BlockIp { .. }));

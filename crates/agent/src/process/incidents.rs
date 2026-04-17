@@ -481,7 +481,15 @@ pub(crate) async fn process_incidents(
         // Build graph context: attack narrative from knowledge graph neighborhood.
         // Phase 015: prefer the Incident node as center (richest context after 014-D
         // incident enrichment links incidents to processes), fall back to entity nodes.
-        let graph_context = {
+        //
+        // Spec 025: alongside the prose narrative, also emit the same
+        // neighbourhood as a structured JSON subgraph. Providers prefer
+        // the subgraph; prose stays as a fallback for providers that
+        // haven't been updated and for the decision audit pipeline.
+        // The subgraph is gated by `ai.use_structured_subgraph` (default
+        // true) so operators can A/B compare against the prose-only prod
+        // behaviour for 48h on existing installs before flipping over.
+        let (graph_context, graph_subgraph) = {
             let graph = state.knowledge_graph.read().unwrap();
             let center_node = graph.find_by_incident(&incident.incident_id).or_else(|| {
                 incident.entities.iter().find_map(|e| match e.r#type {
@@ -494,7 +502,18 @@ pub(crate) async fn process_incidents(
                     _ => None,
                 })
             });
-            center_node.map(|node| graph.attack_narrative(node, 3))
+            match center_node {
+                Some(node) => {
+                    let narrative = Some(graph.attack_narrative(node, 3));
+                    let subgraph = if cfg.ai.use_structured_subgraph {
+                        Some(graph.attack_subgraph_json(node, 3))
+                    } else {
+                        None
+                    };
+                    (narrative, subgraph)
+                }
+                None => (None, None),
+            }
         };
 
         let ctx = ai::DecisionContext {
@@ -512,6 +531,7 @@ pub(crate) async fn process_incidents(
             ip_reputation: ip_reputation.clone(),
             ip_geo: ip_geo_early.clone(),
             graph_context,
+            graph_subgraph,
         };
 
         state.telemetry.observe_ai_sent();

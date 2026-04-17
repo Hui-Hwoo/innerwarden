@@ -598,6 +598,22 @@ pub struct AiConfig {
     #[serde(default = "default_batch_window_secs")]
     #[allow(dead_code)]
     pub batch_window_secs: u64,
+
+    /// Spec 025 — send the knowledge graph as a structured JSON subgraph
+    /// to the LLM instead of a prose narrative. Measured on qwen2.5:3b
+    /// (bench in innerwarden-test/ai-grounding): action accuracy 53% →
+    /// 73%, target hallucination 47% → 7%.
+    ///
+    /// Default true. Operators on existing installs can temporarily set
+    /// this to false for 48h to A/B compare against the old prose
+    /// format. Flag scheduled for removal in the next minor release once
+    /// prod drift is verified flat.
+    #[serde(default = "default_use_structured_subgraph")]
+    pub use_structured_subgraph: bool,
+}
+
+fn default_use_structured_subgraph() -> bool {
+    true
 }
 
 fn default_batch_window_secs() -> u64 {
@@ -626,6 +642,7 @@ impl Default for AiConfig {
             min_severity: default_ai_min_severity(),
             batch_triage: false,
             batch_window_secs: default_batch_window_secs(),
+            use_structured_subgraph: default_use_structured_subgraph(),
         }
     }
 }
