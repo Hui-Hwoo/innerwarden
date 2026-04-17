@@ -1798,3 +1798,56 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn once_cli(data_dir: std::path::PathBuf) -> crate::Cli {
+        crate::Cli {
+            data_dir,
+            config: None,
+            once: true,
+            report: false,
+            report_dir: None,
+            dashboard: false,
+            dashboard_bind: "127.0.0.1:8787".to_string(),
+            tls_cert: None,
+            tls_key: None,
+            insecure_no_tls: false,
+            dashboard_generate_password_hash: false,
+            interval: 30,
+            honeypot_sandbox_runner: false,
+            honeypot_sandbox_spec: None,
+            honeypot_sandbox_result: None,
+            cleanup_015_graph_signal_quality: false,
+            backfill_015_research_only: false,
+        }
+    }
+
+    #[test]
+    fn cleanup_015_requires_snapshot() {
+        let dir = TempDir::new().expect("tempdir");
+        let err = run_cleanup_015(dir.path()).expect_err("snapshot should be required");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("No dated snapshot found"));
+    }
+
+    #[test]
+    fn backfill_015_requires_snapshot() {
+        let dir = TempDir::new().expect("tempdir");
+        let err =
+            run_backfill_015_research_only(dir.path()).expect_err("snapshot should be required");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("No dated snapshot found"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_once_boots_with_empty_data_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let cli = once_cli(dir.path().to_path_buf());
+        let result = run_agent(cli).await;
+        assert!(result.is_ok(), "run_agent once-mode failed: {result:?}");
+    }
+}

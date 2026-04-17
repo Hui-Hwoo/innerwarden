@@ -366,3 +366,32 @@ pub(crate) async fn append_honeypot_marker_event(
 
     Ok(events_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn honeypot_runtime_maps_always_on_to_listener() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "always_on".to_string();
+        let runtime = honeypot_runtime(&cfg);
+        assert_eq!(runtime.mode, "listener");
+    }
+
+    #[test]
+    fn honeypot_runtime_preserves_listener_mode() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "listener".to_string();
+        let runtime = honeypot_runtime(&cfg);
+        assert_eq!(runtime.mode, "listener");
+    }
+
+    #[test]
+    fn honeypot_runtime_unknown_mode_falls_back_to_demo() {
+        let mut cfg = config::AgentConfig::default();
+        cfg.honeypot.mode = "unknown_mode".to_string();
+        let runtime = honeypot_runtime(&cfg);
+        assert_eq!(runtime.mode, "demo");
+    }
+}
