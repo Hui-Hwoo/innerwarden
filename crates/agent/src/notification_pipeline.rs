@@ -552,6 +552,10 @@ struct PendingNotification {
     sent_at: DateTime<Utc>,
     detector: String,
     entity_type: EntityType,
+    /// Retained so the persisted `Sent` event captures which specific
+    /// entity fired without an extra hash lookup. Not read by the
+    /// in-memory demotion logic (which keys on detector + entity_type).
+    #[allow(dead_code)]
     entity_value: String,
     incident_id: String,
 }
@@ -814,13 +818,20 @@ pub(crate) fn parse_batch_response(text: &str) -> Vec<(usize, BatchClassificatio
         // `3: URGENT` | `3:URGENT` | `3 URGENT` | `3 - URGENT` — tolerate
         // common AI-response shapes.
         let (idx_part, class_part) = match line.find(|c: char| !c.is_ascii_digit()) {
-            Some(i) => (&line[..i], line[i..].trim_start_matches([':', '-', ' ', '\t'])),
+            Some(i) => (
+                &line[..i],
+                line[i..].trim_start_matches([':', '-', ' ', '\t']),
+            ),
             None => continue,
         };
         let Ok(idx) = idx_part.parse::<usize>() else {
             continue;
         };
-        let up = class_part.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let up = class_part
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
         let class = match up.as_str() {
             "URGENT" => BatchClassification::Urgent,
             "INFO" => BatchClassification::Info,
@@ -1530,13 +1541,7 @@ mod tests {
     fn feedback_pending_increments_and_decrements() {
         let mut t = FeedbackTracker::new();
         assert_eq!(t.pending_count(), 0);
-        t.on_notification_sent(
-            "ssh_bruteforce",
-            EntityType::Ip,
-            "1.2.3.4",
-            "inc-1",
-            now(),
-        );
+        t.on_notification_sent("ssh_bruteforce", EntityType::Ip, "1.2.3.4", "inc-1", now());
         assert_eq!(t.pending_count(), 1);
         let _ = t.on_operator_action("inc-1", "block", now());
         assert_eq!(t.pending_count(), 0);
@@ -1546,13 +1551,7 @@ mod tests {
     fn feedback_aged_pending_converts_to_ignore_tally() {
         let mut t = FeedbackTracker::new();
         let old = Utc::now() - chrono::Duration::hours(25);
-        t.on_notification_sent(
-            "ssh_bruteforce",
-            EntityType::Ip,
-            "1.2.3.4",
-            "inc-a",
-            old,
-        );
+        t.on_notification_sent("ssh_bruteforce", EntityType::Ip, "1.2.3.4", "inc-a", old);
         let events = t.tick(Utc::now());
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], FeedbackEvent::Ignored { .. }));

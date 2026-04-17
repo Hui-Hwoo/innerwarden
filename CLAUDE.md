@@ -108,7 +108,7 @@ Ordenado por numero. ✅ merged, 🚧 in-progress, 📝 draft/planned, ⏸ defer
 | 002 | Telegram Triage v2 (2FA + Undo + Auto-Learn) | ✅ Auto-Learn, Undo, 2FA Telegram. Pendente: dashboard 2FA endpoints (GET/POST `/api/2fa/*`) |
 | 003 | Setup Ready To Use | ✅ |
 | 004 | Setup Zero Friction | ✅ |
-| 005 | Intelligent Notifications | 📝 Spec pronto. Grouping + channel filter + env calibration + AI batch triage. Bloqueado por ninguem — candidato pra proxima fila depois de 023/022 fecharem. |
+| 005 | Intelligent Notifications | ✅ Phases 1-8 shipped (US1-US7). Grouping + channel filter + digest + bootstrap profile + periodic census + operator feedback loop + AI batch triage (opt-in). Integrated into spec 024 via scenario 07 + tightened alert thresholds. |
 | 010 | Detector Migration (Phase 3) | ✅ Phases 3A-3C. 27 graph detectors + 10 correlation rules + dedup + config flag. Phase 3D metrics diferida. |
 | 012 | Eliminate JSONL Dependency (Phase 6) | ✅ Phases 6A-6F. Graph primary for dashboard/bot/reports. |
 | 013 | Graph Single Source of Truth (Phase 7) | ✅ Gaps 1/2/4/5 done. Daily dated snapshots, FP tracking in graph, monthly report from snapshots, 6h window from event_timeline. Gap 3 (telemetry JSONL) por design. |
@@ -122,7 +122,7 @@ Ordenado por numero. ✅ merged, 🚧 in-progress, 📝 draft/planned, ⏸ defer
 | 021 | Observation Verification | ✅ Phases A-D. Score engine + integracao no agent loop + AI batch verification + dashboard score display. Active FP clearing funcional. |
 | 022 | Dashboard Test Coverage | ✅ 6 batches merged + 2 expansoes. Cobertura do dashboard de 0% pra ~30%+. HTML escape, auth, investigation, sensors, actions — tudo testado. |
 | 023 | Coverage Closeout (project-wide) | **In progress** — Batches 1..11 done, awaiting codecov refresh |
-| 024 | Regression Safety Net | ✅ Phases A+B done. `make scenario-qa` (6 canonical scenarios + mock telegram + stub AI), 18 contract tests across 5 boundary subsystems, `/metrics` surfaces all 10 drift metrics, `docs/prometheus-alerts.yaml` + Health tab drift section. Phase C aguarda spec 005 (Intelligent Notifications). |
+| 024 | Regression Safety Net | ✅ Phases A+B+C done. `make scenario-qa` (7 scenarios — 01/02 ready, 03-07 wip/scaffold), 18 contract tests across 5 boundary subsystems, `/metrics` surfaces all 10 drift metrics, `docs/prometheus-alerts.yaml` tightened to 10/h warn + 50/h crit now that spec 005 grouping shipped, Health tab drift section. |
 | 025 | Structured AI Prompt | 📝 Draft P1. Bench mostrou qwen2.5:3b: 53%→73% accuracy (prose→JSON subgraph). Implementacao: 2 AI sessions. Bench em `innerwarden-test/ai-grounding/`. |
 | 026 | Decomposition for Testability | ✅ Phases A-C. main.rs split, honeypot split, telegram split. Agent crate +10.98pp coverage. replay-qa diff zero. |
 

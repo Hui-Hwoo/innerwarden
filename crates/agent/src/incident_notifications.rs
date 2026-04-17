@@ -127,10 +127,7 @@ pub(crate) async fn dispatch_incident_notifications(
             );
             if !is_critical {
                 if let Some(entity) = &primary_entity {
-                    if state
-                        .feedback_tracker
-                        .is_demoted(detector, &entity.r#type)
-                    {
+                    if state.feedback_tracker.is_demoted(detector, &entity.r#type) {
                         *state
                             .telegram_deferred
                             .entry(detector.to_string())
@@ -245,9 +242,7 @@ pub(crate) async fn dispatch_incident_notifications(
                     &incident.incident_id,
                     chrono::Utc::now(),
                 );
-                if let Err(e) =
-                    notification_pipeline::feedback_store::append(data_dir, &ev)
-                {
+                if let Err(e) = notification_pipeline::feedback_store::append(data_dir, &ev) {
                     warn!("feedback persist failed: {e:#}");
                 }
             }

@@ -52,34 +52,40 @@ groups:
             recent config/spec changes.
 
       # ── 2. Telegram messages per hour ──────────────────────────────
+      #
+      # Threshold tightened with spec 005 Phase C. Spec 005's grouping +
+      # actionable filter mean a well-calibrated host should sit at 1-2
+      # msgs/h most of the time; 10/h already implies either a real
+      # sustained campaign or a gate regression.
       - alert: InnerWardenTelegramNoise
-        expr: innerwarden_telegram_msgs_per_hour > 50
+        expr: innerwarden_telegram_msgs_per_hour > 10
         for: 2h
         labels:
           severity: warning
-          spec: "024"
+          spec: "024-phase-c"
         annotations:
           summary: "Telegram notification rate elevated on {{ $labels.instance }}"
           description: |
-            innerwarden_telegram_msgs_per_hour has been above 50/h for 2
-            hours. This is the class of drift that triggered spec 024 —
-            the operator will reach for their phone soon. Check the
-            notification_gate config and recent changes to
-            is_compromise / is_active_intrusion predicates.
+            innerwarden_telegram_msgs_per_hour has been above 10/h for 2
+            hours. With spec 005 grouping in production this should be
+            the new steady-state ceiling. Check the notification_gate
+            config, the grouping engine (notification_pipeline.rs), and
+            recent changes to is_compromise / is_active_intrusion.
 
       - alert: InnerWardenTelegramFlood
-        expr: innerwarden_telegram_msgs_per_hour > 200
+        expr: innerwarden_telegram_msgs_per_hour > 50
         for: 1h
         labels:
           severity: critical
-          spec: "024"
+          spec: "024-phase-c"
         annotations:
-          summary: "Telegram flood on {{ $labels.instance }} — gate broken"
+          summary: "Telegram flood on {{ $labels.instance }} — gate or grouping broken"
           description: |
-            innerwarden_telegram_msgs_per_hour has been above 200/h for 1
-            hour. The notification gate is effectively off. Page the
-            on-call. Temporary workaround: disable Telegram in
-            agent.toml until the gate is restored.
+            innerwarden_telegram_msgs_per_hour has been above 50/h for 1
+            hour. Either the notification_gate is bypassed, the grouping
+            engine is not registering incidents, or a real coordinated
+            attack is under way. Page the on-call. Temporary workaround:
+            disable Telegram in agent.toml until root cause is found.
 
       # ── 3. Blocks per hour by backend ──────────────────────────────
       - alert: InnerWardenBlockVolumeAnomaly

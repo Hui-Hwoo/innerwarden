@@ -400,10 +400,14 @@ pub(crate) fn diff_profiles(
     let prev_crons: HashSet<&String> = previous.crons.iter().collect();
     let curr_crons: HashSet<&String> = current.crons.iter().collect();
     for c in curr_crons.difference(&prev_crons) {
-        out.push(CensusChange::CronAdded { entry: (*c).clone() });
+        out.push(CensusChange::CronAdded {
+            entry: (*c).clone(),
+        });
     }
     for c in prev_crons.difference(&curr_crons) {
-        out.push(CensusChange::CronRemoved { entry: (*c).clone() });
+        out.push(CensusChange::CronRemoved {
+            entry: (*c).clone(),
+        });
     }
 
     out
@@ -411,10 +415,7 @@ pub(crate) fn diff_profiles(
 
 /// Classify which diffs warrant an incident. UID additions and cron
 /// additions are suspicious; removals and service drift are informational.
-pub(crate) fn incidents_for_changes(
-    changes: &[CensusChange],
-    host: &str,
-) -> Vec<Incident> {
+pub(crate) fn incidents_for_changes(changes: &[CensusChange], host: &str) -> Vec<Incident> {
     let now = chrono::Utc::now();
     changes
         .iter()
@@ -425,11 +426,10 @@ pub(crate) fn incidents_for_changes(
                 incident_id: format!("env_census:uid_added:{uid}:{}", now.timestamp()),
                 severity: Severity::Medium,
                 title: format!("Census detected new human UID {uid}"),
-                summary: format!(
-                    "A human-shell UID was added to /etc/passwd since the last \
+                summary: "A human-shell UID was added to /etc/passwd since the last \
                      environment profile. Investigate: new operator, compromised \
                      host, or benign ops change?"
-                ),
+                    .to_string(),
                 evidence: serde_json::json!({ "uid": uid, "kind": "uid_added" }),
                 recommended_checks: vec![
                     "getent passwd <uid> — confirm the account".to_string(),
@@ -457,7 +457,8 @@ pub(crate) fn incidents_for_changes(
                 ),
                 evidence: serde_json::json!({ "entry": entry, "kind": "cron_added" }),
                 recommended_checks: vec![
-                    "Confirm via package manager whether this cron came from an install".to_string(),
+                    "Confirm via package manager whether this cron came from an install"
+                        .to_string(),
                     "Inspect the cron command and who owns the target script".to_string(),
                 ],
                 tags: vec!["env_census".to_string(), "cron".to_string()],
@@ -660,11 +661,7 @@ mod tests {
 
     // ─── Spec 005 Phase 6 — Periodic Census tests ──────────────────
 
-    fn profile_with(
-        uids: Vec<u32>,
-        services: Vec<&str>,
-        crons: Vec<&str>,
-    ) -> EnvironmentProfile {
+    fn profile_with(uids: Vec<u32>, services: Vec<&str>, crons: Vec<&str>) -> EnvironmentProfile {
         EnvironmentProfile {
             platform: "bare_metal".into(),
             provider: "none".into(),
@@ -681,17 +678,11 @@ mod tests {
         let curr = profile_with(vec![1000, 1001], vec![], vec![]);
         let changes = diff_profiles(&prev, &curr);
         assert_eq!(changes.len(), 1);
-        assert!(matches!(
-            changes[0],
-            CensusChange::UidAdded { uid: 1001 }
-        ));
+        assert!(matches!(changes[0], CensusChange::UidAdded { uid: 1001 }));
 
         let reverse = diff_profiles(&curr, &prev);
         assert_eq!(reverse.len(), 1);
-        assert!(matches!(
-            reverse[0],
-            CensusChange::UidRemoved { uid: 1001 }
-        ));
+        assert!(matches!(reverse[0], CensusChange::UidRemoved { uid: 1001 }));
     }
 
     #[test]
@@ -785,10 +776,7 @@ mod tests {
         let now = chrono::Utc::now();
         append_census(dir.path(), &[], now).unwrap();
         let path = census_path(dir.path(), now.date_naive());
-        assert!(
-            !path.exists(),
-            "empty census must not create an empty file"
-        );
+        assert!(!path.exists(), "empty census must not create an empty file");
     }
 
     #[test]

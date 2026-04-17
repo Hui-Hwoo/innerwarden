@@ -592,8 +592,11 @@ pub struct AiConfig {
     pub batch_triage: bool,
 
     /// Window size for batch triage, in seconds. Default 3600 (1h) aligns with
-    /// the notification_pipeline group window.
+    /// the notification_pipeline group window. Reserved for future harness
+    /// revisions that pace batch triage independently from the tick loop;
+    /// today the slow loop runs triage on every grouping tick.
     #[serde(default = "default_batch_window_secs")]
+    #[allow(dead_code)]
     pub batch_window_secs: u64,
 }
 

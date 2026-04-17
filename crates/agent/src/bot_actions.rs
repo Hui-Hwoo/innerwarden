@@ -35,8 +35,7 @@ pub(crate) async fn handle_telegram_action_callback(
             action_label,
             chrono::Utc::now(),
         ) {
-            if let Err(e) = crate::notification_pipeline::feedback_store::append(data_dir, &ev)
-            {
+            if let Err(e) = crate::notification_pipeline::feedback_store::append(data_dir, &ev) {
                 tracing::warn!("feedback action persist failed: {e:#}");
             }
         }
