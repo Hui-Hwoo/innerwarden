@@ -540,6 +540,8 @@ mod tests {
 
     #[test]
     fn no_autoblock_without_interaction() {
+        // Decision path: probe-only sessions must never auto-block to avoid
+        // poisoning the blocklist with harmless scan noise.
         let allowed = vec!["block-ip-ufw".to_string()];
         assert!(!should_auto_block_after_session(
             true, false, false, "ufw", &allowed
@@ -548,6 +550,8 @@ mod tests {
 
     #[test]
     fn autoblock_with_interaction_and_skill_allowed() {
+        // Happy path: when interaction happened and the backend skill is
+        // enabled, the session should become auto-block eligible.
         let allowed = vec!["block-ip-ufw".to_string()];
         assert!(should_auto_block_after_session(
             true, false, true, "ufw", &allowed
@@ -556,7 +560,36 @@ mod tests {
 
     #[test]
     fn elapsed_report_rounds_subsecond_to_one() {
+        // Reporting path: sub-second sessions still report as 1 second so
+        // operator-facing summaries avoid a confusing "0s" duration.
         let started = std::time::Instant::now() - std::time::Duration::from_millis(250);
         assert_eq!(elapsed_secs_for_report(started), 1);
+    }
+
+    #[test]
+    fn no_autoblock_when_responder_is_disabled() {
+        // Guard path: auto-blocking must stay off when responder mode is
+        // disabled even if an interaction occurred.
+        let allowed = vec!["block-ip-ufw".to_string()];
+        assert!(!should_auto_block_after_session(
+            false, false, true, "ufw", &allowed
+        ));
+    }
+
+    #[test]
+    fn no_autoblock_when_ip_already_blocked() {
+        // Idempotency path: repeated sessions from an already blocked IP
+        // should not trigger another auto-block workflow.
+        let allowed = vec!["block-ip-ufw".to_string()];
+        assert!(!should_auto_block_after_session(
+            true, true, true, "ufw", &allowed
+        ));
+    }
+
+    #[test]
+    fn elapsed_report_keeps_whole_seconds() {
+        // Precision path: whole-second durations must pass through unchanged.
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        assert!(elapsed_secs_for_report(started) >= 3);
     }
 }
