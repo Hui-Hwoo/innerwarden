@@ -751,12 +751,29 @@ mod tests {
         // The gate MUST NOT mutate its context. Downstream callers share
         // the context across verdicts and can observe drift if the gate
         // modifies flags. We assert structural equality pre/post.
-        let ctx_before = make_ctx("critical", "killchain.reverse_shell", true, true, false, false);
-        let ctx_after = make_ctx("critical", "killchain.reverse_shell", true, true, false, false);
+        let ctx_before = make_ctx(
+            "critical",
+            "killchain.reverse_shell",
+            true,
+            true,
+            false,
+            false,
+        );
+        let ctx_after = make_ctx(
+            "critical",
+            "killchain.reverse_shell",
+            true,
+            true,
+            false,
+            false,
+        );
         let _ = should_notify(&ctx_before);
         assert_eq!(ctx_before.detector, ctx_after.detector);
         assert_eq!(ctx_before.is_contained, ctx_after.is_contained);
-        assert_eq!(ctx_before.is_active_intrusion, ctx_after.is_active_intrusion);
+        assert_eq!(
+            ctx_before.is_active_intrusion,
+            ctx_after.is_active_intrusion
+        );
         assert_eq!(ctx_before.is_compromise, ctx_after.is_compromise);
         assert_eq!(ctx_before.is_honeypot_probe, ctx_after.is_honeypot_probe);
     }
@@ -777,23 +794,25 @@ mod tests {
             // active + not-contained: send.
             ((false, true, false, false), NotificationVerdict::SendNow),
             // active + contained: defer.
-            ((false, true, true, false), NotificationVerdict::DailyBriefingOnly),
+            (
+                (false, true, true, false),
+                NotificationVerdict::DailyBriefingOnly,
+            ),
             // contained alone: defer.
-            ((false, false, true, false), NotificationVerdict::DailyBriefingOnly),
+            (
+                (false, false, true, false),
+                NotificationVerdict::DailyBriefingOnly,
+            ),
             // probe only (not contained): drop. This is the noise floor.
             ((false, false, false, true), NotificationVerdict::Drop),
             // nothing special: defer.
-            ((false, false, false, false), NotificationVerdict::DailyBriefingOnly),
+            (
+                (false, false, false, false),
+                NotificationVerdict::DailyBriefingOnly,
+            ),
         ];
         for &((compromise, active, contained, probe), want) in rows {
-            let ctx = make_ctx(
-                "medium",
-                "test",
-                contained,
-                active,
-                compromise,
-                probe,
-            );
+            let ctx = make_ctx("medium", "test", contained, active, compromise, probe);
             let got = should_notify(&ctx);
             assert_eq!(
                 got, want,
