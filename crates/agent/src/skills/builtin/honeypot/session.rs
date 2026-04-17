@@ -2788,6 +2788,7 @@ mod tests {
     use crate::skills::HoneypotRuntimeConfig;
     use innerwarden_core::{event::Severity, incident::Incident};
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn ctx(mode: &str) -> SkillContext {
         SkillContext {
@@ -3487,5 +3488,949 @@ mod tests {
         assert!(!status.attempted);
         assert!(!status.success);
         assert!(status.error.is_some());
+    }
+
+    fn free_local_port() -> u16 {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener should expose local address")
+            .port();
+        drop(listener);
+        port
+    }
+
+    fn build_runtime_for_tests(temp_root: &Path) -> SessionRuntime {
+        SessionRuntime {
+            session_id: "test-session".to_string(),
+            target_ip: "127.0.0.1".parse().expect("target IP should parse"),
+            strict_target_only: true,
+            duration_secs: 1,
+            max_connections: 1,
+            max_payload_bytes: 256,
+            transcript_preview_bytes: 64,
+            isolation_profile: "strict_local".to_string(),
+            evidence_path: temp_root.join("evidence.jsonl"),
+            interaction: "banner".to_string(),
+            ssh_max_auth_attempts: 6,
+            http_max_requests: 10,
+            ai_provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_mode_executes_real_session_and_writes_artifacts() {
+        let dir = tempdir().expect("tempdir should be created");
+        let mut context = ctx("listener");
+        context.target_ip = Some("127.0.0.1".to_string());
+        context.data_dir = dir.path().to_path_buf();
+        context.honeypot.bind_addr = "127.0.0.1".to_string();
+        context.honeypot.port = free_local_port();
+        context.honeypot.duration_secs = 1;
+        context.honeypot.max_connections = 1;
+        context.honeypot.max_payload_bytes = 128;
+        context.honeypot.transcript_preview_bytes = 64;
+        context.honeypot.redirect_enabled = false;
+        context.honeypot.sandbox_enabled = false;
+        context.honeypot.pcap_handoff_enabled = false;
+        context.honeypot.external_handoff_enabled = false;
+
+        let result = Honeypot.execute(&context, false).await;
+        assert!(
+            result.success,
+            "listener run should start: {}",
+            result.message
+        );
+        assert!(result.message.contains("Honeypot listeners started"));
+
+        let mut stream =
+            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", context.honeypot.port))
+                .await
+                .expect("test client should connect");
+        stream
+            .write_all(b"PING")
+            .await
+            .expect("payload should be sent");
+        let mut response = [0u8; 64];
+        let bytes = stream
+            .read(&mut response)
+            .await
+            .expect("banner should be read");
+        assert!(bytes > 0);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let session_dir = dir.path().join("honeypot");
+        let entries = std::fs::read_dir(&session_dir)
+            .expect("session dir should exist")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert!(!entries.is_empty(), "session should generate artifacts");
+        assert!(entries.iter().any(|path| {
+            path.file_name()
+                .and_then(|v| v.to_str())
+                .map(|name| name.ends_with(".json"))
+                .unwrap_or(false)
+        }));
+        assert!(entries.iter().any(|path| {
+            path.file_name()
+                .and_then(|v| v.to_str())
+                .map(|name| name.ends_with(".jsonl"))
+                .unwrap_or(false)
+        }));
+    }
+
+    #[tokio::test]
+    async fn sandbox_worker_runs_from_spec_and_writes_result_file() {
+        let dir = tempdir().expect("tempdir should be created");
+        let port = free_local_port();
+        let runtime = build_runtime_for_tests(dir.path());
+        let spec = SandboxWorkerSpec {
+            session_id: runtime.session_id.clone(),
+            target_ip: runtime.target_ip.to_string(),
+            strict_target_only: runtime.strict_target_only,
+            duration_secs: runtime.duration_secs,
+            max_connections: runtime.max_connections,
+            max_payload_bytes: runtime.max_payload_bytes,
+            transcript_preview_bytes: runtime.transcript_preview_bytes,
+            isolation_profile: runtime.isolation_profile.clone(),
+            evidence_path: runtime.evidence_path.clone(),
+            endpoints: vec![SandboxEndpointSpec {
+                service: "ssh".to_string(),
+                bind_addr: "127.0.0.1".to_string(),
+                listen_port: port,
+                redirect_from_port: 22,
+            }],
+            interaction: runtime.interaction.clone(),
+            ssh_max_auth_attempts: runtime.ssh_max_auth_attempts,
+            http_max_requests: runtime.http_max_requests,
+        };
+
+        let spec_path = dir.path().join("sandbox-spec.json");
+        let result_path = dir.path().join("sandbox-result.json");
+        tokio::fs::write(
+            &spec_path,
+            serde_json::to_string(&spec).expect("spec should serialize"),
+        )
+        .await
+        .expect("spec should be written");
+
+        let connect_port = port;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(mut stream) =
+                tokio::net::TcpStream::connect(format!("127.0.0.1:{connect_port}")).await
+            {
+                let _ = stream.write_all(b"HELLO").await;
+            }
+        });
+
+        run_sandbox_worker(&spec_path, &result_path)
+            .await
+            .expect("sandbox worker should succeed");
+
+        let body = tokio::fs::read_to_string(&result_path)
+            .await
+            .expect("result should be readable");
+        let result: SandboxWorkerResult =
+            serde_json::from_str(&body).expect("result should deserialize");
+        assert!(result.success);
+        assert_eq!(result.service_stats.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn external_handoff_success_path_sets_trusted_and_success() {
+        let dir = tempdir().expect("tempdir should be created");
+        let runtime = build_runtime_for_tests(dir.path());
+        let metadata_path = dir.path().join("metadata.json");
+        let evidence_path = dir.path().join("evidence.jsonl");
+        tokio::fs::write(&metadata_path, b"{}\n")
+            .await
+            .expect("metadata should be created");
+        tokio::fs::write(&evidence_path, b"{}\n")
+            .await
+            .expect("evidence should be created");
+
+        let command_path = if Path::new("/bin/echo").exists() {
+            "/bin/echo"
+        } else {
+            "/usr/bin/echo"
+        };
+        let cfg = ExternalHandoffConfig {
+            enabled: true,
+            command: command_path.to_string(),
+            args: vec!["ok".to_string()],
+            timeout_secs: 5,
+            require_success: false,
+            clear_env: false,
+            allowed_commands: vec![],
+            enforce_allowlist: false,
+            signature_enabled: false,
+            signature_key_env: "INNERWARDEN_HANDOFF_SIGNING_KEY".to_string(),
+            attestation_enabled: false,
+            attestation_key_env: "INNERWARDEN_HANDOFF_ATTESTATION_KEY".to_string(),
+            attestation_prefix: "IW_ATTEST".to_string(),
+            attestation_expected_receiver: String::new(),
+        };
+
+        let status = run_external_handoff(
+            dir.path(),
+            &runtime,
+            &metadata_path,
+            &evidence_path,
+            None,
+            &cfg,
+        )
+        .await;
+        assert!(status.attempted);
+        assert_eq!(status.command_success, Some(true));
+        assert!(status.trusted);
+        assert!(status.success);
+        assert!(status.result_file.is_some());
+    }
+
+    #[tokio::test]
+    async fn external_handoff_enforced_allowlist_blocks_disallowed_command() {
+        let dir = tempdir().expect("tempdir should be created");
+        let runtime = build_runtime_for_tests(dir.path());
+        let metadata_path = dir.path().join("metadata.json");
+        let evidence_path = dir.path().join("evidence.jsonl");
+        tokio::fs::write(&metadata_path, b"{}\n")
+            .await
+            .expect("metadata should be created");
+        tokio::fs::write(&evidence_path, b"{}\n")
+            .await
+            .expect("evidence should be created");
+
+        let cfg = ExternalHandoffConfig {
+            enabled: true,
+            command: "/bin/echo".to_string(),
+            args: vec!["blocked".to_string()],
+            timeout_secs: 5,
+            require_success: false,
+            clear_env: false,
+            allowed_commands: vec!["/bin/false".to_string()],
+            enforce_allowlist: true,
+            signature_enabled: false,
+            signature_key_env: "INNERWARDEN_HANDOFF_SIGNING_KEY".to_string(),
+            attestation_enabled: false,
+            attestation_key_env: "INNERWARDEN_HANDOFF_ATTESTATION_KEY".to_string(),
+            attestation_prefix: "IW_ATTEST".to_string(),
+            attestation_expected_receiver: String::new(),
+        };
+
+        let status = run_external_handoff(
+            dir.path(),
+            &runtime,
+            &metadata_path,
+            &evidence_path,
+            None,
+            &cfg,
+        )
+        .await;
+        assert!(status.attempted);
+        assert!(!status.success);
+        assert_eq!(status.allowlist_match, Some(false));
+        assert!(status
+            .error
+            .unwrap_or_default()
+            .contains("not in allowlist"));
+    }
+
+    #[tokio::test]
+    async fn external_handoff_signature_creates_signature_artifact() {
+        let dir = tempdir().expect("tempdir should be created");
+        let runtime = build_runtime_for_tests(dir.path());
+        let metadata_path = dir.path().join("metadata.json");
+        let evidence_path = dir.path().join("evidence.jsonl");
+        tokio::fs::write(&metadata_path, b"{}\n")
+            .await
+            .expect("metadata should be created");
+        tokio::fs::write(&evidence_path, b"{}\n")
+            .await
+            .expect("evidence should be created");
+
+        let command_path = if Path::new("/bin/echo").exists() {
+            "/bin/echo"
+        } else {
+            "/usr/bin/echo"
+        };
+        std::env::set_var("IW_TEST_HANDOFF_SIGNING_KEY", "test-signing-key");
+        let cfg = ExternalHandoffConfig {
+            enabled: true,
+            command: command_path.to_string(),
+            args: vec!["signed".to_string()],
+            timeout_secs: 5,
+            require_success: false,
+            clear_env: false,
+            allowed_commands: vec![],
+            enforce_allowlist: false,
+            signature_enabled: true,
+            signature_key_env: "IW_TEST_HANDOFF_SIGNING_KEY".to_string(),
+            attestation_enabled: false,
+            attestation_key_env: "INNERWARDEN_HANDOFF_ATTESTATION_KEY".to_string(),
+            attestation_prefix: "IW_ATTEST".to_string(),
+            attestation_expected_receiver: String::new(),
+        };
+
+        let status = run_external_handoff(
+            dir.path(),
+            &runtime,
+            &metadata_path,
+            &evidence_path,
+            None,
+            &cfg,
+        )
+        .await;
+        assert!(status.success);
+        assert!(status.signature.is_some());
+        assert!(status.signature_payload_sha256.is_some());
+        assert!(status.signature_file.is_some());
+    }
+
+    #[tokio::test]
+    async fn external_handoff_attestation_missing_env_fails_early() {
+        let dir = tempdir().expect("tempdir should be created");
+        let runtime = build_runtime_for_tests(dir.path());
+        let metadata_path = dir.path().join("metadata.json");
+        let evidence_path = dir.path().join("evidence.jsonl");
+        tokio::fs::write(&metadata_path, b"{}\n")
+            .await
+            .expect("metadata should be created");
+        tokio::fs::write(&evidence_path, b"{}\n")
+            .await
+            .expect("evidence should be created");
+
+        std::env::remove_var("IW_TEST_MISSING_ATTEST");
+        let cfg = ExternalHandoffConfig {
+            enabled: true,
+            command: "/bin/echo".to_string(),
+            args: vec!["attest".to_string()],
+            timeout_secs: 5,
+            require_success: false,
+            clear_env: false,
+            allowed_commands: vec![],
+            enforce_allowlist: false,
+            signature_enabled: false,
+            signature_key_env: "INNERWARDEN_HANDOFF_SIGNING_KEY".to_string(),
+            attestation_enabled: true,
+            attestation_key_env: "IW_TEST_MISSING_ATTEST".to_string(),
+            attestation_prefix: "IW_ATTEST".to_string(),
+            attestation_expected_receiver: String::new(),
+        };
+
+        let status = run_external_handoff(
+            dir.path(),
+            &runtime,
+            &metadata_path,
+            &evidence_path,
+            None,
+            &cfg,
+        )
+        .await;
+        assert!(status.attempted);
+        assert!(!status.success);
+        assert!(status
+            .error
+            .unwrap_or_default()
+            .contains("attestation key is missing"));
+    }
+
+    #[tokio::test]
+    async fn run_pcap_handoff_attempted_path_sets_command_metadata() {
+        let dir = tempdir().expect("tempdir should be created");
+        let status = run_pcap_handoff(
+            dir.path(),
+            "session-test",
+            "1.2.3.4".parse().expect("IP should parse"),
+            1,
+            1,
+        )
+        .await;
+
+        assert!(status.enabled);
+        assert!(status.attempted);
+        assert_eq!(status.timeout_secs, 1);
+        assert_eq!(status.max_packets, 1);
+        assert!(status.command.is_some());
+        assert!(status.pcap_file.is_some());
+    }
+
+    #[tokio::test]
+    async fn external_handoff_timeout_and_empty_command_paths_are_reported() {
+        let dir = tempdir().expect("tempdir should be created");
+        let runtime = build_runtime_for_tests(dir.path());
+        let metadata_path = dir.path().join("metadata.json");
+        let evidence_path = dir.path().join("evidence.jsonl");
+        tokio::fs::write(&metadata_path, b"{}\n")
+            .await
+            .expect("metadata should be created");
+        tokio::fs::write(&evidence_path, b"{}\n")
+            .await
+            .expect("evidence should be created");
+
+        let empty_cfg = ExternalHandoffConfig {
+            enabled: true,
+            command: String::new(),
+            args: vec![],
+            timeout_secs: 5,
+            require_success: false,
+            clear_env: false,
+            allowed_commands: vec![],
+            enforce_allowlist: false,
+            signature_enabled: false,
+            signature_key_env: "INNERWARDEN_HANDOFF_SIGNING_KEY".to_string(),
+            attestation_enabled: false,
+            attestation_key_env: "INNERWARDEN_HANDOFF_ATTESTATION_KEY".to_string(),
+            attestation_prefix: "IW_ATTEST".to_string(),
+            attestation_expected_receiver: String::new(),
+        };
+        let empty = run_external_handoff(
+            dir.path(),
+            &runtime,
+            &metadata_path,
+            &evidence_path,
+            None,
+            &empty_cfg,
+        )
+        .await;
+        assert!(!empty.attempted);
+        assert!(!empty.success);
+        assert!(empty.error.unwrap_or_default().contains("command is empty"));
+
+        let timeout_cfg = ExternalHandoffConfig {
+            enabled: true,
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 2".to_string()],
+            timeout_secs: 1,
+            require_success: false,
+            clear_env: false,
+            allowed_commands: vec![],
+            enforce_allowlist: false,
+            signature_enabled: false,
+            signature_key_env: "INNERWARDEN_HANDOFF_SIGNING_KEY".to_string(),
+            attestation_enabled: false,
+            attestation_key_env: "INNERWARDEN_HANDOFF_ATTESTATION_KEY".to_string(),
+            attestation_prefix: "IW_ATTEST".to_string(),
+            attestation_expected_receiver: String::new(),
+        };
+        let timed_out = run_external_handoff(
+            dir.path(),
+            &runtime,
+            &metadata_path,
+            &evidence_path,
+            None,
+            &timeout_cfg,
+        )
+        .await;
+        assert!(timed_out.attempted);
+        assert!(timed_out.timed_out);
+        assert_eq!(timed_out.command_success, Some(false));
+        assert!(!timed_out.success);
+        assert!(timed_out.error.unwrap_or_default().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn external_handoff_signature_and_attestation_failure_paths_are_reported() {
+        let dir = tempdir().expect("tempdir should be created");
+        let runtime = build_runtime_for_tests(dir.path());
+        let metadata_path = dir.path().join("metadata.json");
+        let evidence_path = dir.path().join("evidence.jsonl");
+        tokio::fs::write(&metadata_path, b"{}\n")
+            .await
+            .expect("metadata should be created");
+        tokio::fs::write(&evidence_path, b"{}\n")
+            .await
+            .expect("evidence should be created");
+
+        std::env::remove_var("IW_TEST_MISSING_SIGNATURE_KEY");
+        let signature_cfg = ExternalHandoffConfig {
+            enabled: true,
+            command: "/bin/echo".to_string(),
+            args: vec!["sig".to_string()],
+            timeout_secs: 5,
+            require_success: false,
+            clear_env: false,
+            allowed_commands: vec![],
+            enforce_allowlist: false,
+            signature_enabled: true,
+            signature_key_env: "IW_TEST_MISSING_SIGNATURE_KEY".to_string(),
+            attestation_enabled: false,
+            attestation_key_env: "INNERWARDEN_HANDOFF_ATTESTATION_KEY".to_string(),
+            attestation_prefix: "IW_ATTEST".to_string(),
+            attestation_expected_receiver: String::new(),
+        };
+        let signature_status = run_external_handoff(
+            dir.path(),
+            &runtime,
+            &metadata_path,
+            &evidence_path,
+            None,
+            &signature_cfg,
+        )
+        .await;
+        assert!(signature_status.attempted);
+        assert!(!signature_status.success);
+        assert!(signature_status.signature_error.is_some());
+        assert!(signature_status
+            .signature_error
+            .unwrap_or_default()
+            .contains("missing signing key"));
+
+        std::env::set_var("IW_TEST_ATTEST_KEY", "attestation-key");
+        let attestation_cfg = ExternalHandoffConfig {
+            enabled: true,
+            command: "/bin/echo".to_string(),
+            args: vec!["IW_ATTEST:receiver-a:wrong:deadbeef".to_string()],
+            timeout_secs: 5,
+            require_success: false,
+            clear_env: false,
+            allowed_commands: vec![],
+            enforce_allowlist: false,
+            signature_enabled: false,
+            signature_key_env: "INNERWARDEN_HANDOFF_SIGNING_KEY".to_string(),
+            attestation_enabled: true,
+            attestation_key_env: "IW_TEST_ATTEST_KEY".to_string(),
+            attestation_prefix: "IW_ATTEST".to_string(),
+            attestation_expected_receiver: "receiver-a".to_string(),
+        };
+        let attestation_status = run_external_handoff(
+            dir.path(),
+            &runtime,
+            &metadata_path,
+            &evidence_path,
+            None,
+            &attestation_cfg,
+        )
+        .await;
+        assert!(attestation_status.attempted);
+        assert_eq!(attestation_status.attestation.matched, Some(false));
+        assert!(!attestation_status.success);
+        assert!(attestation_status.attestation.error.is_some());
+    }
+
+    fn write_runner_script(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("runner script should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)
+                .expect("runner metadata should be available")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("runner script should be executable");
+        }
+    }
+
+    fn sandbox_config_for_runner(path: &Path) -> SandboxLaunchConfig {
+        SandboxLaunchConfig {
+            runner_path: path.display().to_string(),
+            clear_env: false,
+            containment_mode: "process".to_string(),
+            containment_require_success: false,
+            containment_namespace_runner: "unshare".to_string(),
+            containment_namespace_args: vec![
+                "--fork".to_string(),
+                "--pid".to_string(),
+                "--mount-proc".to_string(),
+            ],
+            containment_jail_runner: "bwrap".to_string(),
+            containment_jail_args: vec![],
+            containment_jail_profile: "standard".to_string(),
+            containment_allow_namespace_fallback: true,
+        }
+    }
+
+    fn test_endpoints() -> Vec<DecoyEndpoint> {
+        vec![DecoyEndpoint {
+            service: "ssh".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
+            listen_port: free_local_port(),
+            redirect_from_port: 22,
+            banner: SSH_BANNER,
+        }]
+    }
+
+    #[tokio::test]
+    async fn run_sandbox_worker_reports_missing_and_invalid_spec_errors() {
+        let dir = tempdir().expect("tempdir should be created");
+        let missing_spec = dir.path().join("missing-spec.json");
+        let missing_result = dir.path().join("missing-result.json");
+        let err = run_sandbox_worker(&missing_spec, &missing_result)
+            .await
+            .expect_err("missing spec should fail");
+        assert!(err.to_string().contains("sandbox worker failed"));
+        let missing_body = tokio::fs::read_to_string(&missing_result)
+            .await
+            .expect("result should be written on failure");
+        let missing_out: SandboxWorkerResult =
+            serde_json::from_str(&missing_body).expect("result should deserialize");
+        assert!(!missing_out.success);
+
+        let invalid_spec = dir.path().join("invalid-spec.json");
+        let invalid_result = dir.path().join("invalid-result.json");
+        tokio::fs::write(&invalid_spec, "{invalid-json")
+            .await
+            .expect("invalid spec should be written");
+        let err = run_sandbox_worker(&invalid_spec, &invalid_result)
+            .await
+            .expect_err("invalid spec should fail");
+        assert!(err.to_string().contains("sandbox worker failed"));
+        let invalid_body = tokio::fs::read_to_string(&invalid_result)
+            .await
+            .expect("result should be written on failure");
+        let invalid_out: SandboxWorkerResult =
+            serde_json::from_str(&invalid_body).expect("result should deserialize");
+        assert!(!invalid_out.success);
+    }
+
+    #[tokio::test]
+    async fn run_sandbox_session_success_and_failure_paths() {
+        let dir = tempdir().expect("tempdir should be created");
+        let runtime = build_runtime_for_tests(dir.path());
+        let endpoints = test_endpoints();
+
+        let success_runner = dir.path().join("runner-success.sh");
+        write_runner_script(
+            &success_runner,
+            r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--honeypot-sandbox-result" ]; then
+    result="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf '{"session_id":"test-session","success":true,"error":null,"service_stats":[]}\n' > "$result"
+exit 0
+"#,
+        );
+
+        let outcome = run_sandbox_session(
+            runtime.clone(),
+            endpoints.clone(),
+            dir.path(),
+            &sandbox_config_for_runner(&success_runner),
+        )
+        .await
+        .expect("sandbox session should succeed with helper runner");
+        assert!(outcome.stats.is_empty());
+        assert_eq!(outcome.containment.effective_mode, "process");
+        assert!(outcome.spec_path.exists());
+        assert!(outcome.result_path.exists());
+
+        let failure_runner = dir.path().join("runner-failure.sh");
+        write_runner_script(
+            &failure_runner,
+            r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--honeypot-sandbox-result" ]; then
+    result="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf '{"session_id":"test-session","success":false,"error":"runner-failed","service_stats":[]}\n' > "$result"
+exit 0
+"#,
+        );
+
+        let err = run_sandbox_session(
+            runtime.clone(),
+            endpoints.clone(),
+            dir.path(),
+            &sandbox_config_for_runner(&failure_runner),
+        )
+        .await
+        .expect_err("sandbox session should fail when worker result is unsuccessful");
+        assert!(err.contains("runner-failed"));
+    }
+
+    #[tokio::test]
+    async fn run_sandbox_session_containment_require_success_paths() {
+        let dir = tempdir().expect("tempdir should be created");
+        let runtime = build_runtime_for_tests(dir.path());
+        let endpoints = test_endpoints();
+
+        let success_runner = dir.path().join("runner-ok.sh");
+        write_runner_script(
+            &success_runner,
+            r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--honeypot-sandbox-result" ]; then
+    result="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf '{"session_id":"test-session","success":true,"error":null,"service_stats":[]}\n' > "$result"
+exit 0
+"#,
+        );
+
+        let mut namespace_required = sandbox_config_for_runner(&success_runner);
+        namespace_required.containment_mode = "namespace".to_string();
+        namespace_required.containment_require_success = true;
+        namespace_required.containment_namespace_runner =
+            "definitely-missing-namespace-runner".to_string();
+        let err = run_sandbox_session(
+            runtime.clone(),
+            endpoints.clone(),
+            dir.path(),
+            &namespace_required,
+        )
+        .await
+        .expect_err("missing namespace runner with require_success should fail");
+        assert!(err.contains("requested namespace mode"));
+
+        let mut strict_jail_required = sandbox_config_for_runner(&success_runner);
+        strict_jail_required.containment_mode = "jail".to_string();
+        strict_jail_required.containment_jail_profile = "strict".to_string();
+        strict_jail_required.containment_require_success = true;
+        strict_jail_required.containment_jail_runner = "/bin/sh".to_string();
+        let err = run_sandbox_session(
+            runtime.clone(),
+            endpoints.clone(),
+            dir.path(),
+            &strict_jail_required,
+        )
+        .await
+        .expect_err("strict jail with non-bwrap runner should fail");
+        assert!(err.contains("strict jail profile requires bwrap-compatible runner"));
+
+        let mut namespace_fallback = sandbox_config_for_runner(&success_runner);
+        namespace_fallback.containment_mode = "namespace".to_string();
+        namespace_fallback.containment_require_success = false;
+        namespace_fallback.containment_namespace_runner =
+            "definitely-missing-namespace-runner".to_string();
+        let fallback = run_sandbox_session(runtime, endpoints, dir.path(), &namespace_fallback)
+            .await
+            .expect("namespace fallback to process should succeed");
+        assert_eq!(fallback.containment.requested_mode, "namespace");
+        assert_eq!(fallback.containment.effective_mode, "process");
+        assert!(fallback.containment.fallback_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_listener_rejects_non_target_connections() {
+        let dir = tempdir().expect("tempdir should be created");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+
+        let endpoint = DecoyEndpoint {
+            service: "ssh".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
+            listen_port: addr.port(),
+            redirect_from_port: 22,
+            banner: SSH_BANNER,
+        };
+        let mut runtime = build_runtime_for_tests(dir.path());
+        runtime.target_ip = "127.0.0.2".parse().expect("target IP should parse");
+        runtime.strict_target_only = true;
+        runtime.duration_secs = 1;
+        runtime.max_connections = 1;
+        runtime.evidence_path = dir.path().join("rejections.jsonl");
+
+        let run_task = tokio::spawn(run_listener(endpoint, listener, runtime.clone()));
+        let _client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let stats = run_task.await.expect("listener task should finish");
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.rejected, 1);
+
+        let evidence = tokio::fs::read_to_string(&runtime.evidence_path)
+            .await
+            .expect("rejection evidence should be written");
+        assert!(evidence.contains("connection_rejected"));
+        assert!(evidence.contains("\"target_match\":false"));
+    }
+
+    #[tokio::test]
+    async fn run_listener_medium_http_records_http_evidence() {
+        let dir = tempdir().expect("tempdir should be created");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+
+        let endpoint = DecoyEndpoint {
+            service: "http".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
+            listen_port: addr.port(),
+            redirect_from_port: 80,
+            banner: HTTP_BANNER,
+        };
+        let mut runtime = build_runtime_for_tests(dir.path());
+        runtime.interaction = "medium".to_string();
+        runtime.strict_target_only = false;
+        runtime.duration_secs = 2;
+        runtime.max_connections = 1;
+        runtime.evidence_path = dir.path().join("http-medium.jsonl");
+
+        let run_task = tokio::spawn(run_listener(endpoint, listener, runtime.clone()));
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        client
+            .write_all(b"GET /login HTTP/1.1\r\nHost: honeypot\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("request should be sent");
+        let mut response = vec![0u8; 2048];
+        let n = client
+            .read(&mut response)
+            .await
+            .expect("response should be read");
+        assert!(n > 0);
+        client.shutdown().await.expect("client should shutdown");
+
+        let stats = run_task.await.expect("listener task should finish");
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.rejected, 0);
+
+        let evidence = tokio::fs::read_to_string(&runtime.evidence_path)
+            .await
+            .expect("http evidence should be written");
+        assert!(evidence.contains("http_connection"));
+        assert!(evidence.contains("http_requests_count"));
+    }
+
+    #[tokio::test]
+    async fn run_listener_medium_unknown_service_falls_back_to_banner_mode() {
+        let dir = tempdir().expect("tempdir should be created");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+
+        let endpoint = DecoyEndpoint {
+            service: "smtp".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
+            listen_port: addr.port(),
+            redirect_from_port: 25,
+            banner: b"220 smtp honeypot\r\n",
+        };
+        let mut runtime = build_runtime_for_tests(dir.path());
+        runtime.interaction = "medium".to_string();
+        runtime.strict_target_only = false;
+        runtime.duration_secs = 2;
+        runtime.max_connections = 1;
+        runtime.evidence_path = dir.path().join("fallback.jsonl");
+
+        let run_task = tokio::spawn(run_listener(endpoint, listener, runtime.clone()));
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        client
+            .write_all(b"EHLO attacker.example\r\n")
+            .await
+            .expect("payload should be sent");
+        let mut response = [0u8; 64];
+        let n = client
+            .read(&mut response)
+            .await
+            .expect("banner should be read");
+        assert!(n > 0);
+        client.shutdown().await.expect("client should shutdown");
+
+        let stats = run_task.await.expect("listener task should finish");
+        assert_eq!(stats.accepted, 1);
+        assert!(stats.payload_bytes_captured > 0);
+
+        let evidence = tokio::fs::read_to_string(&runtime.evidence_path)
+            .await
+            .expect("fallback evidence should be written");
+        assert!(evidence.contains("\"service\":\"smtp\""));
+        assert!(evidence.contains("\"interaction\":\"banner\""));
+    }
+
+    #[tokio::test]
+    async fn capture_payload_zero_limit_and_timeout_paths_are_handled() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (mut server_stream, _) = listener.accept().await.expect("server should accept");
+        let _client_stream = client.await.expect("client task should complete");
+
+        let zero = capture_payload(&mut server_stream, 0, 64).await;
+        assert_eq!(zero.bytes_captured, 0);
+        assert_eq!(zero.protocol_guess, "none");
+        assert!(!zero.read_timed_out);
+
+        let timed_out = capture_payload(&mut server_stream, 64, 64).await;
+        assert_eq!(timed_out.bytes_captured, 0);
+        assert_eq!(timed_out.protocol_guess, "unknown");
+        assert!(timed_out.read_timed_out);
+    }
+
+    #[tokio::test]
+    async fn redirect_apply_and_cleanup_branches_record_failures() {
+        let endpoints = vec![DecoyEndpoint {
+            service: "ssh".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
+            listen_port: 2222,
+            redirect_from_port: 22,
+            banner: SSH_BANNER,
+        }];
+        let target_ip: IpAddr = "1.2.3.4".parse().expect("IP should parse");
+
+        let statuses = apply_redirect_rules(&endpoints, target_ip, "iptables").await;
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].apply_error.is_some() || statuses[0].applied);
+
+        let mut synthetic = vec![RedirectRuleStatus {
+            service: "ssh".to_string(),
+            target_ip: "1.2.3.4".to_string(),
+            from_port: 22,
+            to_port: 2222,
+            add_command: "sudo iptables -t nat -A ...".to_string(),
+            remove_command: "sudo iptables -t nat -D ...".to_string(),
+            applied: true,
+            apply_error: None,
+            cleanup_ok: None,
+            cleanup_error: None,
+            cleanup_verified_absent: None,
+        }];
+        cleanup_redirect_rules(&mut synthetic).await;
+        assert!(synthetic[0].cleanup_ok.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_lock_acquire_and_stale_recovery_paths() {
+        let dir = tempdir().expect("tempdir should be created");
+        let lock_path = dir.path().join("listener.lock");
+
+        let lock = SessionLock::acquire(lock_path.clone(), "session-a", 60)
+            .await
+            .expect("initial lock should be acquired");
+        assert!(lock_path.exists());
+        drop(lock);
+        assert!(!lock_path.exists());
+
+        let stale_content = serde_json::json!({
+            "ts": "2020-01-01T00:00:00Z",
+            "session_id": "old-session",
+        });
+        tokio::fs::write(&lock_path, format!("{stale_content}\n"))
+            .await
+            .expect("stale lock should be written");
+        let stale_lock = SessionLock::acquire(lock_path.clone(), "session-b", 1)
+            .await
+            .expect("stale lock should be replaced");
+        assert!(lock_path.exists());
+        drop(stale_lock);
+        assert!(!lock_path.exists());
     }
 }
