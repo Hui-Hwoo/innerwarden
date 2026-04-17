@@ -121,7 +121,7 @@ Ordenado por numero. ✅ merged, 🚧 in-progress, 📝 draft/planned, ⏸ defer
 | 020 | Zero-Trust MDR | 🚧 Phases C + D merged (continuous trust scoring + AI SOC daily checks com 11 system parsers). Phase F-partial (graduated enforcement state machine) merged. |
 | 021 | Observation Verification | ✅ Phases A-D. Score engine + integracao no agent loop + AI batch verification + dashboard score display. Active FP clearing funcional. |
 | 022 | Dashboard Test Coverage | ✅ 6 batches merged + 2 expansoes. Cobertura do dashboard de 0% pra ~30%+. HTML escape, auth, investigation, sensors, actions — tudo testado. |
-| 023 | Coverage Closeout (project-wide) | 🚧 Batches 1-11 merged em PR #125 (aguardando review + codecov refresh). Codecov.yml configurado. Alvo 45%→65%. |
+| 023 | Coverage Closeout (project-wide) | **In progress** — Batches 1..11 done, awaiting codecov refresh |
 | 024 | Regression Safety Net | 📝 Draft P0. Scenario volume tests + `/metrics` drift alerts + contract tests. Kills whack-a-mole. Depende de 023 consolidar antes. |
 | 025 | Structured AI Prompt | 📝 Draft P1. Bench mostrou qwen2.5:3b: 53%→73% accuracy (prose→JSON subgraph). Implementacao: 2 AI sessions. Bench em `innerwarden-test/ai-grounding/`. |
 
