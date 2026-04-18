@@ -823,11 +823,19 @@ pub(super) fn build_journey_from_graph(
 
     let graph = kg.read().unwrap();
 
-    // Find the center node
+    // Detector pivot has no "center node" — it aggregates every Incident whose
+    // `detector` field matches the subject. Branch early so we do not go
+    // through the IP/User-oriented center_id path below, which would otherwise
+    // return an empty journey and make the Threats tab drill-down look broken.
+    if subject_type == PivotKind::Detector {
+        return build_detector_journey(&graph, data_dir, date, subject, window_seconds);
+    }
+
+    // Find the center node (IP or User pivot)
     let center = match subject_type {
         PivotKind::Ip => graph.find_by_ip(subject),
         PivotKind::User => graph.find_by_user(subject),
-        PivotKind::Detector => None, // detector pivot doesn't map to a single node
+        PivotKind::Detector => unreachable!("handled above"),
     };
 
     let center_id = match center {
@@ -1959,6 +1967,162 @@ pub(super) fn scan_honeypot_sessions(
     }
 
     entries
+}
+
+// ---------------------------------------------------------------------------
+// Detector-pivot journey
+// ---------------------------------------------------------------------------
+//
+// Unlike IP/User pivots, a detector name ("sigma", "graph_crypto_miner", …)
+// is not a single node in the graph: it is a field shared by many Incident
+// nodes. The drill-down collects every incident that reports this detector
+// for the requested date and aggregates their timestamps, related entities,
+// and decision history into a JourneyResponse shaped like the IP/User one.
+// Previously the drill-down returned `empty_journey` unconditionally, making
+// the Threats tab look broken when the operator clicked a detector group.
+
+fn build_detector_journey(
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+    data_dir: &Path,
+    date: &str,
+    subject: &str,
+    window_seconds: Option<u64>,
+) -> JourneyResponse {
+    use crate::knowledge_graph::types::*;
+
+    let mut entries: Vec<JourneyEntry> = Vec::new();
+    let mut related_ips: BTreeSet<String> = BTreeSet::new();
+    let mut related_users: BTreeSet<String> = BTreeSet::new();
+    let mut related_detectors: BTreeSet<String> = BTreeSet::new();
+    related_detectors.insert(subject.to_string());
+    let mut has_incident = false;
+
+    // Scan every Incident node — detector is an internal field so there is
+    // no direct index. The graph typically holds O(hundreds) of incidents
+    // so the linear pass is fine; add a secondary index later if needed.
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        let Some(Node::Incident {
+            incident_id,
+            detector,
+            severity,
+            title,
+            summary,
+            ts,
+            mitre_ids,
+            decision,
+            confidence,
+            decision_reason,
+            decision_target,
+            auto_executed,
+            research_only,
+            ..
+        }) = graph.get_node(id)
+        else {
+            continue;
+        };
+        if *research_only || detector != subject {
+            continue;
+        }
+        has_incident = true;
+
+        for edge in graph.outgoing_edges(id) {
+            if edge.relation != Relation::TriggeredBy {
+                continue;
+            }
+            match graph.get_node(edge.to) {
+                Some(Node::Ip { addr, .. }) => {
+                    related_ips.insert(addr.clone());
+                }
+                Some(Node::User { name, .. }) => {
+                    related_users.insert(name.clone());
+                }
+                _ => {}
+            }
+        }
+
+        entries.push(JourneyEntry {
+            ts: *ts,
+            kind: "incident".to_string(),
+            data: serde_json::json!({
+                "incident_id": incident_id,
+                "severity": severity.to_lowercase(),
+                "title": title,
+                "summary": summary,
+                "tags": mitre_ids,
+                "detector": detector,
+            }),
+        });
+
+        if let Some(action) = decision {
+            entries.push(JourneyEntry {
+                ts: *ts,
+                kind: "decision".to_string(),
+                data: serde_json::json!({
+                    "action_type": action,
+                    "confidence": confidence.unwrap_or(0.0),
+                    "auto_executed": auto_executed,
+                    "reason": decision_reason.as_deref().unwrap_or(""),
+                    "target_ip": decision_target,
+                    "incident_id": incident_id,
+                    "execution_result": if *auto_executed { "ok" } else { "skipped" },
+                }),
+            });
+        }
+    }
+
+    // Honeypot sessions surface through related_ips (not the detector name).
+    let mut hp_entries = scan_honeypot_sessions(data_dir, date, &related_ips);
+    entries.append(&mut hp_entries);
+
+    entries.sort_by_key(|e| e.ts);
+    if let Some(window) = window_seconds {
+        if let Some(last_ts) = entries.last().map(|e| e.ts) {
+            let cutoff = last_ts - chrono::Duration::seconds(window as i64);
+            entries.retain(|entry| entry.ts >= cutoff);
+        }
+    }
+
+    let first_seen = entries.first().map(|e| e.ts);
+    let last_seen = entries.last().map(|e| e.ts);
+
+    let outcome = entries
+        .iter()
+        .filter(|e| e.kind == "decision")
+        .filter_map(|e| e.data.get("action_type").and_then(|v| v.as_str()))
+        .find_map(|d| match d {
+            "block_ip" => Some("blocked"),
+            "honeypot" => Some("honeypot"),
+            "monitor" => Some("monitoring"),
+            _ => None,
+        })
+        .unwrap_or(if has_incident { "active" } else { "unknown" })
+        .to_string();
+
+    let summary = build_journey_summary(
+        &entries,
+        &outcome,
+        PivotKind::Detector,
+        subject,
+        &related_ips,
+        &related_users,
+        &related_detectors,
+    );
+
+    let verdict = derive_verdict(&entries, &outcome);
+    let chapters = derive_chapters(&entries);
+
+    JourneyResponse {
+        subject_type: PivotKind::Detector.as_str().to_string(),
+        subject: subject.to_string(),
+        date: date.to_string(),
+        first_seen,
+        last_seen,
+        outcome,
+        summary,
+        verdict,
+        chapters,
+        entries,
+    }
 }
 
 // ---------------------------------------------------------------------------
