@@ -21,6 +21,7 @@
 //! IPs in one hour).
 
 use innerwarden_store::Store;
+use tracing::{info, warn};
 
 /// SQLite KV namespace holding `ip → "1"` entries with a 24h TTL for dedup.
 pub(crate) const REPORTED_NS: &str = "abuseipdb_reported";
@@ -109,21 +110,35 @@ where
     let mut counts = FlushCounts::default();
     for outcome in outcomes {
         match outcome {
-            FlushOutcome::SkipCloud { .. } => {
+            FlushOutcome::SkipCloud { ip, provider } => {
                 counts.dropped_cloud += 1;
+                warn!(
+                    ip = %ip,
+                    provider,
+                    "AbuseIPDB report dropped: target is in cloud safelist"
+                );
             }
-            FlushOutcome::Skip { reason, .. } => match reason {
-                RejectReason::AlreadyReportedToday => counts.dropped_dedup += 1,
-                RejectReason::DailyCapReached => counts.dropped_cap += 1,
-            },
+            FlushOutcome::Skip { ip, reason } => {
+                match reason {
+                    RejectReason::AlreadyReportedToday => counts.dropped_dedup += 1,
+                    RejectReason::DailyCapReached => counts.dropped_cap += 1,
+                }
+                warn!(
+                    ip = %ip,
+                    reason = reason.as_metric_label(),
+                    "AbuseIPDB report skipped by budget gate"
+                );
+            }
             FlushOutcome::Send {
                 ip,
                 categories,
                 comment,
                 commit,
             } => {
+                let ip_for_log = ip.clone();
                 report_fn(ip, categories, comment).await;
                 counts.sent += 1;
+                info!(ip = %ip_for_log, "AbuseIPDB report sent (after 5min delay)");
                 if let (Some(sq), Some(commit)) = (store, commit) {
                     commit.apply(sq);
                 }
@@ -493,6 +508,83 @@ mod tests {
             }
             other => panic!("expected Skip, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_empty_outcomes_returns_zero_counts_and_never_calls_reporter() {
+        // Fast-path: empty ready queue → zero HTTP cost and zero sqlite writes.
+        let mut calls = 0usize;
+        let counts = dispatch_flush_outcomes(Vec::new(), None, |_, _, _| {
+            calls += 1;
+            async {}
+        })
+        .await;
+        assert_eq!(calls, 0);
+        assert_eq!(counts, FlushCounts::default());
+    }
+
+    #[tokio::test]
+    async fn plan_empty_queue_produces_empty_outcomes() {
+        // Defensive check — the planner should tolerate an empty
+        // `state.abuseipdb_report_queue` without touching the store or
+        // the safelist predicate.
+        let outcomes = plan_queue_flush(
+            &[],
+            None,
+            |_| panic!("safelist predicate should not be called on empty queue"),
+            "2026-04-18",
+            800,
+        );
+        assert!(outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_without_commit_still_fires_reporter() {
+        // Covers the pre-016 branch: `commit = None` means no sqlite write
+        // but the reporter must still be called with the original fields.
+        let outcomes = vec![FlushOutcome::Send {
+            ip: "203.0.113.1".into(),
+            categories: "18".into(),
+            comment: "hi".into(),
+            commit: None,
+        }];
+        let mut calls = Vec::new();
+        let counts = dispatch_flush_outcomes(outcomes, None, |ip, cats, cmt| {
+            calls.push((ip, cats, cmt));
+            async {}
+        })
+        .await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "203.0.113.1");
+        assert_eq!(counts.sent, 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_commit_but_no_store_is_a_noop() {
+        // Guard: `Send { commit: Some(_), .. }` paired with `store = None`
+        // (rare — the planner only emits `Some(commit)` when the store is
+        // present, but unit tests can construct this by hand). Must not
+        // panic; the commit is silently dropped since no backing store
+        // exists to apply it to.
+        let store = mem_store();
+        let commit = match check_report_budget(&store, "1.2.3.4", "2026-04-18", 800) {
+            ReportBudgetDecision::Allow(c) => c,
+            _ => panic!("expected allow"),
+        };
+        let outcomes = vec![FlushOutcome::Send {
+            ip: "1.2.3.4".into(),
+            categories: "18".into(),
+            comment: "c".into(),
+            commit: Some(commit),
+        }];
+        let mut calls = 0usize;
+        let counts = dispatch_flush_outcomes(outcomes, None, |_, _, _| {
+            calls += 1;
+            async {}
+        })
+        .await;
+        assert_eq!(calls, 1);
+        assert_eq!(counts.sent, 1);
     }
 
     #[tokio::test]

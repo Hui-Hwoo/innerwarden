@@ -1536,7 +1536,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             &today,
                             daily_cap,
                         );
-                        let counts = if let Some(ref client) = state.abuseipdb {
+                        if let Some(ref client) = state.abuseipdb {
                             abuseipdb_report_budget::dispatch_flush_outcomes(
                                 outcomes,
                                 state.sqlite_store.as_deref(),
@@ -1544,18 +1544,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                     client.report(&ip, &categories, &comment).await;
                                 },
                             )
-                            .await
-                        } else {
-                            abuseipdb_report_budget::FlushCounts::default()
-                        };
-                        if counts.dropped_cloud > 0 {
-                            info!(dropped_cloud = counts.dropped_cloud, "AbuseIPDB queue flush: cloud safelist drops");
-                        }
-                        if counts.dropped_dedup > 0 {
-                            info!(dropped_dedup = counts.dropped_dedup, "AbuseIPDB queue flush: 24h dedup drops");
-                        }
-                        if counts.dropped_cap > 0 {
-                            warn!(dropped_cap = counts.dropped_cap, daily_cap, "AbuseIPDB daily report cap reached — remaining reports paused until UTC midnight");
+                            .await;
                         }
                         state.abuseipdb_report_queue.retain(|(_, _, _, ts)| *ts >= report_cutoff);
                     }
