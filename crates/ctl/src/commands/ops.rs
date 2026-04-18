@@ -198,6 +198,32 @@ pub(crate) fn cmd_configure_sensitivity(cli: &Cli, level: &str) -> Result<()> {
     config_editor::write_str(&cli.agent_config, "webhook", "min_severity", min_severity)?;
     println!("✅ Notification sensitivity: {level}");
     println!("   Telegram + webhook min_severity = \"{min_severity}\"");
+
+    // Apply detector thresholds (math logic from calibrate module)
+    match crate::calibrate::calculate_sensitivity_overrides(level) {
+        Ok(overrides) => {
+            println!("   Applying detector thresholds for '{level}' mode:");
+            for (key, val) in overrides {
+                // key is like "detectors.ssh_bruteforce.threshold"
+                let parts: Vec<&str> = key.split('.').collect();
+                if parts.len() == 3 {
+                    let section = format!("{}.{}", parts[0], parts[1]);
+                    let field = parts[2];
+                    if let Err(e) =
+                        config_editor::write_int(&cli.agent_config, &section, field, val)
+                    {
+                        eprintln!("     [warn] failed to set {key}: {e:#}");
+                    } else {
+                        println!("     - {key} = {val}");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("   [warn] failed to calculate thresholds for '{level}': {e:#}");
+        }
+    }
+
     match level.to_lowercase().as_str() {
         "quiet" => println!("   You'll only be notified for Critical events."),
         "normal" => println!("   You'll be notified for High and Critical events."),
