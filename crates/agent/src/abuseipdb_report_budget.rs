@@ -79,6 +79,140 @@ impl ReportBudgetCommit {
     }
 }
 
+/// Counters emitted by `dispatch_flush_outcomes`. Copied into the slow-loop
+/// log lines and `/metrics` counters downstream.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlushCounts {
+    pub sent: usize,
+    pub dropped_cloud: usize,
+    pub dropped_dedup: usize,
+    pub dropped_cap: usize,
+}
+
+/// Drive every `FlushOutcome` to completion. For `Send` outcomes invokes
+/// `report_fn(ip, categories, comment)` (mockable in tests), then — if the
+/// report call did not panic — applies the budget commit against `store`.
+/// `Skip`/`SkipCloud` outcomes just bump the matching counter.
+///
+/// The slow loop passes a closure that calls `client.report(...)`. Unit
+/// tests pass a counting closure so the whole dispatch table is covered
+/// without a live HTTP endpoint.
+pub(crate) async fn dispatch_flush_outcomes<F, Fut>(
+    outcomes: Vec<FlushOutcome>,
+    store: Option<&Store>,
+    mut report_fn: F,
+) -> FlushCounts
+where
+    F: FnMut(String, String, String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut counts = FlushCounts::default();
+    for outcome in outcomes {
+        match outcome {
+            FlushOutcome::SkipCloud { .. } => {
+                counts.dropped_cloud += 1;
+            }
+            FlushOutcome::Skip { reason, .. } => match reason {
+                RejectReason::AlreadyReportedToday => counts.dropped_dedup += 1,
+                RejectReason::DailyCapReached => counts.dropped_cap += 1,
+            },
+            FlushOutcome::Send {
+                ip,
+                categories,
+                comment,
+                commit,
+            } => {
+                report_fn(ip, categories, comment).await;
+                counts.sent += 1;
+                if let (Some(sq), Some(commit)) = (store, commit) {
+                    commit.apply(sq);
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Outcome of planning a single queue entry for flush. Carries everything
+/// the caller needs to either dispatch the HTTP call + commit the receipt,
+/// or log + bump the matching drop counter. The planner stays I/O-free so
+/// the slow-loop flush logic can be unit tested without a Tokio runtime
+/// or a live AbuseIPDB client.
+pub(crate) enum FlushOutcome {
+    Send {
+        ip: String,
+        categories: String,
+        comment: String,
+        commit: Option<ReportBudgetCommit>,
+    },
+    SkipCloud {
+        ip: String,
+        provider: &'static str,
+    },
+    Skip {
+        ip: String,
+        reason: RejectReason,
+    },
+}
+
+/// Compute the per-entry disposition for every ready queue item. Callers
+/// (slow loop) iterate the returned vector and for each `Send` run
+/// `client.report()` followed by `commit.apply()`; `SkipCloud` and `Skip`
+/// are logged and counted for telemetry.
+///
+/// Parameters:
+/// * `ready` — `(ip, comment, categories, queued_at)` tuples matching the
+///   existing `state.abuseipdb_report_queue` shape.
+/// * `store` — optional sqlite store; when absent (pre-spec-016 deploy /
+///   test harness) the planner falls back to sending everything, which
+///   mirrors pre-fix behaviour.
+/// * `identify_provider` — cloud-safelist lookup; factored out so tests
+///   can inject a stub table.
+/// * `today`, `daily_cap` — forwarded into `check_report_budget`.
+pub(crate) fn plan_queue_flush<F>(
+    ready: &[(String, String, String, chrono::DateTime<chrono::Utc>)],
+    store: Option<&Store>,
+    identify_provider: F,
+    today: &str,
+    daily_cap: u32,
+) -> Vec<FlushOutcome>
+where
+    F: Fn(&str) -> Option<&'static str>,
+{
+    let mut out = Vec::with_capacity(ready.len());
+    for (ip, comment, categories, _) in ready {
+        if let Some(provider) = identify_provider(ip) {
+            out.push(FlushOutcome::SkipCloud {
+                ip: ip.clone(),
+                provider,
+            });
+            continue;
+        }
+
+        let commit = match store {
+            Some(sq) => match check_report_budget(sq, ip, today, daily_cap) {
+                ReportBudgetDecision::Allow(c) => Some(c),
+                ReportBudgetDecision::Reject(reason) => {
+                    out.push(FlushOutcome::Skip {
+                        ip: ip.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+            },
+            None => None,
+        };
+
+        out.push(FlushOutcome::Send {
+            ip: ip.clone(),
+            categories: categories.clone(),
+            comment: comment.clone(),
+            commit,
+        });
+    }
+    out
+}
+
 /// Inspect the dedup + counter state for `ip` on `today`. Returns `Allow`
 /// with a pending commit, or `Reject(reason)` to be logged and skipped.
 ///
@@ -267,6 +401,221 @@ mod tests {
         // Fresh check should allow the re-report.
         let ok = check_report_budget(&store, "1.2.3.4", "2026-04-18", 800);
         assert!(matches!(ok, ReportBudgetDecision::Allow(_)));
+    }
+
+    fn queue_entry(ip: &str) -> (String, String, String, chrono::DateTime<chrono::Utc>) {
+        (
+            ip.to_string(),
+            format!("InnerWarden auto-block: {ip}"),
+            "18,22".to_string(),
+            chrono::Utc::now(),
+        )
+    }
+
+    fn no_cloud(_: &str) -> Option<&'static str> {
+        None
+    }
+
+    #[test]
+    fn plan_flushes_ip_with_no_budget_when_store_absent() {
+        // Pre-spec-016 compat: without a store, the planner emits Send for
+        // every entry (None commit) so legacy deploys keep reporting like
+        // before. The inner gate still blocks cloud IPs via the safelist
+        // predicate though.
+        let ready = vec![queue_entry("1.2.3.4")];
+        let outcomes = plan_queue_flush(&ready, None, no_cloud, "2026-04-18", 800);
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            FlushOutcome::Send { ip, commit, .. } => {
+                assert_eq!(ip, "1.2.3.4");
+                assert!(commit.is_none());
+            }
+            other => panic!("expected Send, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn plan_bucks_cloud_ips_into_skip_cloud() {
+        // Cloud-safelist guard runs before the budget, matching the slow
+        // loop's defence ordering in `loops/boot.rs`.
+        let ready = vec![queue_entry("104.26.12.38"), queue_entry("1.2.3.4")];
+        let outcomes = plan_queue_flush(
+            &ready,
+            Some(&mem_store()),
+            |ip| {
+                if ip.starts_with("104.") {
+                    Some("Cloudflare")
+                } else {
+                    None
+                }
+            },
+            "2026-04-18",
+            800,
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(
+            outcomes[0],
+            FlushOutcome::SkipCloud { ref provider, .. } if *provider == "Cloudflare"
+        ));
+        assert!(matches!(outcomes[1], FlushOutcome::Send { .. }));
+    }
+
+    #[test]
+    fn plan_marks_duplicate_ip_as_skip_with_reason() {
+        let store = mem_store();
+        // Seed the dedup entry so the second call rejects.
+        let first = check_report_budget(&store, "1.2.3.4", "2026-04-18", 800);
+        if let ReportBudgetDecision::Allow(c) = first {
+            c.apply(&store);
+        }
+
+        let ready = vec![queue_entry("1.2.3.4")];
+        let outcomes = plan_queue_flush(&ready, Some(&store), no_cloud, "2026-04-18", 800);
+        match &outcomes[0] {
+            FlushOutcome::Skip { reason, .. } => {
+                assert_eq!(*reason, RejectReason::AlreadyReportedToday);
+            }
+            other => panic!("expected Skip, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn plan_skip_cap_when_counter_at_limit() {
+        let store = mem_store();
+        store
+            .kv_set(LIMITS_NS, "abuseipdb_report_daily_2026-04-18", b"800")
+            .expect("seed cap-hit");
+        let ready = vec![queue_entry("9.9.9.9")];
+        let outcomes = plan_queue_flush(&ready, Some(&store), no_cloud, "2026-04-18", 800);
+        match &outcomes[0] {
+            FlushOutcome::Skip { reason, .. } => {
+                assert_eq!(*reason, RejectReason::DailyCapReached);
+            }
+            other => panic!("expected Skip, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_counts_each_outcome_kind_and_commits_allowed_sends() {
+        // Full dispatch matrix through a mock report closure. Drives every
+        // branch in dispatch_flush_outcomes so boot.rs only needs to wire
+        // the closure + log the counters.
+        let store = mem_store();
+        let allow_commit = match check_report_budget(&store, "198.51.100.1", "2026-04-18", 800) {
+            ReportBudgetDecision::Allow(c) => c,
+            _ => panic!("expected allow"),
+        };
+        let outcomes = vec![
+            FlushOutcome::Send {
+                ip: "198.51.100.1".into(),
+                categories: "18".into(),
+                comment: "atk".into(),
+                commit: Some(allow_commit),
+            },
+            FlushOutcome::SkipCloud {
+                ip: "104.26.12.38".into(),
+                provider: "Cloudflare",
+            },
+            FlushOutcome::Skip {
+                ip: "1.2.3.4".into(),
+                reason: RejectReason::AlreadyReportedToday,
+            },
+            FlushOutcome::Skip {
+                ip: "5.6.7.8".into(),
+                reason: RejectReason::DailyCapReached,
+            },
+        ];
+
+        let mut sent_ips = Vec::new();
+        let counts = dispatch_flush_outcomes(outcomes, Some(&store), |ip, cats, _comment| {
+            sent_ips.push((ip, cats));
+            async {}
+        })
+        .await;
+
+        assert_eq!(
+            counts,
+            FlushCounts {
+                sent: 1,
+                dropped_cloud: 1,
+                dropped_dedup: 1,
+                dropped_cap: 1,
+            }
+        );
+        assert_eq!(sent_ips.len(), 1);
+        assert_eq!(sent_ips[0].0, "198.51.100.1");
+
+        // Commit applied — second plan call for same IP must now reject.
+        let follow_up = check_report_budget(&store, "198.51.100.1", "2026-04-18", 800);
+        assert!(matches!(follow_up, ReportBudgetDecision::Reject(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_commit_when_store_absent() {
+        // Pre-spec-016 safety: with `store = None`, plan emits `Send { commit: None }`,
+        // and dispatch must not panic trying to apply it. The reporter fires,
+        // but no counter/dedup persists.
+        let outcomes = vec![FlushOutcome::Send {
+            ip: "1.2.3.4".into(),
+            categories: "18".into(),
+            comment: "c".into(),
+            commit: None,
+        }];
+        let mut calls = 0usize;
+        let counts = dispatch_flush_outcomes(outcomes, None, |_, _, _| {
+            calls += 1;
+            async {}
+        })
+        .await;
+        assert_eq!(calls, 1);
+        assert_eq!(counts.sent, 1);
+    }
+
+    #[test]
+    fn plan_preserves_queue_order_and_fields() {
+        // Callers (slow loop) rely on Send entries carrying the exact
+        // comment + categories strings originally queued by
+        // decision_block_ip. Regressing this would silently change what we
+        // report to AbuseIPDB — worse than dropping the report.
+        let ready = vec![
+            (
+                "1.1.1.1".to_string(),
+                "comment-a".to_string(),
+                "18".to_string(),
+                chrono::Utc::now(),
+            ),
+            (
+                "2.2.2.2".to_string(),
+                "comment-b".to_string(),
+                "22".to_string(),
+                chrono::Utc::now(),
+            ),
+        ];
+        let outcomes = plan_queue_flush(&ready, None, no_cloud, "2026-04-18", 800);
+        match (&outcomes[0], &outcomes[1]) {
+            (
+                FlushOutcome::Send {
+                    ip: i1,
+                    comment: c1,
+                    categories: cat1,
+                    ..
+                },
+                FlushOutcome::Send {
+                    ip: i2,
+                    comment: c2,
+                    categories: cat2,
+                    ..
+                },
+            ) => {
+                assert_eq!(i1, "1.1.1.1");
+                assert_eq!(c1, "comment-a");
+                assert_eq!(cat1, "18");
+                assert_eq!(i2, "2.2.2.2");
+                assert_eq!(c2, "comment-b");
+                assert_eq!(cat2, "22");
+            }
+            _ => panic!("expected two Send outcomes in order"),
+        }
     }
 
     #[test]
