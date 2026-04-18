@@ -26,7 +26,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![eBPF Hooks](https://img.shields.io/badge/eBPF%20hooks-40-blueviolet)
 ![Detectors](https://img.shields.io/badge/detectors-49-blue)
 ![Correlation Rules](https://img.shields.io/badge/correlation%20rules-47-purple)
-![Tests](https://img.shields.io/badge/tests-2556-brightgreen)
+![Tests](https://img.shields.io/badge/tests-3689-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-65%20mappings-red)
 ![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-208-blueviolet)
 ![Memory](https://img.shields.io/badge/memory-~250MB%20(full%20stack)-green)
@@ -47,7 +47,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 Inner Warden is a self-contained runtime defense stack: kernel-level telemetry, native network visibility, AI triage, and autonomous response in one system. Single SQLite database for all state — no scattered log files, no external database. No SIEM bundle, no external IDS/HIDS dependency, and no cloud control plane required.
 
-40 eBPF kernel hooks. 49 detectors. 22 collectors. 47 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. No cloud. No dependencies. Just two Rust daemons and a CLI.
+40 eBPF kernel hooks. 49 detectors. 22 collectors. 47 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Intelligent notifications** — incidents group into a single Telegram message per IP instead of one-per-event. **Zero-trust MDR** — continuous trust scoring + AI SOC daily checks + graduated enforcement. **Regression safety net** — `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios. No cloud. No dependencies. Just two Rust daemons and a CLI.
 
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
@@ -181,10 +181,19 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │   ┌───────────────────────────────────────────────────────────┐   │
 │   │ Dashboard: HUD, threats, investigation, attacker intel,   │   │
 │   │ MITRE ATT&CK map, monthly reports, baseline learning,     │   │
-│   │ ISO 27001 compliance, hash chain, live SSE, audit trail   │   │
+│   │ ISO 27001 compliance, hash chain, live SSE, audit trail,  │   │
+│   │ drift metrics (spec 024), trust scores (spec 020)         │   │
 │   └───────────────────────────────────────────────────────────┘   │
 └───────────────────────────────────────────────────────────────────┘
 ```
+
+**Runtime layers added in v0.12.0** (sit between the AI Triage and the notification channels above):
+
+- **Notification gate** (spec 005) — every channel (Telegram, Slack, Webhook, Push) goes through a single policy that returns `SendNow` / `DailyBriefingOnly` / `Drop`. Burst summary collapses 50+/h auto-blocks into one "all handled" message.
+- **Graduated enforcement** (spec 020) — state machine promotes a responder from `Observe` → `Warn` → `Contain` → `Enforce` based on continuous trust scoring and AI SOC daily checks (11 system parsers).
+- **Observation verification** (spec 021) — behavioural score engine + AI batch verification clears active false positives instead of leaving them to rot.
+- **Regression safety net** (spec 024) — `make scenario-qa` asserts volume envelopes for 7 canonical scenarios; 10 drift metrics exported on `/metrics`; `docs/prometheus-alerts.yaml` consumes them.
+- **Structured subgraph prompt** (spec 025, opt-in) — when `ai.use_structured_subgraph = true`, the LLM receives the graph context as JSON nodes/edges instead of prose (measured +20pp action accuracy on qwen2.5:3b).
 
 ---
 
