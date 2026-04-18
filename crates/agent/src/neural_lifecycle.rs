@@ -83,22 +83,22 @@ fn kind_index(kind: &str) -> Option<usize> {
 /// Attack-indicative bigram transitions. Slot values follow `BIGRAM_BASE`
 /// (updates when `KIND_SLOTS` changes — keep in sync manually).
 const ATTACK_BIGRAMS: &[(usize, usize, usize)] = &[
-    (14, 13, BIGRAM_BASE),      // ssh_failed → ssh_success
-    (13, 1, BIGRAM_BASE + 1),   // ssh_success → shell_exec
-    (1, 0, BIGRAM_BASE + 2),    // shell_exec → file_read
-    (0, 7, BIGRAM_BASE + 3),    // file_read → outbound_connect
-    (1, 7, BIGRAM_BASE + 4),    // shell_exec → outbound_connect
-    (8, 0, BIGRAM_BASE + 5),    // sudo → file_read
-    (1, 16, BIGRAM_BASE + 6),   // shell_exec → timestomp
-    (1, 17, BIGRAM_BASE + 7),   // shell_exec → truncate
-    (3, 1, BIGRAM_BASE + 8),    // fd_redirect → shell_exec
-    (19, 1, BIGRAM_BASE + 9),   // privesc → shell_exec
-    (1, 20, BIGRAM_BASE + 10),  // shell_exec → memfd_create
-    (7, 7, BIGRAM_BASE + 11),   // outbound → outbound (beaconing)
-    (1, 1, BIGRAM_BASE + 12),   // shell → shell (recon burst)
-    (21, 1, BIGRAM_BASE + 13),  // module_load → shell_exec
-    (23, 9, BIGRAM_BASE + 14),  // listen → accept
-    (4, 3, BIGRAM_BASE + 15),   // clone → fd_redirect
+    (14, 13, BIGRAM_BASE),     // ssh_failed → ssh_success
+    (13, 1, BIGRAM_BASE + 1),  // ssh_success → shell_exec
+    (1, 0, BIGRAM_BASE + 2),   // shell_exec → file_read
+    (0, 7, BIGRAM_BASE + 3),   // file_read → outbound_connect
+    (1, 7, BIGRAM_BASE + 4),   // shell_exec → outbound_connect
+    (8, 0, BIGRAM_BASE + 5),   // sudo → file_read
+    (1, 16, BIGRAM_BASE + 6),  // shell_exec → timestomp
+    (1, 17, BIGRAM_BASE + 7),  // shell_exec → truncate
+    (3, 1, BIGRAM_BASE + 8),   // fd_redirect → shell_exec
+    (19, 1, BIGRAM_BASE + 9),  // privesc → shell_exec
+    (1, 20, BIGRAM_BASE + 10), // shell_exec → memfd_create
+    (7, 7, BIGRAM_BASE + 11),  // outbound → outbound (beaconing)
+    (1, 1, BIGRAM_BASE + 12),  // shell → shell (recon burst)
+    (21, 1, BIGRAM_BASE + 13), // module_load → shell_exec
+    (23, 9, BIGRAM_BASE + 14), // listen → accept
+    (4, 3, BIGRAM_BASE + 15),  // clone → fd_redirect
 ];
 
 /// Extract 48 features from a window of event kinds.

@@ -68,9 +68,8 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(String, Option<String>)>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT kind, data FROM events WHERE ts >= ?1 ORDER BY ts LIMIT ?2",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT kind, data FROM events WHERE ts >= ?1 ORDER BY ts LIMIT ?2")?;
         let rows = stmt.query_map(params![since_ts_iso, limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -81,13 +80,12 @@ impl Store {
             let ip = serde_json::from_str::<serde_json::Value>(&data)
                 .ok()
                 .and_then(|v| {
-                    v.get("details")
-                        .and_then(|d| {
-                            d.get("src_ip")
-                                .or_else(|| d.get("ip"))
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string())
-                        })
+                    v.get("details").and_then(|d| {
+                        d.get("src_ip")
+                            .or_else(|| d.get("ip"))
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                    })
                 });
             out.push((kind, ip));
         }
@@ -212,7 +210,9 @@ mod tests {
         ev3.details = serde_json::json!({"path": "/etc/passwd"});
         store.insert_event(&ev3).unwrap();
 
-        let rows = store.events_for_training("1970-01-01T00:00:00Z", 100).unwrap();
+        let rows = store
+            .events_for_training("1970-01-01T00:00:00Z", 100)
+            .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], ("ssh.login_failed".into(), Some("1.2.3.4".into())));
         assert_eq!(rows[1], ("http.request".into(), Some("5.6.7.8".into())));
