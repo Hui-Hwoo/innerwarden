@@ -27,3 +27,13 @@ __pycache__/
 node_modules/
 # Codex agent metadata
 .agents/
+
+# Claude agent/handbook docs — private to operator
+CLAUDE.md
+**/CLAUDE.md
+.claude/
+**/.claude/
+
+# Project docs live in the GitHub wiki, not the repo
+docs/
+.specify/
