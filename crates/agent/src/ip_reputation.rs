@@ -309,10 +309,89 @@ mod tests {
     }
 
     #[test]
-    fn load_malformed_json_returns_empty() {
+    fn test_malformed_json_returns_empty() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("ip-reputation.json"), "not json").unwrap();
         let loaded = load_ip_reputations(tmp.path());
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_adaptive_block_ttl_full_range() {
+        // 0 or 1 block -> 1 hour
+        assert_eq!(adaptive_block_ttl_secs(0), 3600);
+        assert_eq!(adaptive_block_ttl_secs(1), 3600);
+        // 2 blocks -> 4 hours
+        assert_eq!(adaptive_block_ttl_secs(2), 14400);
+        // 3 blocks -> 24 hours
+        assert_eq!(adaptive_block_ttl_secs(3), 86400);
+        // 4+ blocks -> 7 days
+        assert_eq!(adaptive_block_ttl_secs(4), 604800);
+        assert_eq!(adaptive_block_ttl_secs(10), 604800);
+    }
+
+    #[test]
+    fn test_local_ip_reputation_initialization() {
+        let r = rep();
+        assert_eq!(r.total_incidents, 0);
+        assert_eq!(r.total_blocks, 0);
+        assert_eq!(r.reputation_score, 0.0);
+        assert!(r.first_seen <= chrono::Utc::now());
+        assert_eq!(r.first_seen, r.last_seen);
+    }
+
+    #[test]
+    fn test_local_ip_reputation_recording() {
+        let mut r = rep();
+        let initial_seen = r.last_seen;
+
+        // Record incident: +1 incident, +1.0 score
+        r.record_incident();
+        assert_eq!(r.total_incidents, 1);
+        assert_eq!(r.reputation_score, 1.0);
+        assert!(r.last_seen >= initial_seen);
+
+        // Record block: +1 block, +2.0 score (total 3.0)
+        let mid_seen = r.last_seen;
+        r.record_block();
+        assert_eq!(r.total_blocks, 1);
+        assert_eq!(r.reputation_score, 3.0);
+        assert!(r.last_seen >= mid_seen);
+    }
+
+    #[test]
+    fn test_reputation_persistence_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reputations = HashMap::new();
+
+        let mut r1 = rep();
+        r1.record_incident();
+        reputations.insert("1.1.1.1".to_string(), r1);
+
+        let mut r2 = rep();
+        r2.record_block();
+        reputations.insert("2.2.2.2".to_string(), r2);
+
+        persist_ip_reputations(tmp.path(), &reputations);
+
+        let loaded = load_ip_reputations(tmp.path());
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["1.1.1.1"].total_incidents, 1);
+        assert_eq!(loaded["2.2.2.2"].total_blocks, 1);
+        assert_eq!(loaded["2.2.2.2"].reputation_score, 2.0);
+    }
+
+    #[test]
+    fn test_append_blocked_ip_logic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ip1 = "10.0.0.1";
+        let ip2 = "192.168.1.1";
+
+        append_blocked_ip(tmp.path(), ip1);
+        append_blocked_ip(tmp.path(), ip2);
+
+        let content = std::fs::read_to_string(tmp.path().join("blocked-ips.txt")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines, vec![ip1, ip2]);
     }
 }
