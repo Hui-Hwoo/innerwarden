@@ -85,6 +85,24 @@ async fn handle_completed_chain(
     if crate::incident_auto_rules::is_internal_ip_pub(&ip) {
         return;
     }
+    // Cloud-provider / CDN safelist: prevent correlation chains (CL-008 in
+    // particular — file.read_access → network.outbound_connect within 60s —
+    // matches every normal web server, and would otherwise ban Cloudflare,
+    // AWS, and our own Oracle peer ranges en masse). `execute_block_ip`
+    // already guards at the executor, but short-circuiting here keeps the
+    // ip_reputation counter, cooldown table, and knowledge-graph decision
+    // edge from being polluted in the first place.
+    if let Some(provider) = crate::cloud_safelist::identify_provider(&ip) {
+        info!(
+            chain_id = %chain.chain_id,
+            rule = %chain.rule_id,
+            ip = %ip,
+            provider,
+            "correlation chain targeted a cloud-provider IP — skipping escalation"
+        );
+        state.ip_reputations.remove(&ip);
+        return;
+    }
     if allowlist::is_ip_allowlisted(&ip, &cfg.allowlist.trusted_ips)
         || allowlist::is_ip_allowlisted(&ip, &state.dynamic_trusted_ips)
     {
@@ -320,6 +338,21 @@ async fn check_repeat_offenders(
 
         // Guard checks.
         if crate::incident_auto_rules::is_internal_ip_pub(&ip) {
+            continue;
+        }
+        // Cloud-provider / CDN safelist — drop the reputation entry outright
+        // so the next correlation burst cannot bump this IP back above the
+        // escalation threshold. Production data from 2026-04-18 showed
+        // repeat-offender compounding on Cloudflare CIDRs after CL-008
+        // kept refiring on legitimate outbound traffic.
+        if let Some(provider) = crate::cloud_safelist::identify_provider(&ip) {
+            info!(
+                ip = %ip,
+                provider,
+                total_blocks,
+                "repeat-offender: purging cloud-provider IP from reputation state"
+            );
+            state.ip_reputations.remove(&ip);
             continue;
         }
         if allowlist::is_ip_allowlisted(&ip, &cfg.allowlist.trusted_ips)

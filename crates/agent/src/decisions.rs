@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -54,10 +55,33 @@ pub struct DecisionWriter {
     writer: BufWriter<File>,
     /// SHA-256 hash of the last written decision entry for hash chaining.
     last_hash: Option<String>,
+    /// Unified SQLite store (spec 016). When present every JSONL write is
+    /// mirrored into the `decisions` table so the dashboard, `/metrics`, and
+    /// the spec-024 drift harness all see the same reality as the audit log.
+    /// Before this dual-write the sqlite copy was only populated by the
+    /// one-shot legacy migration, which left production dashboards reading
+    /// a stale table while the JSONL audit trail kept growing.
+    store: Option<Arc<innerwarden_store::Store>>,
 }
 
 impl DecisionWriter {
+    /// JSONL-only constructor retained for tests and any future callers that
+    /// intentionally want to opt out of the sqlite mirror. Production uses
+    /// [`DecisionWriter::with_store`] to keep the audit file and the
+    /// `decisions` table in lockstep.
+    #[allow(dead_code)]
     pub fn new(data_dir: &Path) -> Result<Self> {
+        Self::with_store(data_dir, None)
+    }
+
+    /// Constructor that also takes an optional SQLite store. Production calls
+    /// this with `Some(state.sqlite_store.clone())` so every decision written
+    /// via `DecisionWriter::write` lands in both the JSONL audit file and
+    /// the `decisions` table.
+    pub fn with_store(
+        data_dir: &Path,
+        store: Option<Arc<innerwarden_store::Store>>,
+    ) -> Result<Self> {
         let today = chrono::Local::now()
             .date_naive()
             .format("%Y-%m-%d")
@@ -69,6 +93,7 @@ impl DecisionWriter {
             current_date: today,
             writer: BufWriter::new(file),
             last_hash,
+            store,
         })
     }
 
@@ -128,6 +153,31 @@ impl DecisionWriter {
         self.writer
             .flush()
             .context("failed to flush decision entry")?;
+
+        // Dual-write to sqlite. Failure to persist the row mirrors up as a
+        // warning rather than an error: the JSONL write already succeeded
+        // (that is the audit trail of record), and a sqlite hiccup must not
+        // silently discard the whole decision.
+        if let Some(ref store) = self.store {
+            let row = innerwarden_store::decisions::DecisionRow {
+                ts: entry.ts.to_rfc3339(),
+                incident_id: entry.incident_id.clone(),
+                action_type: entry.action_type.clone(),
+                target_ip: entry.target_ip.clone(),
+                target_user: entry.target_user.clone(),
+                confidence: entry.confidence as f64,
+                auto_executed: entry.auto_executed,
+                reason: Some(entry.reason.clone()),
+                data: line.clone(),
+            };
+            if let Err(e) = store.insert_decision(&row) {
+                warn!(
+                    incident_id = %entry.incident_id,
+                    error = %e,
+                    "decision written to JSONL but sqlite mirror failed"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -326,6 +376,79 @@ mod tests {
         assert_eq!(entry.target_ip, Some("10.0.0.1".to_string()));
         assert_eq!(entry.skill_id, Some("block-ip-xdp".to_string()));
         assert_eq!(entry.execution_result, "success");
+    }
+
+    #[test]
+    fn decision_writer_dual_writes_to_jsonl_and_sqlite() {
+        // Regression guard: before the spec-016 follow-up the writer only
+        // wrote JSONL, leaving dashboards reading a decisions table that
+        // had not been touched since the legacy migration. The dual-write
+        // must land every entry in both the audit file and the sqlite
+        // mirror so `/metrics` + the spec-024 drift harness see the same
+        // reality as the audit trail of record.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(innerwarden_store::Store::open(dir.path()).expect("store"));
+        let mut writer =
+            DecisionWriter::with_store(dir.path(), Some(store.clone())).expect("writer");
+
+        let entry = DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: "inc-dual-1".into(),
+            host: "h".into(),
+            ai_provider: "test".into(),
+            action_type: "block_ip".into(),
+            target_ip: Some("203.0.113.9".into()),
+            target_user: None,
+            skill_id: Some("block-ip-ufw".into()),
+            confidence: 0.91,
+            auto_executed: true,
+            dry_run: false,
+            reason: "synthetic".into(),
+            estimated_threat: "high".into(),
+            execution_result: "ok".into(),
+            prev_hash: None,
+        };
+        writer.write(&entry).expect("write decision");
+
+        // JSONL side.
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let jsonl_path = dir.path().join(format!("decisions-{today}.jsonl"));
+        let jsonl = std::fs::read_to_string(&jsonl_path).expect("jsonl exists");
+        assert!(jsonl.contains("inc-dual-1"), "jsonl must carry the entry");
+
+        // Sqlite side.
+        let count = store.decisions_count().expect("count");
+        assert_eq!(count, 1, "sqlite decisions table must receive one row");
+    }
+
+    #[test]
+    fn decision_writer_without_store_keeps_jsonl_path_working() {
+        // Back-compat: constructing without a store (tests, pre-016 deploys)
+        // must not require the sqlite path to be available.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = DecisionWriter::new(dir.path()).expect("writer");
+        let entry = DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: "inc-jsonl-only".into(),
+            host: "h".into(),
+            ai_provider: "test".into(),
+            action_type: "ignore".into(),
+            target_ip: None,
+            target_user: None,
+            skill_id: None,
+            confidence: 0.4,
+            auto_executed: false,
+            dry_run: true,
+            reason: "low".into(),
+            estimated_threat: "low".into(),
+            execution_result: "skipped".into(),
+            prev_hash: None,
+        };
+        writer.write(&entry).expect("write without store");
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let jsonl = std::fs::read_to_string(dir.path().join(format!("decisions-{today}.jsonl")))
+            .expect("jsonl written");
+        assert!(jsonl.contains("inc-jsonl-only"));
     }
 
     #[test]
