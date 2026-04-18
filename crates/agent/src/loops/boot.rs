@@ -117,6 +117,50 @@ pub(crate) fn run_backfill_015_research_only(data_dir: &std::path::Path) -> Resu
     }
     Ok(())
 }
+/// One-shot: force the nightly autoencoder training run to happen now.
+/// Invoked via `innerwarden-agent --retrain-anomaly`. Reads events from
+/// `innerwarden.db`, trains, saves `anomaly-model.bin`, and prints the
+/// resulting baseline so the operator can check that scores will diversify.
+pub(crate) fn run_retrain_anomaly(cli: &crate::Cli) -> Result<()> {
+    let sqlite_store: Option<std::sync::Arc<innerwarden_store::Store>> =
+        match innerwarden_store::Store::open(&cli.data_dir) {
+            Ok(s) => {
+                info!(
+                    path = %cli.data_dir.join("innerwarden.db").display(),
+                    "sqlite store opened for retrain"
+                );
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                warn!("sqlite store unavailable: {e:#} — falling back to JSONL scan");
+                None
+            }
+        };
+
+    let config = neural_lifecycle::AnomalyConfig {
+        data_dir: cli.data_dir.clone(),
+        ..neural_lifecycle::AnomalyConfig::default()
+    };
+
+    let mut engine = neural_lifecycle::AnomalyEngine::new(config);
+    engine
+        .train_nightly_with_store(sqlite_store.as_deref())
+        .map_err(|e| anyhow::anyhow!("autoencoder training failed: {e}"))?;
+
+    println!("autoencoder retrain complete:");
+    println!("  maturity       : {:.2}", engine.maturity);
+    println!("  cycles         : {}", engine.training_cycles);
+    println!(
+        "  model saved    : {}",
+        cli.data_dir.join("anomaly-model.bin").display()
+    );
+    println!(
+        "  previous       : {} (rotated)",
+        cli.data_dir.join("anomaly-model.prev.bin").display()
+    );
+    Ok(())
+}
+
 pub(crate) fn cleanup_015_backup_path(snapshot_path: &Path, stamp: &str) -> PathBuf {
     snapshot_path.with_extension(format!("json.bak-015-{stamp}"))
 }
@@ -150,6 +194,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     if cli.backfill_015_research_only {
         return run_backfill_015_research_only(&cli.data_dir);
+    }
+
+    if cli.retrain_anomaly {
+        return run_retrain_anomaly(&cli);
     }
 
     if cli.report {
@@ -1184,7 +1232,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             let today_key = format!("anomaly_train:{}", chrono::Utc::now().format("%Y-%m-%d"));
                             if !state.store.has_cooldown(state_store::CooldownTable::Decision, &today_key) {
                                 info!("autoencoder: triggering nightly training");
-                                match state.anomaly_engine.train_nightly() {
+                                match state.anomaly_engine.train_nightly_with_store(
+                                    state.sqlite_store.as_deref(),
+                                ) {
                                     Ok(()) => {
                                         info!(
                                             maturity = format!("{:.2}", state.anomaly_engine.maturity),
@@ -1978,6 +2028,7 @@ mod tests {
             honeypot_sandbox_result: None,
             cleanup_015_graph_signal_quality: false,
             backfill_015_research_only: false,
+            retrain_anomaly: false,
         }
     }
 
