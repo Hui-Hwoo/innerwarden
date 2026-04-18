@@ -1519,7 +1519,14 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             .filter(|(_, _, _, ts)| *ts < report_cutoff)
                             .cloned()
                             .collect();
+                        let today = chrono::Local::now()
+                            .date_naive()
+                            .format("%Y-%m-%d")
+                            .to_string();
+                        let daily_cap = cfg.abuseipdb.report_daily_cap;
                         let mut dropped_cloud = 0usize;
+                        let mut dropped_dedup = 0usize;
+                        let mut dropped_cap = 0usize;
                         if let Some(ref client) = state.abuseipdb {
                             for (ip, comment, categories, _) in &ready {
                                 if let Some(provider) = cloud_safelist::identify_provider(ip) {
@@ -1531,8 +1538,55 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                     );
                                     continue;
                                 }
+
+                                // Budget gate: only bill a report call when
+                                // the store approves (dedup + daily cap).
+                                // Without a store, fall through and let the
+                                // legacy behaviour stand — pre-spec-016
+                                // deploys would otherwise lose reporting.
+                                let commit = if let Some(ref sq) = state.sqlite_store {
+                                    match abuseipdb_report_budget::check_report_budget(
+                                        sq.as_ref(),
+                                        ip,
+                                        &today,
+                                        daily_cap,
+                                    ) {
+                                        abuseipdb_report_budget::ReportBudgetDecision::Allow(c) => {
+                                            Some(c)
+                                        }
+                                        abuseipdb_report_budget::ReportBudgetDecision::Reject(
+                                            reason,
+                                        ) => {
+                                            match reason {
+                                                abuseipdb_report_budget::RejectReason::AlreadyReportedToday => {
+                                                    dropped_dedup += 1;
+                                                }
+                                                abuseipdb_report_budget::RejectReason::DailyCapReached => {
+                                                    dropped_cap += 1;
+                                                }
+                                            }
+                                            warn!(
+                                                ip,
+                                                reason = reason.as_metric_label(),
+                                                "AbuseIPDB report skipped by budget gate"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+
                                 client.report(ip, categories, comment).await;
                                 info!(ip, "AbuseIPDB report sent (after 5min delay)");
+
+                                // Only commit AFTER a successful report call
+                                // so transport failures don't eat quota.
+                                if let (Some(ref sq), Some(commit)) =
+                                    (&state.sqlite_store, commit)
+                                {
+                                    commit.apply(sq.as_ref());
+                                }
                             }
                         }
                         if dropped_cloud > 0 {
@@ -1540,6 +1594,20 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 dropped_cloud,
                                 "AbuseIPDB queue flush: dropped {} cloud-provider entries",
                                 dropped_cloud
+                            );
+                        }
+                        if dropped_dedup > 0 {
+                            info!(
+                                dropped_dedup,
+                                "AbuseIPDB queue flush: dropped {} duplicates (24h dedup)",
+                                dropped_dedup
+                            );
+                        }
+                        if dropped_cap > 0 {
+                            warn!(
+                                dropped_cap,
+                                daily_cap,
+                                "AbuseIPDB daily report cap reached — remaining reports paused until UTC midnight"
                             );
                         }
                         state.abuseipdb_report_queue.retain(|(_, _, _, ts)| *ts >= report_cutoff);
