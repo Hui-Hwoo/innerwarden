@@ -24,17 +24,32 @@ pub(crate) async fn execute_block_ip_decision(
         .recent_blocks
         .retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
 
-    // Safeguard: pure eligibility checks (empty IP, operator session, rate limit).
-    if let Err(reason) = check_block_eligibility(
+    // Safeguard: pure eligibility checks (empty IP, operator session, rate
+    // limit) + cloud-provider / CDN safelist. Operator incident 2026-04-18:
+    // `correlation:CL-008` + `repeat-offender` were auto-blocking Cloudflare
+    // ranges (104.16.0.0/12, 104.26.0.0/15, 172.66.0.0/15, …) as a cascade —
+    // a file read followed by any outbound connect within 60s triggered
+    // CL-008, the response targeted the outbound IP, and the repeat-offender
+    // loop multiplied the damage. The global guard here catches every block
+    // path (correlation, repeat-offender, auto-rule, AbuseIPDB, AI triage,
+    // honeypot) with a single check.
+    if let Err(reason) = check_block_eligibility_with_safelist(
         ip,
         &state.operator_ips,
         state.recent_blocks.len(),
         crate::MAX_BLOCKS_PER_MINUTE,
+        crate::cloud_safelist::identify_provider,
     ) {
         if reason.starts_with("skipped:") {
             info!(ip, "{}", reason);
         } else {
             warn!(ip, "{}", reason);
+        }
+        // Stop the repeat-offender cascade: if we ever bumped this IP's
+        // reputation by mistake (pre-fix production data), wipe it so the
+        // next correlation burst doesn't escalate based on stale counts.
+        if reason.contains("cloud provider safelist") {
+            state.ip_reputations.remove(ip);
         }
         return (reason, false);
     }
@@ -255,12 +270,41 @@ pub(crate) fn is_valid_block_target(s: &str) -> bool {
     }
 }
 
+/// Pure-predicate variant used by the in-tree test suite to exercise
+/// eligibility rules without constructing a cloud-safelist closure. Prod
+/// code routes through `check_block_eligibility_with_safelist`.
+#[allow(dead_code)]
 pub(crate) fn check_block_eligibility(
     ip: &str,
     operator_ips: &std::collections::HashMap<String, std::time::Instant>,
     recent_blocks_len: usize,
     max_blocks_per_min: usize,
 ) -> Result<(), String> {
+    check_block_eligibility_with_safelist(
+        ip,
+        operator_ips,
+        recent_blocks_len,
+        max_blocks_per_min,
+        |_| None,
+    )
+}
+
+/// Variant that also consults a cloud-provider / CDN safelist. The safelist
+/// predicate receives the candidate IP and returns `Some(provider_label)` when
+/// the IP is part of a known CDN / cloud range (Cloudflare, AWS, Oracle, …);
+/// in that case the block is refused outright. Keeps the base eligibility
+/// check pure-testable while every production code path that routes through
+/// `execute_block_ip_decision` inherits the guard.
+pub(crate) fn check_block_eligibility_with_safelist<F>(
+    ip: &str,
+    operator_ips: &std::collections::HashMap<String, std::time::Instant>,
+    recent_blocks_len: usize,
+    max_blocks_per_min: usize,
+    safelist_provider: F,
+) -> Result<(), String>
+where
+    F: Fn(&str) -> Option<&'static str>,
+{
     if ip.is_empty() {
         return Err("skipped: block decision has empty IP".to_string());
     }
@@ -269,6 +313,11 @@ pub(crate) fn check_block_eligibility(
     // "active" entries that can never be reverted.
     if !is_valid_block_target(ip) {
         return Err(format!("skipped: {ip} is not a valid IP address"));
+    }
+    if let Some(provider) = safelist_provider(ip) {
+        return Err(format!(
+            "skipped: {ip} is in cloud provider safelist ({provider})"
+        ));
     }
     if operator_ips.contains_key(ip) {
         return Err(format!("skipped: {ip} is an active operator session"));
@@ -374,6 +423,71 @@ mod tests {
         assert_eq!(
             check_block_eligibility("10.0.0.0/abc", &operator_ips, 0, 20),
             Err("skipped: 10.0.0.0/abc is not a valid IP address".to_string())
+        );
+    }
+
+    #[test]
+    fn check_block_eligibility_with_safelist_refuses_cloud_ranges() {
+        // Regression guard for the operator incident on 2026-04-18:
+        // correlation:CL-008 + repeat-offender kept auto-blocking Cloudflare
+        // CIDRs. With the safelist predicate in play every eligibility check
+        // refuses a matching IP with an explanatory reason before the
+        // firewall skill ever sees it.
+        let operator_ips: HashMap<String, Instant> = HashMap::new();
+        let safelist = |ip: &str| -> Option<&'static str> {
+            if ip.starts_with("104.26.") || ip.starts_with("172.66.") {
+                Some("Cloudflare")
+            } else {
+                None
+            }
+        };
+
+        let err =
+            check_block_eligibility_with_safelist("104.26.12.38", &operator_ips, 0, 20, &safelist)
+                .expect_err("cloudflare IP must be refused");
+        assert!(err.contains("cloud provider safelist"), "got {err}");
+        assert!(err.contains("Cloudflare"), "got {err}");
+
+        // IP outside the safelist still passes (sanity).
+        assert_eq!(
+            check_block_eligibility_with_safelist("198.51.100.7", &operator_ips, 0, 20, &safelist,),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_block_eligibility_with_safelist_wraps_non_safelist_gates() {
+        // The safelist predicate only refuses matches; empty / invalid /
+        // operator / rate-limit checks must keep working exactly like the
+        // pure `check_block_eligibility` variant. Using a never-match
+        // predicate makes the wrapper behaviourally identical.
+        let mut operator_ips: HashMap<String, Instant> = HashMap::new();
+        operator_ips.insert("10.0.0.5".to_string(), Instant::now());
+        let no_match = |_: &str| None;
+
+        assert!(
+            check_block_eligibility_with_safelist("", &operator_ips, 0, 20, &no_match)
+                .unwrap_err()
+                .contains("empty IP")
+        );
+        assert!(
+            check_block_eligibility_with_safelist("bad-ip", &operator_ips, 0, 20, &no_match)
+                .unwrap_err()
+                .contains("not a valid IP")
+        );
+        assert!(
+            check_block_eligibility_with_safelist("10.0.0.5", &operator_ips, 0, 20, &no_match)
+                .unwrap_err()
+                .contains("operator session")
+        );
+        assert!(
+            check_block_eligibility_with_safelist("1.2.3.4", &operator_ips, 20, 20, &no_match)
+                .unwrap_err()
+                .contains("rate-limited")
+        );
+        assert_eq!(
+            check_block_eligibility_with_safelist("8.8.8.8", &operator_ips, 0, 20, &no_match),
+            Ok(())
         );
     }
 

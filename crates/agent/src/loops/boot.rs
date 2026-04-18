@@ -667,7 +667,14 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // Decision writer is always created — Layer 1/2 decisions are written
         // even without AI. Previously gated on cfg.ai.enabled which caused
         // zero audit trail when AI was disabled or during agent restarts.
-        decision_writer: match decisions::DecisionWriter::new(&cli.data_dir) {
+        // Pass the sqlite store so every JSONL write is mirrored into the
+        // `decisions` table; dashboards, `/metrics`, and the scenario-qa
+        // drift harness all query sqlite, so without the mirror they were
+        // reading a table untouched since the legacy migration.
+        decision_writer: match decisions::DecisionWriter::with_store(
+            &cli.data_dir,
+            sqlite_store.clone(),
+        ) {
             Ok(w) => Some(w),
             Err(e) => {
                 warn!("failed to create decision writer: {e:#}");

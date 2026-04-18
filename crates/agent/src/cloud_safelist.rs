@@ -374,12 +374,28 @@ pub fn identify_provider(ip_str: &str) -> Option<&'static str> {
     let Ok(ip) = ip_str.parse::<IpAddr>() else {
         return None;
     };
-    let first_octet = match ip {
-        IpAddr::V4(v4) => v4.octets()[0],
+    let (ip_u32, first_octet) = match ip {
+        IpAddr::V4(v4) => (u32::from(v4), v4.octets()[0]),
         _ => return None,
     };
 
-    // Broad heuristic based on first octet
+    // Authoritative Cloudflare-first check. The first-octet heuristic below
+    // misclassifies large Cloudflare blocks (104.16.0.0/13, 104.24.0.0/14,
+    // 172.64.0.0/13) as Azure / Google because 104 and 172 are shared with
+    // other providers. Operator incident 2026-04-18 showed top auto-blocked
+    // IPs were all Cloudflare ranges (104.26.x, 172.66.x, 172.67.x). Walking
+    // CLOUDFLARE_RANGES keeps the guard correct regardless of heuristic drift.
+    for cidr in CLOUDFLARE_RANGES {
+        if let Some(r) = CidrRange::from_str(cidr) {
+            if r.contains(ip_u32) {
+                return Some("Cloudflare");
+            }
+        }
+    }
+
+    // Broad heuristic based on first octet for the other providers (still
+    // fine-grained enough for operator-facing labels, and any false label
+    // is harmless — the block is refused either way).
     match first_octet {
         34 | 35 | 130 | 142 | 172 | 216 | 209 => Some("Google Cloud"),
         3 | 13 | 15 | 18 | 44 | 52 | 54 | 99 => Some("AWS"),
@@ -418,6 +434,37 @@ mod tests {
         assert!(is_cloud_provider_ip("3.5.1.1"));
         assert!(is_cloud_provider_ip("52.1.1.1"));
         assert!(is_cloud_provider_ip("54.200.1.1"));
+    }
+
+    #[test]
+    fn regression_guard_production_cloudflare_ips_get_identified() {
+        // Operator incident 2026-04-18: correlation:CL-008 +
+        // repeat-offender auto-blocked these IPs in production (top by
+        // block count: 53, 49, 46, 45, 41, ...). All are Cloudflare. If
+        // the safelist ever stops covering any of them the cascade comes
+        // right back — fail loud here before it can leak into a release.
+        init();
+        for cloudflare_ip in [
+            "104.26.12.38",
+            "172.66.0.243",
+            "162.159.140.245",
+            "104.19.192.29",
+            "172.67.70.74",
+            "104.26.13.38",
+            "104.19.192.176",
+            "104.19.192.174",
+            "104.19.193.29",
+        ] {
+            assert!(
+                is_cloud_provider_ip(cloudflare_ip),
+                "{cloudflare_ip} (Cloudflare) must be in the safelist"
+            );
+            assert_eq!(
+                identify_provider(cloudflare_ip),
+                Some("Cloudflare"),
+                "{cloudflare_ip} must resolve to provider=Cloudflare"
+            );
+        }
     }
 
     #[test]
