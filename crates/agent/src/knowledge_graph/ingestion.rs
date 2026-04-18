@@ -332,7 +332,18 @@ impl KnowledgeGraph {
                 innerwarden_core::entities::EntityType::Container => {
                     Some(self.ensure_container(&entity.value))
                 }
-                innerwarden_core::entities::EntityType::Service => None,
+                innerwarden_core::entities::EntityType::Service => {
+                    // Map services (kernel modules, daemons) to File nodes with a
+                    // "service:" prefix so the Threats tab picks them up via the
+                    // detector/entity pivot. Prior behavior was to drop Service
+                    // entities, leaving SIGMA incidents without any graph linkage.
+                    let trimmed = entity.value.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(self.ensure_file(&format!("service:{trimmed}")))
+                    }
+                }
             };
             if let Some(target_id) = target {
                 self.add_edge(Edge::new(
@@ -2271,9 +2282,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_incident_ignores_service_entities_for_trigger_edges() {
-        // Mapping rule: service entities are metadata-only and should not
-        // create TriggeredBy edges, while concrete entities still do.
+    fn test_ingest_incident_maps_service_entities_to_file_nodes() {
+        // Service entities (kernel modules, systemd units) are mapped to a
+        // File node with a "service:" prefix so they surface in the Threats
+        // tab pivot. Previously they were dropped, leaving SIGMA and other
+        // service-scoped incidents without any TriggeredBy edge.
         let mut g = KnowledgeGraph::new();
         let incident = make_incident(
             "service-entity:1",
@@ -2291,16 +2304,39 @@ mod tests {
         let container_id = g
             .find_by_container("container-abc")
             .expect("container entity should be ingested");
+        let service_file_id = g
+            .find_by_path("service:crowdsec")
+            .expect("service entity should be mapped to a File node");
         assert!(
             g.edges.iter().any(|e| e.from == incident_id
                 && e.to == container_id
                 && e.relation == Relation::TriggeredBy),
             "container entities should still produce TriggeredBy edges"
         );
+        assert!(
+            g.edges.iter().any(|e| e.from == incident_id
+                && e.to == service_file_id
+                && e.relation == Relation::TriggeredBy),
+            "service entities should now produce TriggeredBy edges via File nodes"
+        );
+    }
+
+    #[test]
+    fn test_ingest_incident_skips_empty_service_entities() {
+        let mut g = KnowledgeGraph::new();
+        let incident =
+            make_incident("empty-service:1", vec![EntityRef::service("   ".to_string())]);
+        g.ingest_incident(&incident);
+        let incident_id = g
+            .find_by_incident("empty-service:1")
+            .expect("incident node should exist");
         assert_eq!(
-            g.edges.iter().filter(|e| e.from == incident_id).count(),
-            1,
-            "service entities should not create additional TriggeredBy edges"
+            g.edges
+                .iter()
+                .filter(|e| e.from == incident_id && e.relation == Relation::TriggeredBy)
+                .count(),
+            0,
+            "whitespace-only service entities must not create File nodes"
         );
     }
 

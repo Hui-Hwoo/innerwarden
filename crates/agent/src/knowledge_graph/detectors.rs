@@ -1467,6 +1467,16 @@ fn detect_crypto_miner(
             continue;
         }
 
+        // Extract pid and uid from the graph node so the incident can be
+        // linked back to the originating process via the evidence-array
+        // ingestion path (ingestion.rs Phase 014-D). Without pid/uid the
+        // incident ends up with no TriggeredBy edge, so the Threats tab
+        // cannot pivot to it.
+        let (pid, uid) = match graph.get_node(pid_id) {
+            Some(Node::Process { pid, uid, .. }) => (*pid, *uid),
+            _ => (0, 0),
+        };
+
         incidents.push(Incident {
             ts: now,
             host: host.to_string(),
@@ -1477,19 +1487,22 @@ fn detect_crypto_miner(
                 "Process '{}' matches crypto mining patterns (process name or mining pool connection).",
                 comm
             ),
-            evidence: serde_json::json!({
+            evidence: serde_json::json!([{
                 "source": "knowledge_graph",
                 "detector": "graph_crypto_miner",
                 "process": comm,
+                "pid": pid,
+                "comm": comm,
+                "uid": uid,
                 "name_match": name_match,
                 "port_match": port_match,
-            }),
+            }]),
             recommended_checks: vec![
                 format!("Kill process: kill -9 $(pgrep {})", comm),
                 "Check CPU usage: top -bn1 | head -20".to_string(),
             ],
             tags: vec!["T1496".to_string()],
-            entities: vec![],
+            entities: vec![EntityRef::path(format!("service:{comm}"))],
         });
     }
     incidents
