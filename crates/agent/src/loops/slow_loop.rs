@@ -572,8 +572,16 @@ pub(crate) fn backfill_graph_decisions(data_dir: &std::path::Path, state: &mut A
     // Phase 2: dismiss visible incidents that never received any decision.
     // These are historical incidents from before the noise-gate was deployed.
     // Without this, they show as "OBSERVING" forever in the dashboard.
+    //
+    // Age gate: only dismiss incidents older than RETROACTIVE_DISMISS_AGE_SECS
+    // (15 min). Before this gate the scan raced process_incidents + AI triage,
+    // which takes up to ~30s cold-start on local Ollama — every Caldera SIGMA
+    // or crypto_miner hit got dismissed here before the AI ever saw it,
+    // zeroing out the responder (47 of 61 decisions on test001 on 2026-04-18).
+    const RETROACTIVE_DISMISS_AGE_SECS: i64 = 15 * 60;
     {
         use crate::knowledge_graph::types::{Node, NodeType};
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(RETROACTIVE_DISMISS_AGE_SECS);
         let mut graph = state.knowledge_graph.write().unwrap();
         let orphan_ids: Vec<_> = graph
             .nodes_of_type(NodeType::Incident)
@@ -583,10 +591,11 @@ pub(crate) fn backfill_graph_decisions(data_dir: &std::path::Path, state: &mut A
                     incident_id,
                     decision,
                     research_only,
+                    ts,
                     ..
                 }) = graph.get_node(id)
                 {
-                    if decision.is_none() && !research_only {
+                    if decision.is_none() && !research_only && *ts < cutoff {
                         return Some((id, incident_id.clone()));
                     }
                 }
@@ -753,7 +762,13 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
         let incident_with_jsonl = crate::tests::test_incident("198.51.100.50");
-        let orphan_incident = crate::tests::test_incident_with_kind("198.51.100.51", "orphan");
+        // Orphan is "old" (older than RETROACTIVE_DISMISS_AGE_SECS = 15 min).
+        // The retroactive-dismiss pass must only touch stale incidents so it
+        // does not race with live AI triage on recently-created ones. Without
+        // this, Caldera SIGMA/crypto_miner hits were dismissed before the AI
+        // ever saw them (see bug #5 in docs/internal/bug-hunt-2026-04-18.md).
+        let mut orphan_incident = crate::tests::test_incident_with_kind("198.51.100.51", "orphan");
+        orphan_incident.ts = chrono::Utc::now() - chrono::Duration::minutes(30);
         {
             let mut graph = state.knowledge_graph.write().expect("graph write");
             graph.ingest_incident(&incident_with_jsonl);
@@ -804,6 +819,35 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
                 ..
             }) => assert_eq!(decision, "dismiss"),
             other => panic!("expected orphan incident to be dismissed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backfill_graph_decisions_preserves_recent_orphans_for_ai_triage() {
+        // Regression guard for bug #5 (Caldera exercise 2026-04-18): a fresh
+        // incident (ts < RETROACTIVE_DISMISS_AGE_SECS) must NOT be dismissed
+        // by the backfill, so that the AI triage loop has a chance to classify
+        // it before it disappears from the queue.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let fresh = crate::tests::test_incident_with_kind("198.51.100.77", "fresh");
+        {
+            let mut graph = state.knowledge_graph.write().expect("graph write");
+            graph.ingest_incident(&fresh);
+        }
+
+        backfill_graph_decisions(dir.path(), &mut state);
+
+        let graph = state.knowledge_graph.read().expect("graph read");
+        let id = graph
+            .find_by_incident(&fresh.incident_id)
+            .expect("fresh present");
+        match graph.get_node(id) {
+            Some(Node::Incident { decision, .. }) => assert!(
+                decision.is_none(),
+                "fresh orphan must stay open for AI triage, got {decision:?}"
+            ),
+            other => panic!("expected Incident node, got {other:?}"),
         }
     }
 

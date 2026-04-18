@@ -57,7 +57,14 @@ function hydrateStateFromQuery() {
     state.pivot = pivot;
   }
 
-  state.filters.date = (qs.get('date') || '').trim();
+  // Ignore a stale `date` query param from a prior session: if the URL
+  // carries yesterday's date (or older), default to today so the Threats
+  // tab does not appear empty on reload. Users can still pick an older
+  // date manually via the filter — that stays live because refreshLeft
+  // calls syncUrl and keeps the picker value in sync.
+  const qsDate = (qs.get('date') || '').trim();
+  const todayIso = new Date().toISOString().slice(0, 10);
+  state.filters.date = qsDate && qsDate >= todayIso ? qsDate : '';
   state.filters.compare_date = (qs.get('compare_date') || '').trim();
   state.filters.severity_min = (qs.get('severity_min') || '').trim();
   state.filters.detector = (qs.get('detector') || '').trim();

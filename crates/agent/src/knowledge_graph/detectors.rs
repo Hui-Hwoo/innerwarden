@@ -1438,8 +1438,11 @@ fn detect_crypto_miner(
         .collect();
 
     for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
-        let comm = match graph.get_node(pid_id) {
-            Some(Node::Process { comm, .. }) => comm.clone(),
+        // Fetch comm + pid + uid in a single match so the incident evidence
+        // below can populate the Phase 014-D ingestion path (pid/uid) without
+        // needing a second get_node call and a separate defensive fallback.
+        let (comm, pid, uid) = match graph.get_node(pid_id) {
+            Some(Node::Process { comm, pid, uid, .. }) => (comm.clone(), *pid, *uid),
             _ => continue,
         };
 
@@ -1477,19 +1480,22 @@ fn detect_crypto_miner(
                 "Process '{}' matches crypto mining patterns (process name or mining pool connection).",
                 comm
             ),
-            evidence: serde_json::json!({
+            evidence: serde_json::json!([{
                 "source": "knowledge_graph",
                 "detector": "graph_crypto_miner",
                 "process": comm,
+                "pid": pid,
+                "comm": comm,
+                "uid": uid,
                 "name_match": name_match,
                 "port_match": port_match,
-            }),
+            }]),
             recommended_checks: vec![
                 format!("Kill process: kill -9 $(pgrep {})", comm),
                 "Check CPU usage: top -bn1 | head -20".to_string(),
             ],
             tags: vec!["T1496".to_string()],
-            entities: vec![],
+            entities: vec![EntityRef::path(format!("service:{comm}"))],
         });
     }
     incidents

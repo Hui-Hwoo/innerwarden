@@ -823,11 +823,19 @@ pub(super) fn build_journey_from_graph(
 
     let graph = kg.read().unwrap();
 
-    // Find the center node
+    // Detector pivot has no "center node" — it aggregates every Incident whose
+    // `detector` field matches the subject. Branch early so we do not go
+    // through the IP/User-oriented center_id path below, which would otherwise
+    // return an empty journey and make the Threats tab drill-down look broken.
+    if subject_type == PivotKind::Detector {
+        return build_detector_journey(&graph, data_dir, date, subject, window_seconds);
+    }
+
+    // Find the center node (IP or User pivot)
     let center = match subject_type {
         PivotKind::Ip => graph.find_by_ip(subject),
         PivotKind::User => graph.find_by_user(subject),
-        PivotKind::Detector => None, // detector pivot doesn't map to a single node
+        PivotKind::Detector => unreachable!("handled above"),
     };
 
     let center_id = match center {
@@ -1962,6 +1970,162 @@ pub(super) fn scan_honeypot_sessions(
 }
 
 // ---------------------------------------------------------------------------
+// Detector-pivot journey
+// ---------------------------------------------------------------------------
+//
+// Unlike IP/User pivots, a detector name ("sigma", "graph_crypto_miner", …)
+// is not a single node in the graph: it is a field shared by many Incident
+// nodes. The drill-down collects every incident that reports this detector
+// for the requested date and aggregates their timestamps, related entities,
+// and decision history into a JourneyResponse shaped like the IP/User one.
+// Previously the drill-down returned `empty_journey` unconditionally, making
+// the Threats tab look broken when the operator clicked a detector group.
+
+fn build_detector_journey(
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+    data_dir: &Path,
+    date: &str,
+    subject: &str,
+    window_seconds: Option<u64>,
+) -> JourneyResponse {
+    use crate::knowledge_graph::types::*;
+
+    let mut entries: Vec<JourneyEntry> = Vec::new();
+    let mut related_ips: BTreeSet<String> = BTreeSet::new();
+    let mut related_users: BTreeSet<String> = BTreeSet::new();
+    let mut related_detectors: BTreeSet<String> = BTreeSet::new();
+    related_detectors.insert(subject.to_string());
+    let mut has_incident = false;
+
+    // Scan every Incident node — detector is an internal field so there is
+    // no direct index. The graph typically holds O(hundreds) of incidents
+    // so the linear pass is fine; add a secondary index later if needed.
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        let Some(Node::Incident {
+            incident_id,
+            detector,
+            severity,
+            title,
+            summary,
+            ts,
+            mitre_ids,
+            decision,
+            confidence,
+            decision_reason,
+            decision_target,
+            auto_executed,
+            research_only,
+            ..
+        }) = graph.get_node(id)
+        else {
+            continue;
+        };
+        if *research_only || detector != subject {
+            continue;
+        }
+        has_incident = true;
+
+        for edge in graph.outgoing_edges(id) {
+            if edge.relation != Relation::TriggeredBy {
+                continue;
+            }
+            match graph.get_node(edge.to) {
+                Some(Node::Ip { addr, .. }) => {
+                    related_ips.insert(addr.clone());
+                }
+                Some(Node::User { name, .. }) => {
+                    related_users.insert(name.clone());
+                }
+                _ => {}
+            }
+        }
+
+        entries.push(JourneyEntry {
+            ts: *ts,
+            kind: "incident".to_string(),
+            data: serde_json::json!({
+                "incident_id": incident_id,
+                "severity": severity.to_lowercase(),
+                "title": title,
+                "summary": summary,
+                "tags": mitre_ids,
+                "detector": detector,
+            }),
+        });
+
+        if let Some(action) = decision {
+            entries.push(JourneyEntry {
+                ts: *ts,
+                kind: "decision".to_string(),
+                data: serde_json::json!({
+                    "action_type": action,
+                    "confidence": confidence.unwrap_or(0.0),
+                    "auto_executed": auto_executed,
+                    "reason": decision_reason.as_deref().unwrap_or(""),
+                    "target_ip": decision_target,
+                    "incident_id": incident_id,
+                    "execution_result": if *auto_executed { "ok" } else { "skipped" },
+                }),
+            });
+        }
+    }
+
+    // Honeypot sessions surface through related_ips (not the detector name).
+    let mut hp_entries = scan_honeypot_sessions(data_dir, date, &related_ips);
+    entries.append(&mut hp_entries);
+
+    entries.sort_by_key(|e| e.ts);
+    if let Some(window) = window_seconds {
+        if let Some(last_ts) = entries.last().map(|e| e.ts) {
+            let cutoff = last_ts - chrono::Duration::seconds(window as i64);
+            entries.retain(|entry| entry.ts >= cutoff);
+        }
+    }
+
+    let first_seen = entries.first().map(|e| e.ts);
+    let last_seen = entries.last().map(|e| e.ts);
+
+    let outcome = entries
+        .iter()
+        .filter(|e| e.kind == "decision")
+        .filter_map(|e| e.data.get("action_type").and_then(|v| v.as_str()))
+        .find_map(|d| match d {
+            "block_ip" => Some("blocked"),
+            "honeypot" => Some("honeypot"),
+            "monitor" => Some("monitoring"),
+            _ => None,
+        })
+        .unwrap_or(if has_incident { "active" } else { "unknown" })
+        .to_string();
+
+    let summary = build_journey_summary(
+        &entries,
+        &outcome,
+        PivotKind::Detector,
+        subject,
+        &related_ips,
+        &related_users,
+        &related_detectors,
+    );
+
+    let verdict = derive_verdict(&entries, &outcome);
+    let chapters = derive_chapters(&entries);
+
+    JourneyResponse {
+        subject_type: PivotKind::Detector.as_str().to_string(),
+        subject: subject.to_string(),
+        date: date.to_string(),
+        first_seen,
+        last_seen,
+        outcome,
+        summary,
+        verdict,
+        chapters,
+        entries,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -2065,6 +2229,7 @@ pub(super) fn render_markdown_snapshot(snapshot: &InvestigationExport) -> String
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use tempfile::TempDir;
 
     #[test]
     fn test_format_duration() {
@@ -2398,5 +2563,180 @@ mod tests {
         }];
         let (_, _, highlights) = describe_chapter("honeypot_interaction", &entries);
         assert_eq!(highlights, vec!["root/toor".to_string()]);
+    }
+
+    // ─── Detector-pivot journey tests ──────────────────────────────────
+    //
+    // Cover `build_detector_journey` — the path exercised when the
+    // operator clicks a detector group (e.g. `sigma`) from the Threats
+    // tab. Previously the handler short-circuited to `empty_journey`
+    // and the drill-down was blank; regression-guard the new aggregator.
+
+    fn detector_test_incident(
+        detector: &str,
+        ip: Option<&str>,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts: Utc::now(),
+            host: "h".to_string(),
+            incident_id: format!("{detector}:probe:test-{}", detector.len()),
+            severity: innerwarden_core::event::Severity::High,
+            title: format!("{detector} fired"),
+            summary: format!("{detector} summary"),
+            evidence: serde_json::json!([]),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: match ip {
+                Some(ip) => vec![innerwarden_core::entities::EntityRef::ip(ip)],
+                None => vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn detector_journey_empty_graph_returns_unknown_outcome() {
+        let graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
+        assert_eq!(journey.subject_type, "detector");
+        assert_eq!(journey.subject, "sigma");
+        assert_eq!(journey.outcome, "unknown");
+        assert!(journey.entries.is_empty());
+        assert!(journey.first_seen.is_none());
+        assert!(journey.last_seen.is_none());
+    }
+
+    #[test]
+    fn detector_journey_collects_incidents_matching_detector_name() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("sigma", Some("198.51.100.9"));
+        graph.ingest_incident(&inc);
+        // A non-matching detector must not pollute the journey
+        let other = detector_test_incident("proto_anomaly", Some("198.51.100.10"));
+        graph.ingest_incident(&other);
+
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
+        assert_eq!(
+            journey.entries.len(),
+            1,
+            "only matching detector should appear"
+        );
+        assert_eq!(journey.outcome, "active");
+        // IP from TriggeredBy edge must surface in pivot shortcuts
+        assert!(
+            journey
+                .summary
+                .pivot_shortcuts
+                .iter()
+                .any(|t| t.contains("198.51.100.9")),
+            "related IP should be in pivot shortcuts"
+        );
+    }
+
+    #[test]
+    fn detector_journey_skips_research_only_incidents() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let mut inc = detector_test_incident("sigma", None);
+        inc.incident_id = "sigma:research:x".to_string();
+        graph.ingest_incident(&inc);
+        // Flip research_only after ingest
+        {
+            let id = graph
+                .find_by_incident("sigma:research:x")
+                .expect("incident node");
+            if let Some(crate::knowledge_graph::types::Node::Incident { research_only, .. }) =
+                graph.get_node_mut(id)
+            {
+                *research_only = true;
+            }
+        }
+
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
+        assert!(
+            journey.entries.is_empty(),
+            "research-only incidents must not appear in operator journey"
+        );
+        assert_eq!(journey.outcome, "unknown");
+    }
+
+    #[test]
+    fn detector_journey_outcome_reflects_decision_block_ip() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("sigma", Some("198.51.100.11"));
+        graph.ingest_incident(&inc);
+        graph.ingest_decision(
+            &inc.incident_id,
+            "block_ip",
+            Some("198.51.100.11"),
+            0.9,
+            "unit test",
+            true,
+            Utc::now(),
+        );
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
+        // incident + decision entries
+        assert_eq!(journey.entries.len(), 2);
+        assert_eq!(journey.outcome, "blocked");
+    }
+
+    #[test]
+    fn detector_journey_outcome_reflects_decision_honeypot() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("sigma", None);
+        graph.ingest_incident(&inc);
+        graph.ingest_decision(
+            &inc.incident_id,
+            "honeypot",
+            None,
+            0.8,
+            "unit test",
+            true,
+            Utc::now(),
+        );
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
+        assert_eq!(journey.outcome, "honeypot");
+    }
+
+    #[test]
+    fn detector_journey_outcome_reflects_decision_monitor() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("sigma", None);
+        graph.ingest_incident(&inc);
+        graph.ingest_decision(
+            &inc.incident_id,
+            "monitor",
+            None,
+            0.7,
+            "unit test",
+            true,
+            Utc::now(),
+        );
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
+        assert_eq!(journey.outcome, "monitoring");
+    }
+
+    #[test]
+    fn detector_journey_window_trims_old_entries() {
+        // Two incidents: one recent, one > 1 hour old. Window 600s keeps
+        // only the recent one.
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let old = innerwarden_core::incident::Incident {
+            ts: Utc::now() - chrono::Duration::hours(2),
+            incident_id: "sigma:old:x".to_string(),
+            ..detector_test_incident("sigma", None)
+        };
+        let recent = detector_test_incident("sigma", None);
+        graph.ingest_incident(&old);
+        graph.ingest_incident(&recent);
+
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", Some(600));
+        // Window drops the 2h-old incident, leaves just the fresh one.
+        assert_eq!(journey.entries.len(), 1);
     }
 }

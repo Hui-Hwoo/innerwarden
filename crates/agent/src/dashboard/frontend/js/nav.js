@@ -77,7 +77,8 @@ function showView(name) {
   if (name === 'intel') loadIntel();
   if (name === 'monthly') loadMonthly();
   if (name === 'responses') loadResponses();
-  if (name === 'graph') loadGraph();
+  // Graph tab was removed and stats moved to Health; the old loadGraph()
+  // module is no longer bundled so we stop dispatching here too.
 }
 
 // Click-outside handler for More dropdown
