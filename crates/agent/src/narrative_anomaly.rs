@@ -241,7 +241,9 @@ mod tests {
         assert_eq!(state.neural_incidents.len(), 1);
         let incident = &state.neural_incidents[0];
         assert!(incident.summary.contains("agreed within 30 seconds"));
-        assert!(incident.summary.contains("autoencoder (21 days of training)"));
+        assert!(incident
+            .summary
+            .contains("autoencoder (21 days of training)"));
         assert!(state.last_baseline_anomaly_ts.is_none());
         assert!(state.last_autoencoder_anomaly_ts.is_none());
     }

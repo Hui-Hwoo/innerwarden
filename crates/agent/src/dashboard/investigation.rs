@@ -2735,7 +2735,12 @@ mod tests {
         let now = Utc::now();
 
         graph.add_edge(Edge::new(inc_id, user_id, Relation::TriggeredBy, now));
-        graph.add_edge(Edge::new(inc_id, ignored_ip_id, Relation::CorrelatedWith, now));
+        graph.add_edge(Edge::new(
+            inc_id,
+            ignored_ip_id,
+            Relation::CorrelatedWith,
+            now,
+        ));
         graph.add_edge(Edge::new(inc_id, other_id, Relation::TriggeredBy, now));
 
         let dir = TempDir::new().expect("tmpdir");
