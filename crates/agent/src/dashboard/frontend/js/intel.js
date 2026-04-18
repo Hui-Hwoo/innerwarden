@@ -10,7 +10,7 @@ async function loadIntel() {
     if (!data || !data.profiles) { content.innerHTML = '<p style="color:var(--dim)">No attacker profiles yet.</p>'; return; }
 
     let html = `<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px;">
-      <div class="kpi-card"><div class="kpi-value">${data.total}</div><div class="kpi-label">Total Profiles</div></div>
+      <div class="kpi-card"><div class="kpi-value">${data.total || 0}</div><div class="kpi-label">Total Profiles</div></div>
       <div class="kpi-card"><div class="kpi-value">${data.profiles.filter(p=>p.risk_score>=70).length}</div><div class="kpi-label">High Risk (≥70)</div></div>
       <div class="kpi-card"><div class="kpi-value">${new Set(data.profiles.map(p=>p.dna?.pattern_class).filter(Boolean)).size}</div><div class="kpi-label">Pattern Types</div></div>
       <div class="kpi-card"><div class="kpi-value">${new Set(data.profiles.map(p=>p.geo?.country_code).filter(Boolean)).size}</div><div class="kpi-label">Countries</div></div>
@@ -104,9 +104,9 @@ async function showProfileDetail(ip) {
         <tr><td style="padding:2px 8px;color:var(--dim);">Max Severity</td><td style="font-weight:600;">${p.max_severity}</td></tr>
       </tbody></table>
       <h4 style="margin:12px 0 4px;font-size:0.8rem;color:var(--dim);">Detectors Triggered</h4>
-      <div style="display:flex;flex-wrap:wrap;gap:4px;">${(p.detectors_triggered||[]).map(d=>`<span style="padding:2px 6px;border-radius:4px;background:var(--border);font-size:0.7rem;">${d}</span>`).join('')}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px;">${(p.detectors_triggered||[]).map(d=>`<span style="padding:2px 6px;border-radius:4px;background:var(--border);font-size:0.7rem;">${esc(d)}</span>`).join('')}</div>
       <h4 style="margin:12px 0 4px;font-size:0.8rem;color:var(--dim);">MITRE Techniques</h4>
-      <div style="display:flex;flex-wrap:wrap;gap:4px;">${(p.mitre_techniques||[]).map(t=>`<span style="padding:2px 6px;border-radius:4px;background:#2c1810;color:#f39c12;font-size:0.7rem;">${t}</span>`).join('')}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px;">${(p.mitre_techniques||[]).map(t=>`<span style="padding:2px 6px;border-radius:4px;background:#2c1810;color:#f39c12;font-size:0.7rem;">${esc(t)}</span>`).join('')}</div>
     </div>`;
     html += `</div>`;
 
@@ -120,10 +120,10 @@ async function showProfileDetail(ip) {
           <div style="display:flex;justify-content:space-between;font-size:0.6rem;color:var(--dim);"><span>0h</span><span>12h</span><span>23h</span></div>
         </div>
         <div><h4 style="font-size:0.8rem;color:var(--dim);margin:0 0 4px;">Target Users</h4>
-          ${(p.dna?.target_users||[]).map(u=>`<div style="font-family:monospace;font-size:0.75rem;">${u}</div>`).join('')||'<span style="color:var(--dim);font-size:0.75rem;">none</span>'}
+          ${(p.dna?.target_users||[]).map(u=>`<div style="font-family:monospace;font-size:0.75rem;">${esc(u)}</div>`).join('')||'<span style="color:var(--dim);font-size:0.75rem;">none</span>'}
         </div>
         <div><h4 style="font-size:0.8rem;color:var(--dim);margin:0 0 4px;">Tool Signatures</h4>
-          ${(p.dna?.tool_signatures||[]).map(t=>`<span style="padding:2px 6px;border-radius:4px;background:#1a2634;color:#3498db;font-size:0.7rem;margin:2px;">${t}</span>`).join('')||'<span style="color:var(--dim);font-size:0.75rem;">none</span>'}
+          ${(p.dna?.tool_signatures||[]).map(t=>`<span style="padding:2px 6px;border-radius:4px;background:#1a2634;color:#3498db;font-size:0.7rem;margin:2px;">${esc(t)}</span>`).join('')||'<span style="color:var(--dim);font-size:0.75rem;">none</span>'}
         </div>
       </div>
     </div>`;
@@ -135,16 +135,16 @@ async function showProfileDetail(ip) {
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
           <div><h4 style="font-size:0.8rem;color:var(--dim);margin:0 0 4px;">Credentials Attempted</h4>
             <table style="font-size:0.75rem;"><tbody>
-              ${(p.credentials_attempted||[]).slice(0,10).map(([u,pw])=>`<tr><td style="padding:1px 6px;font-family:monospace;">${u}</td><td style="padding:1px 6px;font-family:monospace;color:var(--dim);">${pw}</td></tr>`).join('')}
+              ${(p.credentials_attempted||[]).slice(0,10).map(([u,pw])=>`<tr><td style="padding:1px 6px;font-family:monospace;">${esc(u)}</td><td style="padding:1px 6px;font-family:monospace;color:var(--dim);">${esc(pw)}</td></tr>`).join('')}
             </tbody></table>
           </div>
           <div><h4 style="font-size:0.8rem;color:var(--dim);margin:0 0 4px;">Commands Executed</h4>
-            ${(p.commands_executed||[]).slice(0,10).map(c=>`<div style="font-family:monospace;font-size:0.7rem;padding:2px 0;border-bottom:1px solid var(--border);">${c}</div>`).join('')}
+            ${(p.commands_executed||[]).slice(0,10).map(c=>`<div style="font-family:monospace;font-size:0.7rem;padding:2px 0;border-bottom:1px solid var(--border);">${esc(c)}</div>`).join('')}
           </div>
         </div>
         ${(p.iocs?.urls||[]).length > 0 ? `<h4 style="font-size:0.8rem;color:var(--dim);margin:12px 0 4px;">IOCs</h4>
-          ${(p.iocs.urls||[]).map(u=>`<div style="font-family:monospace;font-size:0.7rem;">🔗 ${u}</div>`).join('')}
-          ${(p.iocs.ips||[]).map(i=>`<div style="font-family:monospace;font-size:0.7rem;">🌐 ${i}</div>`).join('')}` : ''}
+          ${(p.iocs.urls||[]).map(u=>`<div style="font-family:monospace;font-size:0.7rem;">🔗 ${esc(u)}</div>`).join('')}
+          ${(p.iocs.ips||[]).map(i=>`<div style="font-family:monospace;font-size:0.7rem;">🌐 ${esc(i)}</div>`).join('')}` : ''}
       </div>`;
     }
 

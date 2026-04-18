@@ -384,7 +384,6 @@ pub async fn serve(
         .route("/js/compliance.js", get(serve_js_compliance))
         .route("/js/honeypot.js", get(serve_js_honeypot))
         .route("/js/intel.js", get(serve_js_intel))
-        .route("/js/graph.js", get(serve_js_graph))
         .route("/js/monthly.js", get(serve_js_monthly))
         .route("/js/responses.js", get(serve_js_responses))
         .route("/js/actions.js", get(serve_js_actions))
@@ -685,7 +684,6 @@ js_handler!(serve_js_status, JS_STATUS);
 js_handler!(serve_js_compliance, JS_COMPLIANCE);
 js_handler!(serve_js_honeypot, JS_HONEYPOT);
 js_handler!(serve_js_intel, JS_INTEL);
-js_handler!(serve_js_graph, JS_GRAPH);
 js_handler!(serve_js_monthly, JS_MONTHLY);
 js_handler!(serve_js_responses, JS_RESPONSES);
 js_handler!(serve_js_actions, JS_ACTIONS);
@@ -714,7 +712,6 @@ const JS_STATUS: &str = include_str!("frontend/js/status.js");
 const JS_COMPLIANCE: &str = include_str!("frontend/js/compliance.js");
 const JS_HONEYPOT: &str = include_str!("frontend/js/honeypot.js");
 const JS_INTEL: &str = include_str!("frontend/js/intel.js");
-const JS_GRAPH: &str = include_str!("frontend/js/graph.js");
 const JS_MONTHLY: &str = include_str!("frontend/js/monthly.js");
 const JS_RESPONSES: &str = include_str!("frontend/js/responses.js");
 const JS_ACTIONS: &str = include_str!("frontend/js/actions.js");

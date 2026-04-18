@@ -92,13 +92,13 @@ async function loadResponses() {
         }
 
         html += `<tr style="border-bottom:1px solid var(--border);${rowStyle}">
-          <td style="padding:6px;font-family:monospace;font-weight:600;">${a.target}</td>
-          <td style="padding:6px;"><span title="${backendTip}" style="padding:2px 6px;border-radius:3px;background:${backendColor}20;color:${backendColor};font-size:0.7rem;cursor:help">${a.backend}</span></td>
+          <td style="padding:6px;font-family:monospace;font-weight:600;">${esc(a.target)}</td>
+          <td style="padding:6px;"><span title="${esc(backendTip)}" style="padding:2px 6px;border-radius:3px;background:${backendColor}20;color:${backendColor};font-size:0.7rem;cursor:help">${esc(a.backend)}</span></td>
           <td style="padding:6px;">${stateBadge}</td>
-          <td style="padding:6px;">${a.type}</td>
+          <td style="padding:6px;">${esc(a.type)}</td>
           <td style="padding:6px;">${ttlH}h</td>
           <td style="padding:6px;font-weight:600;color:${mins < 10 ? '#e74c3c' : 'var(--text)'};">${remaining}</td>
-          <td style="padding:6px;font-size:0.7rem;color:var(--dim);">${(a.incident_id||'').substring(0,40)}</td>
+          <td style="padding:6px;font-size:0.7rem;color:var(--dim);">${esc((a.incident_id||'').substring(0,40))}</td>
         </tr>`;
       });
       html += '</tbody></table>';
@@ -133,9 +133,9 @@ async function loadResponses() {
           reasonLabel = 'orphaned';
         }
         html += `<tr style="border-bottom:1px solid var(--border);">
-          <td style="padding:4px 6px;font-family:monospace;">${h.target}</td>
-          <td style="padding:4px 6px;">${h.backend}</td>
-          <td style="padding:4px 6px;"><span title="${reasonTitle.replace(/"/g,'&quot;')}" style="color:${reasonColor};${reasonTitle?'cursor:help;':''}">${reasonLabel}</span></td>
+          <td style="padding:4px 6px;font-family:monospace;">${esc(h.target)}</td>
+          <td style="padding:4px 6px;">${esc(h.backend)}</td>
+          <td style="padding:4px 6px;"><span title="${esc(reasonTitle)}" style="color:${reasonColor};${reasonTitle?'cursor:help;':''}">${esc(reasonLabel)}</span></td>
           <td style="padding:4px 6px;color:var(--dim);">${new Date(h.reverted_at).toLocaleString()}</td>
         </tr>`;
       });

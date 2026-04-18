@@ -35,9 +35,14 @@ async function loadDeepSecurity() {
       } else { fw.innerHTML = '<span style="color:var(--ok)">Active</span>'; }
     }
     if (hv) {
-      const env = ds.hypervisor_environment || 'Detecting…';
+      const env = String(ds.hypervisor_environment || 'Detecting…');
       const col = env.includes('BareMetal') ? 'var(--ok)' : env.includes('Virtual') ? 'var(--accent)' : 'var(--muted)';
-      hv.innerHTML = '<span style="color:' + col + '">' + env.replace(/[{}"]/g,'').replace(/hypervisor:\\s*/,'').trim() + '</span>';
+      // Strip the structured TOML leak (`{ hypervisor: "Foo" }` style) and
+      // escape whatever is left — the previous regex sanitiser only touched a
+      // few punctuation chars, leaving `<img onerror=...>` payloads live if
+      // they ever leaked into hypervisor detection output.
+      const cleaned = env.replace(/[{}"]/g, '').replace(/hypervisor:\s*/gi, '').trim();
+      hv.innerHTML = '<span style="color:' + col + '">' + esc(cleaned) + '</span>';
     }
     if (kc) {
       kc.innerHTML = '<span style="color:var(--text)">' + ds.killchain_pids_tracked + ' tracked</span>' +
