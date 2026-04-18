@@ -88,6 +88,16 @@ fn parse_suppressed_patterns(content: &str) -> Vec<String> {
 }
 
 pub(crate) fn cmd_block(cli: &Cli, ip: &str, reason: &str, data_dir: &Path) -> Result<()> {
+    cmd_block_with_sudo(cli, ip, reason, data_dir, "sudo")
+}
+
+fn cmd_block_with_sudo(
+    cli: &Cli,
+    ip: &str,
+    reason: &str,
+    data_dir: &Path,
+    sudo_bin: &str,
+) -> Result<()> {
     // Basic IP validation
     if !looks_like_ip(ip) {
         anyhow::bail!("'{ip}' doesn't look like a valid IP address");
@@ -110,7 +120,7 @@ pub(crate) fn cmd_block(cli: &Cli, ip: &str, reason: &str, data_dir: &Path) -> R
     }
 
     // Execute the block
-    let blocked = std::process::Command::new("sudo")
+    let blocked = std::process::Command::new(sudo_bin)
         .args(block_command_args(backend.as_str(), ip))
         .status()
         .map(|s| s.success())
@@ -146,6 +156,16 @@ pub(crate) fn cmd_block(cli: &Cli, ip: &str, reason: &str, data_dir: &Path) -> R
 }
 
 pub(crate) fn cmd_unblock(cli: &Cli, ip: &str, reason: &str, data_dir: &Path) -> Result<()> {
+    cmd_unblock_with_sudo(cli, ip, reason, data_dir, "sudo")
+}
+
+fn cmd_unblock_with_sudo(
+    cli: &Cli,
+    ip: &str,
+    reason: &str,
+    data_dir: &Path,
+    sudo_bin: &str,
+) -> Result<()> {
     if !looks_like_ip(ip) {
         anyhow::bail!("'{ip}' doesn't look like a valid IP address");
     }
@@ -165,7 +185,7 @@ pub(crate) fn cmd_unblock(cli: &Cli, ip: &str, reason: &str, data_dir: &Path) ->
         return Ok(());
     }
 
-    let unblocked = std::process::Command::new("sudo")
+    let unblocked = std::process::Command::new(sudo_bin)
         .args(unblock_command_args(backend.as_str(), ip))
         .status()
         .map(|s| s.success())
@@ -450,6 +470,21 @@ mod tests {
     use clap::Parser;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn fake_sudo_script(temp: &TempDir, exit_code: u8) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = temp.path().join(format!("fake-sudo-{exit_code}.sh"));
+        std::fs::write(&script, format!("#!/bin/sh\nexit {exit_code}\n"))
+            .expect("test should write fake sudo script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("fake sudo metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("fake sudo chmod");
+        script
+    }
+
     fn write_agent_config(path: &Path, content: &str) {
         std::fs::write(path, content).expect("test should write agent config");
     }
@@ -577,6 +612,27 @@ mod tests {
             .expect("dry-run block should succeed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cmd_block_with_sudo_non_dry_run_surfaces_command_failure() {
+        // Covers the non-dry-run command execution branch safely via a fake sudo binary.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let mut cli = test_cli(&temp);
+        cli.dry_run = false;
+        write_agent_config(&cli.agent_config, "[responder]\nblock_backend = \"pf\"\n");
+        let fake_sudo = fake_sudo_script(&temp, 1);
+
+        let err = cmd_block_with_sudo(
+            &cli,
+            "1.2.3.4",
+            "investigation",
+            temp.path(),
+            fake_sudo.to_str().expect("utf-8 fake sudo path"),
+        )
+        .expect_err("fake sudo failure must propagate");
+        assert!(err.to_string().contains("block command failed"));
+    }
+
     #[test]
     fn cmd_unblock_dry_run_succeeds_with_valid_ip() {
         // Covers unblock dry-run path to keep manual rollback CLI available in non-root test contexts.
@@ -584,6 +640,26 @@ mod tests {
         let cli = test_cli(&temp);
         cmd_unblock(&cli, "1.2.3.4", "false-positive", temp.path())
             .expect("dry-run unblock should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_unblock_with_sudo_non_dry_run_handles_command_failure_and_continues() {
+        // Executes non-dry-run unblock path without invoking real sudo/firewall commands.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let mut cli = test_cli(&temp);
+        cli.dry_run = false;
+        write_agent_config(&cli.agent_config, "[responder]\nblock_backend = \"pf\"\n");
+        let fake_sudo = fake_sudo_script(&temp, 1);
+
+        cmd_unblock_with_sudo(
+            &cli,
+            "1.2.3.4",
+            "false-positive",
+            temp.path(),
+            fake_sudo.to_str().expect("utf-8 fake sudo path"),
+        )
+        .expect("unblock should continue even when command fails");
     }
 
     #[test]
@@ -640,5 +716,14 @@ mod tests {
         let content =
             std::fs::read_to_string(&suppress_path).expect("suppress file should still exist");
         assert!(content.trim().is_empty());
+    }
+
+    #[test]
+    fn cmd_suppress_list_reads_and_parses_saved_patterns() {
+        // Covers suppress-list parser path used by the CLI command itself.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        cmd_suppress_add(&cli, "detector:example").expect("add should succeed");
+        cmd_suppress_list(&cli).expect("list should parse and print active suppressions");
     }
 }
