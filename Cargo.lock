@@ -2022,6 +2022,7 @@ dependencies = [
  "innerwarden-agent-guard",
  "innerwarden-hypervisor",
  "innerwarden-smm",
+ "innerwarden-store",
  "innerwarden_core",
  "p256 0.13.2",
  "qrcode",

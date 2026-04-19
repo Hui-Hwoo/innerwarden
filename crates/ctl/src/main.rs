@@ -1696,6 +1696,37 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show the block-rate circuit breaker state for the current UTC hour.
+    ///
+    /// When `responder.circuit_breaker_mode = "pause"` the agent refuses
+    /// every auto-block once the hourly cap is crossed, to stop cascade
+    /// incidents (see operator incident 2026-04-18). This command lets
+    /// you inspect the current hour's counter and trip marker.
+    ///
+    /// Examples:
+    ///   innerwarden system circuit-status
+    ///   innerwarden system circuit-status --json
+    #[clap(name = "circuit-status")]
+    CircuitStatus {
+        /// Output as JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Clear the circuit breaker for the current UTC hour. Use this once
+    /// you have diagnosed the cascade source and want to resume autonomous
+    /// blocking without waiting for the next hour boundary.
+    ///
+    /// Examples:
+    ///   innerwarden system circuit-reset
+    ///   innerwarden system circuit-reset --json
+    #[clap(name = "circuit-reset")]
+    CircuitReset {
+        /// Output as JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2092,6 +2123,12 @@ fn main() -> Result<()> {
                 }
             }
             SystemCommand::Hypervisor { json } => commands::firmware::cmd_hypervisor(*json),
+            SystemCommand::CircuitStatus { json } => {
+                commands::circuit::cmd_circuit_status(&cli.agent_config, &cli.data_dir, *json)
+            }
+            SystemCommand::CircuitReset { json } => {
+                commands::circuit::cmd_circuit_reset(&cli.agent_config, &cli.data_dir, *json)
+            }
         },
 
         // ===================================================================
