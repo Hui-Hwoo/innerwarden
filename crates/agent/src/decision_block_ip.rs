@@ -24,6 +24,60 @@ pub(crate) async fn execute_block_ip_decision(
         .recent_blocks
         .retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
 
+    // Circuit breaker: hard ceiling on auto-blocks per UTC hour. Catches
+    // the CL-008 *class* of regression — any future correlation rule that
+    // starts cascading against unrelated IPs trips this pause regardless
+    // of signal source. Runs BEFORE per-minute rate limit and safelist so
+    // the counter reflects attempts, not just survivors.
+    if let Some(ref sq) = state.sqlite_store {
+        let mode =
+            crate::circuit_breaker::Mode::from_str_or_default(&cfg.responder.circuit_breaker_mode);
+        let decision = crate::circuit_breaker::check_and_record(
+            sq.as_ref(),
+            chrono::Utc::now(),
+            cfg.responder.max_blocks_per_hour,
+            mode,
+        );
+        match &decision {
+            crate::circuit_breaker::Decision::TripAndRefuse { count, limit, hour } => {
+                warn!(
+                    ip,
+                    count,
+                    limit,
+                    hour = %hour,
+                    mode = mode.as_label(),
+                    "circuit breaker TRIPPED — pausing block pipeline until UTC hour rolls over (or run `innerwarden system circuit-reset`)"
+                );
+            }
+            crate::circuit_breaker::Decision::RefuseAfterTrip { count, limit, hour } => {
+                info!(
+                    ip,
+                    count,
+                    limit,
+                    hour = %hour,
+                    "circuit breaker still tripped — block refused silently"
+                );
+            }
+            crate::circuit_breaker::Decision::AutoRearm { count, limit, hour } => {
+                info!(
+                    ip,
+                    count,
+                    limit,
+                    hour = %hour,
+                    "circuit breaker auto-rearmed — new UTC hour, counters reset"
+                );
+            }
+            crate::circuit_breaker::Decision::Allow { .. } => {}
+        }
+        if !decision.should_block() {
+            let reason = format!(
+                "skipped: circuit breaker tripped (blocks this hour exceed {})",
+                cfg.responder.max_blocks_per_hour
+            );
+            return (reason, false);
+        }
+    }
+
     // Safeguard: pure eligibility checks (empty IP, operator session, rate
     // limit) + cloud-provider / CDN safelist. Operator incident 2026-04-18:
     // `correlation:CL-008` + `repeat-offender` were auto-blocking Cloudflare
