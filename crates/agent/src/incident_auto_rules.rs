@@ -205,17 +205,6 @@ pub(crate) async fn try_handle_auto_rule(
         rep.record_block();
     }
 
-    // Feed decision to defender brain for training (Phase D).
-    // Layer 1 decisions are high-quality ground truth: deterministic, correct by definition.
-    crate::incident_decision_eval::log_deterministic_decision_to_brain(
-        incident,
-        &format!("{:?}", auto_decision.action),
-        0.95,
-        &format!("auto-rule:{detector}"),
-        data_dir,
-        state,
-    );
-
     // Set cooldown
     state.store.set_cooldown(
         crate::state_store::CooldownTable::Decision,

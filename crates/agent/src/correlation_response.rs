@@ -233,17 +233,6 @@ async fn handle_completed_chain(
         rep.reputation_score += chain.confidence * 3.0;
     }
 
-    // Feed decision to defender brain for training (Phase D).
-    // Correlation chain decisions are high-quality: multi-signal confirmation.
-    crate::incident_decision_eval::log_deterministic_decision_to_brain(
-        &incident,
-        &format!("{:?}", decision.action),
-        chain.confidence,
-        &format!("correlation:{}", chain.rule_id),
-        data_dir,
-        state,
-    );
-
     // Cooldown.
     state.store.set_cooldown(
         crate::state_store::CooldownTable::Decision,

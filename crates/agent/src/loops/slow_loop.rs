@@ -78,16 +78,6 @@ pub(crate) async fn process_narrative_tick(
 
     state.telemetry.observe_events(&events_entries);
 
-    // Spec 031: feed the rolling event-kind history used by defender brain
-    // feature positions 36..=59. Bounded ring maintained by the tested
-    // helper so this hot-path stays a one-liner.
-    for ev in &events_entries {
-        crate::incident_decision_eval::push_event_kind_history(
-            &mut state.recent_event_kinds,
-            &ev.kind,
-        );
-    }
-
     // Track operator IPs: any SSH login via publickey is an operator (has the private key).
     for ev in &events_entries {
         if ev.kind == "ssh.login_success"

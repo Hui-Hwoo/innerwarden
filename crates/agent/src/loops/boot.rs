@@ -830,9 +830,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             None
         },
         recent_blocks: std::collections::VecDeque::new(),
-        recent_event_kinds: std::collections::VecDeque::with_capacity(
-            crate::incident_decision_eval::BRAIN_FEATURE_HISTORY_CAP,
-        ),
         xdp_block_times: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(
             &cli.data_dir,
@@ -854,11 +851,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         last_intel_consolidation_at: None,
         correlation_engine: correlation_engine::CorrelationEngine::new(),
         playbook_engine: playbook::PlaybookEngine::new(&cli.data_dir),
-        defender_brain: defender_brain::DefenderBrain::load(
-            &cli.data_dir.join("defender-brain.json").to_string_lossy(),
-        ),
-        brain_history: defender_brain::BrainHistory::new(500),
-        brain_stats: defender_brain::BrainStats::load(&cli.data_dir),
         pcap_capture: pcap_capture::PcapCapture::new(&cli.data_dir),
         scoring_engine: scoring::ScoringEngine::new(0.95),
         last_firmware_incident_at: None,
@@ -1312,38 +1304,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     }
 
                     // Defender brain daily retrain — at 3:30 AM UTC (after autoencoder at 3 AM).
-                    // Reads brain-log.json (features + AI decisions), fine-tunes policy head.
-                    {
-                        let now_utc = chrono::Utc::now();
-                        if now_utc.hour() == 3 && now_utc.minute() >= 30 {
-                            let today_key = format!("brain_retrain:{}", now_utc.format("%Y-%m-%d"));
-                            if !state.store.has_cooldown(state_store::CooldownTable::Decision, &today_key) {
-                                info!("defender brain: triggering daily retrain");
-                                match state.defender_brain.retrain_from_log(&cli.data_dir) {
-                                    Some((entries, accuracy)) => {
-                                        info!(
-                                            entries,
-                                            accuracy = format!("{:.1}%", accuracy * 100.0),
-                                            "defender brain: retrain complete"
-                                        );
-                                        state.brain_stats.last_retrain =
-                                            Some(now_utc.to_rfc3339());
-                                        state.brain_stats.last_retrain_accuracy = Some(accuracy);
-                                        state.brain_stats.last_retrain_entries = Some(entries);
-                                        state.brain_stats.total_since_retrain = 0;
-                                        state.brain_stats.agreed_since_retrain = 0;
-                                        state.brain_stats.save(&cli.data_dir);
-                                    }
-                                    None => info!("defender brain: retrain skipped (not enough data)"),
-                                }
-                                state.store.set_cooldown(
-                                    state_store::CooldownTable::Decision,
-                                    &today_key,
-                                    now_utc,
-                                );
-                            }
-                        }
-                    }
+                    // Brain retrain block removed: defender_brain replaced
+                    // by SecureBERT classifier provider routed through the
+                    // AI router. Local classifier inference happens in the
+                    // hot path, no nightly retrain needed.
 
                     // Trim in-memory structures to prevent unbounded memory growth
                     state.blocklist.trim_if_needed(10_000);
