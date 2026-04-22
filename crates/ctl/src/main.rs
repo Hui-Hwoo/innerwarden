@@ -475,6 +475,43 @@ enum Command {
         #[command(subcommand)]
         command: SuppressCommand,
     },
+
+    /// Install the local SecureBERT classifier model used by the
+    /// agent's local_classifier AI provider.
+    ///
+    /// Downloads `model.onnx` and `tokenizer.json` from the configured
+    /// GitHub release artifact and installs them under
+    /// `/var/lib/innerwarden/models/classifier/`. The classifier
+    /// provider activates automatically when the agent restarts and
+    /// the operator has set `[ai.classifier].provider = "local_classifier"`
+    /// in `agent.toml` (the `configure` wizard does that for you).
+    ///
+    /// Examples:
+    ///   innerwarden install-classifier
+    ///   innerwarden install-classifier --model minilm-l6 --yes
+    ///   innerwarden install-classifier --url https://github.com/InnerWarden/innerwarden/releases/download/classifier-v1/minilm-l6.tar.gz
+    InstallClassifier {
+        /// Model variant to install. Supported: `minilm-l6` (86 MB,
+        /// distilled, default) and `roberta-v1` (474 MB, full
+        /// precision validated 0.975).
+        #[arg(long, default_value = "minilm-l6")]
+        model: String,
+
+        /// Override the default release URL. Only needed for
+        /// air-gapped installs or self-hosted artifact mirrors.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// SHA-256 of the downloaded archive. When omitted, uses the
+        /// pinned hash for the chosen model variant. Override only
+        /// for `--url` mirror installs.
+        #[arg(long)]
+        sha256: Option<String>,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2422,6 +2459,18 @@ fn main() -> Result<()> {
                 commands::history::cmd_gdpr_erase(&cli.data_dir, entity, *yes)
             }
         },
+        Command::InstallClassifier {
+            ref model,
+            ref url,
+            ref sha256,
+            yes,
+        } => commands::ai::cmd_install_classifier(
+            &cli,
+            model,
+            url.as_deref(),
+            sha256.as_deref(),
+            yes,
+        ),
     }
 }
 

@@ -518,6 +518,181 @@ pub(crate) fn prompt_ollama_api_key() -> Result<String> {
     Ok(key)
 }
 
+// ---------------------------------------------------------------------------
+// Local SecureBERT classifier installer
+// ---------------------------------------------------------------------------
+
+/// Pinned release artifact metadata for the supported classifier
+/// variants. URL stays in one place so air-gapped operators can pull
+/// the same archive from a mirror with `--url`.
+pub(crate) struct ClassifierVariant {
+    /// Name accepted on the CLI.
+    name: &'static str,
+    /// Default GitHub release URL.
+    url: &'static str,
+    /// SHA-256 of the tar.gz archive at the URL above.
+    sha256: &'static str,
+    /// Approximate uncompressed size, used in the operator preview.
+    approx_size_mb: u32,
+    /// Brief one-liner shown in the preview.
+    description: &'static str,
+}
+
+const CLASSIFIER_VARIANTS: &[ClassifierVariant] = &[
+    ClassifierVariant {
+        name: "minilm-l6",
+        // TODO: replace with the published release URL once the artifact
+        // is uploaded. Operators in the meantime can run with `--url`.
+        url: "https://github.com/InnerWarden/innerwarden/releases/download/classifier-v1/minilm-l6.tar.gz",
+        sha256: "TBD-publish-pin-after-release",
+        approx_size_mb: 87,
+        description: "MiniLM L6 distilled (87 MB, ~60 ms p50 on ARM, recommended)",
+    },
+    ClassifierVariant {
+        name: "roberta-v1",
+        url: "https://github.com/InnerWarden/innerwarden/releases/download/classifier-v1/roberta-v1.tar.gz",
+        sha256: "TBD-publish-pin-after-release",
+        approx_size_mb: 478,
+        description: "RoBERTa V1 (478 MB, full precision, validated 0.975 on block_ip)",
+    },
+];
+
+const CLASSIFIER_INSTALL_DIR: &str = "/var/lib/innerwarden/models/classifier";
+
+/// Resolve a CLI variant name to its pinned metadata. Pure helper so
+/// the `--model` validation has its own unit test without touching
+/// the network.
+pub(crate) fn resolve_classifier_variant(name: &str) -> Option<&'static ClassifierVariant> {
+    CLASSIFIER_VARIANTS.iter().find(|v| v.name == name)
+}
+
+/// `innerwarden install-classifier` — fetch and install the local
+/// SecureBERT model files used by the agent's `local_classifier`
+/// AI provider. Replaces the deleted defender-brain pipeline.
+pub(crate) fn cmd_install_classifier(
+    cli: &Cli,
+    model: &str,
+    url_override: Option<&str>,
+    sha256_override: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    if !cli.dry_run {
+        require_sudo(cli);
+    }
+
+    let variant = resolve_classifier_variant(model).ok_or_else(|| {
+        let supported: Vec<&str> = CLASSIFIER_VARIANTS.iter().map(|v| v.name).collect();
+        anyhow::anyhow!(
+            "unknown classifier variant `{model}`. Supported: {}",
+            supported.join(", ")
+        )
+    })?;
+
+    let url = url_override.unwrap_or(variant.url);
+    let expected_sha = sha256_override.unwrap_or(variant.sha256);
+
+    println!("InnerWarden local classifier install");
+    println!();
+    println!("  Variant: {} - {}", variant.name, variant.description);
+    println!("  URL:     {url}");
+    println!("  SHA-256: {expected_sha}");
+    println!("  Target:  {CLASSIFIER_INSTALL_DIR}");
+    println!("  Size:    ~{} MB", variant.approx_size_mb);
+    println!();
+    println!("Active classifier replaces the (now removed) AlphaZero defender brain.");
+    println!("The agent's `local_classifier` provider activates automatically when");
+    println!("`agent.toml` has `[ai.classifier].provider = \"local_classifier\"` and");
+    println!("`base_url = \"{CLASSIFIER_INSTALL_DIR}\"`. Run `innerwarden configure ai`");
+    println!("after install to wire the slot if you have not already.");
+    println!();
+
+    if expected_sha.starts_with("TBD") {
+        println!(
+            "WARNING: pinned SHA-256 not published yet. Pass --sha256 explicitly or wait \
+             for the release to be cut. Refusing to install without a real hash."
+        );
+        anyhow::bail!("classifier install requires --sha256 until the release artifact is pinned");
+    }
+
+    if !yes {
+        print!("Proceed with install? [Y/n] ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_lowercase();
+        if !trimmed.is_empty() && trimmed != "y" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    if cli.dry_run {
+        println!("[dry-run] would download {url}");
+        println!("[dry-run] would verify SHA-256 against {expected_sha}");
+        println!("[dry-run] would extract into {CLASSIFIER_INSTALL_DIR}");
+        return Ok(());
+    }
+
+    install_classifier_archive(url, expected_sha, CLASSIFIER_INSTALL_DIR)?;
+
+    println!();
+    println!("Done. Restart the agent to load the classifier:");
+    println!("  sudo systemctl restart innerwarden-agent");
+    Ok(())
+}
+
+/// Download the archive at `url`, verify the SHA-256, and extract it
+/// into `target_dir`. Split out so the operator-facing wrapper can
+/// stay short and the IO logic has a clear seam for future tests.
+fn install_classifier_archive(url: &str, expected_sha: &str, target_dir: &str) -> Result<()> {
+    use std::process::Command;
+
+    let target = std::path::Path::new(target_dir);
+    std::fs::create_dir_all(target).map_err(|e| anyhow::anyhow!("create {target_dir}: {e}"))?;
+
+    let tmp = std::env::temp_dir().join("innerwarden-classifier.tar.gz");
+
+    println!("[1/3] Downloading...");
+    let status = Command::new("curl")
+        .args(["-fsSL", "-o"])
+        .arg(&tmp)
+        .arg(url)
+        .status()
+        .map_err(|e| anyhow::anyhow!("spawn curl: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("curl failed (exit {status})");
+    }
+
+    println!("[2/3] Verifying SHA-256...");
+    let bytes = std::fs::read(&tmp)?;
+    let actual = sha256_hex(&bytes);
+    if actual != expected_sha {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("SHA-256 mismatch: expected {expected_sha}, got {actual}");
+    }
+
+    println!("[3/3] Extracting into {target_dir}...");
+    let status = Command::new("tar")
+        .args(["-xzf"])
+        .arg(&tmp)
+        .args(["-C", target_dir])
+        .status()
+        .map_err(|e| anyhow::anyhow!("spawn tar: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("tar failed (exit {status})");
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
+}
+
+/// Hex SHA-256 of a byte slice. Pure helper kept private; the variant
+/// catalogue tests exercise it indirectly.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +797,50 @@ mod tests {
             choose_model_from_input(&models, "custom-model"),
             "custom-model"
         );
+    }
+
+    // ── install-classifier helpers ─────────────────────────────────────
+
+    #[test]
+    fn resolve_classifier_variant_returns_known_names() {
+        let v = resolve_classifier_variant("minilm-l6").expect("minilm-l6 known");
+        assert_eq!(v.name, "minilm-l6");
+        assert!(v.description.contains("MiniLM"));
+
+        let v = resolve_classifier_variant("roberta-v1").expect("roberta-v1 known");
+        assert_eq!(v.name, "roberta-v1");
+    }
+
+    #[test]
+    fn resolve_classifier_variant_returns_none_for_unknown() {
+        assert!(resolve_classifier_variant("not-a-real-variant").is_none());
+        assert!(resolve_classifier_variant("").is_none());
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_test_vectors() {
+        // Empty input vector is the canonical SHA-256 sanity check.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // "abc" — the second vector cited in FIPS 180-4 §6.2.
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn classifier_variants_have_distinct_names() {
+        // Catalogue invariant: the CLI dispatcher matches by name, so
+        // duplicate names would silently shadow.
+        let mut names: Vec<&str> = CLASSIFIER_VARIANTS.iter().map(|v| v.name).collect();
+        names.sort_unstable();
+        let unique = names
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert_eq!(unique, names.len(), "duplicate variant names: {names:?}");
     }
 }
