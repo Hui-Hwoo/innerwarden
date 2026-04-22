@@ -59,38 +59,6 @@ pub(crate) async fn process_narrative_tick(
         .format("%Y-%m-%d")
         .to_string();
 
-    // Read new events: from Redis if available, JSONL otherwise.
-    #[cfg(feature = "redis-reader")]
-    let (events_entries, events_count) = if let Some(ref mut rr) = state.redis_reader {
-        match rr.read_events::<innerwarden_core::event::Event>().await {
-            Ok(entries) => {
-                let count = entries.len();
-                (entries, count)
-            }
-            Err(e) => {
-                warn!("Redis event read failed: {e:#}");
-                state.telemetry.observe_error("redis_reader");
-                (Vec::new(), 0)
-            }
-        }
-    } else if let Some(ref sq) = state.sqlite_store {
-        let cval = sq.get_agent_cursor("events").unwrap_or(0);
-        match sq.events_since(cval, 5000) {
-            Ok(rows) if !rows.is_empty() => {
-                let max_id = rows.last().unwrap().0;
-                let entries: Vec<_> = rows.into_iter().map(|(_, ev)| ev).collect();
-                let count = entries.len();
-                let _ = sq.set_agent_cursor("events", max_id);
-                (entries, count)
-            }
-            _ => (Vec::new(), 0),
-        }
-    } else {
-        warn!("sqlite_store not available — cannot read events");
-        (Vec::new(), 0)
-    };
-
-    #[cfg(not(feature = "redis-reader"))]
     let (events_entries, events_count) = if let Some(ref sq) = state.sqlite_store {
         let cval = sq.get_agent_cursor("events").unwrap_or(0);
         match sq.events_since(cval, 5000) {
@@ -443,7 +411,12 @@ pub(crate) async fn process_narrative_tick(
     // Spec 021 — Observation verification (Fase 3).
     // Score undecided incidents and auto-dismiss/escalate clear-cut cases.
     // Ambiguous items go to AI batch verification.
-    let ambiguous_items = narrative_observation_verify::verify_observing_incidents(cfg, state);
+    //
+    // Spec 028-b: verify_observing_incidents is async because the Escalate
+    // branch can now promote the incident all the way through decide() and
+    // the skill executor when the operator has enabled the feature flag.
+    let ambiguous_items =
+        narrative_observation_verify::verify_observing_incidents(cfg, state, data_dir).await;
     narrative_observation_verify::ai_verify_ambiguous(ambiguous_items, cfg, state).await;
 
     narrative_daily_summary::maybe_write_daily_summary_and_digest(

@@ -359,6 +359,16 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         };
+        // Spec 029 PR-C.2: dedicated router for the dashboard spawn.
+        // Logic (including tracing) lives in `ai::router::build_for_dashboard`
+        // so it is unit-tested and this boot path stays a single call.
+        let dashboard_router = ai::router::build_for_dashboard(
+            dashboard_ai.as_ref().map(Arc::clone),
+            &cfg.ai.classifier,
+            &cfg.ai.llm,
+            Some(&cfg.ai.shadow),
+            cfg.ai.confidence_threshold,
+        );
         let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
         let briefing_hour = cfg.briefing.hour;
         let briefing_minute = cfg.briefing.minute;
@@ -381,7 +391,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 agent_alert_tx,
                 deep_security,
                 dashboard_graph,
-                dashboard_ai,
+                dashboard_router,
                 dashboard_briefing,
                 briefing_hour,
                 briefing_minute,
@@ -441,6 +451,14 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     let removed = data_retention::cleanup(&cli.data_dir, &cfg.data);
     if removed > 0 {
         info!(removed, "data_retention: cleaned up old files on startup");
+    }
+    let (fs_removed, fs_bytes) = data_retention::cleanup_filestore(&cli.data_dir, &cfg.data);
+    if fs_removed > 0 {
+        info!(
+            files = fs_removed,
+            bytes = fs_bytes,
+            "data_retention: pruned filestore on startup"
+        );
     }
 
     // Build shared agent state
@@ -635,6 +653,52 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         });
     }
 
+    // Build the primary AI provider once; it feeds the spec 029
+    // capability router. When `[ai.classifier]` / `[ai.llm]` are not
+    // set, both router slots hold this same provider (legacy
+    // behaviour). When they are set, the router builds dedicated
+    // per-role providers and reserves this primary for fallback.
+    let ai_provider: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.enabled {
+        match ai::build_provider(&cfg.ai) {
+            Ok(p) => Some(Arc::from(p)),
+            Err(e) => {
+                warn!("failed to create AI provider: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Spec 029 PR-C.1: per-role providers. When `[ai.classifier].enabled`
+    // is true, build a separate provider for the classifier slot;
+    // otherwise the primary `[ai]` provider fills that slot (PR-B
+    // back-compat). Same for `[ai.llm]`. Branch logic lives in the
+    // unit-testable `ai::router::build_from_config`; this block just
+    // wires tracing callbacks.
+    let ai_router = ai::router::build_from_config(
+        ai_provider.as_ref().map(Arc::clone),
+        &cfg.ai.classifier,
+        &cfg.ai.llm,
+        Some(&cfg.ai.shadow),
+        cfg.ai.confidence_threshold,
+        |slot, provider_name| {
+            info!(
+                slot,
+                provider = provider_name,
+                "AI router: per-role slot configured"
+            );
+        },
+        |slot, provider_name, err| {
+            warn!(
+                slot,
+                provider = provider_name,
+                "failed to build per-role provider, falling back to primary: {err:#}"
+            );
+        },
+    );
+    info!(router = %ai_router.describe(), "AI router ready");
+
     let mut state = AgentState {
         skill_registry: skills::SkillRegistry::default_builtin(),
         blocklist: startup_blocklist,
@@ -654,17 +718,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         },
-        ai_provider: if cfg.ai.enabled {
-            match ai::build_provider(&cfg.ai) {
-                Ok(p) => Some(Arc::from(p)),
-                Err(e) => {
-                    warn!("failed to create AI provider: {e:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        },
+        ai_router,
         // Decision writer is always created — Layer 1/2 decisions are written
         // even without AI. Previously gated on cfg.ai.enabled which caused
         // zero audit trail when AI was disabled or during agent restarts.
@@ -847,8 +901,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         knowledge_graph: shared_graph.clone(),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
@@ -918,21 +970,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             );
         }
         state.threat_feed = Some(client);
-    }
-
-    // Connect Redis reader if configured
-    #[cfg(feature = "redis-reader")]
-    if let Some(ref url) = cfg.redis_url {
-        let redis_cfg = redis_reader::agent_config(url, cfg.redis_stream.as_deref());
-        match redis_reader::RedisStreamReader::connect(redis_cfg).await {
-            Ok(r) => {
-                info!("Redis stream reader connected - events from Redis");
-                state.redis_reader = Some(r);
-            }
-            Err(e) => {
-                warn!("Redis reader connection failed ({e:#}), using JSONL fallback");
-            }
-        }
     }
 
     if !state.ip_reputations.is_empty() {
@@ -1036,7 +1073,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 None
             };
             let abuseipdb_threshold = cfg.abuseipdb.auto_block_threshold;
-            let ai_clone = state.ai_provider.clone();
+            // Spec 029 PR-C.2: honeypot always-on uses the AI provider
+            // for short attack-profile explanations of auth attempts.
+            // Prefer Explain, fall back to any LLM (typical deploy has
+            // only one anyway). Logic lives in `AiRouter::explain_or_any_llm`
+            // so it is unit-tested without spawning the honeypot loop.
+            let ai_clone = state.ai_router.explain_or_any_llm();
             let tg_clone = state.telegram_client.clone();
             let gate_counter = state.telemetry.gate_suppressed_counter();
             let data_dir_clone = cli.data_dir.clone();
@@ -1149,7 +1191,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             // normal filter path runs — spec § fallback.
                             let batch_classes: Option<Vec<notification_pipeline::BatchClassification>> =
                                 if cfg.ai.batch_triage {
-                                    if let Some(provider) = state.ai_provider.as_ref() {
+                                    // Spec 029 PR-C.2: batch triage is a
+                                    // classification task (incident group
+                                    // → category label). Classify role.
+                                    if let Some(provider) =
+                                        state.ai_router.provider_for(crate::ai::Capability::Classify)
+                                    {
                                         notification_pipeline::run_batch_triage(
                                             provider.as_ref(),
                                             &summaries,
@@ -1554,6 +1601,30 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     if removed > 0 {
                         info!(removed, "data_retention: cleaned up old files");
                     }
+                    let (fs_removed, fs_bytes) =
+                        data_retention::cleanup_filestore(&cli.data_dir, &cfg.data);
+                    if fs_removed > 0 {
+                        info!(
+                            files = fs_removed,
+                            bytes = fs_bytes,
+                            "data_retention: pruned filestore"
+                        );
+                    }
+
+                    // Spec 030: compress warm-tier JSONL files past the
+                    // `warm_gzip_days` threshold. Runs alongside the
+                    // delete sweep (once per slow tick) so a long-idle
+                    // agent catches up in one pass. The call is a no-op
+                    // when `warm_gzip_days = 0`.
+                    let (compressed, bytes_saved) =
+                        data_retention::gzip_warm_jsonl(&cli.data_dir, &cfg.data);
+                    if compressed > 0 {
+                        info!(
+                            compressed,
+                            bytes_saved,
+                            "data_retention: gzipped warm-tier files"
+                        );
+                    }
 
                     // ── SQLite maintenance (time-gated inside tick) ──
                     if let (Some(ref mut sched), Some(ref sq)) =
@@ -1617,6 +1688,22 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
                         // ── Pcap capture cooldown cleanup ──
                         state.pcap_capture.cleanup();
+
+                        // ── Process-health self-observation ──
+                        // Detects child-process leaks (e.g. tcpdump that
+                        // never exits) at the service boundary instead of
+                        // waiting for someone to notice on the host.
+                        {
+                            let snapshot = crate::process_health::ProcessHealth::snapshot();
+                            if snapshot.looks_stuck() {
+                                warn!(
+                                    children = snapshot.children_total,
+                                    oldest_age_secs = ?snapshot.oldest_child_age_secs,
+                                    by_comm = ?snapshot.children_by_comm,
+                                    "process_health: unusual child-process state; possible spawn leak"
+                                );
+                            }
+                        }
 
                         // ── 2FA pending action expiry cleanup ──
                         state.two_factor_state.cleanup_expired();
@@ -1963,6 +2050,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     let removed = data_retention::cleanup(&cli.data_dir, &cfg.data);
                     if removed > 0 {
                         info!(removed, "data_retention: cleaned up old files");
+                    }
+                    let (fs_removed, fs_bytes) =
+                        data_retention::cleanup_filestore(&cli.data_dir, &cfg.data);
+                    if fs_removed > 0 {
+                        info!(
+                            files = fs_removed,
+                            bytes = fs_bytes,
+                            "data_retention: pruned filestore"
+                        );
                     }
                     false
                 }

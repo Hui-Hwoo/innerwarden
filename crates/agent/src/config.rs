@@ -76,15 +76,6 @@ pub struct AgentConfig {
     /// Environment auto-profiling and census.
     #[serde(default)]
     pub environment: EnvironmentConfig,
-    /// Redis URL for reading events from Redis Streams instead of JSONL files.
-    /// When set, events are consumed via XREADGROUP. Incidents still read from JSONL.
-    #[serde(default)]
-    #[cfg_attr(not(feature = "redis-reader"), allow(dead_code))]
-    pub redis_url: Option<String>,
-    /// Redis stream name for events. Default: "innerwarden:events".
-    #[serde(default)]
-    #[cfg_attr(not(feature = "redis-reader"), allow(dead_code))]
-    pub redis_stream: Option<String>,
     /// Daily AI intelligence briefing
     #[serde(default)]
     pub briefing: BriefingConfig,
@@ -112,6 +103,44 @@ pub struct AgentConfig {
     /// Example: ["threat_intel", "lateral_movement", "persistence"]
     #[serde(default)]
     pub graph_only_detectors: Vec<String>,
+    /// Incident lifecycle flow configuration (spec 028).
+    #[serde(default)]
+    pub incident_flow: IncidentFlowConfig,
+}
+
+/// Incident lifecycle routing knobs (spec 028).
+///
+/// The only knob currently live is the `escalate_to_decide` feature flag. When
+/// true, observation-verify's Escalate branch is expected to forward incidents
+/// into the Fase 4 `ai_provider.decide()` pipeline so attackers that score
+/// above the escalate threshold actually get actioned instead of sitting under
+/// the OBSERVING bucket forever.
+///
+/// Default is `false` because the full wiring (threading the provider + skill
+/// executor + state into narrative_observation_verify) is intentionally
+/// staged: this PR lands the flag + config, the follow-up PR lands the decide
+/// call. See spec 028 section 028-b.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct IncidentFlowConfig {
+    /// When true, Escalate from observation-verify should trigger a Fase 4
+    /// decide() call. The wiring itself is a follow-up PR; today the flag
+    /// is read but the code path only logs an intent line. Flip to true in
+    /// /etc/innerwarden/agent.toml after the wiring PR lands.
+    #[serde(default)]
+    pub escalate_to_decide: bool,
+    /// Detector prefixes whose incidents should skip the Fase 3 observation
+    /// verifier entirely and go direct to Fase 4. The spec lists
+    /// `threat_intel:*`, `sudo_abuse:*`, and `suspicious_execution:*` as
+    /// candidates because they are inherently high-signal. Matched via
+    /// prefix (case-sensitive). Empty by default; the skip path is also
+    /// Consumed by `incident_flow::evaluate_pre_ai_flow` (spec 028-b
+    /// full wiring): when the incident id starts with any entry in
+    /// this list (optionally followed by `:`), the pre-AI gate
+    /// bypasses the below-severity and decision-cooldown guards so
+    /// the incident reaches `ai_provider.decide()`. Allowlist and
+    /// per-tick budget still apply.
+    #[serde(default)]
+    pub detectors_skip_fase3: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -552,8 +581,15 @@ pub struct AiConfig {
     /// - anthropic: defaults to https://api.anthropic.com (leave empty)
     /// - ollama: defaults to http://localhost:11434 (override for remote Ollama)
     ///   Can also be set via OLLAMA_BASE_URL env var for Ollama.
+    /// - azure_openai: required - https://<resource>.openai.azure.com
     #[serde(default)]
     pub base_url: String,
+
+    /// Azure OpenAI API version (only used when provider = "azure_openai").
+    /// Defaults to "2024-12-01-preview" when empty. See Azure docs for the
+    /// current stable/preview versions.
+    #[serde(default)]
+    pub api_version: String,
 
     /// Maximum number of AI calls per incident tick (default: 5).
     /// When more incidents arrive in a single tick than this limit, the excess
@@ -619,6 +655,168 @@ pub struct AiConfig {
     /// prod drift is verified flat.
     #[serde(default = "default_use_structured_subgraph")]
     pub use_structured_subgraph: bool,
+
+    /// Optional shadow provider: runs in parallel with the primary provider
+    /// and logs each decision for operator audit. Primary drives production;
+    /// shadow is purely observational. Use to validate a new provider (e.g.
+    /// a local classifier) against a known-good one (e.g. Azure OpenAI)
+    /// before promoting the shadow to primary.
+    #[serde(default)]
+    pub shadow: ShadowConfig,
+
+    /// Spec 029 PR-C: dedicated provider for the classifier role
+    /// (triage decisions + structured classification). When
+    /// `enabled = false` (default), the primary `[ai]` block fills
+    /// the classifier slot of the router — identical to the pre-029
+    /// behaviour. When `enabled = true`, the router uses this block
+    /// for `Capability::Decide` and `Capability::Classify`. Typical
+    /// production config points this at the local ONNX classifier
+    /// so triage runs without LLM cost.
+    #[serde(default)]
+    pub classifier: RoleProviderConfig,
+
+    /// Spec 029 PR-C: dedicated provider for the LLM role
+    /// (free-form generation, explanation, honeypot shell
+    /// simulation). When `enabled = false` (default), the primary
+    /// `[ai]` block fills the llm slot. When enabled, the router
+    /// uses this block for `Capability::Generate`,
+    /// `Capability::Explain`, and `Capability::SimulateShell`.
+    /// Typical production config points this at a full LLM (Azure
+    /// OpenAI GPT-5.4-mini, Claude, etc.) so operator-facing chat
+    /// and briefings keep working when the classifier role is
+    /// served by a narrow local model.
+    #[serde(default)]
+    pub llm: RoleProviderConfig,
+}
+
+/// Slim per-role provider configuration introduced in spec 029 PR-C.
+/// Shared by `[ai.classifier]` and `[ai.llm]`. Fields are a subset of
+/// `AiConfig` (only what a single provider needs to be constructed);
+/// shared knobs like `confidence_threshold`, `min_severity`, and the
+/// shadow wrapper continue to live on the top-level `[ai]` block.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct RoleProviderConfig {
+    /// If false (default), this role is not configured separately
+    /// and the boot path falls back to the primary `[ai]` block.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Provider name. Same set of valid values as `[ai].provider`
+    /// (openai, anthropic, ollama, azure_openai, local_classifier,
+    /// stub, or any OpenAI-compatible registered name).
+    #[serde(default)]
+    pub provider: String,
+
+    /// Same semantics as `[ai].api_key`. Empty string means the
+    /// agent reads the provider-specific env var at startup
+    /// (OPENAI_API_KEY, AZURE_OPENAI_API_KEY, etc.).
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Same semantics as `[ai].model`.
+    #[serde(default)]
+    pub model: String,
+
+    /// Same semantics as `[ai].base_url`.
+    #[serde(default)]
+    pub base_url: String,
+
+    /// Same semantics as `[ai].api_version` (used by `azure_openai`).
+    #[serde(default)]
+    pub api_version: String,
+}
+
+impl RoleProviderConfig {
+    /// Project this role config into a full `AiConfig` shell suitable
+    /// for handing to `ai::build_provider`. Reuses the defaults from
+    /// `AiConfig::default()` for all knobs that are not per-role
+    /// (confidence threshold, max calls per tick, etc.). Leaves
+    /// `api_key` as-is on the returned config so the downstream
+    /// `AiConfig::resolved_api_key` env-var fallback fires exactly
+    /// like it does for the primary `[ai]` block — operators set
+    /// `AZURE_OPENAI_API_KEY` once and both the primary and the LLM
+    /// slot pick it up.
+    pub fn to_ai_config(&self) -> AiConfig {
+        AiConfig {
+            enabled: self.enabled,
+            provider: self.provider.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            api_version: self.api_version.clone(),
+            ..AiConfig::default()
+        }
+    }
+}
+
+/// Shadow provider configuration (subset of AiConfig applied to a second
+/// provider that runs in parallel with the primary for auditing).
+#[derive(Debug, Deserialize)]
+pub struct ShadowConfig {
+    /// If false (default), no shadow provider is created.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Provider name. Same set of valid values as `[ai].provider`.
+    #[serde(default)]
+    pub provider: String,
+
+    /// Same semantics as `[ai].api_key`. Can be empty if the env var
+    /// (e.g. OPENAI_API_KEY) provides the key.
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Same semantics as `[ai].model`.
+    #[serde(default)]
+    pub model: String,
+
+    /// Same semantics as `[ai].base_url`.
+    #[serde(default)]
+    pub base_url: String,
+
+    /// Same semantics as `[ai].api_version` (used by `azure_openai`).
+    #[serde(default)]
+    pub api_version: String,
+
+    /// Where to append per-incident comparison lines. Default:
+    /// `/var/lib/innerwarden/shadow-decisions.jsonl`.
+    #[serde(default = "default_shadow_log_path")]
+    pub log_path: String,
+}
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            base_url: String::new(),
+            api_version: String::new(),
+            log_path: default_shadow_log_path(),
+        }
+    }
+}
+
+fn default_shadow_log_path() -> String {
+    "/var/lib/innerwarden/shadow-decisions.jsonl".to_string()
+}
+
+impl ShadowConfig {
+    /// Resolve API key: config field first, then provider-specific env var.
+    pub fn resolved_api_key(&self) -> String {
+        if !self.api_key.is_empty() {
+            return self.api_key.clone();
+        }
+        let env_var = match self.provider.as_str() {
+            "openai" => "OPENAI_API_KEY",
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "ollama" => "OLLAMA_API_KEY",
+            "azure_openai" => "AZURE_OPENAI_API_KEY",
+            _ => "AI_API_KEY",
+        };
+        std::env::var(env_var).unwrap_or_default()
+    }
 }
 
 fn default_use_structured_subgraph() -> bool {
@@ -644,6 +842,7 @@ impl Default for AiConfig {
             confidence_threshold: default_confidence_threshold(),
             incident_poll_secs: default_incident_poll_secs(),
             base_url: String::new(),
+            api_version: String::new(),
             max_ai_calls_per_tick: default_max_ai_calls_per_tick(),
             circuit_breaker_threshold: 0,
             circuit_breaker_cooldown_secs: default_circuit_breaker_cooldown_secs(),
@@ -652,6 +851,9 @@ impl Default for AiConfig {
             batch_triage: false,
             batch_window_secs: default_batch_window_secs(),
             use_structured_subgraph: default_use_structured_subgraph(),
+            shadow: ShadowConfig::default(),
+            classifier: RoleProviderConfig::default(),
+            llm: RoleProviderConfig::default(),
         }
     }
 }
@@ -704,6 +906,7 @@ impl AiConfig {
             "openai" => "OPENAI_API_KEY",
             "anthropic" => "ANTHROPIC_API_KEY",
             "ollama" => "OLLAMA_API_KEY",
+            "azure_openai" => "AZURE_OPENAI_API_KEY",
             _ => "AI_API_KEY",
         };
         std::env::var(env_var).unwrap_or_default()
@@ -2002,6 +2205,39 @@ pub struct DataRetentionConfig {
     /// Keep trial-report-*.{json,md} for N days (default: 30)
     #[serde(default = "default_data_reports_keep_days")]
     pub reports_keep_days: usize,
+
+    /// Spec 030: keep `graph-snapshot-YYYY-MM-DD.json` files for N
+    /// days. Only the most recent snapshot is needed for recovery;
+    /// older ones pile up at ~40 MB/day if not pruned. (default: 3)
+    #[serde(default = "default_data_graph_snapshot_keep_days")]
+    pub graph_snapshot_keep_days: usize,
+
+    /// Spec 030: compress warm-tier JSONL files (events, incidents,
+    /// decisions, telemetry, admin-actions, agent-guard-events) with
+    /// gzip once they are older than this many days. The reader
+    /// transparently decompresses `.jsonl.gz` so downstream callers
+    /// do not have to know the difference. Set to 0 to disable
+    /// compression. (default: 7)
+    #[serde(default = "default_data_warm_gzip_days")]
+    pub warm_gzip_days: usize,
+
+    /// Retention for `filestore/extracted/<shard>/<sha256>.<ext>`
+    /// files captured by the sensor's HTTP body extractor. These
+    /// dedup-by-hash forensic artifacts have no pruning path of
+    /// their own and grow unbounded (observed 6 GB / 44k files on
+    /// prod). Uses mtime rather than filename-date since filenames
+    /// are content hashes. Set to 0 to disable age-based pruning.
+    /// (default: 30)
+    #[serde(default = "default_data_filestore_keep_days")]
+    pub filestore_keep_days: usize,
+
+    /// Hard size cap for the entire `filestore/extracted/` tree in
+    /// megabytes. After the age-based pass runs, oldest files are
+    /// pruned until the total is under this cap. Protects against
+    /// bursty captures overrunning disk between retention ticks.
+    /// Set to 0 to disable the size cap. (default: 2048)
+    #[serde(default = "default_data_filestore_max_size_mb")]
+    pub filestore_max_size_mb: u64,
 }
 
 impl Default for DataRetentionConfig {
@@ -2012,6 +2248,10 @@ impl Default for DataRetentionConfig {
             decisions_keep_days: default_data_decisions_keep_days(),
             telemetry_keep_days: default_data_telemetry_keep_days(),
             reports_keep_days: default_data_reports_keep_days(),
+            graph_snapshot_keep_days: default_data_graph_snapshot_keep_days(),
+            warm_gzip_days: default_data_warm_gzip_days(),
+            filestore_keep_days: default_data_filestore_keep_days(),
+            filestore_max_size_mb: default_data_filestore_max_size_mb(),
         }
     }
 }
@@ -2030,6 +2270,18 @@ fn default_data_telemetry_keep_days() -> usize {
 }
 fn default_data_reports_keep_days() -> usize {
     30
+}
+fn default_data_graph_snapshot_keep_days() -> usize {
+    3
+}
+fn default_data_warm_gzip_days() -> usize {
+    7
+}
+fn default_data_filestore_keep_days() -> usize {
+    30
+}
+fn default_data_filestore_max_size_mb() -> u64 {
+    2048
 }
 
 fn default_telegram_min_severity() -> String {
@@ -3034,5 +3286,247 @@ approval_ttl_secs = 300
             (cfg.ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
             "load() must apply clamp so autonomous execution can fire"
         );
+    }
+
+    #[test]
+    fn shadow_config_default_is_disabled() {
+        let s = ShadowConfig::default();
+        assert!(!s.enabled);
+        assert!(s.provider.is_empty());
+        assert!(s.api_key.is_empty());
+        assert!(s.model.is_empty());
+        assert!(s.base_url.is_empty());
+        assert!(s.api_version.is_empty());
+        assert_eq!(s.log_path, "/var/lib/innerwarden/shadow-decisions.jsonl");
+    }
+
+    #[test]
+    fn shadow_config_default_log_path_constant() {
+        assert_eq!(
+            default_shadow_log_path(),
+            "/var/lib/innerwarden/shadow-decisions.jsonl"
+        );
+    }
+
+    #[test]
+    fn shadow_resolved_api_key_field_wins() {
+        let mut s = ShadowConfig::default();
+        s.api_key = "explicit-key".into();
+        s.provider = "openai".into();
+        assert_eq!(s.resolved_api_key(), "explicit-key");
+    }
+
+    #[test]
+    fn shadow_resolved_api_key_matches_each_provider_branch() {
+        // Each provider branch must compile + run without panic regardless of
+        // the host's env. Function returns String (never errors).
+        for provider in ["openai", "anthropic", "ollama", "azure_openai", "unknown"] {
+            let mut s = ShadowConfig::default();
+            s.provider = provider.into();
+            // field empty -> goes into match
+            let _ = s.resolved_api_key();
+        }
+    }
+
+    #[test]
+    fn ai_config_default_has_disabled_shadow() {
+        let cfg = AiConfig::default();
+        assert!(!cfg.shadow.enabled);
+        assert!(cfg.api_version.is_empty());
+    }
+
+    #[test]
+    fn load_parses_shadow_config_block() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai]
+provider = "azure_openai"
+model = "gpt-5-4-mini"
+base_url = "https://example-resource.openai.azure.com"
+api_version = "2024-12-01-preview"
+
+[ai.shadow]
+enabled = true
+provider = "stub"
+log_path = "/tmp/shadow.jsonl"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.ai.provider, "azure_openai");
+        assert_eq!(cfg.ai.api_version, "2024-12-01-preview");
+        assert!(cfg.ai.shadow.enabled);
+        assert_eq!(cfg.ai.shadow.provider, "stub");
+        assert_eq!(cfg.ai.shadow.log_path, "/tmp/shadow.jsonl");
+    }
+
+    #[test]
+    fn ai_resolved_api_key_recognises_azure_env() {
+        // The AiConfig::resolved_api_key match added "azure_openai" arm.
+        // Same coverage guarantee as shadow: hit each branch without panic.
+        for provider in ["openai", "anthropic", "ollama", "azure_openai", "unknown"] {
+            let mut ai = AiConfig::default();
+            ai.provider = provider.into();
+            let _ = ai.resolved_api_key();
+        }
+    }
+
+    // Spec 028-b: incident_flow config defaults keep the flag off and the
+    // skip-fase3 list empty so bundled deploy changes nothing about decision
+    // behaviour until operator flips the flag explicitly.
+    #[test]
+    fn incident_flow_defaults_are_conservative() {
+        let cfg = IncidentFlowConfig::default();
+        assert!(!cfg.escalate_to_decide);
+        assert!(cfg.detectors_skip_fase3.is_empty());
+    }
+
+    #[test]
+    fn load_parses_incident_flow_section() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[incident_flow]
+escalate_to_decide = true
+detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert!(cfg.incident_flow.escalate_to_decide);
+        assert_eq!(cfg.incident_flow.detectors_skip_fase3.len(), 3);
+        assert!(cfg
+            .incident_flow
+            .detectors_skip_fase3
+            .iter()
+            .any(|d| d == "threat_intel"));
+    }
+
+    // Spec 029 PR-C: RoleProviderConfig default is disabled + empty.
+    // When both per-role blocks are absent from agent.toml the router
+    // falls back to the primary [ai] provider (PR-B back-compat).
+    #[test]
+    fn role_provider_config_default_is_disabled() {
+        let r = RoleProviderConfig::default();
+        assert!(!r.enabled);
+        assert!(r.provider.is_empty());
+        assert!(r.api_key.is_empty());
+        assert!(r.model.is_empty());
+        assert!(r.base_url.is_empty());
+        assert!(r.api_version.is_empty());
+    }
+
+    // Spec 029 PR-C: ai_config defaults keep both per-role blocks
+    // disabled so pre-029 configs auto-use the primary [ai] block.
+    #[test]
+    fn ai_config_default_has_disabled_per_role_blocks() {
+        let cfg = AiConfig::default();
+        assert!(!cfg.classifier.enabled);
+        assert!(!cfg.llm.enabled);
+    }
+
+    // Spec 029 PR-C: to_ai_config maps the per-role fields into a
+    // full AiConfig shell suitable for ai::build_provider. Shared
+    // knobs (confidence_threshold, min_severity, etc.) default.
+    #[test]
+    fn role_provider_to_ai_config_maps_fields() {
+        let role = RoleProviderConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            api_key: "explicit".into(),
+            model: "gpt-5.4-mini".into(),
+            base_url: "https://example.openai.azure.com".into(),
+            api_version: "2024-12-01-preview".into(),
+        };
+        let cfg = role.to_ai_config();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.provider, "azure_openai");
+        assert_eq!(cfg.api_key, "explicit");
+        assert_eq!(cfg.model, "gpt-5.4-mini");
+        assert_eq!(cfg.base_url, "https://example.openai.azure.com");
+        assert_eq!(cfg.api_version, "2024-12-01-preview");
+        // Shared knobs come from AiConfig::default().
+        assert!(!cfg.shadow.enabled);
+        assert_eq!(cfg.min_severity, "medium");
+    }
+
+    // Spec 029 PR-C: empty api_key on to_ai_config stays empty so
+    // the downstream AiConfig::resolved_api_key env-var fallback
+    // (OPENAI_API_KEY, AZURE_OPENAI_API_KEY, etc.) fires normally.
+    #[test]
+    fn role_provider_to_ai_config_preserves_empty_api_key() {
+        let role = RoleProviderConfig {
+            enabled: true,
+            provider: "openai".into(),
+            api_key: String::new(),
+            ..Default::default()
+        };
+        let cfg = role.to_ai_config();
+        assert!(cfg.api_key.is_empty());
+    }
+
+    // Spec 029 PR-C: parses the classifier + llm TOML sections.
+    #[test]
+    fn load_parses_classifier_and_llm_sections() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai]
+enabled = true
+provider = "stub"
+
+[ai.classifier]
+enabled = true
+provider = "local_classifier"
+base_url = "/var/lib/innerwarden/models/classifier"
+
+[ai.llm]
+enabled = true
+provider = "azure_openai"
+model = "gpt-5.4-mini"
+base_url = "https://example.openai.azure.com"
+api_version = "2024-12-01-preview"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+
+        assert!(cfg.ai.enabled);
+        assert_eq!(cfg.ai.provider, "stub");
+
+        assert!(cfg.ai.classifier.enabled);
+        assert_eq!(cfg.ai.classifier.provider, "local_classifier");
+        assert_eq!(
+            cfg.ai.classifier.base_url,
+            "/var/lib/innerwarden/models/classifier"
+        );
+
+        assert!(cfg.ai.llm.enabled);
+        assert_eq!(cfg.ai.llm.provider, "azure_openai");
+        assert_eq!(cfg.ai.llm.model, "gpt-5.4-mini");
+        assert_eq!(cfg.ai.llm.api_version, "2024-12-01-preview");
+    }
+
+    // Spec 029 PR-C: legacy `[ai]` only config is still parsed with
+    // classifier/llm blocks defaulting to disabled. Back-compat gate.
+    #[test]
+    fn load_without_per_role_sections_leaves_slots_disabled() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai]
+enabled = true
+provider = "stub"
+model = "legacy"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.ai.provider, "stub");
+        // Per-role blocks default to disabled so the boot path falls
+        // back to the primary [ai] provider for both slots.
+        assert!(!cfg.ai.classifier.enabled);
+        assert!(!cfg.ai.llm.enabled);
     }
 }

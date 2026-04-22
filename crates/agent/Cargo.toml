@@ -11,7 +11,13 @@ keywords = ["security", "incident-response", "autonomous-defense", "linux", "rus
 categories = ["command-line-utilities", "network-programming"]
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-tikv-jemallocator = "0.6"
+# `profiling` compiles the jemalloc heap profiler into the binary; it
+# is inert at runtime until `MALLOC_CONF=prof:true,...` is set, so
+# there is no steady-state overhead. `unprefixed_malloc_on_supported_platforms`
+# is required for `MALLOC_CONF` and the `malloc_conf` weak symbol to
+# be picked up by the runtime. See docs/heap-profile.md for the
+# on-demand workflow.
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 
 [dependencies]
 innerwarden_core = { path = "../core" }
@@ -56,16 +62,25 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 bytes = "1"
 
-redis = { version = "1.2", features = ["tokio-comp", "aio"], optional = true }
+# Pure-Rust ONNX inference (no C runtime dependency, slightly slower than ort
+# but compiles cleanly on any target and is easier to distribute).
+tract-onnx = { version = "0.21", optional = true }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen = "0.13"
 rustls-pki-types = "1"
+# Spec 030: warm-tier JSONL compression + atomic rename.
+flate2 = "1"
+tempfile = "3"
 
 [features]
 default = []
-redis-reader = ["redis"]
+# Enables the local ONNX classifier provider. Adds ~50 MB to the binary from
+# the ONNX runtime static link plus the tokenizer; off by default so users
+# without the classifier model installed don't pay the cost.
+local-classifier = ["tract-onnx", "tokenizers"]
 
 [dev-dependencies]
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+filetime = "0.2"

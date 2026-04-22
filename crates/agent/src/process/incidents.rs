@@ -204,8 +204,18 @@ pub(crate) async fn process_incidents(
         state.circuit_breaker_until.is_some()
     };
 
-    // Pre-compute AI context (only if AI is configured and circuit breaker is not open)
-    let ai_enabled = cfg.ai.enabled && state.ai_provider.is_some() && !circuit_breaker_open;
+    // Pre-compute AI context (only if AI is configured and circuit breaker is not open).
+    //
+    // Spec 029 PR-C.2: provider resolution migrated to the capability
+    // router. This is the Decide path, so we pull from
+    // `state.ai_router.provider_for(Capability::Decide)`. When the
+    // operator has configured a dedicated classifier via
+    // `[ai.classifier]`, triage routes through the classifier without
+    // touching the rest of the decision pipeline. Legacy configs
+    // (no `[ai.classifier]` / `[ai.llm]`) populate both slots with the
+    // primary provider, so behaviour is identical.
+    let decide_provider = state.ai_router.provider_for(ai::Capability::Decide);
+    let ai_enabled = cfg.ai.enabled && decide_provider.is_some() && !circuit_breaker_open;
     let (all_events, skill_infos, ai_provider, provider_name, already_blocked, mut blocked_set) =
         if ai_enabled {
             let events = if let Some(ref sq) = state.sqlite_store {
@@ -217,8 +227,9 @@ pub(crate) async fn process_incidents(
                 vec![]
             };
             let infos = state.skill_registry.infos();
-            // Clone the Arc - owned handle, no borrow of `state`
-            let prov: Arc<dyn ai::AiProvider> = state.ai_provider.as_ref().unwrap().clone();
+            // Owned handle from the router, no borrow of `state` across
+            // async calls below.
+            let prov: Arc<dyn ai::AiProvider> = decide_provider.expect("decide_provider checked");
             let pname = prov.name();
             let blocked = state.blocklist.as_vec();
             // Mutable so we can update it mid-tick to prevent duplicate AI calls
@@ -615,6 +626,7 @@ pub(crate) async fn process_incidents(
                     ("block_container", Some(container_id.as_str()))
                 }
                 ai::AiAction::Ignore { .. } => ("ignore", None),
+                ai::AiAction::Dismiss { .. } => ("dismiss", None),
                 ai::AiAction::RequestConfirmation { .. } => ("request_confirmation", None),
                 ai::AiAction::KillChainResponse { .. } => ("kill_chain_response", None),
             };

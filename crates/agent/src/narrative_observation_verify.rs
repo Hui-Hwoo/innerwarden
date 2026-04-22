@@ -26,9 +26,17 @@ pub(crate) struct AmbiguousItem {
 /// Run observation verification on all OBSERVING incidents in the knowledge graph.
 ///
 /// Returns the list of ambiguous items that need AI verification (Phase C).
-pub(crate) fn verify_observing_incidents(
+///
+/// Spec 028-b: became `async` so the Escalate branch can reach the Fase 4
+/// `ai_provider.decide()` path. `data_dir` is threaded through for the
+/// decision audit / skill execution helpers. The behaviour shift is gated
+/// behind `cfg.incident_flow.escalate_to_decide`; when the flag is false
+/// (default) this function still only escalates to the graph + JSONL and
+/// the async surface is equivalent to the prior sync one.
+pub(crate) async fn verify_observing_incidents(
     cfg: &crate::config::AgentConfig,
     state: &mut AgentState,
+    data_dir: &std::path::Path,
 ) -> Vec<AmbiguousItem> {
     if !cfg.observation.enabled {
         return Vec::new();
@@ -65,7 +73,7 @@ pub(crate) fn verify_observing_incidents(
     );
 
     // Collect undecided incident data from the graph (read lock)
-    let undecided: Vec<(String, String, String, serde_json::Value)> = {
+    let undecided: Vec<(String, String, String, serde_json::Value, Option<String>)> = {
         let graph = state.knowledge_graph.read().unwrap();
         collect_undecided_incidents(&graph)
     };
@@ -78,7 +86,7 @@ pub(crate) fn verify_observing_incidents(
     let mut escalated = 0u32;
     let mut ambiguous_items = Vec::new();
 
-    for (incident_id, detector, title, evidence) in undecided {
+    for (incident_id, detector, title, evidence, primary_ip) in undecided {
         let (result, breakdown) = observation_verify::behaviour_score(
             &evidence,
             operator_active,
@@ -108,16 +116,32 @@ pub(crate) fn verify_observing_incidents(
                 );
             }
             VerificationResult::Escalate { score, reason } => {
-                let mut graph = state.knowledge_graph.write().unwrap();
-                graph.ingest_decision(
+                apply_escalate(
+                    &state.knowledge_graph,
+                    state.decision_writer.as_mut(),
+                    cfg.incident_flow.escalate_to_decide,
                     &incident_id,
-                    "escalate",
-                    None,
-                    0.8,
-                    &format!("obs-verify score {score}/100: {reason}"),
-                    true,
-                    chrono::Utc::now(),
+                    primary_ip.as_deref(),
+                    score,
+                    &reason,
                 );
+                // Spec 028-b: when the operator has flipped the flag, follow
+                // the escalate through to the Fase 4 decide() + execute path
+                // so the IP actually gets actioned instead of sitting under
+                // the "escalate" label forever (the autonomy gap that
+                // motivated spec 028).
+                if cfg.incident_flow.escalate_to_decide {
+                    promote_escalated_to_decision(
+                        cfg,
+                        state,
+                        data_dir,
+                        &incident_id,
+                        &detector,
+                        &title,
+                        primary_ip.as_deref(),
+                    )
+                    .await;
+                }
                 escalated += 1;
                 debug!(
                     incident_id,
@@ -152,9 +176,14 @@ pub(crate) fn verify_observing_incidents(
 }
 
 /// Collect undecided incident data from the knowledge graph.
+///
+/// The last tuple element is the primary IP entity connected to the incident,
+/// if any. Spec 028-c uses this so the escalate decision written below can
+/// link back to a target IP and the dashboard can bucket the IP as "needs
+/// attention" instead of "observing".
 fn collect_undecided_incidents(
     graph: &KnowledgeGraph,
-) -> Vec<(String, String, String, serde_json::Value)> {
+) -> Vec<(String, String, String, serde_json::Value, Option<String>)> {
     graph
         .nodes_of_type(NodeType::Incident)
         .iter()
@@ -181,13 +210,20 @@ fn collect_undecided_incidents(
                     "summary": summary,
                 });
 
-                // Enrich evidence from connected graph nodes
+                // Enrich evidence from connected graph nodes.
+                // Track the first IP entity we see as the primary attacker IP.
+                let mut primary_ip: Option<String> = None;
                 for edge in graph.edges_slice() {
                     if edge.from != id && edge.to != id {
                         continue;
                     }
                     let other_id = if edge.from == id { edge.to } else { edge.from };
                     if let Some(node) = graph.get_node(other_id) {
+                        if primary_ip.is_none() {
+                            if let Node::Ip { addr, .. } = node {
+                                primary_ip = Some(addr.clone());
+                            }
+                        }
                         enrich_evidence_from_node(&mut evidence, node, graph);
                     }
                 }
@@ -197,6 +233,7 @@ fn collect_undecided_incidents(
                     detector.clone(),
                     title.clone(),
                     evidence,
+                    primary_ip,
                 ))
             } else {
                 None
@@ -260,6 +297,376 @@ fn find_process_comm_by_pid(graph: &KnowledgeGraph, pid: u32) -> Option<String> 
     None
 }
 
+/// Promote an escalated incident into the Fase 4 decide() + execute path
+/// (spec 028-b full wiring). Called only when the
+/// `incident_flow.escalate_to_decide` feature flag is enabled.
+///
+/// Reconstructs a minimal `Incident` from the graph + evidence, builds a
+/// `DecisionContext`, invokes the production AI provider, runs the decision
+/// through the same safeguards / execution gate / audit helpers the fast
+/// loop uses, and writes the resulting decision to both the decisions
+/// JSONL and the knowledge graph. The graph label written by
+/// `apply_escalate` immediately before is overwritten by the real action
+/// (`block_ip`, `ignore`, etc.) because `ingest_decision` updates in place.
+///
+/// Intentionally shallow context (empty `recent_events` /
+/// `related_incidents`, graph_subgraph built from the incident's connected
+/// nodes) because this path runs in the slow loop where assembling full
+/// enrichment is expensive and would duplicate fast-loop work. The primary
+/// value is executing on escalates the fast loop would not have reached.
+async fn promote_escalated_to_decision(
+    cfg: &crate::config::AgentConfig,
+    state: &mut AgentState,
+    data_dir: &std::path::Path,
+    incident_id: &str,
+    detector: &str,
+    title: &str,
+    primary_ip: Option<&str>,
+) {
+    // 1. Provider must exist. If AI is disabled entirely this path is a
+    //    no-op and we stay at the "escalate" label in the graph.
+    //
+    // Spec 029 PR-C.2: this is the Decide role (the escalate-to-decide
+    // wiring from 028-b), so route through the capability router.
+    let Some(provider) = state.ai_router.provider_for(crate::ai::Capability::Decide) else {
+        tracing::debug!(
+            incident_id,
+            "028-b: no Decide provider configured, leaving escalated in graph"
+        );
+        return;
+    };
+    let provider_name = provider.name();
+
+    // 2. Reconstruct the minimal Incident from the graph node. This loses
+    //    fields like `recommended_checks` and full `tags` but preserves
+    //    everything the provider and the downstream helpers actually read.
+    let Some(incident) = reconstruct_incident_from_graph(state, incident_id) else {
+        tracing::warn!(
+            incident_id,
+            "028-b: incident node missing from graph, skipping promote"
+        );
+        return;
+    };
+
+    // 3. Build a slim DecisionContext. recent_events + related_incidents
+    //    stay empty; graph_subgraph carries the structural context the
+    //    fast loop would otherwise have included.
+    let available_skills: Vec<crate::ai::SkillInfo> = state
+        .skill_registry
+        .infos()
+        .into_iter()
+        .map(|s| crate::ai::SkillInfo {
+            id: s.id.clone(),
+            applicable_to: s.applicable_to.clone(),
+        })
+        .collect();
+
+    let graph_subgraph = if cfg.ai.use_structured_subgraph {
+        let graph = state.knowledge_graph.read().unwrap();
+        graph
+            .find_by_incident(incident_id)
+            .map(|nid| graph.attack_subgraph_json(nid, 3))
+    } else {
+        None
+    };
+
+    let ctx = crate::ai::DecisionContext {
+        incident: &incident,
+        recent_events: Vec::new(),
+        related_incidents: Vec::new(),
+        already_blocked: state.blocklist.as_vec(),
+        available_skills,
+        ip_reputation: None,
+        ip_geo: None,
+        graph_context: None,
+        graph_subgraph,
+    };
+
+    tracing::info!(
+        incident_id,
+        detector,
+        target_ip = ?primary_ip,
+        "028-b: promoting escalated incident to decide()"
+    );
+    state.telemetry.observe_ai_sent();
+
+    let decision_start = std::time::Instant::now();
+    let mut decision = match provider.decide(&ctx).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                incident_id,
+                provider_name,
+                error = %e,
+                "028-b: provider.decide() failed, leaving escalated in graph"
+            );
+            state.telemetry.observe_error("observation_verify_decide");
+            return;
+        }
+    };
+    let latency_ms = decision_start.elapsed().as_millis();
+    state
+        .telemetry
+        .observe_ai_decision(&decision.action, latency_ms);
+
+    // 4. Reuse the existing post-decision safeguards so that
+    //    already-blocked IPs, below-threshold confidence, and other fast-
+    //    loop guards apply identically here.
+    let mut blocked_set = state.blocklist.as_vec().into_iter().collect();
+    crate::incident_post_decision::apply_post_decision_safeguards(
+        &incident,
+        cfg,
+        state,
+        &mut decision,
+        &mut blocked_set,
+    );
+
+    // 5. Execute (or skip) the decision via the same gate the fast loop
+    //    uses. This is what closes the autonomy gap: previously the
+    //    escalated incident would die at the graph label; now it reaches
+    //    the skill executor.
+    let (execution_result, _cloudflare_pushed) =
+        crate::incident_execution_gate::execute_or_skip_decision(
+            &incident, &decision, data_dir, cfg, state,
+        )
+        .await;
+
+    // 6. Audit trail: decision entry in JSONL with the real action, not
+    //    the "escalate" placeholder.
+    crate::incident_audit_write::write_decision_audit_entry(
+        &incident,
+        provider_name,
+        &decision,
+        &execution_result,
+        cfg,
+        state,
+    );
+
+    // 7. Overwrite the graph decision with the real action. ingest_decision
+    //    updates the Incident node in place, so the "escalate" label
+    //    written moments ago becomes the real action here.
+    {
+        let (action_type, action_target) = match &decision.action {
+            crate::ai::AiAction::BlockIp { ip, .. } => ("block_ip", Some(ip.as_str())),
+            crate::ai::AiAction::Monitor { ip } => ("monitor", Some(ip.as_str())),
+            crate::ai::AiAction::Honeypot { ip } => ("honeypot", Some(ip.as_str())),
+            crate::ai::AiAction::SuspendUserSudo { user, .. } => {
+                ("suspend_user_sudo", Some(user.as_str()))
+            }
+            crate::ai::AiAction::KillProcess { user, .. } => ("kill_process", Some(user.as_str())),
+            crate::ai::AiAction::BlockContainer { container_id, .. } => {
+                ("block_container", Some(container_id.as_str()))
+            }
+            crate::ai::AiAction::Ignore { .. } => ("ignore", None),
+            crate::ai::AiAction::Dismiss { .. } => ("dismiss", None),
+            crate::ai::AiAction::RequestConfirmation { .. } => ("request_confirmation", None),
+            crate::ai::AiAction::KillChainResponse { .. } => ("kill_chain_response", None),
+        };
+        let auto_executed = decision.auto_execute && !execution_result.is_empty();
+        let mut graph = state.knowledge_graph.write().unwrap();
+        graph.ingest_decision(
+            incident_id,
+            action_type,
+            action_target,
+            decision.confidence,
+            &decision.reason,
+            auto_executed,
+            chrono::Utc::now(),
+        );
+    }
+
+    // Title is available for log context; pass it so operators tailing
+    // journalctl see which incident was promoted without having to cross-
+    // reference incident_id.
+    let _ = title;
+}
+
+/// Reconstruct an Incident from the graph node and its connected entities.
+/// Used by `promote_escalated_to_decision` because the slow-loop verifier
+/// does not have the original `Incident` object in memory (the fast loop
+/// consumed it on arrival).
+///
+/// Fields that are not preserved in the graph (`recommended_checks`, full
+/// `tags` list beyond MITRE IDs, arbitrary extra evidence keys) come back
+/// as defaults. This is a lossy reconstruction but covers everything the
+/// decision pipeline actually reads.
+fn reconstruct_incident_from_graph(
+    state: &AgentState,
+    incident_id: &str,
+) -> Option<innerwarden_core::incident::Incident> {
+    use innerwarden_core::entities::{EntityRef, EntityType};
+    use innerwarden_core::event::Severity;
+
+    let graph = state.knowledge_graph.read().unwrap();
+    let inc_node_id = graph.find_by_incident(incident_id)?;
+    let Node::Incident {
+        severity,
+        title,
+        summary,
+        ts,
+        mitre_ids,
+        ..
+    } = graph.get_node(inc_node_id)?
+    else {
+        return None;
+    };
+
+    let severity = match severity.to_ascii_lowercase().as_str() {
+        "critical" => Severity::Critical,
+        "high" => Severity::High,
+        "medium" => Severity::Medium,
+        "low" => Severity::Low,
+        _ => Severity::Info,
+    };
+
+    // Collect entities by walking the edges of the incident node.
+    let mut entities: Vec<EntityRef> = Vec::new();
+    for edge in graph.edges_slice() {
+        if edge.from != inc_node_id && edge.to != inc_node_id {
+            continue;
+        }
+        let other_id = if edge.from == inc_node_id {
+            edge.to
+        } else {
+            edge.from
+        };
+        let Some(node) = graph.get_node(other_id) else {
+            continue;
+        };
+        match node {
+            Node::Ip { addr, .. } => entities.push(EntityRef {
+                r#type: EntityType::Ip,
+                value: addr.clone(),
+            }),
+            Node::User { name, .. } => entities.push(EntityRef {
+                r#type: EntityType::User,
+                value: name.clone(),
+            }),
+            Node::Container { container_id, .. } => entities.push(EntityRef {
+                r#type: EntityType::Container,
+                value: container_id.clone(),
+            }),
+            Node::File { path, .. } => entities.push(EntityRef {
+                r#type: EntityType::Path,
+                value: path.clone(),
+            }),
+            _ => {}
+        }
+    }
+
+    Some(innerwarden_core::incident::Incident {
+        ts: *ts,
+        host: String::new(),
+        incident_id: incident_id.to_string(),
+        severity,
+        title: title.clone(),
+        summary: summary.clone(),
+        evidence: serde_json::json!({}),
+        recommended_checks: Vec::new(),
+        tags: mitre_ids.clone(),
+        entities,
+    })
+}
+
+/// Apply the Escalate branch of observation-verify (spec 028-b/c).
+///
+/// Writes the escalate label to the knowledge graph, writes the escalate
+/// decision to the decisions JSONL (if a writer is configured), and reads
+/// the 028-b feature flag to log intent for the future decide() call. The
+/// extraction keeps the verify_observing_incidents match arm short and
+/// makes the whole Escalate side effect unit-testable without constructing
+/// a full AgentState.
+fn apply_escalate(
+    graph: &std::sync::Arc<std::sync::RwLock<KnowledgeGraph>>,
+    decision_writer: Option<&mut crate::decisions::DecisionWriter>,
+    escalate_to_decide: bool,
+    incident_id: &str,
+    primary_ip: Option<&str>,
+    score: u8,
+    reason: &str,
+) {
+    {
+        let mut g = graph.write().unwrap();
+        g.ingest_decision(
+            incident_id,
+            "escalate",
+            primary_ip,
+            0.8,
+            &format!("obs-verify score {score}/100: {reason}"),
+            true,
+            chrono::Utc::now(),
+        );
+    }
+    if let Some(writer) = decision_writer {
+        write_escalate_decision(writer, incident_id, primary_ip, score, reason);
+    }
+    // Spec 028-b stub: the flag is read here so operators can already
+    // toggle it in agent.toml, but the actual forwarding into Fase 4 is a
+    // follow-up PR (needs provider + skill_executor threading + async
+    // conversion).
+    log_escalate_to_decide_intent(escalate_to_decide, incident_id, primary_ip);
+}
+
+/// Write an escalate decision to the decisions JSONL (spec 028-c).
+///
+/// Extracted so the Escalate match arm stays short and so the JSONL-write
+/// path can be unit tested without spinning up a full AgentState. Failures
+/// are logged at warn! level but never propagated; the knowledge graph
+/// already carries the decision, so a JSONL write failure is a visibility
+/// regression, not a correctness one.
+fn write_escalate_decision(
+    writer: &mut crate::decisions::DecisionWriter,
+    incident_id: &str,
+    primary_ip: Option<&str>,
+    score: u8,
+    reason: &str,
+) {
+    let entry = crate::decisions::DecisionEntry {
+        ts: chrono::Utc::now(),
+        incident_id: incident_id.to_string(),
+        host: String::new(),
+        ai_provider: "observation-verify".to_string(),
+        action_type: "escalate".to_string(),
+        target_ip: primary_ip.map(|s| s.to_string()),
+        target_user: None,
+        skill_id: None,
+        confidence: 0.8,
+        auto_executed: true,
+        dry_run: false,
+        reason: format!("obs-verify score {score}/100: {reason}"),
+        estimated_threat: "medium".to_string(),
+        execution_result: "pending-fase4".to_string(),
+        prev_hash: None,
+    };
+    if let Err(e) = writer.write(&entry) {
+        tracing::warn!(
+            incident_id = %incident_id,
+            error = %e,
+            "observation-verify: failed to write escalate decision to JSONL"
+        );
+    }
+}
+
+/// Log intent when the 028-b feature flag is on (spec 028-b stub).
+///
+/// Extracted from the Escalate match arm both for readability and so the
+/// flag-read branch is trivially exercisable by a unit test. The flag
+/// default is false, so in production this is a no-op until an operator
+/// explicitly flips it in agent.toml.
+fn log_escalate_to_decide_intent(
+    escalate_to_decide: bool,
+    incident_id: &str,
+    primary_ip: Option<&str>,
+) {
+    if escalate_to_decide {
+        tracing::info!(
+            incident_id = %incident_id,
+            target_ip = ?primary_ip,
+            "observation-verify: spec 028-b flag on - decide() call pending (follow-up PR threading)"
+        );
+    }
+}
+
 /// AI batch verification for ambiguous items (spec 021 Phase C).
 ///
 /// Takes the ambiguous items collected by `verify_observing_incidents`,
@@ -274,9 +681,15 @@ pub(crate) async fn ai_verify_ambiguous(
         return;
     }
 
-    let ai = match &state.ai_provider {
-        Some(ai) => ai.clone(),
-        None => return,
+    // Spec 029 PR-C.2: ai_verify_ambiguous uses the LLM chat() API to
+    // group-score N OBSERVING incidents in a single prompt. Maps to
+    // the Classify capability (structured input → short structured
+    // label per incident).
+    let Some(ai) = state
+        .ai_router
+        .provider_for(crate::ai::Capability::Classify)
+    else {
+        return;
     };
 
     // Build host profile from environment
@@ -455,6 +868,677 @@ mod tests {
         let graph = KnowledgeGraph::new();
         let result = collect_undecided_incidents(&graph);
         assert!(result.is_empty());
+    }
+
+    // Spec 028-c: write_escalate_decision must land a line in the decisions
+    // JSONL shaped so the dashboard's determine_outcome can bucket the IP
+    // into "escalated" → "needs_attention".
+    #[test]
+    fn write_escalate_decision_emits_jsonl_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = crate::decisions::DecisionWriter::new(tmp.path()).unwrap();
+
+        write_escalate_decision(
+            &mut writer,
+            "test-incident-1",
+            Some("203.0.113.42"),
+            55,
+            "masscan fingerprint",
+        );
+        drop(writer); // flush buffer
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut found = false;
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(&today))
+            {
+                let content = std::fs::read_to_string(&path).unwrap();
+                assert!(content.contains("\"action_type\":\"escalate\""));
+                assert!(content.contains("\"target_ip\":\"203.0.113.42\""));
+                assert!(content.contains("\"ai_provider\":\"observation-verify\""));
+                assert!(content.contains("\"execution_result\":\"pending-fase4\""));
+                assert!(content.contains("masscan fingerprint"));
+                assert!(content.contains("55/100"));
+                found = true;
+            }
+        }
+        assert!(found, "decisions JSONL file must exist for today");
+    }
+
+    // Spec 028-c: target_ip is optional (incident may lack an IP entity).
+    // The writer still produces a valid line with target_ip = null.
+    #[test]
+    fn write_escalate_decision_handles_missing_ip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = crate::decisions::DecisionWriter::new(tmp.path()).unwrap();
+
+        write_escalate_decision(&mut writer, "test-incident-2", None, 45, "no ip");
+        drop(writer);
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(&today))
+            {
+                let content = std::fs::read_to_string(&path).unwrap();
+                assert!(content.contains("\"target_ip\":null"));
+                return;
+            }
+        }
+        panic!("decisions JSONL file must exist for today");
+    }
+
+    // Spec 028-b stub: the intent-log branch reads the flag without side
+    // effects. Flag-off and flag-on are both tested here for coverage; the
+    // real assertion is that the helper does not panic and compiles in both
+    // shapes.
+    #[test]
+    fn log_escalate_to_decide_intent_is_side_effect_free() {
+        log_escalate_to_decide_intent(false, "id-off", None);
+        log_escalate_to_decide_intent(true, "id-on", Some("198.51.100.1"));
+        log_escalate_to_decide_intent(true, "id-on-no-ip", None);
+    }
+
+    // Spec 028-c: apply_escalate writes to graph + JSONL in one call. The
+    // graph must be seeded with the incident node first because
+    // ingest_decision silently no-ops when find_by_incident returns None.
+    // This test exercises the whole Escalate side effect directly with a
+    // seeded graph and DecisionWriter, bypassing the behaviour_score layer
+    // that is tested elsewhere.
+    #[test]
+    fn apply_escalate_writes_graph_and_jsonl() {
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph = std::sync::Arc::new(std::sync::RwLock::new(KnowledgeGraph::new()));
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "proto_anomaly:SshVersionAnomaly:198.51.100.77:apply-escalate-test".into(),
+            severity: Severity::Medium,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("198.51.100.77".to_string())],
+        };
+        {
+            let mut g = graph.write().unwrap();
+            g.ingest_incident(&incident);
+        }
+        let mut writer = crate::decisions::DecisionWriter::new(tmp.path()).unwrap();
+
+        apply_escalate(
+            &graph,
+            Some(&mut writer),
+            false,
+            &incident.incident_id,
+            Some("198.51.100.77"),
+            35,
+            "low confidence signal",
+        );
+        drop(writer);
+
+        // Graph side: the incident node now carries decision="escalate".
+        {
+            let g = graph.read().unwrap();
+            let mut saw_escalate = false;
+            for &id in &g.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    decision: Some(d), ..
+                }) = g.get_node(id)
+                {
+                    if d == "escalate" {
+                        saw_escalate = true;
+                    }
+                }
+            }
+            assert!(saw_escalate, "incident node must carry decision=escalate");
+        }
+
+        // JSONL side: one line shaped like a dashboard-consumable entry.
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut saw = false;
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(&today) && name.ends_with(".jsonl") {
+                let content = std::fs::read_to_string(&path).unwrap();
+                if content.contains("\"action_type\":\"escalate\"")
+                    && content.contains("\"target_ip\":\"198.51.100.77\"")
+                    && content.contains("\"ai_provider\":\"observation-verify\"")
+                    && content.contains("low confidence signal")
+                {
+                    saw = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw, "apply_escalate must write the escalate line to JSONL");
+    }
+
+    // Spec 028-c: apply_escalate tolerates a missing writer and a missing
+    // incident in the graph (ingest_decision no-ops). Assertion: no panic.
+    #[test]
+    fn apply_escalate_tolerates_missing_writer_and_node() {
+        let graph = std::sync::Arc::new(std::sync::RwLock::new(KnowledgeGraph::new()));
+        apply_escalate(&graph, None, false, "id-no-writer", None, 20, "r");
+    }
+
+    // Spec 028-b full: promote_escalated_to_decision is a no-op when the
+    // agent has no AI provider configured (the graph still carries the
+    // "escalate" label from apply_escalate).
+    #[tokio::test]
+    async fn promote_is_noop_without_provider() {
+        use crate::config::AgentConfig;
+        use crate::tests::triage_test_state;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = triage_test_state(tmp.path());
+        assert!(
+            state.ai_router.is_disabled(),
+            "triage_test_state baseline has a disabled router"
+        );
+        let cfg = AgentConfig::default();
+
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "proto_anomaly:SshVersionAnomaly:198.51.100.42:promote-no-provider".into(),
+            severity: Severity::Medium,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("198.51.100.42".to_string())],
+        };
+        {
+            let mut g = state.knowledge_graph.write().unwrap();
+            g.ingest_incident(&incident);
+        }
+
+        promote_escalated_to_decision(
+            &cfg,
+            &mut state,
+            tmp.path(),
+            &incident.incident_id,
+            "proto_anomaly",
+            "t",
+            Some("198.51.100.42"),
+        )
+        .await;
+
+        // No decision should have been written to the graph by the
+        // promote path because no provider was available.
+        let g = state.knowledge_graph.read().unwrap();
+        let node = g.find_by_incident(&incident.incident_id).and_then(|nid| {
+            if let Some(Node::Incident { decision, .. }) = g.get_node(nid) {
+                decision.clone()
+            } else {
+                None
+            }
+        });
+        assert!(
+            node.is_none(),
+            "without provider, promote must not touch the incident decision field"
+        );
+    }
+
+    // Spec 028-b full: promote_escalated_to_decision calls the stub
+    // provider and writes the resulting decision to the graph + JSONL.
+    #[tokio::test]
+    async fn promote_with_stub_provider_writes_decision() {
+        use crate::config::{AgentConfig, AiConfig};
+        use crate::tests::triage_test_state;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = triage_test_state(tmp.path());
+        // Build the stub provider via the public factory (stub module is
+        // private) with provider="stub" which bypasses all network setup.
+        let ai_cfg = AiConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let provider = crate::ai::build_provider(&ai_cfg).expect("stub provider builds");
+        let provider_arc: Arc<dyn crate::ai::AiProvider> = Arc::from(provider);
+        state.ai_router =
+            crate::ai::AiRouter::new(Some(Arc::clone(&provider_arc)), Some(provider_arc))
+                .expect("router with stub provider");
+        let cfg = AgentConfig::default();
+
+        // ssh_bruteforce + public IP: stub returns BlockIp.
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "ssh_bruteforce:198.51.100.77:promote-test".into(),
+            severity: Severity::High,
+            title: "SSH brute force".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("198.51.100.77".to_string())],
+        };
+        {
+            let mut g = state.knowledge_graph.write().unwrap();
+            g.ingest_incident(&incident);
+        }
+
+        promote_escalated_to_decision(
+            &cfg,
+            &mut state,
+            tmp.path(),
+            &incident.incident_id,
+            "ssh_bruteforce",
+            "SSH brute force",
+            Some("198.51.100.77"),
+        )
+        .await;
+
+        // Graph should show block_ip decision now (stub returns BlockIp
+        // for ssh_bruteforce detector with an IP entity).
+        {
+            let g = state.knowledge_graph.read().unwrap();
+            let nid = g.find_by_incident(&incident.incident_id).unwrap();
+            if let Some(Node::Incident {
+                decision: Some(d), ..
+            }) = g.get_node(nid)
+            {
+                assert_eq!(d, "block_ip", "stub decides block_ip on ssh_bruteforce");
+            } else {
+                panic!("incident node missing decision");
+            }
+        }
+
+        // Drop state so decision_writer flushes.
+        drop(state);
+
+        // JSONL should also contain the block_ip decision.
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut saw_block = false;
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(&today) && name.ends_with(".jsonl") {
+                let content = std::fs::read_to_string(&path).unwrap();
+                if content.contains("\"action_type\":\"block_ip\"")
+                    && content.contains("\"target_ip\":\"198.51.100.77\"")
+                {
+                    saw_block = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_block,
+            "block_ip decision must appear in decisions JSONL"
+        );
+    }
+
+    // Spec 028-b full: reconstruct_incident_from_graph covers all entity
+    // kinds (Ip, User, Container, File) so downstream helpers get back
+    // exactly what they would have received from the fast loop.
+    #[test]
+    fn reconstruct_incident_covers_all_entity_kinds() {
+        use crate::tests::triage_test_state;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = triage_test_state(tmp.path());
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "cross_layer_chain:multi-entity:test".into(),
+            severity: Severity::High,
+            title: "cross layer".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec!["T1055".into()],
+            entities: vec![
+                EntityRef::ip("203.0.113.9".to_string()),
+                EntityRef {
+                    r#type: innerwarden_core::entities::EntityType::User,
+                    value: "attacker".into(),
+                },
+                EntityRef {
+                    r#type: innerwarden_core::entities::EntityType::Container,
+                    value: "container-xyz".into(),
+                },
+                EntityRef {
+                    r#type: innerwarden_core::entities::EntityType::Path,
+                    value: "/etc/passwd".into(),
+                },
+            ],
+        };
+        {
+            let mut g = state.knowledge_graph.write().unwrap();
+            g.ingest_incident(&incident);
+        }
+
+        let reconstructed = reconstruct_incident_from_graph(&state, &incident.incident_id).unwrap();
+
+        assert_eq!(reconstructed.incident_id, incident.incident_id);
+        assert!(matches!(reconstructed.severity, Severity::High));
+        assert!(reconstructed.tags.contains(&"T1055".to_string()));
+
+        let kinds: std::collections::HashSet<_> = reconstructed
+            .entities
+            .iter()
+            .map(|e| format!("{:?}", e.r#type))
+            .collect();
+        // Ip + User + Container + Path all survive the graph round-trip.
+        assert!(kinds.contains("Ip"));
+        assert!(kinds.contains("User"));
+        assert!(kinds.contains("Container"));
+        assert!(kinds.contains("Path"));
+    }
+
+    // Spec 028-b full: severity strings in the graph map back to enum
+    // variants correctly, with Info as the fallback for unknown strings.
+    #[test]
+    fn reconstruct_incident_severity_mapping() {
+        use crate::tests::triage_test_state;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = triage_test_state(tmp.path());
+
+        for (label, expected) in [
+            ("critical-test", Severity::Critical),
+            ("high-test", Severity::High),
+            ("medium-test", Severity::Medium),
+            ("low-test", Severity::Low),
+        ] {
+            let incident = Incident {
+                ts: chrono::Utc::now(),
+                host: "h".into(),
+                incident_id: format!("detector:{label}"),
+                severity: expected.clone(),
+                title: "t".into(),
+                summary: "s".into(),
+                evidence: serde_json::json!({}),
+                recommended_checks: vec![],
+                tags: vec![],
+                entities: vec![],
+            };
+            {
+                let mut g = state.knowledge_graph.write().unwrap();
+                g.ingest_incident(&incident);
+            }
+            let r = reconstruct_incident_from_graph(&state, &incident.incident_id).unwrap();
+            assert_eq!(
+                format!("{:?}", r.severity),
+                format!("{:?}", expected),
+                "severity round-trip {label}"
+            );
+        }
+    }
+
+    // Spec 028-b full: reconstruct returns None when the incident id is
+    // not in the graph.
+    #[test]
+    fn reconstruct_incident_missing_returns_none() {
+        use crate::tests::triage_test_state;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = triage_test_state(tmp.path());
+        assert!(reconstruct_incident_from_graph(&state, "does-not-exist").is_none());
+    }
+
+    // Spec 028-b full: when the provider's decide() errors, promote logs
+    // a warning and returns without mutating the graph. The pre-written
+    // "escalate" label from apply_escalate is left intact (though this
+    // test checks only that promote itself does not write a decision).
+    #[tokio::test]
+    async fn promote_tolerates_provider_error() {
+        use crate::ai::{AiDecision, AiProvider, DecisionContext};
+        use crate::config::AgentConfig;
+        use crate::tests::triage_test_state;
+        use anyhow::Result;
+        use async_trait::async_trait;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+        use std::sync::Arc;
+
+        struct ErroringProvider;
+        #[async_trait]
+        impl AiProvider for ErroringProvider {
+            fn name(&self) -> &'static str {
+                "erroring"
+            }
+            async fn decide(&self, _ctx: &DecisionContext<'_>) -> Result<AiDecision> {
+                anyhow::bail!("forced error for test")
+            }
+            async fn chat(&self, _s: &str, _u: &str) -> Result<String> {
+                anyhow::bail!("unused")
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = triage_test_state(tmp.path());
+        let err_arc: Arc<dyn crate::ai::AiProvider> = Arc::new(ErroringProvider);
+        state.ai_router = crate::ai::AiRouter::new(Some(Arc::clone(&err_arc)), Some(err_arc))
+            .expect("router with erroring provider");
+
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "proto_anomaly:SshVersionAnomaly:198.51.100.55:error-path".into(),
+            severity: Severity::Medium,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("198.51.100.55".to_string())],
+        };
+        {
+            let mut g = state.knowledge_graph.write().unwrap();
+            g.ingest_incident(&incident);
+        }
+
+        let cfg = AgentConfig::default();
+        promote_escalated_to_decision(
+            &cfg,
+            &mut state,
+            tmp.path(),
+            &incident.incident_id,
+            "proto_anomaly",
+            "t",
+            Some("198.51.100.55"),
+        )
+        .await;
+
+        // Graph should not have a decision written by the promote path —
+        // it must not panic and must not mask the provider failure.
+        let g = state.knowledge_graph.read().unwrap();
+        let nid = g.find_by_incident(&incident.incident_id).unwrap();
+        if let Some(Node::Incident { decision, .. }) = g.get_node(nid) {
+            assert!(
+                decision.is_none(),
+                "provider error must leave decision field untouched"
+            );
+        }
+    }
+
+    // Spec 028-b full: a detector not recognised by the stub provider
+    // (anything outside ssh_bruteforce / port_scan / honeypot / shield)
+    // returns Ignore. The promote path must still write the ignore
+    // decision so the audit trail shows the AI was consulted.
+    #[tokio::test]
+    async fn promote_ignore_decision_still_audited() {
+        use crate::config::{AgentConfig, AiConfig};
+        use crate::tests::triage_test_state;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = triage_test_state(tmp.path());
+        let ai_cfg = AiConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let provider = crate::ai::build_provider(&ai_cfg).expect("stub builds");
+        let provider_arc: Arc<dyn crate::ai::AiProvider> = Arc::from(provider);
+        state.ai_router =
+            crate::ai::AiRouter::new(Some(Arc::clone(&provider_arc)), Some(provider_arc))
+                .expect("router with stub");
+        let cfg = AgentConfig::default();
+
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "unknown_detector:198.51.100.66:ignore-path".into(),
+            severity: Severity::Medium,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("198.51.100.66".to_string())],
+        };
+        {
+            let mut g = state.knowledge_graph.write().unwrap();
+            g.ingest_incident(&incident);
+        }
+
+        promote_escalated_to_decision(
+            &cfg,
+            &mut state,
+            tmp.path(),
+            &incident.incident_id,
+            "unknown_detector",
+            "t",
+            Some("198.51.100.66"),
+        )
+        .await;
+
+        // Graph decision should now be "ignore".
+        {
+            let g = state.knowledge_graph.read().unwrap();
+            let nid = g.find_by_incident(&incident.incident_id).unwrap();
+            if let Some(Node::Incident {
+                decision: Some(d), ..
+            }) = g.get_node(nid)
+            {
+                assert_eq!(d, "ignore");
+            } else {
+                panic!("incident node missing decision");
+            }
+        }
+
+        drop(state);
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut saw = false;
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(&today) && name.ends_with(".jsonl") {
+                let content = std::fs::read_to_string(&path).unwrap();
+                if content.contains("\"action_type\":\"ignore\"")
+                    && content.contains("198.51.100.66")
+                {
+                    saw = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw, "ignore decision must appear in decisions JSONL");
+    }
+
+    // Spec 028-b stub: flag on/off must produce the same persistent side
+    // effects. Running apply_escalate twice with identical inputs apart
+    // from the flag must yield identical JSONL output and graph state.
+    #[test]
+    fn apply_escalate_flag_toggle_is_observational() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph = std::sync::Arc::new(std::sync::RwLock::new(KnowledgeGraph::new()));
+        let mut writer = crate::decisions::DecisionWriter::new(tmp.path()).unwrap();
+
+        apply_escalate(
+            &graph,
+            Some(&mut writer),
+            false,
+            "flag-test-off",
+            Some("198.51.100.88"),
+            30,
+            "reason",
+        );
+        apply_escalate(
+            &graph,
+            Some(&mut writer),
+            true,
+            "flag-test-on",
+            Some("198.51.100.88"),
+            30,
+            "reason",
+        );
+        drop(writer);
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut lines_off = 0;
+        let mut lines_on = 0;
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(&today) && name.ends_with(".jsonl") {
+                let content = std::fs::read_to_string(&path).unwrap();
+                for line in content.lines() {
+                    if line.contains("flag-test-off") {
+                        lines_off += 1;
+                    }
+                    if line.contains("flag-test-on") {
+                        lines_on += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(lines_off, 1, "flag=false path must emit exactly one line");
+        assert_eq!(lines_on, 1, "flag=true path must emit exactly one line");
     }
 
     #[test]
@@ -729,5 +1813,44 @@ mod tests {
         let profile = build_host_profile_from_env(&env);
         assert!(profile.contains("bare_metal"));
         assert!(profile.contains("sshd"));
+    }
+
+    // Spec 029 PR-C.2: ai_verify_ambiguous now resolves the provider
+    // via `state.ai_router.provider_for(Classify)` instead of reading
+    // the legacy `state.ai_provider` field. When the router has no
+    // Classify-capable provider (Falco-mode or classifier-only with
+    // the classifier declining Classify), the function must return
+    // early without panicking.
+    #[tokio::test]
+    async fn ai_verify_ambiguous_noop_when_router_has_no_classify_provider() {
+        use crate::config::AgentConfig;
+        use crate::tests::triage_test_state;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = triage_test_state(tmp.path());
+        // triage_test_state leaves state.ai_router as AiRouter::disabled();
+        // the router yields None for every capability.
+        assert!(state
+            .ai_router
+            .provider_for(crate::ai::Capability::Classify)
+            .is_none());
+
+        let mut cfg = AgentConfig::default();
+        cfg.observation.ai_verification = true;
+
+        // One ambiguous item forces the early-return branch we care
+        // about (otherwise the function returns on the empty-items
+        // check above it).
+        let items = vec![AmbiguousItem {
+            incident_id: "proto_anomaly:SshVersionAnomaly:198.51.100.99:t".into(),
+            score: 55,
+            evidence: serde_json::json!({}),
+            detector: "proto_anomaly".into(),
+            title: "t".into(),
+        }];
+
+        // No panic, no mutation of decision_writer state, graph stays
+        // untouched.
+        ai_verify_ambiguous(items, &cfg, &mut state).await;
     }
 }
