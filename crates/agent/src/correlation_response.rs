@@ -233,16 +233,18 @@ async fn handle_completed_chain(
         rep.reputation_score += chain.confidence * 3.0;
     }
 
-    // Feed decision to defender brain for training (Phase D).
-    // Correlation chain decisions are high-quality: multi-signal confirmation.
-    crate::incident_decision_eval::log_deterministic_decision_to_brain(
+    // Brain-training feed removed: defender_brain replaced by SecureBERT
+    // classifier provider routed through the AI router. Keep arguments
+    // bound so the surrounding closure still type-checks.
+    let _brain_train_inputs = (
         &incident,
-        &format!("{:?}", decision.action),
+        format!("{:?}", decision.action),
         chain.confidence,
-        &format!("correlation:{}", chain.rule_id),
+        format!("correlation:{}", chain.rule_id),
         data_dir,
-        state,
+        &state,
     );
+    drop(_brain_train_inputs);
 
     // Cooldown.
     state.store.set_cooldown(

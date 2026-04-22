@@ -60,7 +60,6 @@ mod decision_cooldown;
 mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
-mod defender_brain;
 mod dna_inline;
 mod environment_profile;
 mod fail2ban;
@@ -474,12 +473,6 @@ struct AgentState {
     /// Rate limiter: timestamps of recent block actions (rolling 1-minute window).
     /// Prevents false-positive cascades from blocking too many IPs at once.
     recent_blocks: std::collections::VecDeque<chrono::DateTime<chrono::Utc>>,
-    /// Spec 031: rolling window of the last 20 event `kind` strings. Feeds
-    /// defender-brain feature positions 36..=59 (kill chain stage presence,
-    /// event diversity, burst density, technique categories, attack bigrams).
-    /// Mirrors the `hist` rolling window in `innerwarden-gym::environment`
-    /// so training and serving see the same signal shape.
-    recent_event_kinds: std::collections::VecDeque<String>,
     /// XDP blocklist entries with timestamps and per-IP TTL for adaptive expiration.
     /// Periodically cleaned: IPs older than their individual TTL are removed.
     xdp_block_times: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)>,
@@ -513,12 +506,6 @@ struct AgentState {
     baseline: baseline::BaselineStore,
     /// Playbook engine: automated response sequences.
     playbook_engine: playbook::PlaybookEngine,
-    /// AlphaZero-trained defender brain: neural decision engine.
-    defender_brain: defender_brain::DefenderBrain,
-    /// History of brain suggestions for dashboard + FP audit.
-    brain_history: defender_brain::BrainHistory,
-    /// Brain evolution stats (agreement tracking, weekly trend).
-    brain_stats: defender_brain::BrainStats,
     /// Selective packet capture on incidents.
     pcap_capture: pcap_capture::PcapCapture,
     /// V10 neural scoring model — replaced by autoencoder (anomaly_engine).

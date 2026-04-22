@@ -14,7 +14,6 @@ use types::*;
 mod actions;
 mod agent_api;
 mod auth;
-mod brain;
 mod compliance;
 mod data_api;
 mod helpers;
@@ -31,8 +30,6 @@ use actions::*;
 use agent_api::*;
 #[allow(unused_imports)]
 use auth::*;
-#[allow(unused_imports)]
-use brain::*;
 #[allow(unused_imports)]
 use compliance::*;
 #[allow(unused_imports)]
@@ -444,10 +441,6 @@ pub async fn serve(
         .route("/api/incident-groups", get(api_incident_groups))
         .route("/api/mitre/navigator", get(api_mitre_navigator))
         .route("/api/mitre/coverage", get(api_mitre_coverage))
-        // Defender Brain (AlphaZero)
-        .route("/api/defender-brain/recent", get(api_brain_recent))
-        .route("/api/defender-brain/stats", get(api_brain_stats))
-        .route("/api/defender-brain/feedback", post(api_brain_feedback))
         // Deep Security (integrated modules)
         .route("/api/deep-security", get(api_deep_security))
         // D6 - SSE live event stream

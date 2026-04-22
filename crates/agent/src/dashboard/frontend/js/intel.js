@@ -157,7 +157,7 @@ async function showProfileDetail(ip) {
 let currentIntelTab = 'profiles';
 function switchIntelTab(tab) {
   currentIntelTab = tab;
-  const tabs = ['Profiles','Campaigns','Chains','Baseline','Playbooks','Brain','Mitre'];
+  const tabs = ['Profiles','Campaigns','Chains','Baseline','Playbooks','Mitre'];
   tabs.forEach(t => {
     const btn = document.getElementById('intelTab'+t);
     if (btn) { const active = t.toLowerCase() === tab; btn.style.background = active ? 'var(--accent)' : 'var(--card-bg)'; btn.style.color = active ? '#0a0f1a' : 'var(--text)'; btn.style.fontWeight = active ? '600' : '400'; btn.style.borderColor = active ? 'var(--accent)' : 'var(--border)'; }
@@ -166,7 +166,6 @@ function switchIntelTab(tab) {
   else if (tab === 'chains') loadChains();
   else if (tab === 'baseline') loadBaseline();
   else if (tab === 'playbooks') loadPlaybooks();
-  else if (tab === 'brain') loadBrain();
   else if (tab === 'mitre') loadMitreCoverage();
   else loadIntel();
 }
@@ -379,81 +378,9 @@ async function loadPlaybooks() {
   } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
 }
 
-// ── Defender Brain sub-tab ───────────────────────────────────────
-async function loadBrain() {
-  const content = document.getElementById('intelContent');
-  const status = document.getElementById('intelViewStatus');
-  if (status) status.textContent = 'Loading brain…';
-  try {
-    const [stats, recent] = await Promise.all([
-      loadJson('/api/defender-brain/stats'),
-      loadJson('/api/defender-brain/recent'),
-    ]);
-
-    const retrainInfo = stats.last_retrain
-      ? `Last retrain: ${new Date(stats.last_retrain).toLocaleDateString()} (${esc(String(((stats.last_retrain_accuracy||0)*100).toFixed(1)))}% accuracy, ${stats.last_retrain_entries||0} entries)`
-      : 'No retrain yet — daily retrain runs at 3:30 AM UTC';
-
-    let html = `<div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-bottom:16px;">
-      <div class="kpi-card"><div class="kpi-value">${stats.loaded ? '✅' : '❌'}</div><div class="kpi-label">Model Loaded</div></div>
-      <div class="kpi-card"><div class="kpi-value">${stats.total_suggestions}</div><div class="kpi-label">Suggestions</div></div>
-      <div class="kpi-card"><div class="kpi-value">${esc(stats.agreement_rate)}</div><div class="kpi-label">AI Agreement</div></div>
-      <div class="kpi-card"><div class="kpi-value" style="color:var(--ok)">${stats.tp_count}</div><div class="kpi-label">Confirmed TP</div></div>
-      <div class="kpi-card"><div class="kpi-value" style="color:var(--danger)">${stats.fp_count}</div><div class="kpi-label">Marked FP</div></div>
-    </div>`;
-
-    html += `<div style="font-size:0.8rem;color:var(--dim);margin-bottom:8px;">V5 50M defender brain (19K params, 3.1M train steps). Daily retrain from production decisions at 3:30 AM UTC.</div>`;
-    html += `<div style="font-size:0.75rem;color:var(--dim);margin-bottom:12px;">${retrainInfo}</div>`;
-
-    if (!recent?.entries?.length) {
-      html += '<div style="text-align:center;padding:40px;"><div style="font-size:2rem;">🧠</div><p style="color:var(--muted);">No brain suggestions yet.</p><p style="font-size:0.8rem;color:var(--muted);">The V5 defender model is loaded and ready. Suggestions will appear here as incidents are processed and the brain evaluates each one alongside the AI provider.</p></div>';
-    } else {
-      html += '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">';
-      html += '<table style="width:100%;border-collapse:collapse;font-size:0.8rem;min-width:640px;"><thead><tr style="border-bottom:1px solid var(--border);">';
-      html += '<th style="padding:6px;text-align:left;">Time</th>';
-      html += '<th style="padding:6px;text-align:left;">Detector</th>';
-      html += '<th style="padding:6px;text-align:left;">Severity</th>';
-      html += '<th style="padding:6px;text-align:left;">Brain Says</th>';
-      html += '<th style="padding:6px;text-align:left;">AI Says</th>';
-      html += '<th style="padding:6px;text-align:center;">Agree?</th>';
-      html += '<th style="padding:6px;text-align:center;">Audit</th>';
-      html += '</tr></thead><tbody>';
-
-      for (const e of recent.entries) {
-        const agreeIcon = e.agreed ? '✅' : '⚠️';
-        const iid = esc(e.incident_id).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        const feedbackHtml = e.feedback === true ? '<span style="color:var(--ok)">TP</span>'
-          : e.feedback === false ? '<span style="color:var(--danger)">FP</span>'
-          : `<button onclick="brainFeedback('${iid}',true)" style="padding:2px 8px;border-radius:4px;border:1px solid var(--ok);background:transparent;color:var(--ok);cursor:pointer;font-size:0.7rem;margin-right:2px;" aria-label="Mark true positive">✓</button><button onclick="brainFeedback('${iid}',false)" style="padding:2px 8px;border-radius:4px;border:1px solid var(--danger);background:transparent;color:var(--danger);cursor:pointer;font-size:0.7rem;" aria-label="Mark false positive">✗</button>`;
-        const sevColor = e.severity === 'Critical' ? 'var(--danger)' : e.severity === 'High' ? 'var(--orange)' : e.severity === 'Medium' ? 'var(--warn)' : 'var(--muted)';
-        html += `<tr style="border-bottom:1px solid var(--border);">`;
-        html += `<td style="padding:6px;white-space:nowrap;">${new Date(e.ts).toLocaleString()}</td>`;
-        html += `<td style="padding:6px;">${esc(e.detector)}</td>`;
-        html += `<td style="padding:6px;"><span style="color:${sevColor}">${esc(e.severity)}</span></td>`;
-        html += `<td style="padding:6px;"><strong>${esc(e.brain_action)}</strong> (${(e.brain_confidence*100).toFixed(0)}%)</td>`;
-        html += `<td style="padding:6px;">${esc(e.ai_action)} (${(e.ai_confidence*100).toFixed(0)}%)</td>`;
-        html += `<td style="padding:6px;text-align:center;">${agreeIcon}</td>`;
-        html += `<td style="padding:6px;text-align:center;">${feedbackHtml}</td>`;
-        html += `</tr>`;
-      }
-      html += '</tbody></table></div>';
-    }
-
-    content.innerHTML = html;
-    if (status) status.textContent = `${stats.total_suggestions} suggestions`;
-  } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
-}
-
-async function brainFeedback(incidentId, correct) {
-  try {
-    await fetch('/api/defender-brain/feedback', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({incident_id: incidentId, correct: correct}),
-    });
-    loadBrain(); // Refresh
-  } catch(e) { console.error('Brain feedback failed:', e); }
-}
+// Defender Brain sub-tab removed: the AlphaZero brain was replaced
+// by the SecureBERT classifier provider routed through ai::AiRouter.
+// Decisions per provider are visible in the Threats journey view.
 
 async function loadMitreCoverage() {
   const content = document.getElementById('intelContent');
