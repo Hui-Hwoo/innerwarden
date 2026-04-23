@@ -9,11 +9,18 @@ pub(super) async fn api_honeypot_sessions(
     let honeypot_dir = state.data_dir.join("honeypot");
 
     // Collect blocked IPs from knowledge graph (Phase 6A: no JSONL reads).
-    // Includes all block_ip decisions (dry-run and executed) to match original semantics.
-    let mut blocked_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
-    {
+    // Includes all block_ip decisions (dry-run and executed) to match
+    // original semantics. Runs on the blocking pool because the KG read
+    // lock can be contended with the slow_loop write path; holding it
+    // here on an async worker would stall sibling dashboard requests
+    // (`RECURRING_BUGS.md` "Dashboard handlers block tokio worker
+    // threads"). The rest of this handler uses `tokio::fs::*` so there
+    // are no other blocking sinks to wrap.
+    let kg = std::sync::Arc::clone(&state.knowledge_graph);
+    let blocked_ips: std::collections::HashSet<String> = tokio::task::spawn_blocking(move || {
         use crate::knowledge_graph::types::{Node, NodeType};
-        let graph = state.knowledge_graph.read().unwrap();
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let graph = kg.read().unwrap();
         for id in graph.nodes_of_type(NodeType::Incident) {
             if let Some(Node::Incident {
                 decision: Some(dec),
@@ -22,11 +29,14 @@ pub(super) async fn api_honeypot_sessions(
             }) = graph.get_node(id)
             {
                 if dec == "block_ip" {
-                    blocked_ips.insert(target.clone());
+                    set.insert(target.clone());
                 }
             }
         }
-    }
+        set
+    })
+    .await
+    .unwrap_or_default();
 
     // Read session metadata files
     let mut sessions: Vec<serde_json::Value> = Vec::new();
@@ -456,5 +466,36 @@ mod tests {
         assert!(intact);
         assert_eq!(len, 0);
         assert_eq!(last, "none");
+    }
+
+    // ── api_honeypot_sessions (Finding 4 anchor) ─────────────────────
+    //
+    // The handler wraps the KG read in spawn_blocking. Verify the full
+    // async path returns a well-formed JSON object even when no
+    // honeypot directory exists (the early-return path).
+
+    #[tokio::test]
+    async fn api_honeypot_sessions_returns_empty_when_dir_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Don't create the honeypot/ subdir → handler short-circuits.
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let Json(payload) = api_honeypot_sessions(State(state)).await;
+        let sessions = payload["sessions"].as_array().expect("sessions array");
+        assert!(sessions.is_empty(), "no honeypot dir → empty sessions");
+    }
+
+    #[tokio::test]
+    async fn api_honeypot_sessions_runs_blocked_ip_collection_on_blocking_pool() {
+        // Anchors the spawn_blocking wrapper around the graph read.
+        // Even with an empty graph, the handler must complete (proves
+        // the spawn_blocking awaits without panicking and the blocked_ips
+        // set is empty as expected).
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("honeypot")).unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let Json(payload) = api_honeypot_sessions(State(state)).await;
+        let sessions = payload["sessions"].as_array().expect("sessions array");
+        // No session JSON files → no entries.
+        assert!(sessions.is_empty());
     }
 }

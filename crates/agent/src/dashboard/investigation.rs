@@ -8,9 +8,11 @@ pub(super) async fn api_entities(
 ) -> Json<EntitiesResponse> {
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
+    let filters =
+        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    // Build attackers from knowledge graph
-    let attackers = build_attackers_from_graph(&state.knowledge_graph, limit);
+    // Build attackers from knowledge graph (filters applied inline).
+    let attackers = build_attackers_from_graph(&state.knowledge_graph, limit, &filters);
     Json(EntitiesResponse { date, attackers })
 }
 
@@ -21,8 +23,10 @@ pub(super) async fn api_pivots(
     let date = resolve_date(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let group_by = PivotKind::parse(query.group_by.as_deref());
+    let filters =
+        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    let items = build_pivots_from_graph(&state.knowledge_graph, group_by, limit);
+    let items = build_pivots_from_graph(&state.knowledge_graph, group_by, limit, &filters);
     Json(PivotResponse {
         date,
         group_by: group_by.as_str().to_string(),
@@ -249,7 +253,7 @@ fn build_export_response(
         let graph = kg.read().unwrap();
         compute_overview_from_graph(&graph, &data_dir, &date)
     };
-    let pivots = build_pivots_from_graph(&kg, group_by, limit);
+    let pivots = build_pivots_from_graph(&kg, group_by, limit, &filters);
     let clusters = build_cluster_items_from_graph(&kg, limit, window_seconds);
     let journey = subject.as_ref().filter(|s| !s.is_empty()).map(|s| {
         build_journey_from_graph(
@@ -317,9 +321,12 @@ pub(super) fn build_pivots_from_graph(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     group_by: PivotKind,
     limit: usize,
+    filters: &InvestigationFilters,
 ) -> Vec<PivotItem> {
     use crate::knowledge_graph::types::*;
     let graph = kg.read().unwrap();
+    let sev_min_rank = filters.severity_min_rank();
+    let detector_substring = filters.detector_lower();
 
     let node_type = match group_by {
         PivotKind::Ip => NodeType::Ip,
@@ -413,17 +420,59 @@ pub(super) fn build_pivots_from_graph(
         std::collections::HashMap::new();
 
     for inc_id in graph.nodes_of_type(NodeType::Incident) {
-        // Skip research_only incidents — same filter as api_incidents
-        // and api_overview. Without this, self-traffic IPs like
-        // 149.154.166.110 (Telegram Bot API) appear in the Threats tab
-        // entity list with 198 incidents, even though every one of them
-        // is research_only. The operator sees a "threat" that is actually
-        // the agent's own notification traffic and is one click away from
-        // blocking their own Telegram integration.
-        if let Some(Node::Incident { research_only, .. }) = graph.get_node(inc_id) {
+        // Apply the SAME filter the public site live-feed applies, so the
+        // Threats tab and the site agree on what counts as a "real"
+        // incident. Pre-2026-04-23 the threats tab applied only
+        // `research_only` + `internal_ips` + `self_traffic_ips`, but the
+        // site additionally rejects advisory-only detectors
+        // (`neural_anomaly`, `host_drift`, `network_sniffing`,
+        // `discovery_burst`) and IW system processes via title-prefix
+        // (`(en-agent)`, `(en-sensor)`, `(systemd)`, etc.). The filter is
+        // canonicalised in `live_feed::is_internal_incident_fields`; both
+        // surfaces call it via the same code path so any future change
+        // updates both at once. See `NUMBER_CONSISTENCY.md` row
+        // "blocks today / IPs blocked".
+        let skip = if let Some(Node::Incident {
+            research_only,
+            detector,
+            title,
+            severity,
+            ..
+        }) = graph.get_node(inc_id)
+        {
             if *research_only {
-                continue;
+                true
+            } else {
+                let has_external_ip = graph
+                    .outgoing_edges(inc_id)
+                    .iter()
+                    .filter(|e| e.relation == Relation::TriggeredBy)
+                    .any(|e| {
+                        matches!(
+                            graph.get_node(e.to),
+                            Some(Node::Ip {
+                                is_internal: false,
+                                ..
+                            })
+                        )
+                    });
+                let internal = crate::dashboard::live_feed::is_internal_incident_fields(
+                    detector,
+                    title,
+                    has_external_ip,
+                );
+                let below_severity = sev_min_rank > 0 && severity_rank(severity) < sev_min_rank;
+                let detector_mismatch = match &detector_substring {
+                    Some(needle) => !detector.to_ascii_lowercase().contains(needle),
+                    None => false,
+                };
+                internal || below_severity || detector_mismatch
             }
+        } else {
+            false
+        };
+        if skip {
+            continue;
         }
         for edge in graph.outgoing_edges(inc_id) {
             if edge.relation != Relation::TriggeredBy {
@@ -527,8 +576,9 @@ pub(super) fn severity_rank(s: &str) -> u8 {
 pub(super) fn build_attackers_from_graph(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     limit: usize,
+    filters: &InvestigationFilters,
 ) -> Vec<AttackerSummary> {
-    build_pivots_from_graph(kg, PivotKind::Ip, limit)
+    build_pivots_from_graph(kg, PivotKind::Ip, limit, filters)
         .into_iter()
         .map(|p| AttackerSummary {
             ip: p.value,
@@ -3087,5 +3137,199 @@ mod tests {
             joined.contains("Low activity") || joined.contains("Routine scanner"),
             "expected low-activity hint when not blocked, got: {joined}"
         );
+    }
+
+    // ── build_pivots_from_graph filter behavior (Inconsistencies 2 + 3) ─
+    //
+    // Anchors for two complementary fixes:
+    //   - Inconsistency 2: incidents that pass `is_internal_incident_fields`
+    //     (advisory-only detectors, IW-system processes) must be excluded.
+    //   - Inconsistency 3: operator-supplied severity_min and detector
+    //     filters must narrow the result set.
+
+    fn make_kg_with_attackers(
+    ) -> std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>> {
+        use crate::knowledge_graph::types::*;
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = Utc::now();
+        // External IP, ssh_bruteforce HIGH — should pass all filters.
+        let ip_a = g.ensure_ip("203.0.113.10", now);
+        let inc_a_id = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:1".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "SSH brute force from 203.0.113.10".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            decision_target: Some("203.0.113.10".into()),
+            confidence: Some(0.95),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_a_id, ip_a, Relation::TriggeredBy, now));
+        // External IP, port_scan LOW — passes filter only without severity_min.
+        let ip_b = g.ensure_ip("198.51.100.20", now);
+        let inc_b_id = g.add_node(Node::Incident {
+            incident_id: "port_scan:1".into(),
+            detector: "port_scan".into(),
+            severity: "low".into(),
+            title: "Port scan from 198.51.100.20".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("monitor".into()),
+            decision_target: Some("198.51.100.20".into()),
+            confidence: Some(0.6),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_b_id, ip_b, Relation::TriggeredBy, now));
+        // Advisory-only detector — must be EXCLUDED by Inconsistency 2 fix.
+        let ip_c = g.ensure_ip("192.0.2.30", now);
+        let inc_c_id = g.add_node(Node::Incident {
+            incident_id: "neural_anomaly:1".into(),
+            detector: "neural_anomaly".into(),
+            severity: "high".into(),
+            title: "Neural anomaly".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            decision_target: None,
+            confidence: None,
+            decision_reason: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_c_id, ip_c, Relation::TriggeredBy, now));
+        std::sync::Arc::new(std::sync::RwLock::new(g))
+    }
+
+    #[test]
+    fn build_pivots_from_graph_excludes_advisory_only_detectors() {
+        let kg = make_kg_with_attackers();
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default());
+        // 2 attackers should remain (ssh + port_scan). neural_anomaly is filtered.
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(ips.contains("203.0.113.10"));
+        assert!(ips.contains("198.51.100.20"));
+        assert!(
+            !ips.contains("192.0.2.30"),
+            "neural_anomaly is advisory-only and must not appear as an attacker"
+        );
+    }
+
+    #[test]
+    fn build_pivots_from_graph_severity_min_filter_narrows_results() {
+        let kg = make_kg_with_attackers();
+        let high_only = InvestigationFilters::from_query(Some("high"), None);
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &high_only);
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            ips.contains("203.0.113.10"),
+            "ssh_bruteforce HIGH should pass"
+        );
+        assert!(
+            !ips.contains("198.51.100.20"),
+            "port_scan LOW must be filtered when severity_min=high"
+        );
+    }
+
+    #[test]
+    fn build_pivots_from_graph_detector_filter_narrows_results() {
+        let kg = make_kg_with_attackers();
+        let ssh_only = InvestigationFilters::from_query(None, Some("ssh"));
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &ssh_only);
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            ips.contains("203.0.113.10"),
+            "ssh_bruteforce should match detector=ssh"
+        );
+        assert!(
+            !ips.contains("198.51.100.20"),
+            "port_scan must not match detector=ssh"
+        );
+    }
+
+    #[test]
+    fn build_pivots_from_graph_combined_filters_intersect() {
+        let kg = make_kg_with_attackers();
+        let critical_ssh = InvestigationFilters::from_query(Some("critical"), Some("ssh"));
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &critical_ssh);
+        // No ssh incident is critical-severity → empty.
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_entities_async_handler_applies_filters() {
+        // Anchors the api_entities async handler — proves the
+        // EntitiesQuery → InvestigationFilters → build_attackers_from_graph
+        // wiring is reachable end-to-end.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        // Replace the empty graph with the fixture from the helper above.
+        state.knowledge_graph = make_kg_with_attackers();
+
+        let q = EntitiesQuery {
+            limit: Some(50),
+            date: None,
+            severity_min: Some("high".to_string()),
+            detector: None,
+            group_by: None,
+        };
+        let Json(resp) = api_entities(State(state), Query(q)).await;
+        let ips: std::collections::HashSet<&str> =
+            resp.attackers.iter().map(|a| a.ip.as_str()).collect();
+        assert!(ips.contains("203.0.113.10"));
+        assert!(!ips.contains("198.51.100.20"));
+    }
+
+    #[tokio::test]
+    async fn api_pivots_async_handler_applies_filters() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        state.knowledge_graph = make_kg_with_attackers();
+
+        let q = EntitiesQuery {
+            limit: Some(50),
+            date: None,
+            severity_min: None,
+            detector: Some("ssh".to_string()),
+            group_by: Some("ip".to_string()),
+        };
+        let Json(resp) = api_pivots(State(state), Query(q)).await;
+        let values: std::collections::HashSet<&str> =
+            resp.items.iter().map(|p| p.value.as_str()).collect();
+        assert!(values.contains("203.0.113.10"));
+        assert!(!values.contains("198.51.100.20"));
+        assert_eq!(resp.group_by, "ip");
+        assert_eq!(resp.total, resp.items.len());
+    }
+
+    #[test]
+    fn build_attackers_from_graph_forwards_filters() {
+        let kg = make_kg_with_attackers();
+        let high = InvestigationFilters::from_query(Some("high"), None);
+        let attackers = build_attackers_from_graph(&kg, 100, &high);
+        let ips: std::collections::HashSet<&str> =
+            attackers.iter().map(|a| a.ip.as_str()).collect();
+        assert!(ips.contains("203.0.113.10"));
+        assert!(!ips.contains("198.51.100.20"));
     }
 }

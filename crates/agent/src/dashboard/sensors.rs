@@ -5,6 +5,14 @@ use super::*;
 /// GET /api/sensors - sensor activity time-series for dashboard graphs.
 /// Returns event counts bucketed by 5-minute intervals, grouped by source.
 /// Cached for 30 seconds to avoid re-reading the events file on every request.
+///
+/// Cache miss path holds the KG read lock and walks every Incident node to
+/// build the detector timeline. `tokio::task::spawn_blocking` keeps that
+/// work off the async worker thread (see `RECURRING_BUGS.md` "Dashboard
+/// handlers block tokio worker threads"). The 30s cache makes contention
+/// rare but the spawn_blocking is correctness, not optimisation: a slow
+/// path that pins an async worker can starve sibling handlers regardless
+/// of frequency.
 pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     // Check cache (30s TTL)
     {
@@ -18,7 +26,11 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
         }
     }
 
-    let result = api_sensors_inner(&state).await;
+    let kg = std::sync::Arc::clone(&state.knowledge_graph);
+    let data_dir = state.data_dir.clone();
+    let result = tokio::task::spawn_blocking(move || build_sensors_payload(&kg, &data_dir))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
 
     // Update cache
     {
@@ -33,11 +45,22 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
     Json(result)
 }
 
+/// Async-safe variant retained for any future caller that already runs on
+/// a blocking thread (e.g. integration test). Production handler uses
+/// `build_sensors_payload` via `spawn_blocking`.
+#[allow(dead_code)]
 pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
+    build_sensors_payload(&state.knowledge_graph, &state.data_dir)
+}
+
+fn build_sensors_payload(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    data_dir: &std::path::Path,
+) -> serde_json::Value {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     use crate::knowledge_graph::types::{Node, NodeType};
-    let graph = state.knowledge_graph.read().unwrap();
+    let graph = kg.read().unwrap();
 
     // Event telemetry — prefer graph counters, fall back to telemetry snapshot
     let (total_events_val, sources) = if graph.total_events_ingested > 0 {
@@ -50,7 +73,7 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
         (graph.total_events_ingested, s)
     } else {
         // Fallback: read from telemetry snapshot (has events_by_collector)
-        let telem = crate::telemetry::read_latest_snapshot(&state.data_dir, &today);
+        let telem = crate::telemetry::read_latest_snapshot(data_dir, &today);
         match telem {
             Some(t) => {
                 let total = t.events_by_collector.values().sum::<u64>() as usize;
@@ -542,5 +565,114 @@ mod tests {
         };
         assert!(action_cfg.enabled);
         assert!(action_cfg.execution_guard_enabled);
+    }
+
+    // ── build_sensors_payload (Finding 4 anchor) ─────────────────────
+    //
+    // The handler runs this on the blocking pool. The payload structure
+    // must be stable; the test pins the JSON shape so a future refactor
+    // (e.g. the spawn_blocking wrapper changing arg order) cannot
+    // accidentally drop a field.
+
+    #[test]
+    fn build_sensors_payload_returns_expected_shape_on_empty_graph() {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path());
+
+        // Required fields: date, total_events, total_incidents, sources,
+        // top_kinds, detectors, event_timeline, detector_timeline.
+        for field in [
+            "date",
+            "total_events",
+            "total_incidents",
+            "sources",
+            "top_kinds",
+            "detectors",
+            "event_timeline",
+            "detector_timeline",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "build_sensors_payload missing required field {field}"
+            );
+        }
+        assert_eq!(payload["total_events"].as_u64(), Some(0));
+        assert_eq!(payload["total_incidents"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn api_sensors_async_handler_returns_payload_via_spawn_blocking() {
+        // Anchors the spawn_blocking wrapper around build_sensors_payload.
+        // Goes through the full async handler so the cache + spawn_blocking
+        // + extracted helper chain stays exercised.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        // Force `last_activity` to "recent" so the sleeping path doesn't
+        // short-circuit the handler.
+        state.last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let Json(payload) = api_sensors(State(state)).await;
+        // First call is a cache miss; payload must include the canonical
+        // shape from build_sensors_payload.
+        for field in [
+            "date",
+            "total_events",
+            "total_incidents",
+            "sources",
+            "top_kinds",
+            "detectors",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "api_sensors response missing required field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_sensors_payload_falls_back_to_telemetry_snapshot_when_graph_empty() {
+        // Anchors the `else` branch of `if graph.total_events_ingested > 0`
+        // — when the graph hasn't seen any telemetry, the handler reads
+        // from the JSONL telemetry snapshot. Empty tempdir → fallback
+        // returns empty sources but the payload still has the right shape.
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path());
+        // Total stays 0 (no graph counters AND no telemetry file).
+        assert_eq!(payload["total_events"].as_u64(), Some(0));
+        let sources = payload["sources"].as_array().expect("sources array");
+        assert_eq!(sources.len(), 0, "no telemetry snapshot → no sources");
+    }
+
+    #[test]
+    fn build_sensors_payload_counts_telemetry_from_graph() {
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        // Inject telemetry counters directly so we don't depend on the
+        // event-ingest pipeline. Sensors handler reads these counters
+        // directly when total_events_ingested > 0.
+        g.record_event_telemetry("auth_log", "ssh.login_failed", chrono::Utc::now());
+        g.record_event_telemetry("auth_log", "ssh.login_failed", chrono::Utc::now());
+        g.record_event_telemetry("nginx_access", "http.request", chrono::Utc::now());
+
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path());
+
+        assert_eq!(payload["total_events"].as_u64(), Some(3));
+        let sources = payload["sources"].as_array().expect("sources array");
+        // Two distinct sources, sorted by count desc — auth_log first.
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0]["name"].as_str(), Some("auth_log"));
+        assert_eq!(sources[0]["count"].as_u64(), Some(2));
     }
 }

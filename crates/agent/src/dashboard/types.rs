@@ -68,10 +68,11 @@ pub(crate) struct ActionResponse {
 pub(crate) struct ListQuery {
     pub(super) limit: Option<usize>,
     pub(super) date: Option<String>,
+    pub(super) severity_min: Option<String>,
+    pub(super) detector: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // severity_min/detector accepted for API forward-compat; graph filters land in spec 016
 pub(crate) struct EntitiesQuery {
     pub(super) limit: Option<usize>,
     pub(super) date: Option<String>,
@@ -151,6 +152,14 @@ pub(crate) struct OverviewResponse {
     pub(super) unresolved_count: usize,
     /// Incidents safely resolved (blocked, killed, contained, monitored, honeypot).
     pub(super) safely_resolved: usize,
+    /// Distinct attacker IPs the AI took a non-ignore action on today.
+    /// Reported by the home tile so the number matches what the operator
+    /// sees when they click through to the Threats tab (which dedupes by
+    /// IP). Pre-2026-04-23 home displayed `safely_resolved` (incident
+    /// count) and threats displayed unique-IP-count; the operator saw
+    /// "54 handled" but counted only ~14 entries on the threats page.
+    /// See `NUMBER_CONSISTENCY.md` row "handled count".
+    pub(super) handled_ips_today: usize,
     /// Breakdown by severity level: {"critical": N, "high": N, ...}
     pub(super) severity_breakdown: std::collections::HashMap<String, usize>,
     /// Incidents from allowlisted IPs/users (can be hidden in dashboard).
@@ -395,8 +404,7 @@ impl PivotKind {
     }
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // fields consumed by `#[cfg(test)]` legacy JSONL helpers until spec 016
+#[derive(Debug, Clone, Default)]
 pub(crate) struct InvestigationFilters {
     pub(super) severity_min: Option<u8>,
     pub(super) detector: Option<String>,
@@ -422,6 +430,19 @@ impl InvestigationFilters {
             severity_min,
             detector,
         }
+    }
+
+    /// Severity rank threshold (0 = no filter). Same numeric scale as
+    /// `crate::dashboard::investigation::severity_rank` so producers and
+    /// consumers compare against the same totem.
+    pub(crate) fn severity_min_rank(&self) -> u8 {
+        self.severity_min.unwrap_or(0)
+    }
+
+    /// Lowercased detector substring for `contains` filtering. `None`
+    /// means "match all detectors".
+    pub(crate) fn detector_lower(&self) -> Option<&str> {
+        self.detector.as_deref()
     }
 }
 
@@ -653,6 +674,57 @@ mod tests {
         let needs_attention = vec!["active", "open", "something_else", ""];
         for status in needs_attention {
             assert_eq!(status_determination(status), "needs_attention");
+        }
+    }
+
+    // ── InvestigationFilters helpers (Inconsistency 3 anchor) ────────
+
+    #[test]
+    fn investigation_filters_from_query_normalises_severity_and_detector() {
+        let f = InvestigationFilters::from_query(Some("HIGH"), Some(" SSH "));
+        assert_eq!(f.severity_min_rank(), 4); // "high" rank
+        assert_eq!(f.detector_lower(), Some("ssh")); // trimmed + lowercased
+    }
+
+    #[test]
+    fn investigation_filters_treats_empty_strings_as_no_filter() {
+        let f = InvestigationFilters::from_query(Some(""), Some("   "));
+        assert_eq!(f.severity_min_rank(), 0);
+        assert_eq!(f.detector_lower(), None);
+
+        let none = InvestigationFilters::from_query(None, None);
+        assert_eq!(none.severity_min_rank(), 0);
+        assert_eq!(none.detector_lower(), None);
+    }
+
+    #[test]
+    fn investigation_filters_unknown_severity_collapses_to_zero() {
+        // severity_order returns 0 for "panic" / "warn" / typos. The filter
+        // collapses 0 to "no filter" so a typo doesn't accidentally exclude
+        // every incident.
+        let f = InvestigationFilters::from_query(Some("panic"), None);
+        assert_eq!(f.severity_min_rank(), 0);
+    }
+
+    #[test]
+    fn investigation_filters_severity_min_rank_matches_string_severity_rank() {
+        // The `severity_min_rank` returned here is compared against the
+        // result of `dashboard::investigation::severity_rank` on individual
+        // incident severities. Pin the same scale on both ends so a future
+        // refactor cannot silently drift.
+        for (s, expected) in &[
+            ("critical", 5),
+            ("high", 4),
+            ("medium", 3),
+            ("low", 2),
+            ("info", 1),
+        ] {
+            let f = InvestigationFilters::from_query(Some(s), None);
+            assert_eq!(
+                f.severity_min_rank(),
+                *expected,
+                "severity_min={s} expected rank {expected}"
+            );
         }
     }
 }
