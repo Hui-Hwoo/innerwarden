@@ -1110,6 +1110,40 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         );
     }
 
+    #[tokio::test]
+    async fn process_narrative_tick_runs_snapshot_block_when_due() {
+        // Anchors the new 3-scope lock-split snapshot block in
+        // `process_narrative_tick`. Pre-fix the whole block ran under
+        // a single write lock; the test here just proves all three
+        // scopes execute without panicking when last_graph_snapshot is
+        // older than 60s and the file/SQLite paths run end-to-end.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        // Force snapshot tick to fire.
+        state.last_graph_snapshot = std::time::Instant::now() - std::time::Duration::from_secs(90);
+        let cfg = config::AgentConfig::default();
+        let mut cursor = reader::AgentCursor::default();
+
+        let count = process_narrative_tick(dir.path(), &mut cursor, &cfg, &mut state)
+            .await
+            .expect("narrative tick");
+        assert_eq!(count, 0);
+        // Snapshot should have advanced last_graph_snapshot to "now",
+        // proving Scope 3 (no-lock I/O) reached the end of the block.
+        assert!(state.last_graph_snapshot.elapsed().as_secs() < 5);
+        // Dated snapshot file should exist on disk after the tick.
+        let snap_path = crate::knowledge_graph::KnowledgeGraph::dated_snapshot_path(dir.path());
+        assert!(
+            snap_path.exists(),
+            "dated snapshot file must be written after the tick"
+        );
+        // graph-stats.json should also exist (metrics serialised).
+        assert!(
+            dir.path().join("graph-stats.json").exists(),
+            "graph-stats.json must be written by the snapshot block"
+        );
+    }
+
     #[test]
     fn try_recover_sqlite_store_respects_60s_backoff() {
         let dir = tempfile::tempdir().expect("tempdir");

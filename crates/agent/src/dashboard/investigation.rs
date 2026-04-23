@@ -3276,6 +3276,52 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[tokio::test]
+    async fn api_entities_async_handler_applies_filters() {
+        // Anchors the api_entities async handler — proves the
+        // EntitiesQuery → InvestigationFilters → build_attackers_from_graph
+        // wiring is reachable end-to-end.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        // Replace the empty graph with the fixture from the helper above.
+        state.knowledge_graph = make_kg_with_attackers();
+
+        let q = EntitiesQuery {
+            limit: Some(50),
+            date: None,
+            severity_min: Some("high".to_string()),
+            detector: None,
+            group_by: None,
+        };
+        let Json(resp) = api_entities(State(state), Query(q)).await;
+        let ips: std::collections::HashSet<&str> =
+            resp.attackers.iter().map(|a| a.ip.as_str()).collect();
+        assert!(ips.contains("203.0.113.10"));
+        assert!(!ips.contains("198.51.100.20"));
+    }
+
+    #[tokio::test]
+    async fn api_pivots_async_handler_applies_filters() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        state.knowledge_graph = make_kg_with_attackers();
+
+        let q = EntitiesQuery {
+            limit: Some(50),
+            date: None,
+            severity_min: None,
+            detector: Some("ssh".to_string()),
+            group_by: Some("ip".to_string()),
+        };
+        let Json(resp) = api_pivots(State(state), Query(q)).await;
+        let values: std::collections::HashSet<&str> =
+            resp.items.iter().map(|p| p.value.as_str()).collect();
+        assert!(values.contains("203.0.113.10"));
+        assert!(!values.contains("198.51.100.20"));
+        assert_eq!(resp.group_by, "ip");
+        assert_eq!(resp.total, resp.items.len());
+    }
+
     #[test]
     fn build_attackers_from_graph_forwards_filters() {
         let kg = make_kg_with_attackers();

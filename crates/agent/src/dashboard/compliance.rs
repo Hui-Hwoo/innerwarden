@@ -467,4 +467,35 @@ mod tests {
         assert_eq!(len, 0);
         assert_eq!(last, "none");
     }
+
+    // ── api_honeypot_sessions (Finding 4 anchor) ─────────────────────
+    //
+    // The handler wraps the KG read in spawn_blocking. Verify the full
+    // async path returns a well-formed JSON object even when no
+    // honeypot directory exists (the early-return path).
+
+    #[tokio::test]
+    async fn api_honeypot_sessions_returns_empty_when_dir_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Don't create the honeypot/ subdir → handler short-circuits.
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let Json(payload) = api_honeypot_sessions(State(state)).await;
+        let sessions = payload["sessions"].as_array().expect("sessions array");
+        assert!(sessions.is_empty(), "no honeypot dir → empty sessions");
+    }
+
+    #[tokio::test]
+    async fn api_honeypot_sessions_runs_blocked_ip_collection_on_blocking_pool() {
+        // Anchors the spawn_blocking wrapper around the graph read.
+        // Even with an empty graph, the handler must complete (proves
+        // the spawn_blocking awaits without panicking and the blocked_ips
+        // set is empty as expected).
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("honeypot")).unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let Json(payload) = api_honeypot_sessions(State(state)).await;
+        let sessions = payload["sessions"].as_array().expect("sessions array");
+        // No session JSON files → no entries.
+        assert!(sessions.is_empty());
+    }
 }

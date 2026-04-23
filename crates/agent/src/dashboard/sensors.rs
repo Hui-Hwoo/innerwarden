@@ -603,6 +603,57 @@ mod tests {
         assert_eq!(payload["total_incidents"].as_u64(), Some(0));
     }
 
+    #[tokio::test]
+    async fn api_sensors_async_handler_returns_payload_via_spawn_blocking() {
+        // Anchors the spawn_blocking wrapper around build_sensors_payload.
+        // Goes through the full async handler so the cache + spawn_blocking
+        // + extracted helper chain stays exercised.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        // Force `last_activity` to "recent" so the sleeping path doesn't
+        // short-circuit the handler.
+        state.last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let Json(payload) = api_sensors(State(state)).await;
+        // First call is a cache miss; payload must include the canonical
+        // shape from build_sensors_payload.
+        for field in [
+            "date",
+            "total_events",
+            "total_incidents",
+            "sources",
+            "top_kinds",
+            "detectors",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "api_sensors response missing required field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_sensors_payload_falls_back_to_telemetry_snapshot_when_graph_empty() {
+        // Anchors the `else` branch of `if graph.total_events_ingested > 0`
+        // — when the graph hasn't seen any telemetry, the handler reads
+        // from the JSONL telemetry snapshot. Empty tempdir → fallback
+        // returns empty sources but the payload still has the right shape.
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path());
+        // Total stays 0 (no graph counters AND no telemetry file).
+        assert_eq!(payload["total_events"].as_u64(), Some(0));
+        let sources = payload["sources"].as_array().expect("sources array");
+        assert_eq!(sources.len(), 0, "no telemetry snapshot → no sources");
+    }
+
     #[test]
     fn build_sensors_payload_counts_telemetry_from_graph() {
         let mut g = crate::knowledge_graph::KnowledgeGraph::new();
