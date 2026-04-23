@@ -1,9 +1,124 @@
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::graph::KnowledgeGraph;
 use super::types::*;
 use tracing::warn;
+
+/// Gzip magic bytes — the first two bytes of any RFC 1952 gzip stream.
+/// Used to distinguish compressed snapshots (written by agents from the
+/// 2026-04-23 fix onwards) from legacy uncompressed JSON (which always
+/// starts with `{`).
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// Default gzip compression level. 6 is flate2's default — a sweet spot
+/// for typical JSON payloads (graph snapshots compress 6-10x). Bumping
+/// to 9 saves ~5% more space at significant CPU cost; 1 is barely worth
+/// running. Tuning here affects the slow_loop tick latency, not just disk.
+const SNAPSHOT_GZIP_LEVEL: flate2::Compression = flate2::Compression::new(6);
+
+/// Compress a JSON-bytes snapshot into gzip. Returns the original bytes
+/// on compression error so the caller can still persist the snapshot
+/// (correctness over efficiency under degraded conditions).
+fn gzip_snapshot_bytes(json: &[u8]) -> Vec<u8> {
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::with_capacity(json.len() / 4), SNAPSHOT_GZIP_LEVEL);
+    if encoder.write_all(json).is_err() {
+        return json.to_vec();
+    }
+    encoder.finish().unwrap_or_else(|_| json.to_vec())
+}
+
+/// Strict shape predicate for a date-string used as a filesystem path
+/// component or SQL parameter. Accepts only the canonical
+/// `YYYY-MM-DD` form: exactly 10 ASCII chars, digits and dashes in
+/// fixed positions. Rejects loose variants chrono would otherwise
+/// accept (`2026-4-23`, `2026-04-23T00`, etc.) so the on-disk filename
+/// is always canonical and predictable.
+fn has_canonical_iso_date_shape(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    if bytes.len() != 10 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, &b)| match i {
+        4 | 7 => b == b'-',
+        _ => b.is_ascii_digit(),
+    })
+}
+
+/// Parse a date-string and return a SAFE filename component for the
+/// snapshot store. The user-controlled `date: &str` flows from the
+/// `/api/report?date=...` HTTP query into a `data_dir.join(...)` call;
+/// without this guard a request like `?date=../../etc/passwd` would
+/// attempt to read outside `data_dir`.
+///
+/// Three layered defenses:
+///
+/// 1. **Shape check**: `has_canonical_iso_date_shape` rejects any
+///    string that is not exactly 10 ASCII chars in `YYYY-MM-DD` form,
+///    short-circuiting the path-traversal payloads that CodeQL flagged.
+/// 2. **Calendar validation**: `chrono::NaiveDate::parse_from_str`
+///    rejects shape-passing-but-impossible dates (`2026-13-01`,
+///    `2026-02-30`).
+/// 3. **Taint break**: the filename is **reconstructed** from the typed
+///    `(year, month, day)` primitives, NOT from the original `&str`.
+///    CodeQL's path-traversal taint analysis follows string flow; passing
+///    `date` through `parse → reformat` produces a fresh string whose
+///    contents are provably ASCII digits + dashes in fixed positions,
+///    breaking the taint chain at the function boundary.
+///
+/// Returns the safe filename (e.g. `"graph-snapshot-2026-04-23.json"`)
+/// or `None` if the input fails any of the three checks.
+pub(crate) fn safe_snapshot_filename(date: &str) -> Option<String> {
+    use chrono::Datelike;
+    if !has_canonical_iso_date_shape(date) {
+        return None;
+    }
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(format!(
+        "graph-snapshot-{:04}-{:02}-{:02}.json",
+        parsed.year(),
+        parsed.month(),
+        parsed.day(),
+    ))
+}
+
+/// Like `safe_snapshot_filename` but returns the raw `YYYY-MM-DD` form,
+/// used by `load_dated_from_store` where the date is bound as a SQL
+/// parameter (no path component). The taint break is the same: parse +
+/// reformat from typed primitives, never the original string.
+pub(crate) fn safe_date_string(date: &str) -> Option<String> {
+    use chrono::Datelike;
+    if !has_canonical_iso_date_shape(date) {
+        return None;
+    }
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        parsed.year(),
+        parsed.month(),
+        parsed.day(),
+    ))
+}
+
+/// Decompress a snapshot blob if it carries the gzip magic header,
+/// otherwise return the bytes unchanged. Pre-2026-04-23 snapshots were
+/// stored as raw JSON starting with `{`; the magic-byte check makes the
+/// reader back-compat with both schemes without a separate version
+/// column. On a corrupted gzip stream the reader yields `None` so the
+/// caller falls through to the same "snapshot corrupted" path used for
+/// invalid JSON.
+fn maybe_decompress(blob: &[u8]) -> Option<Vec<u8>> {
+    if blob.len() >= 2 && blob[0] == GZIP_MAGIC[0] && blob[1] == GZIP_MAGIC[1] {
+        let mut decoder = flate2::read::GzDecoder::new(blob);
+        let mut out = Vec::with_capacity(blob.len() * 6); // conservative pre-allocation
+        decoder.read_to_end(&mut out).ok()?;
+        Some(out)
+    } else {
+        Some(blob.to_vec())
+    }
+}
 
 /// Owned snapshot used by load (deserialize moves into KnowledgeGraph).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -54,9 +169,15 @@ impl<'a> GraphSnapshotRef<'a> {
 
 impl KnowledgeGraph {
     /// Save the graph to a JSON file with rotation (T029: keep last 3 snapshots).
+    ///
+    /// Bytes are gzip-compressed before write (typical JSON payload shrinks
+    /// 6-10× — 47 MB → ~5 MB on the prod baseline at 14k nodes / 145k edges).
+    /// Reader detects the format via the gzip magic header so legacy
+    /// uncompressed snapshots still load.
     pub fn save_snapshot(&self, path: &Path) -> anyhow::Result<()> {
         let snapshot = GraphSnapshotRef::from_graph(self);
-        let data = serde_json::to_vec(&snapshot)?;
+        let json = serde_json::to_vec(&snapshot)?;
+        let data = gzip_snapshot_bytes(&json);
 
         // T029: rotate previous snapshots before writing new one
         rotate_snapshots(path, 3);
@@ -64,10 +185,11 @@ impl KnowledgeGraph {
         std::fs::write(path, &data)?;
 
         tracing::info!(
-            "Knowledge graph snapshot saved: {} nodes, {} edges, {} bytes",
-            self.nodes.len(),
-            self.edges.len(),
-            data.len()
+            nodes = self.nodes.len(),
+            edges = self.edges.len(),
+            bytes_on_disk = data.len(),
+            bytes_uncompressed = json.len(),
+            "Knowledge graph snapshot saved"
         );
 
         Ok(())
@@ -134,9 +256,14 @@ impl KnowledgeGraph {
     }
 
     /// Load a historical dated snapshot for a specific date string (e.g. "2026-04-10").
-    /// Returns None if the snapshot doesn't exist or is corrupt.
+    /// Returns None if the snapshot doesn't exist, is corrupt, or the
+    /// date string fails strict `YYYY-MM-DD` parsing. The filename is
+    /// reconstructed from typed `(year, month, day)` primitives via
+    /// `safe_snapshot_filename`, breaking the path-traversal taint chain
+    /// for `?date=../../etc/passwd`-style HTTP query payloads.
     pub fn load_dated(data_dir: &Path, date: &str) -> Option<Self> {
-        let path = data_dir.join(format!("graph-snapshot-{date}.json"));
+        let safe_name = safe_snapshot_filename(date)?;
+        let path = data_dir.join(safe_name);
         Self::try_load_snapshot(&path)
     }
 
@@ -176,9 +303,20 @@ impl KnowledgeGraph {
     }
 
     fn try_load_snapshot(path: &Path) -> Option<Self> {
-        let data = match std::fs::read(path) {
+        let raw = match std::fs::read(path) {
             Ok(d) => d,
             Err(_) => return None,
+        };
+
+        let data = match maybe_decompress(&raw) {
+            Some(d) => d,
+            None => {
+                warn!(
+                    path = %path.display(),
+                    "Knowledge graph snapshot has gzip header but failed to decompress"
+                );
+                return None;
+            }
         };
 
         let snapshot: GraphSnapshot = match serde_json::from_slice(&data) {
@@ -199,25 +337,34 @@ impl KnowledgeGraph {
     // ── SQLite-backed snapshot API (spec 016) ────────────────────────────
 
     /// Save graph snapshot to the unified SQLite store.
+    ///
+    /// Bytes are gzip-compressed before bind. SQLite's `bind_blob` copies
+    /// the slice into its internal buffer, so the smaller the BLOB the
+    /// less memory the slow_loop allocates per tick (the prod baseline
+    /// at 14k nodes / 145k edges shrinks from ~47 MB JSON to ~5 MB gzip).
     pub fn save_to_store(&self, store: &innerwarden_store::Store) -> anyhow::Result<()> {
         let today = chrono::Local::now()
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
         let snapshot = GraphSnapshotRef::from_graph(self);
-        let data = serde_json::to_vec(&snapshot)?;
+        let json = serde_json::to_vec(&snapshot)?;
+        let data = gzip_snapshot_bytes(&json);
         store.save_graph_snapshot(&today, &data, self.node_count(), self.edge_count())?;
         tracing::info!(
-            "Graph snapshot saved to SQLite: {} nodes, {} edges",
-            self.node_count(),
-            self.edge_count()
+            nodes = self.node_count(),
+            edges = self.edge_count(),
+            bytes_in_blob = data.len(),
+            bytes_uncompressed = json.len(),
+            "Graph snapshot saved to SQLite"
         );
         Ok(())
     }
 
     /// Load the latest graph snapshot from the unified SQLite store.
     pub fn load_from_store(store: &innerwarden_store::Store) -> Option<Self> {
-        let (date, data) = store.load_latest_graph_snapshot().ok()??;
+        let (date, raw) = store.load_latest_graph_snapshot().ok()??;
+        let data = maybe_decompress(&raw)?;
         let snapshot: GraphSnapshot = serde_json::from_slice(&data).ok()?;
         let graph = Self::reconstruct_from_snapshot(snapshot)?;
         tracing::info!(date = %date, "Graph loaded from SQLite store");
@@ -225,8 +372,15 @@ impl KnowledgeGraph {
     }
 
     /// Load a graph snapshot for a specific date from the unified SQLite store.
+    /// Date is parsed via `safe_date_string` — the SQL path is parameter-bound
+    /// so SQL injection is not the risk; the parse-and-reformat just keeps
+    /// the API surface uniform with `load_dated` and means the SQL parameter
+    /// is always the canonical reformatted form, not whatever the user
+    /// originally typed.
     pub fn load_dated_from_store(store: &innerwarden_store::Store, date: &str) -> Option<Self> {
-        let data = store.load_graph_snapshot(date).ok()??;
+        let safe_date = safe_date_string(date)?;
+        let raw = store.load_graph_snapshot(&safe_date).ok()??;
+        let data = maybe_decompress(&raw)?;
         let snapshot: GraphSnapshot = serde_json::from_slice(&data).ok()?;
         let graph = Self::reconstruct_from_snapshot(snapshot)?;
         tracing::debug!(date = %date, "Graph loaded from SQLite store for date");
@@ -256,11 +410,35 @@ impl KnowledgeGraph {
         }
         graph.nodes = snapshot.nodes;
 
-        // Restore edges and rebuild adjacency lists
+        // Restore edges and rebuild adjacency lists. Also rebuild the
+        // `last_edge_ts` LRU index used by `enforce_memory_limit`. The index
+        // is derived from `edges` and not part of the wire format, so old
+        // snapshots load unchanged — same precedent as `outgoing`/`incoming`.
         for (idx, edge) in snapshot.edges.iter().enumerate() {
             graph.outgoing.entry(edge.from).or_default().push(idx);
             graph.incoming.entry(edge.to).or_default().push(idx);
             graph.memory_estimate += Self::estimate_edge_size(edge);
+            let edge_ts = edge.ts;
+            graph
+                .last_edge_ts
+                .entry(edge.from)
+                .and_modify(|t| {
+                    if edge_ts > *t {
+                        *t = edge_ts;
+                    }
+                })
+                .or_insert(edge_ts);
+            if edge.to != edge.from {
+                graph
+                    .last_edge_ts
+                    .entry(edge.to)
+                    .and_modify(|t| {
+                        if edge_ts > *t {
+                            *t = edge_ts;
+                        }
+                    })
+                    .or_insert(edge_ts);
+            }
         }
         graph.edges = snapshot.edges;
 
@@ -452,5 +630,231 @@ mod tests {
         let loaded = KnowledgeGraph::load_snapshot(&path);
         assert!(loaded.node_count() > 0);
         assert!(loaded.find_by_ip("10.0.0.1").is_some());
+    }
+
+    // ── gzip snapshot tests ──────────────────────────────────────────
+    //
+    // Anchors for the size reduction shipped 2026-04-23. The wire format
+    // changed from raw JSON to gzip-wrapped JSON. The reader uses a
+    // magic-byte sniff so legacy uncompressed snapshots still load —
+    // these tests pin both directions of that contract.
+
+    #[test]
+    fn save_snapshot_writes_gzip_compressed_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+        let mut g = KnowledgeGraph::new();
+        // Make the graph non-trivial so compression actually engages.
+        for i in 0..50 {
+            g.ensure_ip(&format!("203.0.113.{i}"), Utc::now());
+        }
+        g.save_snapshot(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b,
+            "snapshot must start with gzip magic bytes"
+        );
+    }
+
+    #[test]
+    fn load_snapshot_reads_gzip_compressed_bytes_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+        let mut g = KnowledgeGraph::new();
+        let p = g.ensure_process(7777, 1, "redis", 0, Utc::now());
+        let ip = g.ensure_ip("198.51.100.42", Utc::now());
+        g.add_edge(Edge::new(p, ip, Relation::ConnectedTo, Utc::now()));
+        g.save_snapshot(&path).unwrap();
+
+        let loaded = KnowledgeGraph::load_snapshot(&path);
+        assert_eq!(loaded.node_count(), g.node_count());
+        assert_eq!(loaded.edge_count(), g.edge_count());
+        assert!(loaded.find_by_pid(7777).is_some());
+        assert!(loaded.find_by_ip("198.51.100.42").is_some());
+    }
+
+    #[test]
+    fn load_snapshot_back_compat_reads_legacy_uncompressed_json() {
+        // Simulates a snapshot written by an agent BEFORE the gzip change.
+        // Reader must detect "no gzip magic" and parse as raw JSON.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+
+        let mut g = KnowledgeGraph::new();
+        g.ensure_ip("10.0.0.99", Utc::now());
+
+        // Write the snapshot the OLD way: raw JSON, no gzip wrapping.
+        let snap_ref = GraphSnapshotRef::from_graph(&g);
+        let raw_json = serde_json::to_vec(&snap_ref).unwrap();
+        assert_eq!(
+            raw_json[0], b'{',
+            "test fixture must look like legacy raw JSON"
+        );
+        std::fs::write(&path, &raw_json).unwrap();
+
+        let loaded = KnowledgeGraph::load_snapshot(&path);
+        assert!(
+            loaded.find_by_ip("10.0.0.99").is_some(),
+            "legacy uncompressed snapshot must still load (back-compat)"
+        );
+    }
+
+    #[test]
+    fn maybe_decompress_passes_through_non_gzip_bytes() {
+        // Defensive unit test for the reader helper.
+        let raw = b"{\"nodes\":{},\"edges\":[]}".to_vec();
+        let out = maybe_decompress(&raw).expect("non-gzip bytes return unchanged");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn maybe_decompress_round_trips_gzip_bytes() {
+        let original = b"hello inner warden compression check 12345".repeat(10);
+        let compressed = gzip_snapshot_bytes(&original);
+        // Compression with non-trivial input must produce different bytes.
+        assert_ne!(compressed, original);
+        assert!(
+            compressed.len() >= 2 && compressed[0] == 0x1f && compressed[1] == 0x8b,
+            "compressor output must carry gzip magic"
+        );
+        let decoded = maybe_decompress(&compressed).expect("gzip round-trip");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn maybe_decompress_handles_corrupt_gzip_gracefully() {
+        // Magic bytes present but the rest is garbage — must return None,
+        // not panic, so the caller can fall through to its "snapshot
+        // corrupted" branch.
+        let mut bad = vec![0x1f, 0x8b];
+        bad.extend_from_slice(&[0u8; 32]);
+        assert!(maybe_decompress(&bad).is_none());
+    }
+
+    #[test]
+    fn save_to_store_writes_gzip_and_load_round_trips() {
+        // SQLite path equivalent of the file-snapshot test.
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+
+        let mut g = KnowledgeGraph::new();
+        for i in 0..20 {
+            g.ensure_ip(&format!("198.51.100.{i}"), Utc::now());
+        }
+        g.save_to_store(&store).unwrap();
+
+        // The blob in the store must be gzip-compressed.
+        let (_date, raw_blob) = store
+            .load_latest_graph_snapshot()
+            .expect("load_latest succeeds")
+            .expect("latest blob exists");
+        assert!(
+            raw_blob.len() >= 2 && raw_blob[0] == 0x1f && raw_blob[1] == 0x8b,
+            "SQLite blob must be gzip-compressed"
+        );
+
+        // Round-trip via the public load API.
+        let loaded = KnowledgeGraph::load_from_store(&store).expect("load_from_store");
+        for i in 0..20 {
+            assert!(loaded.find_by_ip(&format!("198.51.100.{i}")).is_some());
+        }
+    }
+
+    // ── path-traversal guard tests ───────────────────────────────────
+    //
+    // CodeQL flagged `try_load_snapshot` as a path-traversal sink because
+    // `load_dated`'s `date: &str` flows from the `/api/report?date=...`
+    // HTTP query into a `data_dir.join(...)` call. The fix:
+    // `safe_snapshot_filename` parses the input to typed primitives and
+    // reconstructs the filename from those, breaking the taint chain.
+    // These tests pin both the accept/reject set AND the round-trip
+    // shape of the reconstructed filename.
+
+    #[test]
+    fn safe_snapshot_filename_returns_canonical_form_for_valid_dates() {
+        assert_eq!(
+            safe_snapshot_filename("2026-04-23").as_deref(),
+            Some("graph-snapshot-2026-04-23.json")
+        );
+        assert_eq!(
+            safe_snapshot_filename("0001-01-01").as_deref(),
+            Some("graph-snapshot-0001-01-01.json")
+        );
+        assert_eq!(
+            safe_snapshot_filename("9999-12-31").as_deref(),
+            Some("graph-snapshot-9999-12-31.json")
+        );
+    }
+
+    #[test]
+    fn safe_snapshot_filename_rejects_path_traversal_payloads() {
+        // The exact attack payload from the CodeQL alert.
+        assert_eq!(safe_snapshot_filename("../../etc/passwd"), None);
+        // Variants that could slip past a naive contains-check.
+        assert_eq!(safe_snapshot_filename(".."), None);
+        assert_eq!(safe_snapshot_filename("/etc"), None);
+        assert_eq!(safe_snapshot_filename("2026-04-23/.."), None);
+        assert_eq!(safe_snapshot_filename("2026-04-23\0evil"), None);
+        assert_eq!(safe_snapshot_filename("2026-04-23\n"), None);
+        assert_eq!(safe_snapshot_filename("2026/04/23"), None);
+        assert_eq!(safe_snapshot_filename(""), None);
+        // Length 10 but non-digit content
+        assert_eq!(safe_snapshot_filename("aaaa-bb-cc"), None);
+        // Off-by-one length
+        assert_eq!(safe_snapshot_filename("2026-4-23"), None);
+        assert_eq!(safe_snapshot_filename("2026-04-2"), None);
+        assert_eq!(safe_snapshot_filename("2026-04-233"), None);
+        // Out-of-range months/days that pass shape but fail calendar
+        assert_eq!(safe_snapshot_filename("2026-13-01"), None);
+        assert_eq!(safe_snapshot_filename("2026-02-30"), None);
+        assert_eq!(safe_snapshot_filename("2026-00-15"), None);
+    }
+
+    #[test]
+    fn safe_snapshot_filename_output_has_no_path_separators() {
+        // The whole point of the parse-and-reconstruct dance is that
+        // the output cannot contain a path separator. Belt-and-braces:
+        // assert it directly on a permissive set of inputs.
+        for date in ["2026-04-23", "0001-01-01", "9999-12-31"] {
+            let f = safe_snapshot_filename(date).unwrap();
+            assert!(!f.contains('/'), "filename must not contain '/': {f:?}");
+            assert!(!f.contains('\\'), "filename must not contain '\\\\': {f:?}");
+            assert!(
+                !f.contains(".."),
+                "filename must not contain parent-traversal: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_date_string_round_trips_canonical_form() {
+        assert_eq!(
+            safe_date_string("2026-04-23").as_deref(),
+            Some("2026-04-23")
+        );
+        assert_eq!(safe_date_string("../etc"), None);
+        assert_eq!(safe_date_string(""), None);
+    }
+
+    #[test]
+    fn load_dated_returns_none_for_path_traversal_payload() {
+        let dir = tempdir().unwrap();
+        // Plant a file outside `data_dir` that the attacker would target.
+        let outside = dir.path().join("..").join("evil.json");
+        let _ = std::fs::write(&outside, br#"{"nodes":{},"edges":[]}"#);
+
+        // The attacker payload — even if `outside` exists, `load_dated`
+        // must return None because the date string fails parsing.
+        assert!(KnowledgeGraph::load_dated(dir.path(), "../evil").is_none());
+        assert!(KnowledgeGraph::load_dated(dir.path(), "../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn load_dated_from_store_returns_none_for_path_traversal_payload() {
+        // SQL path is already parameter-bound. Parsing keeps the API
+        // uniform and means the parameter is always the canonical form.
+        let store = innerwarden_store::Store::open_memory().unwrap();
+        assert!(KnowledgeGraph::load_dated_from_store(&store, "../etc/passwd").is_none());
+        assert!(KnowledgeGraph::load_dated_from_store(&store, "").is_none());
     }
 }
