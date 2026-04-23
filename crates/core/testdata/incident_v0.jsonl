@@ -1,0 +1,3 @@
+{"ts":"2026-04-17T12:30:00Z","host":"srv-01","incident_id":"ssh_bruteforce:203.0.113.5:1","severity":"critical","title":"SSH brute force burst","summary":"30 failed auth attempts in 2 min","evidence":{"attempt_count":30,"first_ts":"2026-04-17T12:28:00Z"},"recommended_checks":["review auth.log","rotate keys"],"tags":["ssh","brute"],"entities":[{"type":"ip","value":"203.0.113.5"}]}
+{"ts":"2026-04-17T12:31:00Z","host":"srv-01","incident_id":"minimal:test:1","severity":"medium","title":"Minimal incident","summary":"low-detail record"}
+{"ts":"2026-04-17T12:32:00Z","host":"srv-01","incident_id":"no_sev:test:1","title":"No severity","summary":"severity field absent, should default to Info"}

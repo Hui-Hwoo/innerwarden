@@ -1,0 +1,3 @@
+{"ts":"2026-04-17T12:30:00Z","host":"srv-01","source":"auth.log","kind":"auth_fail","severity":"high","summary":"Failed SSH auth from 203.0.113.5","details":{"user":"root","attempts":7},"tags":["ssh","brute"],"entities":[{"type":"ip","value":"203.0.113.5"}]}
+{"ts":"2026-04-17T12:31:00Z","host":"srv-01","source":"journald","kind":"systemd_fail","severity":"low","summary":"Service restart"}
+{"ts":"2026-04-17T12:32:00Z","host":"srv-01","source":"misc","kind":"generic","summary":"record with no severity field"}

@@ -114,6 +114,17 @@ pub(crate) fn write_incidents(
         for inc in incidents {
             match serde_json::from_value::<innerwarden_core::incident::Incident>(inc.clone()) {
                 Ok(parsed) => {
+                    // Structural guard: `core::Incident` now tolerates missing
+                    // fields via `#[serde(default)]` (spec 035 A5, JSONL
+                    // backwards compat), so garbage input like
+                    // `{"foo": 1}` parses into a default-filled Incident
+                    // with an empty `incident_id`. Drop those before they
+                    // reach sqlite — an incident without an id is not an
+                    // incident.
+                    if parsed.incident_id.is_empty() {
+                        warn!("killchain: incident missing incident_id, skipping");
+                        continue;
+                    }
                     if let Err(e) = store.insert_incident(&parsed) {
                         warn!(error = %e, "killchain: sqlite insert_incident failed");
                     } else {
@@ -412,8 +423,13 @@ mod tests {
         assert!(jsonl.contains("REVERSE_SHELL"));
     }
 
-    // A malformed incident (missing required fields) must not corrupt sqlite
-    // and must be skipped with a warning — the rest of the batch still writes.
+    // A malformed incident (missing `incident_id`) must be dropped before it
+    // reaches sqlite — the rest of the batch still writes. Pre-spec-035-A5
+    // the serde layer rejected records missing required fields; post-A5 the
+    // wire type tolerates missing fields (JSONL backwards-compat with old
+    // releases), so the guard moved to a structural check in `write_incidents`
+    // on the one invariant that still rules a record out as "not an incident":
+    // a non-empty id. See spec 035 A5 and the comment in `write_incidents`.
     #[test]
     fn write_incidents_skips_malformed_and_persists_valid() {
         let tmp = tempfile::tempdir().expect("tempdir");
