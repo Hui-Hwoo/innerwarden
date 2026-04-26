@@ -2079,6 +2079,84 @@ mod tests {
     }
 
     #[test]
+    fn train_nightly_runs_against_dedicated_store_when_agent_pool_is_saturated() {
+        // Spec 037 production fix anchor (2026-04-26): the 03 UTC training
+        // trigger opens a dedicated `Store` instead of borrowing
+        // `state.sqlite_store`, so a long-running training read cannot
+        // exhaust the agent's r2d2 pool and cascade into a tokio runtime
+        // deadlock. This test pins that property: hold every connection
+        // in pool A (the "agent" store), then run training against pool B
+        // (the "dedicated" store) on the same on-disk database. Training
+        // must succeed because the two pools are independent.
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::{Event, Severity};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool_a = innerwarden_store::Store::open(dir.path()).expect("agent store");
+
+        // Seed events through pool A — the rows are visible to any
+        // connection against the same on-disk DB.
+        let kinds = [
+            "file.read_access",
+            "shell.command_exec",
+            "network.outbound_connect",
+            "ssh.login_success",
+            "http.request",
+            "tcp_stream.ssh",
+        ];
+        let mut events = Vec::new();
+        for i in 0..1000 {
+            events.push(Event {
+                ts: Utc::now(),
+                host: "test-host".into(),
+                source: "test".into(),
+                kind: kinds[i % kinds.len()].into(),
+                severity: Severity::Info,
+                summary: "synthetic".into(),
+                details: serde_json::json!({"src_ip": "1.2.3.4"}),
+                tags: vec![],
+                entities: vec![EntityRef::ip("1.2.3.4")],
+            });
+        }
+        pool_a
+            .insert_events_batch(&events)
+            .expect("seed events for training");
+
+        // Saturate pool A — hold all 4 connections so any code path that
+        // tries to call `pool_a.conn()` would block. If training were
+        // still using `state.sqlite_store`, this would deadlock.
+        let _holds: Vec<_> = (0..4)
+            .map(|_| pool_a.conn().expect("acquire connection from pool A"))
+            .collect();
+
+        // Pool B = the "dedicated" store the production code now opens
+        // for training. Independent r2d2 pool, same DB file.
+        let pool_b = innerwarden_store::Store::open(dir.path()).expect("dedicated store");
+
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            training_epochs: 4,
+            training_timeout_secs: 60,
+            training_max_ram_mb: 64,
+            training_retention_days: 30,
+            threshold: 0.5,
+            ..AnomalyConfig::default()
+        });
+
+        // The proof: training completes while pool A is fully held.
+        engine
+            .train_nightly_with_store(Some(&pool_b))
+            .expect("training with dedicated store succeeds despite saturated agent pool");
+        assert!(
+            engine.training_cycles >= 1,
+            "training must have advanced at least one cycle"
+        );
+
+        drop(_holds);
+    }
+
+    #[test]
     fn train_nightly_with_store_falls_back_to_jsonl_when_sqlite_is_empty() {
         // Backward-compat path: pre-016 layouts keep working. A store without
         // events + JSONL fixtures in data_dir should still feed the trainer.

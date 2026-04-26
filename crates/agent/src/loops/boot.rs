@@ -1418,25 +1418,65 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             let today_key = format!("anomaly_train:{}", chrono::Utc::now().format("%Y-%m-%d"));
                             if !state.store.has_cooldown(state_store::CooldownTable::Decision, &today_key) {
                                 info!(trigger_hour, "autoencoder: triggering nightly training");
-                                let result = tokio::task::block_in_place(|| {
-                                    state.anomaly_engine.train_nightly_with_store(
-                                        state.sqlite_store.as_deref(),
-                                    )
-                                });
-                                match result {
-                                    Ok(()) => {
+                                // Open a dedicated `Store` for the training run instead
+                                // of borrowing `state.sqlite_store`. Training reads
+                                // tens of thousands of events synchronously and can
+                                // hold a connection from the agent's r2d2 pool
+                                // (max_size = 4) for several minutes. On 2026-04-26
+                                // 03:00 UTC this pinned a connection while the
+                                // slow_loop's other SQLite writers (events_since
+                                // cursor, KG snapshot save, response_lifecycle
+                                // persist) tried to grab the remaining slots; pool
+                                // exhaustion cascaded into a tokio runtime deadlock
+                                // (18/19 threads in `futex_wait_queue`), the same
+                                // pattern observed on 2026-04-25 02:59 UTC.
+                                //
+                                // A dedicated `Store` opens its own r2d2 pool
+                                // against the same `innerwarden.db` file (SQLite
+                                // WAL mode supports concurrent connections from
+                                // separate pools — sensor + agent already do this
+                                // routinely). The dedicated pool drops at the end
+                                // of the match arm, freeing its connections.
+                                //
+                                // Same pattern `run_retrain_anomaly` (CLI
+                                // `--retrain-anomaly`) has used since spec 016
+                                // (boot.rs:124-148): isolated training,
+                                // independent connection lifecycle.
+                                match innerwarden_store::Store::open(&cli.data_dir) {
+                                    Ok(dedicated_store) => {
                                         info!(
-                                            maturity = format!("{:.2}", state.anomaly_engine.maturity),
-                                            cycles = state.anomaly_engine.training_cycles,
-                                            "autoencoder: training complete"
+                                            "autoencoder: opening dedicated store for nightly training (isolated from slow_loop pool)"
                                         );
-                                        state.store.set_cooldown(
-                                            state_store::CooldownTable::Decision,
-                                            &today_key,
-                                            chrono::Utc::now(),
+                                        let result = tokio::task::block_in_place(|| {
+                                            state.anomaly_engine.train_nightly_with_store(
+                                                Some(&dedicated_store),
+                                            )
+                                        });
+                                        match result {
+                                            Ok(()) => {
+                                                info!(
+                                                    maturity = format!("{:.2}", state.anomaly_engine.maturity),
+                                                    cycles = state.anomaly_engine.training_cycles,
+                                                    "autoencoder: training complete"
+                                                );
+                                                state.store.set_cooldown(
+                                                    state_store::CooldownTable::Decision,
+                                                    &today_key,
+                                                    chrono::Utc::now(),
+                                                );
+                                            }
+                                            Err(e) => warn!(error = %e, "autoencoder training failed"),
+                                        }
+                                        // dedicated_store drops here — its 4
+                                        // r2d2 connections close, returning fd
+                                        // budget to the OS.
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            "autoencoder: cannot open dedicated store, skipping nightly training"
                                         );
                                     }
-                                    Err(e) => warn!("autoencoder training failed: {e}"),
                                 }
                             }
                         }
