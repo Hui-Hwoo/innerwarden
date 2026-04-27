@@ -84,6 +84,49 @@ async fn write_evidence_line_or_warn(
     }
 }
 
+/// Execute a `ResponseSkill` and surface failure outcomes via `warn!`
+/// with structured context. Replaces the prior
+/// `let _ = skill.execute(&ctx, dry_run).await;` value-discard at the
+/// AbuseIPDB-gate auto-block site (Spec 037 I-13 follow-up #2).
+///
+/// Why a helper rather than inlining: `ResponseSkill::execute` returns
+/// `SkillResult { success: bool, message: String }` (a value type, not
+/// `Result<_, Err>`), so the failure information lives in the value
+/// rather than the type system. The previous `let _ =` threw away
+/// both the outcome and the diagnostic — the operator had no signal
+/// when the gate fired but the skill rejected the input or the
+/// backend was unavailable, leaving the malicious IP unblocked.
+///
+/// The wrapper is silent on success (no per-call info-spam — the
+/// upstream decision audit at `decisions::append_chained` already
+/// records the gate decision) and emits a structured `warn!` on
+/// `success == false` carrying `ip`, `skill_id`, `dry_run`, and the
+/// skill's `message` for forensic context. Mirrors the established
+/// pattern at `decision_block_ip.rs::execute_block_ip_decision` for
+/// the firewall-skill failure path.
+///
+/// Returns `()` (infallible) so the call site stays one-line and the
+/// calling auto-block flow continues regardless of the skill's
+/// success — same observable shape as the prior `let _ =`.
+async fn execute_block_skill_or_warn(
+    skill: &dyn skills::ResponseSkill,
+    ctx: &skills::SkillContext,
+    dry_run: bool,
+    ip: &str,
+    skill_id: &str,
+) {
+    let result = skill.execute(ctx, dry_run).await;
+    if !result.success {
+        warn!(
+            ip,
+            skill_id,
+            dry_run,
+            reason = result.message,
+            "honeypot abuseipdb gate: block skill execution failed"
+        );
+    }
+}
+
 /// Handle a single always-on honeypot connection end-to-end:
 /// SSH key exchange, credential capture, optional LLM shell, evidence write,
 /// IOC extraction, AI verdict, auto-block, Telegram T.5 report.
@@ -597,7 +640,12 @@ async fn always_on_abuseipdb_block(
             _ => Some(Box::new(skills::builtin::BlockIpUfw)),
         };
         if let Some(skill) = skill_box {
-            let _ = skill.execute(&ctx, dry_run).await;
+            // Spec 037 I-13 follow-up #2: surface skill-execution
+            // failures (`SkillResult.success == false`) via warn
+            // with structured context. The decision audit row is
+            // already written upstream; this closes the loop on
+            // whether the auto-block actually applied.
+            execute_block_skill_or_warn(skill.as_ref(), &ctx, dry_run, ip, &skill_id).await;
         }
     }
 }
@@ -854,6 +902,177 @@ mod tests {
             after.as_slice(),
             pre,
             "a failed write must not somehow mutate the file"
+        );
+    }
+
+    // ── Spec 037 I-13 follow-up #2 — execute_block_skill_or_warn anchors ──
+    //
+    // Follow-up #2 converts the prior `let _ = skill.execute(..).await`
+    // value-discard at the AbuseIPDB-gate auto-block site into a
+    // `warn!`-on-`success=false` pattern via `execute_block_skill_or_warn`.
+    // Tests use real `BlockIpUfw` in dry-run with two contexts:
+    //
+    //   1. Valid `target_ip` → dry-run returns `success=true` →
+    //      helper must NOT emit the failure warn.
+    //   2. `target_ip = None` → `BlockIpUfw` returns `success=false`
+    //      with message "block-ip-ufw: no target IP in context" →
+    //      helper MUST emit the warn carrying ip + skill_id +
+    //      dry_run + reason.
+    //
+    // No mock skill needed — `BlockIpUfw` is deterministic in dry-run.
+    // Tests serialize via `crate::TRACING_CAPTURE_LOCK` (PR #310) so
+    // sibling capture tests cannot poison the assertions.
+
+    fn make_block_skill_ctx(target_ip: Option<&str>) -> skills::SkillContext {
+        skills::SkillContext {
+            incident: innerwarden_core::incident::Incident {
+                ts: chrono::Utc::now(),
+                host: "test-host".into(),
+                incident_id: "honeypot:always-on:abuseipdb:test".into(),
+                severity: innerwarden_core::event::Severity::High,
+                title: "test".into(),
+                summary: "test".into(),
+                evidence: serde_json::json!({}),
+                recommended_checks: vec![],
+                tags: vec![],
+                entities: vec![],
+            },
+            target_ip: target_ip.map(str::to_string),
+            target_user: None,
+            target_container: None,
+            duration_secs: None,
+            host: "test-host".into(),
+            data_dir: std::env::temp_dir(),
+            honeypot: skills::HoneypotRuntimeConfig::default(),
+            ai_provider: None,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_block_skill_or_warn_silent_on_success() {
+        // Happy path: BlockIpUfw + valid target_ip + dry_run=true
+        // → success=true → helper must NOT emit the failure warn.
+        //
+        // Uses `tracing::subscriber::set_default` (returns a thread-
+        // local guard that resets on drop) rather than the closure-
+        // form `with_default`, because we need to `.await` inside
+        // the dispatcher scope and the closure form does not allow
+        // suspending across await points. `#[tokio::test]` defaults
+        // to a current-thread runtime so the dispatcher
+        // thread-local stays in scope across the await.
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _dispatch_guard = tracing::subscriber::set_default(subscriber);
+
+        let ctx = make_block_skill_ctx(Some("203.0.113.42"));
+        let skill = skills::builtin::BlockIpUfw;
+
+        execute_block_skill_or_warn(&skill, &ctx, true, "203.0.113.42", "block-ip-ufw").await;
+
+        // Drop the dispatcher guard before reading the buffer so any
+        // tail flush lands.
+        drop(_dispatch_guard);
+
+        let captured_str =
+            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .expect("captured logs are utf8");
+        assert!(
+            !captured_str.contains("block skill execution failed"),
+            "successful skill execution must not emit the failure warn — got: {captured_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_block_skill_or_warn_emits_warn_on_failure() {
+        // Failure path: BlockIpUfw with target_ip=None forces
+        // success=false ("block-ip-ufw: no target IP in context").
+        // Helper must emit the warn carrying ip + skill_id +
+        // dry_run + reason.
+        //
+        // See sibling test for why we use `set_default` instead of
+        // `with_default` here.
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _dispatch_guard = tracing::subscriber::set_default(subscriber);
+
+        let ctx = make_block_skill_ctx(None);
+        let skill = skills::builtin::BlockIpUfw;
+
+        execute_block_skill_or_warn(&skill, &ctx, true, "198.51.100.1", "block-ip-ufw").await;
+
+        drop(_dispatch_guard);
+
+        let captured_str =
+            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .expect("captured logs are utf8");
+
+        assert!(
+            captured_str.contains("block skill execution failed"),
+            "warn message missing on failed skill execution — got: {captured_str}"
+        );
+        // ip field carries the operator-relevant target identifier
+        // (the IP that was supposed to be blocked).
+        assert!(
+            captured_str.contains("198.51.100.1"),
+            "ip field missing — got: {captured_str}"
+        );
+        // skill_id field tells the operator which backend failed.
+        assert!(
+            captured_str.contains("block-ip-ufw"),
+            "skill_id field missing — got: {captured_str}"
+        );
+        // dry_run flag distinguishes a real-world failure from a
+        // test-mode rejection in the operator log.
+        assert!(
+            captured_str.contains("dry_run=true"),
+            "dry_run field missing — got: {captured_str}"
+        );
+        // reason carries the SkillResult.message — needed to
+        // diagnose WHY the skill rejected the input.
+        assert!(
+            captured_str.contains("no target IP in context"),
+            "reason field missing skill-provided message — got: {captured_str}"
         );
     }
 }
