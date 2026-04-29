@@ -169,14 +169,28 @@ pub(super) async fn api_entities(
             query.severity_min.as_deref(),
             query.detector.as_deref(),
         );
-        let graph = graph_for_date(&state, explicit_date.as_deref());
-        let attackers = build_attackers_from_graph(
-            &graph,
-            limit,
-            &filters,
-            explicit_date.as_deref(),
-            state.sqlite_store.as_ref(),
-        );
+        // Phase 6 (audit RC-2 deeper close, second surface): the
+        // Threats left-rail list must read from durable SQLite, not
+        // the lossy in-memory KG. Phase 5 closed `/api/overview`'s
+        // count source. This closes the per-attacker list source so
+        // the operator no longer sees "Home: 22 handled / Threats:
+        // 1 attacker" because the KG TTL-evicted 109 of 110 IPs.
+        let sqlite_attackers = state
+            .sqlite_store
+            .as_ref()
+            .and_then(|store| build_attackers_from_sqlite(store, &display_date, &filters, limit));
+        let attackers = if let Some(att) = sqlite_attackers {
+            att
+        } else {
+            let graph = graph_for_date(&state, explicit_date.as_deref());
+            build_attackers_from_graph(
+                &graph,
+                limit,
+                &filters,
+                explicit_date.as_deref(),
+                state.sqlite_store.as_ref(),
+            )
+        };
         EntitiesResponse {
             date: display_date,
             attackers,
@@ -933,6 +947,198 @@ pub(super) fn severity_rank(s: &str) -> u8 {
         "info" => 1,
         _ => 0,
     }
+}
+
+/// Phase 6 (audit RC-2 second surface): build the IP-pivot attacker list
+/// from the durable SQLite store, not the lossy in-memory KG.
+///
+/// The KG's TTL eviction culls nodes after ~12h. Today's earlier
+/// attackers vanish from the KG by the afternoon, even though their
+/// incidents and decisions are still in SQLite. The operator's
+/// Threats list ended up showing 1 IP when 110 had actually fired
+/// during the day -- 99% drift. This SQL path reads the canonical
+/// store, applies the same canonical filters as `/api/overview`
+/// (Phase 5), and aggregates by IP exactly the way the prior
+/// graph-pivot path did.
+///
+/// Returns `None` if the SQL read fails (caller should fall back to
+/// graph path). Returns `Some(empty vec)` when SQLite is reachable
+/// but no qualifying incidents exist for `date` -- that is a real
+/// answer, not a fallback signal.
+pub(super) fn build_attackers_from_sqlite(
+    store: &std::sync::Arc<innerwarden_store::Store>,
+    date: &str,
+    filters: &InvestigationFilters,
+    limit: usize,
+) -> Option<Vec<AttackerSummary>> {
+    use crate::dashboard::threat_contract;
+
+    #[derive(Default)]
+    struct Acc {
+        first_seen: Option<chrono::DateTime<Utc>>,
+        last_seen: Option<chrono::DateTime<Utc>>,
+        max_severity_rank: u8,
+        max_severity_str: String,
+        detectors: BTreeSet<String>,
+        incident_outcomes: Vec<&'static str>,
+        incident_count: usize,
+    }
+    let conn = store.conn().ok()?;
+    let pattern = format!("{date}%");
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT i.incident_id, i.ts, i.detector, i.severity, i.title, i.data, \
+                    d.action_type \
+             FROM incidents i \
+             LEFT JOIN ( \
+                 SELECT incident_id, action_type, \
+                        ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id DESC) AS rn \
+                 FROM decisions \
+             ) d ON d.incident_id = i.incident_id AND d.rn = 1 \
+             WHERE i.ts LIKE ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([&pattern], |row| {
+            Ok((
+                row.get::<_, String>(0)?,         // incident_id
+                row.get::<_, String>(1)?,         // ts iso
+                row.get::<_, String>(2)?,         // detector
+                row.get::<_, String>(3)?,         // severity
+                row.get::<_, String>(4)?,         // title
+                row.get::<_, String>(5)?,         // data (JSON)
+                row.get::<_, Option<String>>(6)?, // action_type
+            ))
+        })
+        .ok()?;
+    let mut by_ip: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
+    for row in rows {
+        let Ok((_iid, ts_iso, detector, severity, title, data, action_type)) = row else {
+            continue;
+        };
+        // Parse JSON to extract IPs + research_only.
+        let parsed: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed
+            .get("research_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        // External IPs only (RFC 1918 / loopback excluded).
+        let ips: Vec<String> = parsed
+            .get("entities")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        let is_ip = e
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t.eq_ignore_ascii_case("ip"))
+                            .unwrap_or(false);
+                        if !is_ip {
+                            return None;
+                        }
+                        let value = e.get("value").and_then(|v| v.as_str())?;
+                        if value.is_empty() || crate::incident_auto_rules::is_internal_ip_pub(value)
+                        {
+                            return None;
+                        }
+                        Some(value.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ips.is_empty() {
+            continue;
+        }
+        // Same is_internal_incident_fields filter the live feed and
+        // /api/overview use, so the Threats list aggregates over
+        // exactly the same incidents the Home tile counts.
+        let has_external_ip = !ips.is_empty();
+        if crate::dashboard::live_feed::is_internal_incident_fields(
+            &detector,
+            &title,
+            has_external_ip,
+        ) {
+            continue;
+        }
+        // Operator severity_min filter.
+        let min_rank = filters.severity_min_rank();
+        if min_rank > 0 && severity_rank(&severity) < min_rank {
+            continue;
+        }
+        // Operator detector substring filter (already lowercased by from_query).
+        if let Some(needle) = filters.detector_lower() {
+            if !detector.to_ascii_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        let ts: chrono::DateTime<Utc> = match chrono::DateTime::parse_from_rfc3339(&ts_iso) {
+            Ok(t) => t.with_timezone(&Utc),
+            Err(_) => continue,
+        };
+        let sev_rank = severity_rank(&severity);
+        let outcome = threat_contract::classify_decision(action_type.as_deref(), Some("ok"));
+        // Detector display label: strip the suffix after the first
+        // colon so "ssh_bruteforce:178.105.x" displays as
+        // "ssh_bruteforce" -- matches the existing graph pivot
+        // detector aggregation.
+        let detector_label = detector.split(':').next().unwrap_or(&detector).to_string();
+        for ip in ips {
+            let entry = by_ip.entry(ip).or_default();
+            entry.incident_count += 1;
+            entry.detectors.insert(detector_label.clone());
+            entry.incident_outcomes.push(outcome);
+            match entry.first_seen {
+                Some(prev) if prev <= ts => {}
+                _ => entry.first_seen = Some(ts),
+            }
+            match entry.last_seen {
+                Some(prev) if prev >= ts => {}
+                _ => entry.last_seen = Some(ts),
+            }
+            if sev_rank > entry.max_severity_rank {
+                entry.max_severity_rank = sev_rank;
+                entry.max_severity_str = severity.to_lowercase();
+            }
+        }
+    }
+    let now = Utc::now();
+    let mut summaries: Vec<AttackerSummary> = by_ip
+        .into_iter()
+        .map(|(ip, acc)| {
+            let aggregate = threat_contract::aggregate_outcomes(acc.incident_outcomes);
+            AttackerSummary {
+                block_state: Some(threat_contract::block_state_for_ip(Some(store), &ip, now)),
+                ip,
+                first_seen: acc.first_seen.unwrap_or(now),
+                last_seen: acc.last_seen.unwrap_or(now),
+                max_severity: if acc.max_severity_str.is_empty() {
+                    "info".to_string()
+                } else {
+                    acc.max_severity_str
+                },
+                detectors: acc.detectors.into_iter().collect(),
+                outcome: aggregate.to_string(),
+                incident_count: acc.incident_count,
+                event_count: 0, // Phase 6 scope: incidents only; events come later
+            }
+        })
+        .collect();
+    // Same sort order the graph path used: most incidents first, then
+    // most recent.
+    summaries.sort_by(|a, b| {
+        b.incident_count
+            .cmp(&a.incident_count)
+            .then(b.last_seen.cmp(&a.last_seen))
+    });
+    summaries.truncate(limit);
+    Some(summaries)
 }
 
 pub(super) fn build_attackers_from_graph(
@@ -3740,6 +3946,226 @@ mod tests {
             attackers.iter().map(|a| a.ip.as_str()).collect();
         assert!(ips.contains("203.0.113.10"));
         assert!(!ips.contains("198.51.100.20"));
+    }
+
+    // ── Phase 6 anchors: attackers list from SQLite, KG-eviction-resistant ──
+    //
+    // The pre-Phase-6 Threats list iterated the in-memory KG. By
+    // afternoon TTL eviction had culled most of the day's attackers,
+    // and the operator saw "Home: 22 handled / Threats list: 1 IP"
+    // (99% drift, prod 2026-04-29). These anchors lock the SQLite
+    // path so any future revert is caught.
+
+    fn insert_attacker_test_incident(
+        store: &innerwarden_store::Store,
+        incident_id: &str,
+        ts_iso: &str,
+        severity: &str,
+        title: &str,
+        ip: &str,
+    ) {
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+        let sev = match severity.to_lowercase().as_str() {
+            "critical" => Severity::Critical,
+            "high" => Severity::High,
+            "medium" => Severity::Medium,
+            "low" => Severity::Low,
+            _ => Severity::Info,
+        };
+        let inc = Incident {
+            ts: chrono::DateTime::parse_from_rfc3339(ts_iso)
+                .unwrap()
+                .with_timezone(&Utc),
+            host: "test-host".into(),
+            incident_id: incident_id.into(),
+            severity: sev,
+            title: title.into(),
+            summary: "test".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip(ip)],
+        };
+        store.insert_incident(&inc).expect("insert");
+    }
+
+    fn insert_attacker_test_decision(
+        store: &innerwarden_store::Store,
+        incident_id: &str,
+        ts_iso: &str,
+        action: &str,
+        ip: &str,
+    ) {
+        let row = innerwarden_store::decisions::DecisionRow {
+            ts: ts_iso.into(),
+            incident_id: incident_id.into(),
+            action_type: action.into(),
+            target_ip: Some(ip.into()),
+            target_user: None,
+            confidence: 1.0,
+            auto_executed: true,
+            reason: Some("test".into()),
+            data: serde_json::json!({"action_type": action}).to_string(),
+        };
+        store.insert_decision(&row).expect("insert");
+    }
+
+    #[test]
+    fn build_attackers_from_sqlite_returns_all_external_ips_for_date() {
+        // The motivating regression: 110 unique IPs fired today on
+        // prod, KG showed 1 because TTL eviction culled the rest.
+        // SQLite path must return ALL of today's external IPs.
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let date = "2026-04-29";
+        // 3 different external IPs across 4 incidents.
+        insert_attacker_test_incident(
+            &store,
+            "ssh:bf:1",
+            "2026-04-29T01:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.10",
+        );
+        insert_attacker_test_decision(
+            &store,
+            "ssh:bf:1",
+            "2026-04-29T01:00:01Z",
+            "block_ip",
+            "203.0.113.10",
+        );
+        insert_attacker_test_incident(
+            &store,
+            "ssh:bf:2",
+            "2026-04-29T05:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.10",
+        );
+        insert_attacker_test_decision(
+            &store,
+            "ssh:bf:2",
+            "2026-04-29T05:00:01Z",
+            "block_ip",
+            "203.0.113.10",
+        );
+        insert_attacker_test_incident(
+            &store,
+            "ssh:bf:3",
+            "2026-04-29T06:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.20",
+        );
+        insert_attacker_test_decision(
+            &store,
+            "ssh:bf:3",
+            "2026-04-29T06:00:01Z",
+            "monitor",
+            "203.0.113.20",
+        );
+        insert_attacker_test_incident(
+            &store,
+            "ssh:bf:4",
+            "2026-04-29T11:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.30",
+        );
+        // No decision for ssh:bf:4 -> open.
+        // Yesterday's incident must NOT leak.
+        insert_attacker_test_incident(
+            &store,
+            "ssh:bf:old",
+            "2026-04-28T22:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.99",
+        );
+
+        let filters = InvestigationFilters::from_query(None, None);
+        let attackers = build_attackers_from_sqlite(&store, date, &filters, 100)
+            .expect("sqlite path returns Some");
+        let ips: std::collections::HashSet<&str> =
+            attackers.iter().map(|a| a.ip.as_str()).collect();
+        assert_eq!(attackers.len(), 3, "today's 3 unique IPs (not yesterday)");
+        assert!(ips.contains("203.0.113.10"));
+        assert!(ips.contains("203.0.113.20"));
+        assert!(ips.contains("203.0.113.30"));
+        assert!(!ips.contains("203.0.113.99"), "yesterday must not leak");
+        // 203.0.113.10 had 2 incidents.
+        let ip10 = attackers
+            .iter()
+            .find(|a| a.ip == "203.0.113.10")
+            .expect("ip10");
+        assert_eq!(ip10.incident_count, 2);
+        // Aggregate outcome for IP-with-block_ip-decisions = blocked.
+        assert_eq!(ip10.outcome, "blocked");
+    }
+
+    #[test]
+    fn build_attackers_from_sqlite_excludes_internal_ips() {
+        // RFC 1918 IPs must be excluded -- otherwise the operator
+        // sees their own server's outbound NAT IP as an attacker.
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let date = "2026-04-29";
+        insert_attacker_test_incident(
+            &store,
+            "ssh:internal",
+            "2026-04-29T01:00:00Z",
+            "high",
+            "ssh brute",
+            "10.0.0.5",
+        );
+        insert_attacker_test_incident(
+            &store,
+            "ssh:external",
+            "2026-04-29T02:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.10",
+        );
+        let filters = InvestigationFilters::from_query(None, None);
+        let attackers = build_attackers_from_sqlite(&store, date, &filters, 100)
+            .expect("sqlite path returns Some");
+        let ips: Vec<&str> = attackers.iter().map(|a| a.ip.as_str()).collect();
+        assert_eq!(ips, vec!["203.0.113.10"]);
+    }
+
+    #[tokio::test]
+    async fn api_entities_uses_sqlite_when_kg_evicted() {
+        // End-to-end: graph empty (TTL eviction simulated), SQLite has
+        // attackers. The handler must return them from SQLite, not 0.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let today = chrono::Utc::now().date_naive().to_string();
+        let ts = format!("{today}T01:00:00Z");
+        insert_attacker_test_incident(&store, "ssh:1", &ts, "high", "ssh brute", "203.0.113.10");
+        insert_attacker_test_decision(
+            &store,
+            "ssh:1",
+            &format!("{today}T01:00:01Z"),
+            "block_ip",
+            "203.0.113.10",
+        );
+        state.sqlite_store = Some(store);
+        // KG stays empty -> simulates the post-eviction state.
+        let q = EntitiesQuery {
+            limit: Some(50),
+            date: None,
+            severity_min: None,
+            detector: None,
+            group_by: None,
+        };
+        let Json(resp) = api_entities(State(state), Query(q)).await;
+        assert_eq!(resp.attackers.len(), 1, "must return SQLite attacker");
+        assert_eq!(resp.attackers[0].ip, "203.0.113.10");
+        assert_eq!(resp.attackers[0].outcome, "blocked");
     }
 
     // ── Phase 3 anchors: block_state plumbing on the IP pivot ──────────
