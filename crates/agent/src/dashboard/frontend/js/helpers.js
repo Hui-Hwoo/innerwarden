@@ -143,6 +143,51 @@ function aggregateIncidents(incidents) {
   });
 }
 
+// Phase 12 (QA fix #1, 2026-04-29): persistent header pill
+// (#modeBadge) used to show GUARD/WATCH/MONITOR forever, never
+// reflecting runtime health. When SystemHealth flipped to
+// AiNotResponding (red Hero alert), pill stayed green
+// "PROTECTED" — two contradictory states on one screen. This
+// helper syncs the pill from /api/overview.snapshot every time
+// the home or threats page refreshes overview.
+//
+// Priority: critical health alert > medium (backed up / abandoned
+// backlog) > steady mode-badge from actionCfg.
+function syncModeBadgeFromHealth(overview, modeCfg) {
+  var badge = document.getElementById('modeBadge');
+  if (!badge) return;
+  var health = overview && overview.snapshot && overview.snapshot.health;
+  if (health && health.kind === 'ai_not_responding') {
+    badge.textContent = '⚠ AI NOT RESPONDING';
+    badge.className = 'status-badge status-badge-alert';
+    badge.title = 'AI provider/classifier is not answering. See system health.';
+    return;
+  }
+  if (health && (health.kind === 'backed_up' || health.kind === 'abandoned_backlog')) {
+    badge.textContent = '⏳ CATCHING UP';
+    badge.className = 'status-badge status-badge-medium';
+    badge.title = 'AI is processing a backlog. Current protection is unaffected.';
+    return;
+  }
+  // Steady state: restore the mode badge from cached actionCfg.
+  // Source of truth is actions.js — we mirror it here.
+  if (modeCfg) {
+    if (modeCfg.enabled) {
+      if (modeCfg.dry_run) {
+        badge.textContent = '👁 WATCHING';
+        badge.className = 'status-badge status-badge-watch';
+      } else {
+        badge.textContent = '🛡 PROTECTED';
+        badge.className = 'status-badge status-badge-guard';
+      }
+    } else {
+      badge.textContent = '📖 MONITOR';
+      badge.className = 'status-badge status-badge-read';
+    }
+    badge.title = '';
+  }
+}
+
 function outcomeBadgeHtml(outcome) {
   if (outcome === 'blocked' || outcome === 'killed' || outcome === 'contained' || outcome === 'suspended')
     return '<span class="badge-contained">BLOCKED</span>';

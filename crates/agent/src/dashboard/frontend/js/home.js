@@ -60,6 +60,11 @@ async function loadHome() {
 
     updateHomeNow(overview, activeHighCriticalList.length, softStale, totalEventsScanned);
     updateHomeKpis(overview, totalEventsScanned);
+    // Phase 12 (QA fix #1): keep the persistent header pill in sync
+    // with runtime SystemHealth. Without this, the green "PROTECTED"
+    // pill stayed up while the hero said "System Health Alert" — a
+    // contradictory state on one screen.
+    syncModeBadgeFromHealth(overview, actionCfg);
     updateCollectorStrip(sensors);
     loadBriefing();
   } catch(e) { console.warn('loadHome error:', e); }
@@ -272,9 +277,13 @@ function updateHomeBanner(status, homeState) {
       telemetryHtml = '<span class="home-meta-item">\u2764 ' + telemetrySecs + 's ago</span>';
     }
 
-    var links = '<a href="javascript:void(0)" class="home-link" onclick="viewActivity()">View activity \u2192</a>';
+    // Phase 12 (QA fix #5, 2026-04-29): real navigable anchors
+    // (href="#threats" / "#health") instead of javascript:void(0)
+    // — Cmd/Ctrl+click opens in new tab, screen readers announce
+    // them as actual links.
+    var links = '<a href="#threats" class="home-link" onclick="event.preventDefault(); viewActivity()">View activity \u2192</a>';
     if (homeState.state === 'health_alert') {
-      links += ' <a href="javascript:void(0)" class="home-link" onclick="viewSystemHealth()">View system health \u2192</a>';
+      links += ' <a href="#health" class="home-link" onclick="event.preventDefault(); viewSystemHealth()">View system health \u2192</a>';
     }
 
     meta.innerHTML =

@@ -231,11 +231,20 @@ function renderCard(item) {
   const recentDot = isRecent ? '<span class="' + dotClass + '" title="Active in last 5 min"></span>' : '';
   const sevDim = isContained ? ';opacity:0.5' : '';
 
+  // Phase 12 (QA fix #5, 2026-04-29): cards used to be <div onclick>
+  // — not focusable, screen readers couldn't announce them as actions,
+  // no Cmd/Ctrl+click affordance. Now <button> with type="button"
+  // gives keyboard focus, screen-reader role=button by default, and
+  // a visible focus ring. Layout stays the same via class re-use.
+  var ariaLabel = 'Open threat details for ' + value + '. Severity ' +
+    sev + ', ' + (item.incident_count || 0) + ' incidents.';
   return `
-    <div class="attacker-card${active}"
-         data-subject-type="${esc(state.pivot)}"
-         data-subject-value="${esc(value)}"
-         onclick="loadJourney('${esc(state.pivot)}','${esc(value)}')">
+    <button type="button"
+            class="attacker-card${active}"
+            data-subject-type="${esc(state.pivot)}"
+            data-subject-value="${esc(value)}"
+            aria-label="${esc(ariaLabel)}"
+            onclick="loadJourney('${esc(state.pivot)}','${esc(value)}')">
       <div class="card-row">
         <div class="card-ip">${recentDot} ${esc(value)}</div>
         <span class="${sevCss}" style="font-size:0.65rem;font-weight:700${sevDim}">${esc(sev.toUpperCase())}</span>
@@ -246,7 +255,7 @@ function renderCard(item) {
         <span class="card-time">${ago(item.last_seen)}</span>
       </div>
       ${badges ? `<div class="card-badges">${badges}</div>` : ''}
-    </div>`;
+    </button>`;
 }
 
 function renderClusterCard(cluster) {
@@ -397,6 +406,33 @@ function setThreatsDate(date) {
 }
 
 function setThreatsPivot(p) {
+  // Phase 12 (QA fix #4, 2026-04-29): switching pivot used to leave
+  // the right-side journey panel showing the previously selected
+  // subject (e.g. an IP detail still rendered after switching to
+  // User pivot — orphaned context, confusing). Clear the selection
+  // and reset the journey pane so the new pivot list looks clean.
+  if (state.pivot !== p) {
+    state.selected = { type: null, value: null };
+    state.lastSubjectKey = null;
+    var pane = document.getElementById('journeyPane');
+    if (pane) {
+      pane.innerHTML =
+        '<div class="empty" style="padding:30px 24px;text-align:center;color:var(--muted)">' +
+        '<div style="font-size:1.6rem;margin-bottom:8px">🔍</div>' +
+        '<div>Select a threat to investigate</div>' +
+        '</div>';
+    }
+    // Clear selection highlight on cards.
+    document.querySelectorAll('.attacker-card.active').forEach(function(c) {
+      c.classList.remove('active');
+    });
+    // Push a clean URL state so a refresh / share doesn't re-open
+    // a stale subject from the pre-switch pivot.
+    if (typeof history !== 'undefined' && history.replaceState) {
+      var qs = '?pivot=' + encodeURIComponent(p);
+      history.replaceState(null, '', qs + '#threats');
+    }
+  }
   state.pivot = p;
   document.querySelectorAll('.pivot-tab').forEach(function(t) {
     t.classList.toggle('active', t.getAttribute('data-pivot') === p);
@@ -514,6 +550,14 @@ async function refreshLeft(forceRefreshJourney = false) {
     // Store agent mode globally so outcomeOf() can adapt.
     // guard = AI blocks autonomously, watch/read_only = AI detects only.
     window._agentMode = statusData.mode || 'guard';
+
+    // Phase 12 (QA fix #1): persistent header pill must reflect
+    // runtime SystemHealth, not just the static GUARD/WATCH mode.
+    // Without this, the operator sees green "PROTECTED" alongside
+    // a red Hero alert — two contradictory states on one screen.
+    if (typeof syncModeBadgeFromHealth === 'function') {
+      syncModeBadgeFromHealth(ov, typeof actionCfg !== 'undefined' ? actionCfg : null);
+    }
 
     const items = entityData.items || [];
     state.clusters = clusterData.items || [];

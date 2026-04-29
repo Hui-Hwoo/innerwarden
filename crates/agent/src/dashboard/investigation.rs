@@ -47,43 +47,69 @@ pub(super) async fn api_threats_diagnostic(
             query.detector.as_deref(),
         );
 
-        let graph = graph_for_date(&state, explicit_date.as_deref());
-        let ip_count = build_pivots_from_graph(
-            &graph,
-            PivotKind::Ip,
-            500,
-            &filters,
-            explicit_date.as_deref(),
-        )
-        .len();
-        let user_count = build_pivots_from_graph(
-            &graph,
-            PivotKind::User,
-            500,
-            &filters,
-            explicit_date.as_deref(),
-        )
-        .len();
-        let det_count = build_pivots_from_graph(
-            &graph,
-            PivotKind::Detector,
-            500,
-            &filters,
-            explicit_date.as_deref(),
-        )
-        .len();
+        // Phase 12 (QA fix #3): the diagnostic now mirrors the same
+        // SQLite path the entities/pivots endpoints use, so its
+        // counts match the actual data the operator's list shows.
+        // Pre-Phase-12 the diagnostic walked the lossy KG and
+        // reported `scope_mismatch=true` whenever the KG was sparse,
+        // even though SQLite had the data — wrong empty-state copy.
+        let pivots_from_sqlite = state.sqlite_store.as_ref().map(|store| {
+            let ip_items =
+                build_pivots_from_sqlite(store, &display_date, PivotKind::Ip, &filters, 500)
+                    .unwrap_or_default();
+            let user_items =
+                build_pivots_from_sqlite(store, &display_date, PivotKind::User, &filters, 500)
+                    .unwrap_or_default();
+            let det_items =
+                build_pivots_from_sqlite(store, &display_date, PivotKind::Detector, &filters, 500)
+                    .unwrap_or_default();
+            (ip_items, user_items, det_items)
+        });
+        let (ip_count, user_count, det_count, incidents_in_scope) = match pivots_from_sqlite {
+            Some((ip_items, user_items, det_items)) => {
+                let inc_sum: usize = det_items.iter().map(|p| p.incident_count).sum();
+                (ip_items.len(), user_items.len(), det_items.len(), inc_sum)
+            }
+            None => {
+                let graph = graph_for_date(&state, explicit_date.as_deref());
+                let ip_count = build_pivots_from_graph(
+                    &graph,
+                    PivotKind::Ip,
+                    500,
+                    &filters,
+                    explicit_date.as_deref(),
+                )
+                .len();
+                let user_count = build_pivots_from_graph(
+                    &graph,
+                    PivotKind::User,
+                    500,
+                    &filters,
+                    explicit_date.as_deref(),
+                )
+                .len();
+                let det_count = build_pivots_from_graph(
+                    &graph,
+                    PivotKind::Detector,
+                    500,
+                    &filters,
+                    explicit_date.as_deref(),
+                )
+                .len();
+                let inc_sum: usize = build_pivots_from_graph(
+                    &graph,
+                    PivotKind::Detector,
+                    500,
+                    &filters,
+                    explicit_date.as_deref(),
+                )
+                .iter()
+                .map(|p| p.incident_count)
+                .sum();
+                (ip_count, user_count, det_count, inc_sum)
+            }
+        };
         let total_pivot = ip_count + user_count + det_count;
-
-        let incidents_in_scope = build_pivots_from_graph(
-            &graph,
-            PivotKind::Detector,
-            500,
-            &filters,
-            explicit_date.as_deref(),
-        )
-        .iter()
-        .map(|p| p.incident_count)
-        .sum();
 
         let has_incidents = incidents_in_scope > 0;
         let has_entities = (ip_count + user_count) > 0;
@@ -208,7 +234,17 @@ pub(super) async fn api_pivots(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,
 ) -> Json<PivotResponse> {
-    // Audit I-06: same blocking-pool treatment as api_entities.
+    // Phase 12 (QA fix #3, 2026-04-29): the User and Detector pivots
+    // were still reading from the lossy in-memory KG via
+    // `build_pivots_from_graph`, the same way Phase 6 found the IP
+    // pivot to be broken. With operator's severity=critical filter
+    // applied, the lossy KG returns 0 because today's earlier
+    // critical incidents got TTL-evicted, and the empty list shows
+    // the "No incidents on YYYY-MM-DD / Pick a date with data"
+    // diagnostic — even though SQLite has the incidents intact.
+    // Migration mirrors Phase 6 / 8 / 10: read SQLite primarily,
+    // fall back to graph only when the store is unreachable (test
+    // fixtures).
     let response = tokio::task::spawn_blocking(move || {
         let display_date = resolve_date(query.date.as_deref());
         let explicit_date = explicit_date_filter(query.date.as_deref()).map(|s| s.to_string());
@@ -218,9 +254,15 @@ pub(super) async fn api_pivots(
             query.severity_min.as_deref(),
             query.detector.as_deref(),
         );
-        let graph = graph_for_date(&state, explicit_date.as_deref());
-        let items =
-            build_pivots_from_graph(&graph, group_by, limit, &filters, explicit_date.as_deref());
+        let sqlite_items = state.sqlite_store.as_ref().and_then(|store| {
+            build_pivots_from_sqlite(store, &display_date, group_by, &filters, limit)
+        });
+        let items = if let Some(items) = sqlite_items {
+            items
+        } else {
+            let graph = graph_for_date(&state, explicit_date.as_deref());
+            build_pivots_from_graph(&graph, group_by, limit, &filters, explicit_date.as_deref())
+        };
         PivotResponse {
             date: display_date,
             group_by: group_by.as_str().to_string(),
@@ -965,6 +1007,238 @@ pub(super) fn severity_rank(s: &str) -> u8 {
 /// graph path). Returns `Some(empty vec)` when SQLite is reachable
 /// but no qualifying incidents exist for `date` -- that is a real
 /// answer, not a fallback signal.
+/// Phase 12 (QA fix #3, 2026-04-29): SQLite-backed pivot builder
+/// for User and Detector groupings (IP grouping uses
+/// `build_attackers_from_sqlite` and is converted via the wrapper
+/// below). Mirrors the filter stack of the IP-pivot path so all
+/// three pivots agree on which incidents qualify.
+///
+/// Returns `None` if the SQL read fails — caller falls back to the
+/// graph-based path.
+pub(super) fn build_pivots_from_sqlite(
+    store: &std::sync::Arc<innerwarden_store::Store>,
+    date: &str,
+    group_by: PivotKind,
+    filters: &InvestigationFilters,
+    limit: usize,
+) -> Option<Vec<PivotItem>> {
+    use crate::dashboard::threat_contract;
+
+    // For IP pivot, reuse the existing function and project to PivotItem.
+    if group_by == PivotKind::Ip {
+        let attackers = build_attackers_from_sqlite(store, date, filters, limit)?;
+        return Some(
+            attackers
+                .into_iter()
+                .map(|a| PivotItem {
+                    group_by: "ip".to_string(),
+                    value: a.ip,
+                    first_seen: a.first_seen,
+                    last_seen: a.last_seen,
+                    max_severity: a.max_severity,
+                    incident_count: a.incident_count,
+                    event_count: a.event_count,
+                    outcome: a.outcome,
+                    detectors: a.detectors,
+                })
+                .collect(),
+        );
+    }
+
+    // User and Detector branches: walk SQLite incidents+latest decision,
+    // group by the appropriate value.
+    #[derive(Default)]
+    struct Acc {
+        first_seen: Option<chrono::DateTime<Utc>>,
+        last_seen: Option<chrono::DateTime<Utc>>,
+        max_severity_rank: u8,
+        max_severity_str: String,
+        detectors: BTreeSet<String>,
+        incident_outcomes: Vec<&'static str>,
+        incident_count: usize,
+        any_allowlisted: bool,
+    }
+    let conn = store.conn().ok()?;
+    let pattern = format!("{date}%");
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT i.incident_id, i.ts, i.detector, i.severity, i.title, i.data, \
+                    i.is_allowlisted, d.action_type \
+             FROM incidents i \
+             LEFT JOIN ( \
+                 SELECT incident_id, action_type, \
+                        ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id DESC) AS rn \
+                 FROM decisions \
+             ) d ON d.incident_id = i.incident_id AND d.rn = 1 \
+             WHERE i.ts LIKE ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([&pattern], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })
+        .ok()?;
+    let mut grouped: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
+    for row in rows {
+        let Ok((_iid, ts_iso, detector, severity, title, data, allow_flag, action_type)) = row
+        else {
+            continue;
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed
+            .get("research_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        // Pull external IPs to feed is_internal_incident_fields. Same
+        // semantic as the IP-pivot path: IP must be external for the
+        // incident to be operator-relevant.
+        let external_ip_present = parsed
+            .get("entities")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|e| {
+                    let is_ip = e
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.eq_ignore_ascii_case("ip"))
+                        .unwrap_or(false);
+                    if !is_ip {
+                        return false;
+                    }
+                    let value = e.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    !value.is_empty() && !crate::incident_auto_rules::is_internal_ip_pub(value)
+                })
+            })
+            .unwrap_or(false);
+        if crate::dashboard::live_feed::is_internal_incident_fields(
+            &detector,
+            &title,
+            external_ip_present,
+        ) {
+            continue;
+        }
+        // Severity + detector operator filters.
+        let min_rank = filters.severity_min_rank();
+        if min_rank > 0 && severity_rank(&severity) < min_rank {
+            continue;
+        }
+        if let Some(needle) = filters.detector_lower() {
+            if !detector.to_ascii_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        let ts: chrono::DateTime<Utc> = match chrono::DateTime::parse_from_rfc3339(&ts_iso) {
+            Ok(t) => t.with_timezone(&Utc),
+            Err(_) => continue,
+        };
+        let sev_rank = severity_rank(&severity);
+        let outcome = threat_contract::classify_decision(action_type.as_deref(), Some("ok"));
+        let detector_label = detector.split(':').next().unwrap_or(&detector).to_string();
+
+        // Extract group keys per pivot kind.
+        let keys: Vec<String> = match group_by {
+            PivotKind::User => parsed
+                .get("entities")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            let is_user = e
+                                .get("type")
+                                .and_then(|t| t.as_str())
+                                .map(|t| t.eq_ignore_ascii_case("user"))
+                                .unwrap_or(false);
+                            if !is_user {
+                                return None;
+                            }
+                            let value = e.get("value").and_then(|v| v.as_str())?;
+                            if value.is_empty() {
+                                return None;
+                            }
+                            Some(value.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            PivotKind::Detector => vec![detector_label.clone()],
+            PivotKind::Ip => unreachable!("IP pivot handled above"),
+        };
+        if keys.is_empty() {
+            continue;
+        }
+        for key in keys {
+            let entry = grouped.entry(key).or_default();
+            entry.incident_count += 1;
+            entry.detectors.insert(detector_label.clone());
+            entry.incident_outcomes.push(outcome);
+            if allow_flag != 0 {
+                entry.any_allowlisted = true;
+            }
+            match entry.first_seen {
+                Some(prev) if prev <= ts => {}
+                _ => entry.first_seen = Some(ts),
+            }
+            match entry.last_seen {
+                Some(prev) if prev >= ts => {}
+                _ => entry.last_seen = Some(ts),
+            }
+            if sev_rank > entry.max_severity_rank {
+                entry.max_severity_rank = sev_rank;
+                entry.max_severity_str = severity.to_lowercase();
+            }
+        }
+    }
+    let now = Utc::now();
+    let group_label = group_by.as_str().to_string();
+    let mut items: Vec<PivotItem> = grouped
+        .into_iter()
+        .map(|(value, acc)| {
+            let aggregate = if acc.any_allowlisted {
+                "allowlisted"
+            } else {
+                threat_contract::aggregate_outcomes(acc.incident_outcomes)
+            };
+            PivotItem {
+                group_by: group_label.clone(),
+                value,
+                first_seen: acc.first_seen.unwrap_or(now),
+                last_seen: acc.last_seen.unwrap_or(now),
+                max_severity: if acc.max_severity_str.is_empty() {
+                    "info".to_string()
+                } else {
+                    acc.max_severity_str
+                },
+                incident_count: acc.incident_count,
+                event_count: 0,
+                outcome: aggregate.to_string(),
+                detectors: acc.detectors.into_iter().collect(),
+            }
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        b.incident_count
+            .cmp(&a.incident_count)
+            .then(b.last_seen.cmp(&a.last_seen))
+    });
+    items.truncate(limit);
+    Some(items)
+}
+
 pub(super) fn build_attackers_from_sqlite(
     store: &std::sync::Arc<innerwarden_store::Store>,
     date: &str,
@@ -4475,6 +4749,133 @@ mod tests {
             hostile.outcome, "blocked",
             "non-allowlisted IP keeps its real outcome"
         );
+    }
+
+    // ── Phase 12 anchors: pivots from SQLite (User + Detector) ────────
+    //
+    // Phase 6 migrated /api/entities (IP pivot only) to SQLite, but
+    // /api/pivots (User + Detector) was still reading from the lossy
+    // KG. With operator's severity=critical filter, the lossy KG
+    // returned 0 because today's earlier critical incidents got
+    // TTL-evicted, and the empty list rendered the "No incidents on
+    // YYYY-MM-DD / Pick a date" diagnostic — even though SQLite
+    // had the incidents intact. These anchors prove the SQLite path
+    // returns the right groupings under severity filter.
+
+    #[test]
+    fn build_pivots_from_sqlite_user_groups_under_severity_filter() {
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let date = "2026-04-29";
+        // Insert a CRITICAL incident with both an IP and a user entity.
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+        let inc = Incident {
+            ts: chrono::DateTime::parse_from_rfc3339("2026-04-29T01:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            host: "h".into(),
+            incident_id: "ssh:bf:1".into(),
+            severity: Severity::Critical,
+            title: "ssh brute".into(),
+            summary: "x".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("203.0.113.10"), EntityRef::user("alice")],
+        };
+        store.insert_incident(&inc).expect("insert");
+        // Also insert a LOW incident that must NOT appear under the
+        // critical filter — proves filter actually narrows.
+        let inc_low = Incident {
+            ts: chrono::DateTime::parse_from_rfc3339("2026-04-29T02:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            host: "h".into(),
+            incident_id: "noise:1".into(),
+            severity: Severity::Low,
+            title: "noise".into(),
+            summary: "x".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("203.0.113.20"), EntityRef::user("bob")],
+        };
+        store.insert_incident(&inc_low).expect("insert");
+
+        let critical_filter = InvestigationFilters::from_query(Some("critical"), None);
+        let users = build_pivots_from_sqlite(&store, date, PivotKind::User, &critical_filter, 100)
+            .expect("user pivot returns Some");
+        let names: Vec<&str> = users.iter().map(|p| p.value.as_str()).collect();
+        assert_eq!(names, vec!["alice"], "only user from critical incident");
+    }
+
+    #[test]
+    fn build_pivots_from_sqlite_detector_groups_under_severity_filter() {
+        // Same scenario, detector pivot. Critical kill_chain incident
+        // must surface under critical filter; low proto_anomaly must
+        // not.
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let date = "2026-04-29";
+        insert_attacker_test_incident(
+            &store,
+            "kill_chain:detected:1",
+            "2026-04-29T01:00:00Z",
+            "critical",
+            "Kill chain DATA_EXFIL",
+            "203.0.113.10",
+        );
+        insert_attacker_test_incident(
+            &store,
+            "proto_anomaly:weird",
+            "2026-04-29T02:00:00Z",
+            "low",
+            "weird ssh",
+            "203.0.113.20",
+        );
+        let critical_filter = InvestigationFilters::from_query(Some("critical"), None);
+        let detectors =
+            build_pivots_from_sqlite(&store, date, PivotKind::Detector, &critical_filter, 100)
+                .expect("detector pivot");
+        let labels: Vec<&str> = detectors.iter().map(|p| p.value.as_str()).collect();
+        assert_eq!(labels, vec!["kill_chain"], "only critical detector");
+    }
+
+    #[tokio::test]
+    async fn api_pivots_falls_back_to_sqlite_when_kg_evicted() {
+        // End-to-end through api_pivots: KG empty (post-eviction),
+        // SQLite has incidents. The handler must surface them.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let today = chrono::Utc::now().date_naive().to_string();
+        let ts = format!("{today}T01:00:00Z");
+        insert_attacker_test_incident(
+            &store,
+            "kill_chain:detected:1",
+            &ts,
+            "critical",
+            "Kill chain DATA_EXFIL",
+            "203.0.113.10",
+        );
+        state.sqlite_store = Some(store);
+        let q = EntitiesQuery {
+            limit: Some(100),
+            date: None,
+            severity_min: Some("critical".to_string()),
+            detector: None,
+            group_by: Some("detector".to_string()),
+        };
+        let Json(resp) = api_pivots(State(state), Query(q)).await;
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "SQLite must surface critical detector even with empty KG"
+        );
+        assert_eq!(resp.items[0].value, "kill_chain");
     }
 
     #[tokio::test]
