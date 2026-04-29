@@ -278,11 +278,19 @@ pub(super) async fn api_incidents(
     Query(query): Query<ListQuery>,
 ) -> Json<IncidentListResponse> {
     let date = resolve_date(query.date.as_deref());
+    // 2026-04-29: respect the explicit date filter the operator sets
+    // in the Threats date input + load that day's snapshot from
+    // SQLite when it differs from today.
+    let explicit_date =
+        crate::dashboard::investigation::explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
 
-    // Read from knowledge graph (live)
     use crate::knowledge_graph::types::{Node, NodeType};
-    let graph = state.knowledge_graph.read().unwrap();
+    let arc_graph = crate::dashboard::investigation::graph_for_date(&state, explicit_date);
+    let graph = arc_graph.read().unwrap();
+
+    let date_filter: Option<chrono::NaiveDate> =
+        explicit_date.and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
     let mut incident_views: Vec<IncidentView> = graph
         .nodes_of_type(NodeType::Incident)
@@ -302,11 +310,13 @@ pub(super) async fn api_incidents(
                 ..
             }) = graph.get_node(id)
             {
-                // Spec 015 follow-up: research-only incidents belong to
-                // the neural training / investigation views, not the
-                // operator incident list.
                 if *research_only {
                     return None;
+                }
+                if let Some(target) = date_filter {
+                    if ts.naive_utc().date() != target {
+                        return None;
+                    }
                 }
                 // Collect entities from TriggeredBy edges
                 let entities: Vec<String> = graph

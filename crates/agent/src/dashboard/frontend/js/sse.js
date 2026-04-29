@@ -123,6 +123,18 @@ document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') closeActionModal();
 });
 
+// 2026-04-29: cap the date pickers at today so the calendar widget
+// greys out future dates. Browser enforces this only on the calendar
+// UI; `syncFiltersFromUi` adds the matching guard against typed-in
+// future dates.
+(function capDatePickersAtToday() {
+  var today = new Date().toISOString().slice(0, 10);
+  var el = document.getElementById('flt-date');
+  if (el) el.max = today;
+  var cmp = document.getElementById('flt-compare-date');
+  if (cmp) cmp.max = today;
+})();
+
 // Filter event listeners
 document.getElementById('flt-apply').addEventListener('click', () => {
   const list = document.getElementById('attackerList');

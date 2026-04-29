@@ -398,6 +398,82 @@ function updateKpi(id, newVal) {
 }
 
 // D7 - soft live refresh: only new cards get animated, existing stay in place.
+// 2026-04-29: render a diagnostic-aware empty state inside the
+// attackers list when /api/entities returns 0 items. Calls
+// /api/threats/diagnostic to find out WHY (no incidents in scope,
+// scope_mismatch, no entities) and provides clickable date chips
+// when historical snapshots exist.
+function renderEmptyDiagnostic(targetEl) {
+  if (!targetEl) return;
+  var qs = '';
+  var fd = (state.filters && state.filters.date) || '';
+  var fs = (state.filters && state.filters.severity_min) || '';
+  var fdet = (state.filters && state.filters.detector) || '';
+  if (fd) qs += (qs ? '&' : '?') + 'date=' + encodeURIComponent(fd);
+  if (fs) qs += (qs ? '&' : '?') + 'severity_min=' + encodeURIComponent(fs);
+  if (fdet) qs += (qs ? '&' : '?') + 'detector=' + encodeURIComponent(fdet);
+  loadJson('/api/threats/diagnostic' + qs)
+    .then(function(d) {
+      var html = '';
+      if (d.scope_mismatch) {
+        html += '<div class="empty" style="padding:16px">';
+        html += '<div style="font-size:1.2rem;margin-bottom:6px">📅</div>';
+        html += '<div style="margin-bottom:10px">No incidents on <b>' + esc(fd || d.date) + '</b>.</div>';
+        html += '<div style="font-size:0.75rem;color:var(--muted);margin-bottom:8px">Pick a date with data:</div>';
+        var chips = (d.available_dates || []).map(function(dd) {
+          return '<button type="button" class="journey-btn" style="margin:2px;font-size:0.7rem;padding:3px 8px" onclick="setThreatsDate(\'' + esc(dd) + '\')">' + esc(dd) + '</button>';
+        }).join('');
+        html += '<div>' + (chips || '<span style="color:var(--muted)">none available</span>') + '</div>';
+        html += '<div style="margin-top:10px"><button type="button" class="journey-btn" style="font-size:0.7rem" onclick="setThreatsDate(\'\')">Clear date filter</button></div>';
+        html += '</div>';
+      } else if (d.has_incidents && !d.has_entities) {
+        html += '<div class="empty" style="padding:16px">';
+        html += '<div style="font-size:1.2rem;margin-bottom:6px">⚠️</div>';
+        html += '<div style="margin-bottom:8px">' + d.incidents_in_scope + ' incident(s) found, but no IP/User entities linked.</div>';
+        if (d.detector_pivot_count > 0) {
+          html += '<button type="button" class="journey-btn" style="font-size:0.7rem" onclick="setThreatsPivot(\'detector\')">Switch to Detector pivot</button>';
+        }
+        html += '</div>';
+      } else if (!d.has_incidents) {
+        html += '<div class="empty" style="padding:16px">';
+        html += '<div style="font-size:1.2rem;margin-bottom:6px">✨</div>';
+        html += '<div>No threats in scope. Either nothing fired today or the filter is too narrow.</div>';
+        if (fs || fdet) {
+          html += '<div style="margin-top:10px"><button type="button" class="journey-btn" style="font-size:0.7rem" onclick="clearThreatsFilters()">Clear filters</button></div>';
+        }
+        html += '</div>';
+      } else {
+        html += '<div class="empty">No records for the selected filters.</div>';
+      }
+      targetEl.innerHTML = html;
+    })
+    .catch(function() {
+      targetEl.innerHTML = '<div class="empty">No records for the selected filters.</div>';
+    });
+}
+
+function setThreatsDate(date) {
+  var el = document.getElementById('flt-date');
+  if (el) el.value = date;
+  refreshLeft(true);
+}
+
+function setThreatsPivot(p) {
+  state.pivot = p;
+  document.querySelectorAll('.pivot-tab').forEach(function(t) {
+    t.classList.toggle('active', t.getAttribute('data-pivot') === p);
+  });
+  refreshLeft(true);
+}
+
+function clearThreatsFilters() {
+  ['flt-date', 'flt-severity', 'flt-detector'].forEach(function(id) {
+    var e = document.getElementById(id);
+    if (e) e.value = '';
+  });
+  refreshLeft(true);
+}
+
 async function refreshLeftLive() {
   try {
     syncFiltersFromUi();
@@ -533,8 +609,13 @@ async function refreshLeft(forceRefreshJourney = false) {
     const list = document.getElementById('attackerList');
     if (list) {
       if (items.length === 0) {
-        list.innerHTML = '<div class="empty">No records for the selected filters.</div>';
+        // 2026-04-29: when the list is empty, ask /api/threats/diagnostic
+        // why and surface an actionable hint (clear date / pick a
+        // historical date with data) instead of the generic message
+        // that left the operator stuck.
+        list.innerHTML = '<div class="empty">No records yet. Loading diagnostic...</div>';
         state.knownItemValues.clear();
+        renderEmptyDiagnostic(list);
       } else {
         list.innerHTML = buildGroupedList(items);
         state.knownItemValues = new Set(items.map(it => it.value));

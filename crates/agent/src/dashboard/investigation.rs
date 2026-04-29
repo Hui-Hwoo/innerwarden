@@ -25,6 +25,10 @@ pub(crate) struct ThreatsDiagnostic {
     pub(super) ip_pivot_count: usize,
     pub(super) user_pivot_count: usize,
     pub(super) detector_pivot_count: usize,
+    /// 2026-04-29: historical dates with on-disk graph snapshots that
+    /// the operator can drill into via the date filter. Front-end
+    /// renders these as clickable chips in the empty-state hint.
+    pub(super) available_dates: Vec<String>,
 }
 
 pub(super) async fn api_threats_diagnostic(
@@ -37,60 +41,40 @@ pub(super) async fn api_threats_diagnostic(
         InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
     // Reuse the production builder so the diagnostic agrees by
-    // construction with what /api/entities + /api/pivots returns.
-    let ip_count = build_pivots_from_graph(
-        &state.knowledge_graph,
-        PivotKind::Ip,
-        500,
-        &filters,
-        explicit_date,
-    )
-    .len();
-    let user_count = build_pivots_from_graph(
-        &state.knowledge_graph,
-        PivotKind::User,
-        500,
-        &filters,
-        explicit_date,
-    )
-    .len();
-    let det_count = build_pivots_from_graph(
-        &state.knowledge_graph,
-        PivotKind::Detector,
-        500,
-        &filters,
-        explicit_date,
-    )
-    .len();
+    // construction with what /api/entities + /api/pivots returns
+    // (including the historical-date snapshot swap).
+    let graph = graph_for_date(&state, explicit_date);
+    let ip_count =
+        build_pivots_from_graph(&graph, PivotKind::Ip, 500, &filters, explicit_date).len();
+    let user_count =
+        build_pivots_from_graph(&graph, PivotKind::User, 500, &filters, explicit_date).len();
+    let det_count =
+        build_pivots_from_graph(&graph, PivotKind::Detector, 500, &filters, explicit_date).len();
     let total_pivot = ip_count + user_count + det_count;
 
     // "Incidents in scope" = the qualifying-incidents count under the
     // same filter the pivots use. Pulled from the Detector pivot's
     // total since that pivot keeps one row per detector, summed.
-    let incidents_in_scope = build_pivots_from_graph(
-        &state.knowledge_graph,
-        PivotKind::Detector,
-        500,
-        &filters,
-        explicit_date,
-    )
-    .iter()
-    .map(|p| p.incident_count)
-    .sum();
+    let incidents_in_scope =
+        build_pivots_from_graph(&graph, PivotKind::Detector, 500, &filters, explicit_date)
+            .iter()
+            .map(|p| p.incident_count)
+            .sum();
 
     let has_incidents = incidents_in_scope > 0;
     let has_entities = (ip_count + user_count) > 0;
 
     // Scope mismatch: graph has Incident nodes overall, but none for
-    // this date. Lets the empty state suggest "try previous day"
-    // instead of generic "nothing here". Only meaningful when the
-    // operator picked an explicit date filter.
+    // this date. Only meaningful when the operator picked an explicit
+    // date filter; checks the LIVE graph (not the swapped one) since
+    // "the snapshot for that date is empty / missing" is the
+    // operator-visible state.
     let scope_mismatch = if has_incidents || explicit_date.is_none() {
         false
     } else {
         use crate::knowledge_graph::types::NodeType;
-        let graph = state.knowledge_graph.read().unwrap();
-        !graph.nodes_of_type(NodeType::Incident).is_empty()
+        let live = state.knowledge_graph.read().unwrap();
+        !live.nodes_of_type(NodeType::Incident).is_empty()
     };
 
     // Suggested pivots: which non-empty pivot the operator could try.
@@ -107,6 +91,25 @@ pub(super) async fn api_threats_diagnostic(
         suggested_pivots.push("detector".to_string());
     }
 
+    // Available historical dates: scan the SQLite store for
+    // `graph_snapshots` rows, return the last 7 dates the operator
+    // can drill into. Surfaces in the empty-state UI as clickable
+    // chips so the operator stops typing the wrong date.
+    let mut available_dates: Vec<String> = Vec::new();
+    if let Ok(store) = innerwarden_store::Store::open(&state.data_dir) {
+        if let Ok(conn) = store.conn() {
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT date FROM graph_snapshots ORDER BY date DESC LIMIT 7")
+            {
+                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    for row in rows.flatten() {
+                        available_dates.push(row);
+                    }
+                }
+            }
+        }
+    }
+
     Json(ThreatsDiagnostic {
         date: display_date,
         has_incidents,
@@ -117,6 +120,7 @@ pub(super) async fn api_threats_diagnostic(
         ip_pivot_count: ip_count,
         user_pivot_count: user_count,
         detector_pivot_count: det_count,
+        available_dates,
     })
 }
 
@@ -140,8 +144,12 @@ pub(super) async fn api_entities(
     let filters =
         InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    let attackers =
-        build_attackers_from_graph(&state.knowledge_graph, limit, &filters, explicit_date);
+    // Spec 037 Threats UX (2026-04-29): when the explicit date is not
+    // today, swap to that day's snapshot so historical-date selections
+    // actually return data instead of always seeing the live (today-only)
+    // graph.
+    let graph = graph_for_date(&state, explicit_date);
+    let attackers = build_attackers_from_graph(&graph, limit, &filters, explicit_date);
     Json(EntitiesResponse {
         date: display_date,
         attackers,
@@ -152,9 +160,8 @@ pub(super) async fn api_pivots(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,
 ) -> Json<PivotResponse> {
-    // Same date semantics as `api_entities`: only an explicit
-    // YYYY-MM-DD selection filters; the default load shows the full
-    // graph so the operator can see every pivot at once.
+    // Same date semantics as `api_entities`: explicit historical date
+    // pulls that day's snapshot from SQLite via `graph_for_date`.
     let display_date = resolve_date(query.date.as_deref());
     let explicit_date = explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
@@ -162,13 +169,8 @@ pub(super) async fn api_pivots(
     let filters =
         InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    let items = build_pivots_from_graph(
-        &state.knowledge_graph,
-        group_by,
-        limit,
-        &filters,
-        explicit_date,
-    );
+    let graph = graph_for_date(&state, explicit_date);
+    let items = build_pivots_from_graph(&graph, group_by, limit, &filters, explicit_date);
     Json(PivotResponse {
         date: display_date,
         group_by: group_by.as_str().to_string(),
@@ -181,7 +183,7 @@ pub(super) async fn api_pivots(
 /// `YYYY-MM-DD` value. Empty string, missing param, and unparseable
 /// inputs all collapse to `None` so the builder applies no date
 /// filter at all (and the operator sees the whole graph by default).
-fn explicit_date_filter(raw: Option<&str>) -> Option<&str> {
+pub(super) fn explicit_date_filter(raw: Option<&str>) -> Option<&str> {
     let candidate = raw?.trim();
     if candidate.len() != 10 {
         return None;
@@ -191,17 +193,67 @@ fn explicit_date_filter(raw: Option<&str>) -> Option<&str> {
     }
     Some(candidate)
 }
+
+/// Resolve which knowledge-graph snapshot to read for a request.
+///
+/// The live `state.knowledge_graph` only contains TODAY's incidents
+/// (the agent's snapshot model is one-day-per-graph; older days live
+/// in the `graph_snapshots` SQLite table as gzipped blobs but are
+/// never merged into the in-memory graph). Pre-2026-04-29 the Threats
+/// page relied on the live graph regardless of which date the
+/// operator picked, so any historical-date selection silently
+/// returned 0 incidents -- the graph simply did not contain them.
+///
+/// This helper inspects the explicit-date filter:
+///   * `None` or `Some(today)` -> use the live in-memory graph.
+///   * `Some(historical_date)` -> load that date's snapshot from
+///     SQLite (`load_dated_sqlite_first`). Falls back to the live
+///     graph if the snapshot is missing/corrupt so the request never
+///     errors out -- empty result is a normal outcome that the
+///     diagnostic endpoint surfaces to the operator.
+///
+/// Returned graph is owned (a fresh `Arc<RwLock<...>>`) when loaded
+/// from SQLite; cloned when the live graph is reused. The caller
+/// holds it for the duration of the request only.
+pub(super) fn graph_for_date(
+    state: &DashboardState,
+    explicit_date: Option<&str>,
+) -> std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>> {
+    let Some(date) = explicit_date else {
+        return state.knowledge_graph.clone();
+    };
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    if date == today {
+        return state.knowledge_graph.clone();
+    }
+    match crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(&state.data_dir, date) {
+        Some(g) => std::sync::Arc::new(std::sync::RwLock::new(g)),
+        None => state.knowledge_graph.clone(),
+    }
+}
 pub(super) async fn api_clusters(
     State(state): State<DashboardState>,
     Query(query): Query<ClusterQuery>,
 ) -> Json<ClusterResponse> {
     let date = resolve_date(query.date.as_deref());
+    let explicit_date = explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let window_seconds = query.window_seconds.unwrap_or(300).clamp(30, 3600);
 
-    // Build clusters from graph Incident nodes
+    // Build clusters from graph Incident nodes.
+    // 2026-04-29: respect the explicit date filter (was previously
+    // iterating ALL Incident nodes regardless of date) and pull a
+    // historical day's snapshot when the operator drills into
+    // yesterday's clusters.
     use crate::knowledge_graph::types::{Node, NodeType, Relation};
-    let graph = state.knowledge_graph.read().unwrap();
+    let arc_graph = graph_for_date(&state, explicit_date);
+    let graph = arc_graph.read().unwrap();
+
+    let date_filter: Option<chrono::NaiveDate> =
+        explicit_date.and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
     let mut incidents_by_ip: std::collections::HashMap<
         String,
@@ -216,6 +268,11 @@ pub(super) async fn api_clusters(
             ..
         }) = graph.get_node(id)
         {
+            if let Some(target) = date_filter {
+                if ts.naive_utc().date() != target {
+                    continue;
+                }
+            }
             // Find associated IP via TriggeredBy edge
             for edge in graph.outgoing_edges(id) {
                 if edge.relation == Relation::TriggeredBy {
@@ -3779,5 +3836,273 @@ mod tests {
             Some("2026-04-28"),
             "valid date passes through"
         );
+    }
+
+    #[test]
+    fn graph_for_date_loads_historical_snapshot_when_date_differs_from_today() {
+        // 2026-04-29: when an explicit date is not today, the helper
+        // must read that day's snapshot from SQLite. Otherwise the
+        // operator's date filter has no effect because the live
+        // graph only contains today's incidents.
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        use innerwarden_core::event::Severity;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("open");
+
+        // Seed a 2026-04-26 snapshot with one ssh_bruteforce incident.
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-04-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ip = g.ensure_ip("203.0.113.42", ts);
+        let inc = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:hist".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: format!("{:?}", Severity::High),
+            title: "historical".into(),
+            summary: "".into(),
+            ts,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            decision_target: Some("203.0.113.42".into()),
+            confidence: Some(0.9),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, ip, Relation::TriggeredBy, ts));
+        let snap = g.serialize_snapshot_bytes().expect("serialize");
+        store
+            .save_graph_snapshot(
+                "2026-04-26",
+                &snap.bytes,
+                snap.nodes_count,
+                snap.edges_count,
+            )
+            .expect("save");
+
+        // Live graph holds a different date entirely (today's empty).
+        let live = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let mut s = state.clone();
+        s.knowledge_graph = live.clone();
+
+        // Historical date -> snapshot loaded.
+        let hist = graph_for_date(&s, Some("2026-04-26"));
+        let hist_inc = hist
+            .read()
+            .unwrap()
+            .nodes_of_type(crate::knowledge_graph::types::NodeType::Incident)
+            .len();
+        assert_eq!(hist_inc, 1, "historical date must load 2026-04-26 snapshot");
+
+        // None -> live graph (empty).
+        let live_used = graph_for_date(&s, None);
+        let live_inc = live_used
+            .read()
+            .unwrap()
+            .nodes_of_type(crate::knowledge_graph::types::NodeType::Incident)
+            .len();
+        assert_eq!(live_inc, 0, "None must reuse the (empty) live graph");
+    }
+
+    /// Diagnostic: load a real innerwarden.db (typically copied from
+    /// prod) and run the production pivot builders against the latest
+    /// available snapshot. Use to debug "page is empty in prod" without
+    /// having to deploy.
+    ///
+    /// Run with:
+    ///   INNERWARDEN_DIAG_DIR=/path/to/dir \
+    ///     cargo test diagnose_prod_state -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diagnose_prod_state() {
+        let Ok(dir_path) = std::env::var("INNERWARDEN_DIAG_DIR") else {
+            eprintln!("set INNERWARDEN_DIAG_DIR=/path/to/dir/with/innerwarden.db");
+            return;
+        };
+        let parent = std::path::PathBuf::from(&dir_path);
+        let store = innerwarden_store::Store::open(&parent).expect("open store");
+
+        let conn = store.conn().expect("conn");
+        let latest: String = conn
+            .query_row(
+                "SELECT date FROM graph_snapshots ORDER BY date DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("snapshot date");
+        eprintln!("=== latest snapshot date: {latest} ===");
+
+        // Discover available dates (last 7) so we can probe non-today behaviour.
+        let mut stmt = conn
+            .prepare("SELECT date FROM graph_snapshots ORDER BY date DESC LIMIT 7")
+            .expect("snapshot dates");
+        let dates: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .filter_map(|r| r.ok())
+            .collect();
+        eprintln!("=== available dates: {:?} ===", dates);
+
+        let graph =
+            crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(&parent, &latest)
+                .expect("graph loads");
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+
+        // ── 1. Pivot backend behaviour by date ────────────────────────
+        for date_arg in [
+            None,
+            Some(latest.as_str()),
+            Some("2026-04-28"),
+            Some("2026-05-29"),
+        ] {
+            for pivot in [PivotKind::Ip, PivotKind::User, PivotKind::Detector] {
+                let items = build_pivots_from_graph(&kg, pivot, 500, &Default::default(), date_arg);
+                eprintln!(
+                    "[pivot] date={:?} pivot={} -> {} items",
+                    date_arg,
+                    pivot.as_str(),
+                    items.len()
+                );
+            }
+        }
+
+        // ── 2. Check ALL Incident node dates in the graph ─────────────
+        use crate::knowledge_graph::types::*;
+        let g = kg.read().unwrap();
+        let mut by_date: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut research_only_count = 0usize;
+        let mut decision_buckets: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for id in g.nodes_of_type(NodeType::Incident) {
+            if let Some(Node::Incident {
+                ts,
+                research_only,
+                decision,
+                ..
+            }) = g.get_node(id)
+            {
+                *by_date
+                    .entry(ts.naive_utc().date().to_string())
+                    .or_default() += 1;
+                if *research_only {
+                    research_only_count += 1;
+                }
+                let key = decision.as_deref().unwrap_or("None").to_string();
+                *decision_buckets.entry(key).or_default() += 1;
+            }
+        }
+        eprintln!("[graph] incidents by_date: {:?}", by_date);
+        eprintln!(
+            "[graph] research_only={}, decision_buckets={:?}",
+            research_only_count, decision_buckets
+        );
+
+        // ── 3. /api/clusters bug: is it date-scoped? ──────────────────
+        // build_cluster_items_from_graph reads ALL Incident nodes
+        // regardless of the query date. Confirm by checking total
+        // cluster count vs total incidents.
+        eprintln!(
+            "[clusters] total Incident nodes regardless of date = {}",
+            g.nodes_of_type(NodeType::Incident).len()
+        );
+
+        // ── 4. /api/threats/diagnostic shape ──────────────────────────
+        // Replicate the same logic (no need to call the async fn).
+        let det_for_diag = |date: Option<&str>| {
+            build_pivots_from_graph(&kg, PivotKind::Detector, 500, &Default::default(), date)
+                .iter()
+                .map(|p| p.incident_count)
+                .sum::<usize>()
+        };
+        for date_arg in [None, Some(latest.as_str()), Some("2026-05-29")] {
+            eprintln!(
+                "[diag] date={:?} incidents_in_scope={}",
+                date_arg,
+                det_for_diag(date_arg)
+            );
+        }
+
+        // ── 5. Test loading historical day snapshots ─────────────────
+        for d in &dates {
+            if d == &latest {
+                continue;
+            }
+            let yesterday_graph =
+                crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(&parent, d);
+            match yesterday_graph {
+                Some(g) => {
+                    let inc_count = g.nodes_of_type(NodeType::Incident).len();
+                    let arc = std::sync::Arc::new(std::sync::RwLock::new(g));
+                    let pivot_count = build_pivots_from_graph(
+                        &arc,
+                        PivotKind::Ip,
+                        500,
+                        &Default::default(),
+                        Some(d.as_str()),
+                    )
+                    .len();
+                    eprintln!(
+                        "[hist] date={} loadable=YES incidents={} ip_pivot={}",
+                        d, inc_count, pivot_count
+                    );
+                }
+                None => eprintln!("[hist] date={} loadable=NO", d),
+            }
+        }
+
+        // ── 6. Simulate api_entities flow (live -> graph_for_date swap) ──
+        // Build a DashboardState-like wrapper. Easiest: replicate the
+        // graph_for_date logic inline against the real data_dir.
+        eprintln!("--- simulated api_entities/api_pivots flow ---");
+        for date_arg in [
+            None,
+            Some(latest.as_str()),
+            Some("2026-04-28"),
+            Some("2026-04-25"),
+        ] {
+            let arc_for_request: std::sync::Arc<
+                std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>,
+            > = match date_arg {
+                None => kg.clone(),
+                Some(d) if d == latest => kg.clone(),
+                Some(d) => {
+                    match crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(
+                        &parent, d,
+                    ) {
+                        Some(g) => std::sync::Arc::new(std::sync::RwLock::new(g)),
+                        None => kg.clone(),
+                    }
+                }
+            };
+            let ip_count = build_pivots_from_graph(
+                &arc_for_request,
+                PivotKind::Ip,
+                500,
+                &Default::default(),
+                date_arg,
+            )
+            .len();
+            let det_count = build_pivots_from_graph(
+                &arc_for_request,
+                PivotKind::Detector,
+                500,
+                &Default::default(),
+                date_arg,
+            )
+            .len();
+            eprintln!(
+                "[api-sim] date={:?} ip_pivot={} detector_pivot={}",
+                date_arg, ip_count, det_count
+            );
+        }
     }
 }

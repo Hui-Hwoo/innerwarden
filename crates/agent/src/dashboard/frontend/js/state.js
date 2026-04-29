@@ -43,7 +43,21 @@ function buildQuery(params) {
 }
 
 function syncFiltersFromUi() {
-  state.filters.date = document.getElementById('flt-date').value || '';
+  // 2026-04-29: clamp future dates the operator may have picked from
+  // the calendar widget. Without this, picking next month yields an
+  // empty page with no signal the date is wrong. Bring it back to
+  // today; the empty-state diagnostic surfaces a clearer message if
+  // data is still missing.
+  var rawDate = document.getElementById('flt-date').value || '';
+  if (rawDate) {
+    var today = new Date().toISOString().slice(0, 10);
+    if (rawDate > today) {
+      rawDate = today;
+      var dEl = document.getElementById('flt-date');
+      if (dEl) dEl.value = today;
+    }
+  }
+  state.filters.date = rawDate;
   state.filters.compare_date = document.getElementById('flt-compare-date').value || '';
   state.filters.severity_min = document.getElementById('flt-severity').value || '';
   state.filters.detector = (document.getElementById('flt-detector').value || '').trim();
