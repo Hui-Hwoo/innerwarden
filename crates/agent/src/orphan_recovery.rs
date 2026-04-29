@@ -59,8 +59,15 @@ fn hostname() -> String {
 /// the recovery pass will sweep the same N.
 const ORPHAN_AGE_SECS: i64 = 3600;
 
-/// Cap per sweep — see module doc.
-const ORPHAN_SWEEP_LIMIT: usize = 200;
+/// Cap per sweep. Set high enough to clear typical operator backlogs
+/// in a single sweep — when the operator deploys after a multi-day
+/// gap or a misbehaving classifier accumulates orphans, they want
+/// the count cleared NOW, not over multiple ticks. The original
+/// 2026-04-29 17:25 incident on prod surfaced 4701 orphans accrued
+/// before Phase 7B was deployed; with the prior cap of 200 it would
+/// have taken ~4 hours to clear at one sweep / 10min. Bumped to
+/// 5000 so a single sweep handles realistic backlogs in seconds.
+const ORPHAN_SWEEP_LIMIT: usize = 5000;
 
 /// AI-provider label written on the dismiss decision so the audit
 /// trail clearly shows which decisions came from the recovery pass

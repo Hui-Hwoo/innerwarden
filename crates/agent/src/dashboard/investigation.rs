@@ -1479,6 +1479,245 @@ pub(super) fn build_cluster_items_from_graph(
         .collect()
 }
 
+/// Phase 8 (audit RC-2 / 2026-04-29 fourth surface): build a per-IP
+/// or per-user journey timeline directly from SQLite. Used as the
+/// fallback path inside `build_journey_from_graph` when the KG misses
+/// (TTL eviction, post-deploy state, historical date).
+///
+/// The function joins `incidents` with the latest decision per
+/// `incident_id`, then for each row whose `entities` contain the
+/// requested IP/user, emits a `JourneyEntry` for the incident itself
+/// and (when present) a separate `JourneyEntry` for the decision.
+/// Sorting and verdict derivation match the KG path so the front-end
+/// renders the same structure regardless of which path produced it.
+///
+/// Returns `None` only when the SQLite read fails or no qualifying
+/// incidents exist — caller turns that into `empty_journey`.
+pub(super) fn build_journey_from_sqlite(
+    store: &std::sync::Arc<innerwarden_store::Store>,
+    date: &str,
+    subject_type: PivotKind,
+    subject: &str,
+    window_seconds: Option<u64>,
+) -> Option<JourneyResponse> {
+    use crate::dashboard::threat_contract;
+
+    let conn = store.conn().ok()?;
+    let pattern = format!("{date}%");
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT i.incident_id, i.ts, i.detector, i.severity, i.title, i.summary, i.data, \
+                    d.action_type, d.target_ip, d.confidence, d.auto_executed, d.reason \
+             FROM incidents i \
+             LEFT JOIN ( \
+                 SELECT incident_id, action_type, target_ip, confidence, auto_executed, reason, \
+                        ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id DESC) AS rn \
+                 FROM decisions \
+             ) d ON d.incident_id = i.incident_id AND d.rn = 1 \
+             WHERE i.ts LIKE ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([&pattern], |row| {
+            Ok((
+                row.get::<_, String>(0)?,          // incident_id
+                row.get::<_, String>(1)?,          // ts iso
+                row.get::<_, String>(2)?,          // detector
+                row.get::<_, String>(3)?,          // severity
+                row.get::<_, String>(4)?,          // title
+                row.get::<_, Option<String>>(5)?,  // summary
+                row.get::<_, String>(6)?,          // data JSON
+                row.get::<_, Option<String>>(7)?,  // action_type
+                row.get::<_, Option<String>>(8)?,  // target_ip
+                row.get::<_, Option<f64>>(9)?,     // confidence
+                row.get::<_, Option<i64>>(10)?,    // auto_executed
+                row.get::<_, Option<String>>(11)?, // reason
+            ))
+        })
+        .ok()?;
+
+    let mut entries: Vec<JourneyEntry> = Vec::new();
+    let mut related_ips: BTreeSet<String> = BTreeSet::new();
+    let mut related_users: BTreeSet<String> = BTreeSet::new();
+    let mut related_detectors: BTreeSet<String> = BTreeSet::new();
+    let mut incident_outcomes: Vec<&'static str> = Vec::new();
+
+    for row in rows {
+        let Ok((
+            incident_id,
+            ts_iso,
+            detector,
+            severity,
+            title,
+            summary,
+            data,
+            action_type,
+            target_ip,
+            confidence,
+            auto_executed,
+            reason,
+        )) = row
+        else {
+            continue;
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if parsed
+            .get("research_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        // Filter to entries that mention the subject in their entities array.
+        let mut subject_match = false;
+        let entities = parsed.get("entities").and_then(|v| v.as_array());
+        let mut row_ips: BTreeSet<String> = BTreeSet::new();
+        let mut row_users: BTreeSet<String> = BTreeSet::new();
+        if let Some(arr) = entities {
+            for entity in arr {
+                let kind = entity.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let value = entity.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if value.is_empty() {
+                    continue;
+                }
+                if kind.eq_ignore_ascii_case("ip") {
+                    row_ips.insert(value.to_string());
+                    if subject_type == PivotKind::Ip && value == subject {
+                        subject_match = true;
+                    }
+                } else if kind.eq_ignore_ascii_case("user") {
+                    row_users.insert(value.to_string());
+                    if subject_type == PivotKind::User && value == subject {
+                        subject_match = true;
+                    }
+                }
+            }
+        }
+        if !subject_match {
+            continue;
+        }
+
+        let ts: chrono::DateTime<Utc> = match chrono::DateTime::parse_from_rfc3339(&ts_iso) {
+            Ok(t) => t.with_timezone(&Utc),
+            Err(_) => continue,
+        };
+        let detector_label = detector.split(':').next().unwrap_or(&detector).to_string();
+        related_detectors.insert(detector_label.clone());
+        for ip in &row_ips {
+            if subject_type != PivotKind::Ip || ip != subject {
+                related_ips.insert(ip.clone());
+            }
+        }
+        for user in &row_users {
+            if subject_type != PivotKind::User || user != subject {
+                related_users.insert(user.clone());
+            }
+        }
+
+        let mitre_ids = parsed
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // Incident entry.
+        entries.push(JourneyEntry {
+            ts,
+            kind: "incident".to_string(),
+            data: serde_json::json!({
+                "incident_id": incident_id,
+                "severity": severity.to_lowercase(),
+                "title": title,
+                "summary": summary.unwrap_or_default(),
+                "tags": mitre_ids,
+                "detector": detector_label,
+            }),
+        });
+
+        // Decision entry (if present). Outcome is computed via the
+        // canonical contract so the verdict line agrees with the
+        // Home tile and the Threats list.
+        let outcome = threat_contract::classify_decision(action_type.as_deref(), Some("ok"));
+        incident_outcomes.push(outcome);
+        if let Some(action) = &action_type {
+            entries.push(JourneyEntry {
+                ts,
+                kind: "decision".to_string(),
+                data: serde_json::json!({
+                    "action_type": action,
+                    "confidence": confidence.unwrap_or(0.0),
+                    "auto_executed": auto_executed.unwrap_or(0) != 0,
+                    "reason": reason.unwrap_or_default(),
+                    "target_ip": target_ip,
+                    "incident_id": incident_id,
+                    "execution_result": if auto_executed.unwrap_or(0) != 0 { "ok" } else { "skipped" },
+                }),
+            });
+        }
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    entries.sort_by_key(|e| e.ts);
+    if let Some(window) = window_seconds {
+        if let Some(last_ts) = entries.last().map(|e| e.ts) {
+            let cutoff = last_ts - chrono::Duration::seconds(window as i64);
+            entries.retain(|entry| entry.ts >= cutoff);
+        }
+    }
+
+    let first_seen = entries.first().map(|e| e.ts);
+    let last_seen = entries.last().map(|e| e.ts);
+    let outcome = threat_contract::aggregate_outcomes(incident_outcomes).to_string();
+
+    let summary = build_journey_summary(
+        &entries,
+        &outcome,
+        subject_type,
+        subject,
+        &related_ips,
+        &related_users,
+        &related_detectors,
+    );
+    let verdict = derive_verdict(&entries, &outcome);
+    let chapters = derive_chapters(&entries);
+
+    let now = Utc::now();
+    let block_state = if subject_type == PivotKind::Ip {
+        Some(threat_contract::block_state_for_ip(
+            Some(store),
+            subject,
+            now,
+        ))
+    } else {
+        None
+    };
+
+    Some(JourneyResponse {
+        subject_type: subject_type.as_str().to_string(),
+        subject: subject.to_string(),
+        date: date.to_string(),
+        first_seen,
+        last_seen,
+        outcome,
+        summary,
+        verdict,
+        chapters,
+        entries,
+        block_state,
+    })
+}
+
 /// Build the full journey timeline for a selected subject on a given date.
 /// Build a journey timeline from the knowledge graph (live, no JSONL).
 /// Falls back to honeypot JSONL for honeypot sessions (not in graph yet).
@@ -1519,6 +1758,21 @@ pub(super) fn build_journey_from_graph(
     let center_id = match center {
         Some(id) => id,
         None => {
+            // Phase 8 (audit RC-2 fourth surface, 2026-04-29): KG misses
+            // because of TTL eviction. The Threats list shows the IP
+            // (post-Phase-6 reads SQLite) but clicking it landed in
+            // an empty journey because this function used to bail
+            // here. Fall back to the SQLite-backed journey so the
+            // operator sees the actual incidents+decisions for the
+            // subject — same data that drove the list count.
+            drop(graph); // release read lock before re-entering with sqlite
+            if let Some(store) = sqlite {
+                if let Some(j) =
+                    build_journey_from_sqlite(store, date, subject_type, subject, window_seconds)
+                {
+                    return j;
+                }
+            }
             return empty_journey(subject_type, subject, date);
         }
     };
@@ -4254,6 +4508,129 @@ mod tests {
         assert_eq!(resp.attackers.len(), 1, "must return SQLite attacker");
         assert_eq!(resp.attackers[0].ip, "203.0.113.10");
         assert_eq!(resp.attackers[0].outcome, "blocked");
+    }
+
+    // ── Phase 8 anchors: journey from SQLite, RC-2 fourth surface ─────
+    //
+    // The 2026-04-29 17:00 incident: Threats list correctly showed
+    // 197.243.0.62 as an attacker (Phase 6 reads SQLite), but
+    // clicking the row landed on an empty journey because
+    // `build_journey_from_graph` bailed on KG center-node miss.
+    // SQLite had 2 incidents + 3 decisions for the IP. Phase 8
+    // makes the journey path SQLite-aware so the operator drills
+    // into the real history regardless of KG TTL eviction state.
+
+    #[test]
+    fn build_journey_from_sqlite_returns_incidents_and_decisions_for_subject_ip() {
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let date = "2026-04-29";
+        // 2 incidents on the target IP, 1 decision.
+        insert_attacker_test_incident(
+            &store,
+            "ssh:bf:1",
+            "2026-04-29T01:00:00Z",
+            "high",
+            "ssh brute",
+            "203.0.113.10",
+        );
+        insert_attacker_test_incident(
+            &store,
+            "ti:1",
+            "2026-04-29T01:30:00Z",
+            "high",
+            "threat intel match",
+            "203.0.113.10",
+        );
+        insert_attacker_test_decision(
+            &store,
+            "ssh:bf:1",
+            "2026-04-29T01:00:01Z",
+            "block_ip",
+            "203.0.113.10",
+        );
+        // A different IP — must NOT leak into the journey.
+        insert_attacker_test_incident(
+            &store,
+            "other:1",
+            "2026-04-29T02:00:00Z",
+            "high",
+            "scan",
+            "198.51.100.20",
+        );
+
+        let journey = build_journey_from_sqlite(&store, date, PivotKind::Ip, "203.0.113.10", None)
+            .expect("journey returned");
+        assert_eq!(
+            journey.entries.len(),
+            3,
+            "2 incidents + 1 decision = 3 entries for the target IP"
+        );
+        // Outcome from aggregate_outcomes: any block_ip wins.
+        assert_eq!(journey.outcome, "blocked");
+        // Decision entry exists and references the right action.
+        let has_block_decision = journey.entries.iter().any(|e| {
+            e.kind == "decision"
+                && e.data.get("action_type").and_then(|v| v.as_str()) == Some("block_ip")
+        });
+        assert!(has_block_decision);
+    }
+
+    #[test]
+    fn build_journey_from_sqlite_returns_none_when_subject_absent() {
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let date = "2026-04-29";
+        insert_attacker_test_incident(
+            &store,
+            "ssh:1",
+            "2026-04-29T01:00:00Z",
+            "high",
+            "brute",
+            "203.0.113.10",
+        );
+        // Subject is a different IP — no incidents reference it.
+        let journey = build_journey_from_sqlite(&store, date, PivotKind::Ip, "198.51.100.99", None);
+        assert!(journey.is_none(), "no entries for absent subject");
+    }
+
+    #[tokio::test]
+    async fn api_journey_falls_back_to_sqlite_when_kg_missing_subject() {
+        // End-to-end: KG is empty (post-eviction state), SQLite has
+        // incidents+decisions for the IP. The handler must return
+        // those entries instead of an empty journey. This is the
+        // exact scenario the operator hit on 197.243.0.62.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let today = chrono::Utc::now().date_naive().to_string();
+        let ts = format!("{today}T01:00:00Z");
+        insert_attacker_test_incident(&store, "ssh:1", &ts, "high", "brute", "203.0.113.10");
+        insert_attacker_test_decision(
+            &store,
+            "ssh:1",
+            &format!("{today}T01:00:01Z"),
+            "block_ip",
+            "203.0.113.10",
+        );
+        state.sqlite_store = Some(store);
+        // KG stays empty.
+        let q = JourneyQuery {
+            subject_type: Some("ip".to_string()),
+            subject: Some("203.0.113.10".to_string()),
+            ip: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+            window_seconds: None,
+        };
+        let Json(resp) = api_journey(State(state), Query(q)).await;
+        assert!(
+            !resp.entries.is_empty(),
+            "SQLite fallback must surface incident+decision entries"
+        );
+        assert_eq!(resp.outcome, "blocked");
     }
 
     // ── Phase 3 anchors: block_state plumbing on the IP pivot ──────────
