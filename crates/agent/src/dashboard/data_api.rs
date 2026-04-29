@@ -93,9 +93,21 @@ pub(super) async fn api_overview(
         });
     }
 
-    // Read from knowledge graph (live) instead of JSONL
-    let graph = state.knowledge_graph.read().unwrap();
+    // 2026-04-29: respect explicit historical-date selection so the
+    // Home overview agrees with what the operator sees on the
+    // Threats tab when both have the same `?date` query param. Pre-
+    // fix `/api/overview` always read the live graph (today only),
+    // while `/api/entities`/`/api/pivots` swapped to the requested
+    // day's snapshot via `graph_for_date` -- the Home tile counted
+    // today's blocks but the Threats list showed yesterday's pivot,
+    // and the operator could not tell why the numbers diverged.
+    let explicit_date =
+        crate::dashboard::investigation::explicit_date_filter(query.date.as_deref());
+    let arc_graph = crate::dashboard::investigation::graph_for_date(&state, explicit_date);
+    let graph = arc_graph.read().unwrap();
     let metrics = graph.metrics();
+    let date_filter: Option<chrono::NaiveDate> =
+        explicit_date.and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
     // Count decisions from Incident nodes
     use crate::knowledge_graph::types::{Node, NodeType, Relation};
@@ -144,11 +156,20 @@ pub(super) async fn api_overview(
             decision,
             decision_target,
             severity,
+            ts,
             is_allowlisted,
             research_only,
             ..
         }) = graph.get_node(id)
         {
+            // 2026-04-29: filter by requested date (when explicit)
+            // so Home counts agree with the Threats-tab pivots
+            // under the same `?date` query.
+            if let Some(target) = date_filter {
+                if ts.naive_utc().date() != target {
+                    continue;
+                }
+            }
             // Spec 015 follow-up: skip research-only incidents.
             if *research_only {
                 continue;
@@ -197,17 +218,21 @@ pub(super) async fn api_overview(
             *severity_breakdown
                 .entry(severity.to_lowercase())
                 .or_insert(0) += 1;
-            // Spec 037 Threats UX bundle: classify into the three
-            // operator-visible KPI buckets in the same pass. Mirrors
-            // `outcomeOf` semantics in threats.js so the Threats-tab
-            // numbers match the right-side journey/list outcome.
-            match decision.as_deref() {
-                Some("block_ip") | Some("honeypot") => blocked_count += 1,
-                Some("monitor") => observing_count += 1,
-                Some("request_confirmation") => attention_count += 1,
-                Some("ignore") => {} // dismissed; not in any KPI bucket
-                Some(_) => blocked_count += 1, // any other action == contained
-                None => attention_count += 1, // no decision yet => operator must look
+            // 2026-04-29: KPI bucketing routes through
+            // `threat_contract::classify_decision` + `kpi_bucket` so
+            // the Home counters agree with `/api/incidents.outcome`,
+            // pivot row outcomes, and the journey verdict. Pre-fix
+            // this site emitted "blocked_count += 1" for ANY decision
+            // not in {ignore, monitor, request_confirmation},
+            // including unknown future decisions and execution
+            // failures -- inflating "Blocked" by every kernel-level
+            // rejected block.
+            let outcome = super::threat_contract::classify_decision(decision.as_deref(), None);
+            match super::threat_contract::kpi_bucket(outcome) {
+                super::threat_contract::KpiBucket::Blocked => blocked_count += 1,
+                super::threat_contract::KpiBucket::Observing => observing_count += 1,
+                super::threat_contract::KpiBucket::Attention => attention_count += 1,
+                super::threat_contract::KpiBucket::None => {}
             }
             if let Some(dec) = decision {
                 decisions_count += 1;
@@ -344,17 +369,19 @@ fn compute_incidents_blocking(state: &DashboardState, query: ListQuery) -> Incid
                     })
                     .collect();
 
-                let outcome = match decision.as_deref() {
-                    Some("block_ip") => "blocked",
-                    Some("suspend_user_sudo") => "suspended",
-                    Some("kill_process") => "killed",
-                    Some("block_container") => "contained",
-                    Some("monitor") => "monitored",
-                    Some("honeypot") => "honeypot",
-                    Some("ignore") => "ignored",
-                    Some(_) => "resolved",
-                    None => "open",
-                };
+                // 2026-04-29: outcome string normalised via
+                // `threat_contract::classify_decision` so this view
+                // agrees with `/api/overview.blocked_count`,
+                // `/api/pivots`, and the journey verdict. Pre-fix
+                // this site emitted "suspended"/"killed"/"contained"
+                // for the action variants of containment, "monitored"
+                // (singular vs "monitoring" everywhere else), and
+                // "resolved" as a catch-all for unknown decisions
+                // -- five strings that disagreed with five other
+                // sites. The granular skill-kind information is
+                // still preserved on `IncidentView.action_taken`
+                // (which mirrors the raw `decision` string).
+                let outcome = super::threat_contract::classify_decision(decision.as_deref(), None);
 
                 // Effective severity: downgrade for handled incidents
                 let sev_lower = severity.to_lowercase();
@@ -766,15 +793,15 @@ pub(super) fn compute_overview_from_graph(
             *severity_breakdown
                 .entry(severity.to_lowercase())
                 .or_insert(0) += 1;
-            // Spec 037 Threats UX bundle: same KPI classification as
-            // the live `api_overview` path.
-            match decision.as_deref() {
-                Some("block_ip") | Some("honeypot") => blocked_count += 1,
-                Some("monitor") => observing_count += 1,
-                Some("request_confirmation") => attention_count += 1,
-                Some("ignore") => {}
-                Some(_) => blocked_count += 1,
-                None => attention_count += 1,
+            // 2026-04-29: same `threat_contract` routing as the live
+            // `api_overview` path so the two compute helpers cannot
+            // drift again.
+            let outcome = super::threat_contract::classify_decision(decision.as_deref(), None);
+            match super::threat_contract::kpi_bucket(outcome) {
+                super::threat_contract::KpiBucket::Blocked => blocked_count += 1,
+                super::threat_contract::KpiBucket::Observing => observing_count += 1,
+                super::threat_contract::KpiBucket::Attention => attention_count += 1,
+                super::threat_contract::KpiBucket::None => {}
             }
             if let Some(dec) = decision {
                 decisions_count += 1;
@@ -888,18 +915,19 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
     // is the canonical path in production.
     let handled_ips_today = ai_responded;
 
-    // Spec 037 Threats UX bundle: same KPI buckets, classified from
-    // the JSONL `decisions` stream.
+    // 2026-04-29: same `threat_contract` routing as the graph
+    // path. JSONL fallback is test-only but must agree with the
+    // production buckets so test fixtures don't drift.
     let mut blocked_count = 0usize;
     let mut observing_count = 0usize;
     let mut attention_count = 0usize;
     for d in &decisions {
-        match d.action_type.as_str() {
-            "block_ip" | "honeypot" => blocked_count += 1,
-            "monitor" => observing_count += 1,
-            "request_confirmation" => attention_count += 1,
-            "ignore" => {}
-            _ => blocked_count += 1,
+        let outcome = super::threat_contract::classify_decision(Some(&d.action_type), None);
+        match super::threat_contract::kpi_bucket(outcome) {
+            super::threat_contract::KpiBucket::Blocked => blocked_count += 1,
+            super::threat_contract::KpiBucket::Observing => observing_count += 1,
+            super::threat_contract::KpiBucket::Attention => attention_count += 1,
+            super::threat_contract::KpiBucket::None => {}
         }
     }
     // Incidents without a matching decision: count as needing attention.

@@ -23,6 +23,7 @@ mod live_feed;
 mod push;
 mod sensors;
 mod sse;
+mod threat_contract;
 
 #[cfg(test)]
 mod consistency_block_counts;

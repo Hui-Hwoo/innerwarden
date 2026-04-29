@@ -1,5 +1,6 @@
 // Auto-extracted from mod.rs — dashboard investigation handlers
 
+use super::threat_contract;
 use super::*;
 
 /// Spec 037 Threats UX bundle: tells the empty-state renderer WHY
@@ -296,36 +297,56 @@ fn compute_clusters_blocking(state: &DashboardState, query: ClusterQuery) -> Clu
     let explicit_date = explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let window_seconds = query.window_seconds.unwrap_or(300).clamp(30, 3600);
+    let filters =
+        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    use crate::knowledge_graph::types::{Node, NodeType, Relation};
+    use crate::knowledge_graph::types::{Node, Relation};
     let arc_graph = graph_for_date(state, explicit_date);
     let graph = arc_graph.read().unwrap();
 
     let date_filter: Option<chrono::NaiveDate> =
         explicit_date.and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
+    // 2026-04-29: route through `qualifying_incident_ids` so clusters
+    // apply the SAME filter stack as IP/User/Detector pivots
+    // (research_only + internal_incident_fields + severity + detector
+    // substring). Pre-fix this function only honoured the date_filter
+    // and `decision != Some("ignore")`, so clusters could include
+    // self-traffic IPs and advisory-only detectors that the pivots
+    // had rejected -- the operator-reported "click cluster see X
+    // IPs, click pivot see fewer" contradiction (audit RC-3).
+    let qualifying = qualifying_incident_ids(
+        &graph,
+        date_filter,
+        filters.severity_min_rank(),
+        filters.detector_lower(),
+    );
+
     let mut incidents_by_ip: std::collections::HashMap<
         String,
         Vec<(chrono::DateTime<Utc>, String, String)>,
     > = std::collections::HashMap::new();
 
-    for id in graph.nodes_of_type(NodeType::Incident) {
+    for inc_id in qualifying {
         if let Some(Node::Incident {
             incident_id,
             detector,
             ts,
             ..
-        }) = graph.get_node(id)
+        }) = graph.get_node(inc_id)
         {
-            if let Some(target) = date_filter {
-                if ts.naive_utc().date() != target {
-                    continue;
-                }
-            }
-            // Find associated IP via TriggeredBy edge
-            for edge in graph.outgoing_edges(id) {
+            for edge in graph.outgoing_edges(inc_id) {
                 if edge.relation == Relation::TriggeredBy {
-                    if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                    if let Some(Node::Ip {
+                        addr, is_internal, ..
+                    }) = graph.get_node(edge.to)
+                    {
+                        if *is_internal {
+                            continue;
+                        }
+                        if crate::cloud_safelist::is_self_traffic_ip(addr) {
+                            continue;
+                        }
                         incidents_by_ip.entry(addr.clone()).or_default().push((
                             *ts,
                             incident_id.clone(),
@@ -583,6 +604,81 @@ fn build_export_response(
 // Business logic - D2 entities / journey
 // ---------------------------------------------------------------------------
 
+/// 2026-04-29: extracted from `build_pivots_from_graph` so
+/// `compute_clusters_blocking` can apply the same filter stack.
+/// Returns the list of Incident node ids that qualify under the
+/// shared filter (date, research_only, internal/self-traffic,
+/// severity, detector substring).
+///
+/// Pre-extraction `/api/clusters` re-implemented incident iteration
+/// without the filter stack, which meant clusters could include
+/// incidents that the IP/User/Detector pivots had rejected. The
+/// audit (RC-3) flagged this as the most concrete cross-endpoint
+/// drift the operator could see in one session.
+pub(super) fn qualifying_incident_ids(
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+    date_filter: Option<chrono::NaiveDate>,
+    sev_min_rank: u8,
+    detector_substring: Option<&str>,
+) -> Vec<crate::knowledge_graph::types::NodeId> {
+    use crate::knowledge_graph::types::*;
+    graph
+        .nodes_of_type(NodeType::Incident)
+        .into_iter()
+        .filter(|&inc_id| {
+            let Some(Node::Incident {
+                research_only,
+                detector,
+                title,
+                severity,
+                ts,
+                ..
+            }) = graph.get_node(inc_id)
+            else {
+                return false;
+            };
+            if let Some(target) = date_filter {
+                if ts.naive_utc().date() != target {
+                    return false;
+                }
+            }
+            if *research_only {
+                return false;
+            }
+            let has_external_ip = graph
+                .outgoing_edges(inc_id)
+                .iter()
+                .filter(|e| e.relation == Relation::TriggeredBy)
+                .any(|e| {
+                    matches!(
+                        graph.get_node(e.to),
+                        Some(Node::Ip {
+                            is_internal: false,
+                            ..
+                        })
+                    )
+                });
+            let internal = crate::dashboard::live_feed::is_internal_incident_fields(
+                detector,
+                title,
+                has_external_ip,
+            );
+            if internal {
+                return false;
+            }
+            if sev_min_rank > 0 && severity_rank(severity) < sev_min_rank {
+                return false;
+            }
+            if let Some(needle) = detector_substring {
+                if !detector.to_ascii_lowercase().contains(needle) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 /// Build the attacker list for a given date.
 /// Only IPs that appear in at least one incident are included.
 /// Build pivot items from the knowledge graph (live, no JSONL).
@@ -640,69 +736,8 @@ pub(super) fn build_pivots_from_graph(
     // filter except node-type and ended up returning incidents the
     // IP/User pivots had rejected -- "click Detector see X, click
     // IP see 0" was the operator-reported contradiction.
-    let qualifying_incidents: Vec<NodeId> = graph
-        .nodes_of_type(NodeType::Incident)
-        .into_iter()
-        .filter(|&inc_id| {
-            let Some(Node::Incident {
-                research_only,
-                detector,
-                title,
-                severity,
-                ts,
-                ..
-            }) = graph.get_node(inc_id)
-            else {
-                return false;
-            };
-            // Date scope: incident's UTC date must equal the requested
-            // date. Only enforced when the caller provided a parseable
-            // date (defensive: skip the filter rather than silently
-            // returning empty if the caller passed garbage).
-            if let Some(target) = date_filter {
-                if ts.naive_utc().date() != target {
-                    return false;
-                }
-            }
-            if *research_only {
-                return false;
-            }
-            // Same filter the public site live-feed applies, so the
-            // Threats tab and the site agree on what counts as a "real"
-            // incident. See NUMBER_CONSISTENCY.md row "blocks today /
-            // IPs blocked".
-            let has_external_ip = graph
-                .outgoing_edges(inc_id)
-                .iter()
-                .filter(|e| e.relation == Relation::TriggeredBy)
-                .any(|e| {
-                    matches!(
-                        graph.get_node(e.to),
-                        Some(Node::Ip {
-                            is_internal: false,
-                            ..
-                        })
-                    )
-                });
-            let internal = crate::dashboard::live_feed::is_internal_incident_fields(
-                detector,
-                title,
-                has_external_ip,
-            );
-            if internal {
-                return false;
-            }
-            if sev_min_rank > 0 && severity_rank(severity) < sev_min_rank {
-                return false;
-            }
-            if let Some(needle) = &detector_substring {
-                if !detector.to_ascii_lowercase().contains(needle) {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
+    let qualifying_incidents: Vec<NodeId> =
+        qualifying_incident_ids(&graph, date_filter, sev_min_rank, detector_substring);
 
     if group_by == PivotKind::Detector {
         // Spec 037 Threats data contract: Detector pivot now uses the
@@ -721,7 +756,13 @@ pub(super) fn build_pivots_from_graph(
                 let mut first: Option<chrono::DateTime<chrono::Utc>> = None;
                 let mut last: Option<chrono::DateTime<chrono::Utc>> = None;
                 let mut max_sev = "low".to_string();
-                let mut outcome = "open".to_string();
+                // 2026-04-29: outcome string aggregation moved to
+                // `threat_contract::aggregate_outcomes` so the
+                // Detector pivot agrees with IP/User pivots and with
+                // `/api/incidents.outcome`. Pre-fix the keeper
+                // pattern on `ignore` and the `_ => "resolved"`
+                // fallback diverged from every other site.
+                let mut individual_outcomes: Vec<&'static str> = Vec::with_capacity(inc_ids.len());
                 for &iid in &inc_ids {
                     if let Some(Node::Incident {
                         ts,
@@ -735,18 +776,13 @@ pub(super) fn build_pivots_from_graph(
                         if severity_rank(severity) > severity_rank(&max_sev) {
                             max_sev = severity.to_lowercase();
                         }
-                        if let Some(dec) = decision {
-                            outcome = match dec.as_str() {
-                                "block_ip" => "blocked",
-                                "honeypot" => "honeypot",
-                                "monitor" => "monitoring",
-                                "ignore" => outcome.as_str(),
-                                _ => "resolved",
-                            }
-                            .to_string();
-                        }
+                        individual_outcomes.push(threat_contract::classify_decision(
+                            decision.as_deref(),
+                            None,
+                        ));
                     }
                 }
+                let outcome = threat_contract::aggregate_outcomes(&individual_outcomes).to_string();
                 PivotItem {
                     group_by: "detector".to_string(),
                     value: det.clone(),
@@ -812,7 +848,12 @@ pub(super) fn build_pivots_from_graph(
 
             let mut detectors = std::collections::HashSet::new();
             let mut max_sev = "low".to_string();
-            let mut outcome = "open".to_string();
+            // 2026-04-29: same `aggregate_outcomes` path as the
+            // Detector branch above. The pre-fix keeper pattern on
+            // `ignore` survived from the very first pivot
+            // implementation and silently masked drift between
+            // pivots and the journey endpoint.
+            let mut individual_outcomes: Vec<&'static str> = Vec::with_capacity(inc_ids.len());
 
             for &iid in &inc_ids {
                 if let Some(Node::Incident {
@@ -826,18 +867,13 @@ pub(super) fn build_pivots_from_graph(
                     if severity_rank(severity) > severity_rank(&max_sev) {
                         max_sev = severity.to_lowercase();
                     }
-                    if let Some(dec) = decision {
-                        outcome = match dec.as_str() {
-                            "block_ip" => "blocked",
-                            "honeypot" => "honeypot",
-                            "monitor" => "monitoring",
-                            "ignore" => outcome.as_str(), // keep previous non-ignore
-                            _ => "resolved",
-                        }
-                        .to_string();
-                    }
+                    individual_outcomes.push(threat_contract::classify_decision(
+                        decision.as_deref(),
+                        None,
+                    ));
                 }
             }
+            let outcome = threat_contract::aggregate_outcomes(&individual_outcomes).to_string();
 
             PivotItem {
                 group_by: group_by.as_str().to_string(),
@@ -2520,23 +2556,30 @@ fn build_detector_journey(
     let first_seen = entries.first().map(|e| e.ts);
     let last_seen = entries.last().map(|e| e.ts);
 
-    let outcome = entries
+    // 2026-04-29: route through `threat_contract::aggregate_outcomes`
+    // so the Detector journey verdict agrees with the Detector pivot
+    // row's outcome when the operator drills in. The pre-fix
+    // `find_map` short-circuited on the first decision with a known
+    // action_type and skipped block_ip / monitor / honeypot pairs
+    // emitted in different orders.
+    let individual: Vec<&'static str> = entries
         .iter()
         .filter(|e| e.kind == "decision")
         .filter_map(|e| e.data.get("action_type").and_then(|v| v.as_str()))
-        .find_map(|d| {
-            if d == "block_ip" {
-                Some("blocked")
-            } else if d == "honeypot" {
-                Some("honeypot")
-            } else if d == "monitor" {
-                Some("monitoring")
-            } else {
-                None
-            }
-        })
-        .unwrap_or(if has_incident { "active" } else { "unknown" })
-        .to_string();
+        .map(|d| threat_contract::classify_decision(Some(d), None))
+        .collect();
+    let outcome = if !individual.is_empty() {
+        threat_contract::aggregate_outcomes(&individual).to_string()
+    } else if has_incident {
+        // Same fallback the IP/User journey uses (`active` =
+        // incident observed but no decision yet). Kept distinct
+        // from threat_contract's `OUTCOME_OPEN` because the
+        // journey-side rendering keys on `active` for the
+        // "incident observed, awaiting decision" empty-state copy.
+        "active".to_string()
+    } else {
+        "unknown".to_string()
+    };
 
     let summary = build_journey_summary(
         &entries,
@@ -3205,7 +3248,15 @@ mod tests {
     }
 
     #[test]
-    fn detector_journey_unknown_decision_falls_back_to_active() {
+    fn detector_journey_unknown_decision_falls_back_to_open() {
+        // 2026-04-29: pre-contract this test asserted "active" for
+        // an unknown decision string. The audit (RC-2) consolidated
+        // the outcome vocabulary on `OUTCOME_OPEN` for any decision
+        // that does not resolve to a known action, including
+        // forward-compat unknowns. The journey UI (helpers.js
+        // `outcomeBadgeHtml`) already maps both "open" and "active"
+        // to the same "OBSERVING" badge, so the rename is
+        // operator-invisible -- only the contract layer changes.
         let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
         let inc = detector_test_incident("sigma", None);
         graph.ingest_incident(&inc);
@@ -3220,7 +3271,7 @@ mod tests {
         );
         let dir = TempDir::new().expect("tmpdir");
         let journey = build_detector_journey(&graph, dir.path(), "2026-04-18", "sigma", None);
-        assert_eq!(journey.outcome, "active");
+        assert_eq!(journey.outcome, "open");
     }
 
     #[test]
