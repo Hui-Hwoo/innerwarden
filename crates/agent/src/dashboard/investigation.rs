@@ -31,20 +31,27 @@ pub(super) async fn api_threats_diagnostic(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,
 ) -> Json<ThreatsDiagnostic> {
-    let date = resolve_date(query.date.as_deref());
+    let display_date = resolve_date(query.date.as_deref());
+    let explicit_date = explicit_date_filter(query.date.as_deref());
     let filters =
         InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
     // Reuse the production builder so the diagnostic agrees by
     // construction with what /api/entities + /api/pivots returns.
-    let ip_count =
-        build_pivots_from_graph(&state.knowledge_graph, PivotKind::Ip, 500, &filters, &date).len();
+    let ip_count = build_pivots_from_graph(
+        &state.knowledge_graph,
+        PivotKind::Ip,
+        500,
+        &filters,
+        explicit_date,
+    )
+    .len();
     let user_count = build_pivots_from_graph(
         &state.knowledge_graph,
         PivotKind::User,
         500,
         &filters,
-        &date,
+        explicit_date,
     )
     .len();
     let det_count = build_pivots_from_graph(
@@ -52,7 +59,7 @@ pub(super) async fn api_threats_diagnostic(
         PivotKind::Detector,
         500,
         &filters,
-        &date,
+        explicit_date,
     )
     .len();
     let total_pivot = ip_count + user_count + det_count;
@@ -65,7 +72,7 @@ pub(super) async fn api_threats_diagnostic(
         PivotKind::Detector,
         500,
         &filters,
-        &date,
+        explicit_date,
     )
     .iter()
     .map(|p| p.incident_count)
@@ -76,8 +83,9 @@ pub(super) async fn api_threats_diagnostic(
 
     // Scope mismatch: graph has Incident nodes overall, but none for
     // this date. Lets the empty state suggest "try previous day"
-    // instead of generic "nothing here".
-    let scope_mismatch = if has_incidents {
+    // instead of generic "nothing here". Only meaningful when the
+    // operator picked an explicit date filter.
+    let scope_mismatch = if has_incidents || explicit_date.is_none() {
         false
     } else {
         use crate::knowledge_graph::types::NodeType;
@@ -100,7 +108,7 @@ pub(super) async fn api_threats_diagnostic(
     }
 
     Json(ThreatsDiagnostic {
-        date,
+        date: display_date,
         has_incidents,
         has_entities,
         scope_mismatch,
@@ -116,39 +124,72 @@ pub(super) async fn api_entities(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,
 ) -> Json<EntitiesResponse> {
-    let date = resolve_date(query.date.as_deref());
+    // Spec 037 Threats UX hotfix: date is an OPTIONAL filter, not a
+    // mandatory scope. When the operator hasn't explicitly selected a
+    // date, `query.date` is empty and `explicit_date_filter` returns
+    // `None` so the builder sees the full graph. The earlier behaviour
+    // (resolve to today by default) emptied the page on hosts where
+    // today had only self-traffic incidents -- the operator landed on
+    // an empty Threats tab and changing the date didn't help because
+    // each switch still imposed a hard one-day filter on a graph whose
+    // qualifying incidents happened to span other dates. The response
+    // still echoes a stable date string for the UI label.
+    let display_date = resolve_date(query.date.as_deref());
+    let explicit_date = explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let filters =
         InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    // Spec 037 Threats data contract: forward `date` to the builder so
-    // the IP pivot is scoped to the requested day instead of returning
-    // every Incident node accumulated in the in-memory graph.
-    let attackers = build_attackers_from_graph(&state.knowledge_graph, limit, &filters, &date);
-    Json(EntitiesResponse { date, attackers })
+    let attackers =
+        build_attackers_from_graph(&state.knowledge_graph, limit, &filters, explicit_date);
+    Json(EntitiesResponse {
+        date: display_date,
+        attackers,
+    })
 }
 
 pub(super) async fn api_pivots(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,
 ) -> Json<PivotResponse> {
-    let date = resolve_date(query.date.as_deref());
+    // Same date semantics as `api_entities`: only an explicit
+    // YYYY-MM-DD selection filters; the default load shows the full
+    // graph so the operator can see every pivot at once.
+    let display_date = resolve_date(query.date.as_deref());
+    let explicit_date = explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let group_by = PivotKind::parse(query.group_by.as_deref());
     let filters =
         InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
 
-    // Spec 037 Threats data contract: pass `date` to the builder so all
-    // three pivots (IP / User / Detector) honour the same temporal
-    // scope. Previously the date round-tripped to the response but the
-    // builder iterated the entire knowledge graph regardless.
-    let items = build_pivots_from_graph(&state.knowledge_graph, group_by, limit, &filters, &date);
+    let items = build_pivots_from_graph(
+        &state.knowledge_graph,
+        group_by,
+        limit,
+        &filters,
+        explicit_date,
+    );
     Json(PivotResponse {
-        date,
+        date: display_date,
         group_by: group_by.as_str().to_string(),
         total: items.len(),
         items,
     })
+}
+
+/// Returns `Some(date_str)` only when the caller passed a parseable
+/// `YYYY-MM-DD` value. Empty string, missing param, and unparseable
+/// inputs all collapse to `None` so the builder applies no date
+/// filter at all (and the operator sees the whole graph by default).
+fn explicit_date_filter(raw: Option<&str>) -> Option<&str> {
+    let candidate = raw?.trim();
+    if candidate.len() != 10 {
+        return None;
+    }
+    if chrono::NaiveDate::parse_from_str(candidate, "%Y-%m-%d").is_err() {
+        return None;
+    }
+    Some(candidate)
 }
 pub(super) async fn api_clusters(
     State(state): State<DashboardState>,
@@ -369,7 +410,13 @@ fn build_export_response(
         let graph = kg.read().unwrap();
         compute_overview_from_graph(&graph, &data_dir, &date)
     };
-    let pivots = build_pivots_from_graph(&kg, group_by, limit, &filters, &date);
+    let pivots = build_pivots_from_graph(
+        &kg,
+        group_by,
+        limit,
+        &filters,
+        explicit_date_filter(query.date.as_deref()),
+    );
     let clusters = build_cluster_items_from_graph(&kg, limit, window_seconds);
     let journey = subject.as_ref().filter(|s| !s.is_empty()).map(|s| {
         build_journey_from_graph(
@@ -438,22 +485,22 @@ pub(super) fn build_pivots_from_graph(
     group_by: PivotKind,
     limit: usize,
     filters: &InvestigationFilters,
-    date: &str,
+    date: Option<&str>,
 ) -> Vec<PivotItem> {
     use crate::knowledge_graph::types::*;
     let graph = kg.read().unwrap();
     let sev_min_rank = filters.severity_min_rank();
     let detector_substring = filters.detector_lower();
 
-    // Spec 037 Threats data contract: parse the requested date once
-    // and use it as the temporal scope for ALL three pivots. Previously
-    // the builders ignored `date` entirely and iterated the full graph,
-    // so a request for "today" surfaced incidents from any prior date
-    // present in the graph. An unparseable date (resolve_date should
-    // already prevent this) falls back to "no date filter" so the
-    // function never returns spuriously empty results due to caller bug.
+    // Spec 037 Threats UX hotfix: `date` is an OPTIONAL filter.
+    //   * `None` -> no temporal filter; all qualifying incidents in the
+    //     graph appear (default load behaviour the operator expects).
+    //   * `Some("YYYY-MM-DD")` -> filter Incident nodes whose UTC date
+    //     equals the parsed value.
+    //   * `Some(garbage)` collapses to no filter so a malformed UI
+    //     query never spuriously empties the page.
     let date_filter: Option<chrono::NaiveDate> =
-        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok();
+        date.and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
     let node_type = match group_by {
         PivotKind::Ip => NodeType::Ip,
@@ -724,7 +771,7 @@ pub(super) fn build_attackers_from_graph(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     limit: usize,
     filters: &InvestigationFilters,
-    date: &str,
+    date: Option<&str>,
 ) -> Vec<AttackerSummary> {
     build_pivots_from_graph(kg, PivotKind::Ip, limit, filters, date)
         .into_iter()
@@ -3372,7 +3419,7 @@ mod tests {
     #[test]
     fn build_pivots_from_graph_excludes_advisory_only_detectors() {
         let kg = make_kg_with_attackers();
-        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), "");
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), None);
         // 2 attackers should remain (ssh + port_scan). neural_anomaly is filtered.
         let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
         assert!(ips.contains("203.0.113.10"));
@@ -3387,7 +3434,7 @@ mod tests {
     fn build_pivots_from_graph_severity_min_filter_narrows_results() {
         let kg = make_kg_with_attackers();
         let high_only = InvestigationFilters::from_query(Some("high"), None);
-        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &high_only, "");
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &high_only, None);
         let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
         assert!(
             ips.contains("203.0.113.10"),
@@ -3403,7 +3450,7 @@ mod tests {
     fn build_pivots_from_graph_detector_filter_narrows_results() {
         let kg = make_kg_with_attackers();
         let ssh_only = InvestigationFilters::from_query(None, Some("ssh"));
-        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &ssh_only, "");
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &ssh_only, None);
         let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
         assert!(
             ips.contains("203.0.113.10"),
@@ -3419,7 +3466,7 @@ mod tests {
     fn build_pivots_from_graph_combined_filters_intersect() {
         let kg = make_kg_with_attackers();
         let critical_ssh = InvestigationFilters::from_query(Some("critical"), Some("ssh"));
-        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &critical_ssh, "");
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &critical_ssh, None);
         // No ssh incident is critical-severity → empty.
         assert!(items.is_empty());
     }
@@ -3474,7 +3521,7 @@ mod tests {
     fn build_attackers_from_graph_forwards_filters() {
         let kg = make_kg_with_attackers();
         let high = InvestigationFilters::from_query(Some("high"), None);
-        let attackers = build_attackers_from_graph(&kg, 100, &high, "");
+        let attackers = build_attackers_from_graph(&kg, 100, &high, None);
         let ips: std::collections::HashSet<&str> =
             attackers.iter().map(|a| a.ip.as_str()).collect();
         assert!(ips.contains("203.0.113.10"));
@@ -3555,8 +3602,13 @@ mod tests {
         // fora do dia". Graph has incidents on 2026-04-26 and 2026-04-28.
         // Asking for 2026-04-28 must return ONLY the 198.51.100.77 IP.
         let kg = make_kg_with_two_dates();
-        let items =
-            build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), "2026-04-28");
+        let items = build_pivots_from_graph(
+            &kg,
+            PivotKind::Ip,
+            100,
+            &Default::default(),
+            Some("2026-04-28"),
+        );
         let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
         assert!(
             ips.contains("198.51.100.77"),
@@ -3606,8 +3658,13 @@ mod tests {
         // The TriggeredBy edge from Incident to IP must exist so the
         // IP pivot can find it.
         let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
-        let items =
-            build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), "2026-04-28");
+        let items = build_pivots_from_graph(
+            &kg,
+            PivotKind::Ip,
+            100,
+            &Default::default(),
+            Some("2026-04-28"),
+        );
         let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
         assert!(
             ips.contains("198.51.100.123"),
@@ -3623,14 +3680,19 @@ mod tests {
         // operator was the Detector pivot listing items that the IP
         // pivot had filtered out.
         let kg = make_kg_with_two_dates();
-        let ip_items =
-            build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), "2026-04-28");
+        let ip_items = build_pivots_from_graph(
+            &kg,
+            PivotKind::Ip,
+            100,
+            &Default::default(),
+            Some("2026-04-28"),
+        );
         let det_items = build_pivots_from_graph(
             &kg,
             PivotKind::Detector,
             100,
             &Default::default(),
-            "2026-04-28",
+            Some("2026-04-28"),
         );
         // Both pivots are scoped to 2026-04-28 only. The two-date
         // fixture has exactly one incident per day, so both pivots
@@ -3658,6 +3720,64 @@ mod tests {
                 .iter()
                 .map(|p| (p.value.clone(), p.outcome.clone()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Spec 037 Threats UX hotfix ─────────────────────────────────────
+    //
+    // Regression anchors for the "page is empty after deploy" bug. The
+    // operator hit an empty Threats tab because PR #327 made the date
+    // filter mandatory (defaulted to today via `resolve_date`); on
+    // hosts where today had only self-traffic incidents the page went
+    // blank and switching the date didn't help because each switch
+    // imposed a hard one-day filter. Fix: date is now an Option, with
+    // None = no filter (show whole graph), Some = explicit YYYY-MM-DD.
+
+    #[test]
+    fn build_pivots_from_graph_with_none_date_returns_all_dates() {
+        // Anchor for: "page must show data when no date is explicitly
+        // selected". The two-date fixture has incidents on 2026-04-26
+        // and 2026-04-28; with date=None both must surface.
+        let kg = make_kg_with_two_dates();
+        let items = build_pivots_from_graph(&kg, PivotKind::Ip, 100, &Default::default(), None);
+        let ips: std::collections::HashSet<&str> = items.iter().map(|p| p.value.as_str()).collect();
+        assert!(
+            ips.contains("198.51.100.77"),
+            "today's incident must appear, got: {ips:?}"
+        );
+        assert!(
+            ips.contains("203.0.113.99"),
+            "yesterday's incident must ALSO appear when date=None, got: {ips:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_date_filter_rejects_empty_and_garbage() {
+        // Anchor for the explicit-vs-resolved date split. Empty string,
+        // missing param, and garbage all collapse to None so the
+        // builder applies no filter. Only well-formed YYYY-MM-DD values
+        // become Some.
+        assert_eq!(explicit_date_filter(None), None, "missing -> None");
+        assert_eq!(explicit_date_filter(Some("")), None, "empty -> None");
+        assert_eq!(
+            explicit_date_filter(Some("   ")),
+            None,
+            "whitespace -> None"
+        );
+        assert_eq!(
+            explicit_date_filter(Some("not-a-date")),
+            None,
+            "garbage -> None"
+        );
+        assert_eq!(
+            explicit_date_filter(Some("2026-13-99")),
+            None,
+            "out-of-range -> None"
+        );
+        assert_eq!(
+            explicit_date_filter(Some("2026-04-28")),
+            Some("2026-04-28"),
+            "valid date passes through"
         );
     }
 }
