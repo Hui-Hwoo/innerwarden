@@ -48,9 +48,23 @@ function outcomeOf(item) {
   // watch). The dedicated group makes the silenced trust auditable.
   if (o === 'allowlisted') return 'allowlisted';
   if (o === 'open') {
-    // Operator-centric: open means "no decision yet".
-    var modeOpen = (window._agentMode || 'guard');
-    if (modeOpen === 'guard') return 'monitoring';
+    // Phase 13 (QA fix #3, 2026-04-29): explicit `open` outcome from
+    // the backend means "no decision yet" — that is, the AI has not
+    // committed to an action. Pre-Phase-13 this branch mode-rewrote
+    // open→monitoring under guard mode to "reduce alarm fatigue",
+    // but the consequence was that the Home tile (which counts
+    // `buckets.attention.unique_attackers`) said "Needs attention 3"
+    // while the threats list grouped those same 3 IPs under
+    // Observing. Two semantic interpretations of the same backend
+    // field on the same screen — exactly the RC-2 drift class.
+    //
+    // Resolution: `open` always maps to `needs_attention`. The
+    // Pending breakdown panel in the Home view (Phase 7B) already
+    // distinguishes "in flight (<5 min)" from "stuck (>1h)" so the
+    // operator gets the right alarm level without re-classifying
+    // open as monitoring. If alarm-fatigue regresses, the right fix
+    // is to refine the Pending panel copy, not to silently rewrite
+    // the outcome.
     return 'needs_attention';
   }
   if (o === 'ignored' || o === 'noise' || o === 'dismissed') return 'dismissed';
@@ -65,11 +79,11 @@ function outcomeOf(item) {
   if (dec === 'monitor') return 'monitoring';
   if (dec === 'ignore' || dec === 'dismiss') return 'dismissed';
 
-  // 'active', '', escalate, request_confirmation, unknown → depends on mode:
-  //   Guard ON:  AI processing autonomously → 'monitoring' (observing)
-  //   Guard OFF: AI detected but CANNOT act → 'needs_attention'
-  var mode = (window._agentMode || 'guard');
-  if (mode === 'guard') return 'monitoring';
+  // Phase 13 (QA fix #3): 'active', '', escalate, request_confirmation,
+  // unknown — these are all "no committed decision". They join the
+  // `open` branch above and map to 'needs_attention' regardless of
+  // mode. The mode-aware rewrite that used to live here was the same
+  // class of semantic drift the explicit `open` branch had.
   return 'needs_attention';
 }
 
@@ -406,21 +420,24 @@ function setThreatsDate(date) {
 }
 
 function setThreatsPivot(p) {
-  // Phase 12 (QA fix #4, 2026-04-29): switching pivot used to leave
-  // the right-side journey panel showing the previously selected
-  // subject (e.g. an IP detail still rendered after switching to
-  // User pivot — orphaned context, confusing). Clear the selection
-  // and reset the journey pane so the new pivot list looks clean.
+  // Phase 13 (QA fix #4 follow-up, 2026-04-29): the Phase-12 fix
+  // targeted `#journeyPane` (an element that doesn't exist in the
+  // current HTML) — the right panel kept showing the stale detail.
+  // Real structure: `#rightPanel` is the container; `#homeState` is
+  // the placeholder ("Select a threat to investigate"); the
+  // `#journeyContent` div carries the actual detail when populated.
+  // To clear: hide journeyContent, show homeState.
   if (state.pivot !== p) {
     state.selected = { type: null, value: null };
     state.lastSubjectKey = null;
-    var pane = document.getElementById('journeyPane');
-    if (pane) {
-      pane.innerHTML =
-        '<div class="empty" style="padding:30px 24px;text-align:center;color:var(--muted)">' +
-        '<div style="font-size:1.6rem;margin-bottom:8px">🔍</div>' +
-        '<div>Select a threat to investigate</div>' +
-        '</div>';
+    var journeyContent = document.getElementById('journeyContent');
+    var homeState = document.getElementById('homeState');
+    if (journeyContent) {
+      journeyContent.style.display = 'none';
+      journeyContent.innerHTML = '';
+    }
+    if (homeState) {
+      homeState.style.display = '';
     }
     // Clear selection highlight on cards.
     document.querySelectorAll('.attacker-card.active').forEach(function(c) {

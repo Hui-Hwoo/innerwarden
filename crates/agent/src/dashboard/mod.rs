@@ -1047,6 +1047,30 @@ mod tests {
     }
 
     #[test]
+    fn threats_js_open_outcome_always_maps_to_needs_attention() {
+        // Phase 13 (QA fix #3, 2026-04-29): pre-Phase-13 the
+        // outcomeOf function rewrote `open` -> `monitoring` when
+        // mode == 'guard', causing the home tile
+        // `buckets.attention.unique_attackers` (correctly counts
+        // open IPs) to disagree with the threats list group count
+        // (which folded those same IPs into Observing). Anchor
+        // pins the post-fix mapping: open -> needs_attention,
+        // unconditional. If a future cleanup re-introduces the
+        // mode-aware rewrite, the cross-surface drift returns and
+        // this test fails.
+        assert!(
+            JS_THREATS.contains("if (o === 'open')"),
+            "outcomeOf must explicitly handle the 'open' outcome string"
+        );
+        // The fix removed the `modeOpen === 'guard'` short-circuit.
+        // If it comes back, this catches it.
+        assert!(
+            !JS_THREATS.contains("if (modeOpen === 'guard') return 'monitoring';"),
+            "open MUST NOT be mode-rewritten to monitoring — Phase 13 RC-2 drift fix"
+        );
+    }
+
+    #[test]
     fn normalize_limit_is_bounded() {
         assert_eq!(normalize_limit(None), 50);
         assert_eq!(normalize_limit(Some(0)), 1);
