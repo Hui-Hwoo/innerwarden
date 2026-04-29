@@ -61,7 +61,7 @@ use anyhow::{Context, Result};
 use argon2::password_hash::{PasswordHashString, SaltString};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{header, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -179,6 +179,24 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Server entry point
 // ---------------------------------------------------------------------------
+
+/// Audit I-14 (2026-04-29): cap request bodies at 1 MiB across the
+/// whole router. Without this, an authenticated operator session (or
+/// the loopback-bound /api/agent/* endpoints) could be coerced into
+/// POSTing a multi-MB body, OOMing the agent under sustained attack.
+///
+/// 1 MiB is generous for every legitimate POST in this dashboard:
+/// web-push subscribe (~1 KB), AI briefing requests (~2 KB), bot
+/// command audit append (~500 B), session login basic auth (~100 B).
+/// Bump if a future endpoint genuinely needs more.
+pub(super) const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Build the `DefaultBodyLimit` layer that the dashboard router
+/// applies. Extracted so the regression anchor in `tests` exercises
+/// the exact same value `serve()` uses (no duplicated literal).
+pub(super) fn build_body_limit_layer() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(MAX_BODY_BYTES)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
@@ -487,6 +505,7 @@ pub async fn serve(
         .merge(auth_login)
         .merge(live_api)
         .merge(dashboard)
+        .layer(build_body_limit_layer())
         .layer(middleware::from_fn(security_headers))
         .layer(activity_layer)
         .layer(rate_limit_layer);
@@ -2104,6 +2123,99 @@ mod tests {
         assert!(
             !captured_str.contains("failed to set TLS file permissions"),
             "successful chmod must not emit the failure warn — got: {captured_str}"
+        );
+    }
+
+    // ── Audit I-14 (2026-04-29) ────────────────────────────────────────
+    //
+    // The dashboard router caps request bodies at 1 MB via
+    // `DefaultBodyLimit::max(...)`. The anchor below proves the layer
+    // is correctly wired by building a tiny axum router with the SAME
+    // limit + an echo handler, then asserting:
+    //   1. a body strictly under the limit is accepted (200 OK).
+    //   2. a body strictly over the limit yields 413 Payload Too Large.
+    //
+    // This is a layer-behaviour anchor, not a full router integration
+    // test -- a future change that drops the layer from `serve()`
+    // would not be caught here, but a future change that miscalibrates
+    // `MAX_BODY_BYTES` (e.g. accidentally drops the `* 1024 * 1024`
+    // factor) would be.
+
+    #[test]
+    fn max_body_bytes_constant_is_one_mib() {
+        // The chosen cap matters for both audit I-14 closure and for
+        // every legitimate POST in this dashboard (~1 KB to 2 KB
+        // payloads). Pin the value so a future change has to update
+        // this assertion deliberately.
+        assert_eq!(MAX_BODY_BYTES, 1_048_576);
+    }
+
+    #[tokio::test]
+    async fn body_limit_layer_rejects_oversized_post() {
+        // axum's `DefaultBodyLimit` is enforced by extractors that opt
+        // into it (Bytes, String, Json, Form). The router-level layer
+        // sets the configuration; the extractor reads it and rejects
+        // bodies past the cap with 413. The handlers in this dashboard
+        // use Bytes / Json variants, which all honour this contract.
+        //
+        // The test wires `build_body_limit_layer()` to a tiny echo
+        // route so the production helper itself is exercised (rather
+        // than re-declaring the cap here, which would let a future
+        // miscalibration of `MAX_BODY_BYTES` slip through).
+        use axum::body::{Body, Bytes};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::post;
+        use axum::Router;
+        use tower::util::ServiceExt;
+
+        async fn echo(_body: Bytes) -> axum::http::Response<Body> {
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap()
+        }
+
+        let app: Router = Router::new()
+            .route("/echo", post(echo))
+            .layer(build_body_limit_layer());
+
+        // Under-limit body passes.
+        let small = vec![b'x'; MAX_BODY_BYTES - 1];
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/echo")
+                    .header("content-length", small.len().to_string())
+                    .body(Body::from(small))
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "under-limit body must be accepted"
+        );
+
+        // Over-limit body is rejected at the extractor with 413.
+        let big = vec![b'x'; MAX_BODY_BYTES + 1];
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/echo")
+                    .header("content-length", big.len().to_string())
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "over-limit body must yield 413"
         );
     }
 }
