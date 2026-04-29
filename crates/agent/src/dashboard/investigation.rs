@@ -170,8 +170,13 @@ pub(super) async fn api_entities(
             query.detector.as_deref(),
         );
         let graph = graph_for_date(&state, explicit_date.as_deref());
-        let attackers =
-            build_attackers_from_graph(&graph, limit, &filters, explicit_date.as_deref());
+        let attackers = build_attackers_from_graph(
+            &graph,
+            limit,
+            &filters,
+            explicit_date.as_deref(),
+            state.sqlite_store.as_ref(),
+        );
         EntitiesResponse {
             date: display_date,
             attackers,
@@ -479,18 +484,34 @@ pub(super) async fn api_journey(
             },
             chapters: vec![],
             entries: vec![],
+            block_state: None,
         });
     }
 
-    Json(build_journey_from_graph(
-        &state.knowledge_graph,
-        &state.data_dir,
-        &date,
-        subject_type,
-        &subject,
-        &filters,
-        window_seconds,
-    ))
+    // Audit I-06: build_journey_from_graph now does sync SQLite reads
+    // (xdp_block_times kv lookup) on top of the pre-existing graph
+    // read-lock + JSONL scan. Wrap in spawn_blocking so the dashboard
+    // async workers stay responsive under WAL contention.
+    let kg = std::sync::Arc::clone(&state.knowledge_graph);
+    let data_dir = state.data_dir.clone();
+    let sqlite = state.sqlite_store.clone();
+    let date_for_fallback = date.clone();
+    let subject_for_fallback = subject.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        build_journey_from_graph(
+            &kg,
+            &data_dir,
+            &date,
+            subject_type,
+            &subject,
+            &filters,
+            window_seconds,
+            sqlite.as_ref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| empty_journey(subject_type, &subject_for_fallback, &date_for_fallback));
+    Json(response)
 }
 
 pub(super) async fn api_export(
@@ -505,8 +526,11 @@ pub(super) async fn api_export(
     // block tokio worker threads").
     let kg = std::sync::Arc::clone(&state.knowledge_graph);
     let data_dir = state.data_dir.clone();
-    let result =
-        tokio::task::spawn_blocking(move || build_export_response(kg, data_dir, query)).await;
+    let sqlite = state.sqlite_store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        build_export_response(kg, data_dir, sqlite.as_ref(), query)
+    })
+    .await;
     match result {
         Ok(resp) => resp,
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "export task panicked").into_response(),
@@ -516,6 +540,7 @@ pub(super) async fn api_export(
 fn build_export_response(
     kg: std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: std::path::PathBuf,
+    sqlite: Option<&std::sync::Arc<innerwarden_store::Store>>,
     query: ExportQuery,
 ) -> Response {
     let date = resolve_date(query.date.as_deref());
@@ -554,6 +579,7 @@ fn build_export_response(
             s,
             &filters,
             Some(window_seconds),
+            sqlite,
         )
     });
 
@@ -914,10 +940,15 @@ pub(super) fn build_attackers_from_graph(
     limit: usize,
     filters: &InvestigationFilters,
     date: Option<&str>,
+    sqlite: Option<&std::sync::Arc<innerwarden_store::Store>>,
 ) -> Vec<AttackerSummary> {
+    let now = Utc::now();
     build_pivots_from_graph(kg, PivotKind::Ip, limit, filters, date)
         .into_iter()
         .map(|p| AttackerSummary {
+            block_state: sqlite.map(|_| {
+                crate::dashboard::threat_contract::block_state_for_ip(sqlite, &p.value, now)
+            }),
             ip: p.value,
             first_seen: p.first_seen,
             last_seen: p.last_seen,
@@ -948,6 +979,7 @@ pub(super) fn build_attackers(
             outcome: p.outcome,
             incident_count: p.incident_count,
             event_count: p.event_count,
+            block_state: None,
         })
         .collect()
 }
@@ -1219,6 +1251,11 @@ pub(super) fn build_cluster_items_from_graph(
 /// Build the full journey timeline for a selected subject on a given date.
 /// Build a journey timeline from the knowledge graph (live, no JSONL).
 /// Falls back to honeypot JSONL for honeypot sessions (not in graph yet).
+// 8 args after Phase 3 added the SQLite handle for kernel-evidence
+// reads. Refactoring to a parameter struct churn would touch every
+// caller (3 prod + 2 tests) without changing semantics; revisit when
+// any caller passes a 9th arg.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_journey_from_graph(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &Path,
@@ -1227,6 +1264,7 @@ pub(super) fn build_journey_from_graph(
     subject: &str,
     _filters: &InvestigationFilters,
     window_seconds: Option<u64>,
+    sqlite: Option<&std::sync::Arc<innerwarden_store::Store>>,
 ) -> JourneyResponse {
     use crate::knowledge_graph::types::*;
 
@@ -1578,6 +1616,19 @@ pub(super) fn build_journey_from_graph(
     let verdict = derive_verdict(&entries, &outcome);
     let chapters = derive_chapters(&entries);
 
+    // Phase 3 (audit RC-4): kernel-evidence block state for IP pivots.
+    // Detector / user pivots have no single IP to query against
+    // xdp_block_times so they leave block_state at None.
+    let block_state = if subject_type == PivotKind::Ip {
+        Some(crate::dashboard::threat_contract::block_state_for_ip(
+            sqlite,
+            subject,
+            chrono::Utc::now(),
+        ))
+    } else {
+        None
+    };
+
     JourneyResponse {
         subject_type: subject_type.as_str().to_string(),
         subject: subject.to_string(),
@@ -1589,6 +1640,7 @@ pub(super) fn build_journey_from_graph(
         verdict,
         chapters,
         entries,
+        block_state,
     }
 }
 
@@ -1623,6 +1675,7 @@ pub(super) fn empty_journey(subject_type: PivotKind, subject: &str, date: &str) 
         },
         chapters: vec![],
         entries: vec![],
+        block_state: None,
     }
 }
 
@@ -1806,6 +1859,7 @@ pub(super) fn build_journey(
         verdict,
         chapters,
         entries,
+        block_state: None,
     }
 }
 
@@ -2605,6 +2659,7 @@ fn build_detector_journey(
         verdict,
         chapters,
         entries,
+        block_state: None,
     }
 }
 
@@ -3311,6 +3366,7 @@ mod tests {
             "sigma",
             &filters,
             None,
+            None,
         );
 
         assert_eq!(journey.subject_type, "detector");
@@ -3459,6 +3515,7 @@ mod tests {
             PivotKind::Ip,
             "160.119.76.50",
             &filters,
+            None,
             None,
         )
     }
@@ -3678,11 +3735,158 @@ mod tests {
     fn build_attackers_from_graph_forwards_filters() {
         let kg = make_kg_with_attackers();
         let high = InvestigationFilters::from_query(Some("high"), None);
-        let attackers = build_attackers_from_graph(&kg, 100, &high, None);
+        let attackers = build_attackers_from_graph(&kg, 100, &high, None, None);
         let ips: std::collections::HashSet<&str> =
             attackers.iter().map(|a| a.ip.as_str()).collect();
         assert!(ips.contains("203.0.113.10"));
         assert!(!ips.contains("198.51.100.20"));
+    }
+
+    // ── Phase 3 anchors: block_state plumbing on the IP pivot ──────────
+    //
+    // Two anchors covering the new SQLite-handle threading. Without
+    // these the spawn_blocking wrap on `api_journey` and the
+    // `Some(block_state_for_ip(...))` branch of build_journey_from_graph
+    // are unreachable from the test suite, which is the exact dead
+    // surface that codecov/patch flags.
+
+    #[test]
+    fn build_journey_from_graph_ip_pivot_with_sqlite_populates_block_state() {
+        // Real call path: build_journey_from_graph is given a real
+        // SQLite store with a kernel-level block entry for the
+        // subject IP. The journey response must surface
+        // BlockState::BlockedNow (not None, not Open) so the front
+        // end can render the kernel-evidence badge.
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("packet_flood", Some("198.51.100.77"));
+        graph.ingest_incident(&inc);
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let now = chrono::Utc::now();
+        let payload = serde_json::json!({
+            "blocked_at_ms": now.timestamp_millis() - 60_000,
+            "ttl_secs": 3600,
+        });
+        store
+            .kv_set(
+                "xdp_block_times",
+                "198.51.100.77",
+                &serde_json::to_vec(&payload).unwrap(),
+            )
+            .expect("kv_set");
+
+        let filters = InvestigationFilters::from_query(None, None);
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_journey_from_graph(
+            &kg,
+            dir.path(),
+            &now.date_naive().to_string(),
+            PivotKind::Ip,
+            "198.51.100.77",
+            &filters,
+            None,
+            Some(&store),
+        );
+
+        match journey.block_state {
+            Some(crate::dashboard::threat_contract::BlockState::BlockedNow { .. }) => {}
+            other => panic!("expected BlockedNow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_journey_from_graph_detector_pivot_leaves_block_state_none() {
+        // Detector pivot has no single IP to query against
+        // xdp_block_times. block_state must stay None so the front
+        // end does not render a kernel-evidence badge for the
+        // detector group as a whole.
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("sigma", Some("198.51.100.77"));
+        graph.ingest_incident(&inc);
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+
+        let filters = InvestigationFilters::from_query(None, None);
+        let dir = TempDir::new().expect("tmpdir");
+        let journey = build_journey_from_graph(
+            &kg,
+            dir.path(),
+            "2026-04-29",
+            PivotKind::Detector,
+            "sigma",
+            &filters,
+            None,
+            Some(&store),
+        );
+
+        assert!(
+            journey.block_state.is_none(),
+            "detector pivot must not carry a block_state, got {:?}",
+            journey.block_state
+        );
+    }
+
+    #[tokio::test]
+    async fn api_journey_async_handler_threads_sqlite_to_journey_builder() {
+        // Anchors the api_journey -> spawn_blocking -> sqlite-threaded
+        // build_journey_from_graph wiring end-to-end. Without this
+        // test the new spawn_blocking wrapper, the sqlite_store clone,
+        // and the date/subject fallback path are all unexercised
+        // from the test suite (which codecov/patch flagged on
+        // PR #335).
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let inc = detector_test_incident("packet_flood", Some("198.51.100.99"));
+        graph.ingest_incident(&inc);
+        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(graph));
+
+        let q = JourneyQuery {
+            subject_type: Some("ip".to_string()),
+            subject: Some("198.51.100.99".to_string()),
+            ip: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+            window_seconds: None,
+        };
+        let Json(resp) = api_journey(State(state), Query(q)).await;
+        assert_eq!(resp.subject_type, "ip");
+        assert_eq!(resp.subject, "198.51.100.99");
+        // sqlite_store is None on test_dashboard_state, so the IP
+        // pivot block_state must resolve to Open (the no-store
+        // fallback in block_state_for_ip).
+        match resp.block_state {
+            Some(crate::dashboard::threat_contract::BlockState::Open) => {}
+            other => panic!("expected Some(Open) when no sqlite store, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_journey_async_handler_empty_subject_short_circuits() {
+        // The subject.is_empty() branch in api_journey returns the
+        // hand-built JourneyResponse before reaching spawn_blocking.
+        // This anchor covers the new `block_state: None` field on
+        // that early return so a future struct change cannot drop
+        // the field silently.
+        let dir = TempDir::new().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let q = JourneyQuery {
+            subject_type: Some("ip".to_string()),
+            subject: Some(String::new()),
+            ip: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+            window_seconds: None,
+        };
+        let Json(resp) = api_journey(State(state), Query(q)).await;
+        assert_eq!(resp.subject, "");
+        assert!(resp.block_state.is_none());
     }
 
     // ── Spec 037 Threats data contract ─────────────────────────────────

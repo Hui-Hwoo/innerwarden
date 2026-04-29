@@ -1444,6 +1444,7 @@ mod tests {
                 },
                 chapters: vec![],
                 entries: vec![],
+                block_state: None,
             }),
         };
 

@@ -173,6 +173,78 @@ pub(super) fn kpi_bucket(outcome: &str) -> KpiBucket {
     }
 }
 
+/// Phase 3 (audit RC-4): kernel-evidence block state for a single IP.
+///
+/// The pre-fix dashboard surfaced "blocked" as one undifferentiated
+/// label that meant three different things depending on which endpoint
+/// emitted it:
+///
+/// * **decision was made** ("we issued a block_ip yesterday")
+/// * **block currently active in the kernel** ("ufw/xdp/iptables
+///   still rejecting traffic from this IP")
+/// * **block expired** ("we blocked this IP last week, TTL passed")
+///
+/// `BlockState` separates the three so the operator can finally tell
+/// them apart in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum BlockState {
+    /// xdp_block_times has an unexpired entry for this IP. The block
+    /// is still live in the kernel.
+    BlockedNow {
+        since_ms: i64,
+        ttl_secs: i64,
+        /// Seconds until the TTL expires (`ttl_secs - elapsed`).
+        /// Clamped to 0 so the front-end can render a countdown
+        /// without worrying about negatives.
+        expires_in_secs: i64,
+    },
+    /// xdp_block_times has an entry but the TTL has elapsed -- the
+    /// block has rolled off the kernel even though the agent still
+    /// remembers having issued it.
+    BlockedHistorical { last_block_ms: i64 },
+    /// No block evidence for this IP in xdp_block_times. This is the
+    /// default for operator-relevant IPs whose decisions never made
+    /// it past the response_lifecycle (failed exec, dry_run, etc).
+    Open,
+}
+
+pub(super) fn block_state_for_ip(
+    sqlite: Option<&std::sync::Arc<innerwarden_store::Store>>,
+    ip: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BlockState {
+    let Some(store) = sqlite else {
+        return BlockState::Open;
+    };
+    let bytes = match store.kv_get("xdp_block_times", ip) {
+        Ok(Some(b)) => b,
+        _ => return BlockState::Open,
+    };
+    let val: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return BlockState::Open,
+    };
+    let blocked_at_ms = val["blocked_at_ms"].as_i64().unwrap_or(0);
+    let ttl_secs = val["ttl_secs"].as_i64().unwrap_or(0);
+    let now_ms = now.timestamp_millis();
+    let elapsed_secs = (now_ms - blocked_at_ms) / 1000;
+    // ttl_secs == 0 means "no TTL set" -- treat as still active
+    // (matches the slow_loop's xdp cleanup which only expires entries
+    // with a positive ttl).
+    if ttl_secs == 0 || elapsed_secs < ttl_secs {
+        BlockState::BlockedNow {
+            since_ms: blocked_at_ms,
+            ttl_secs,
+            expires_in_secs: (ttl_secs - elapsed_secs).max(0),
+        }
+    } else {
+        BlockState::BlockedHistorical {
+            last_block_ms: blocked_at_ms,
+        }
+    }
+}
+
 fn exec_result_indicates_success(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     // The agent's skill executors emit a small set of result strings:
@@ -317,6 +389,122 @@ mod tests {
         assert_eq!(kpi_bucket(OUTCOME_MONITORING), KpiBucket::Observing);
         assert_eq!(kpi_bucket(OUTCOME_OPEN), KpiBucket::Attention);
         assert_eq!(kpi_bucket(OUTCOME_DISMISSED), KpiBucket::None);
+    }
+
+    // ── Phase 3: BlockState anchors ─────────────────────────────────
+    //
+    // Three anchors for the kernel-evidence path. Each constructs a
+    // real `innerwarden_store::Store` (in-memory rusqlite) and writes
+    // the same JSON shape the response_lifecycle uses
+    // (`{blocked_at_ms, ttl_secs}`), so any future drift between the
+    // writer and the reader fails this test instead of silently
+    // making the dashboard show stale "blocked" badges.
+
+    fn make_store() -> std::sync::Arc<innerwarden_store::Store> {
+        std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"))
+    }
+
+    #[test]
+    fn block_state_open_when_no_sqlite_store() {
+        let now = chrono::Utc::now();
+        assert_eq!(block_state_for_ip(None, "1.2.3.4", now), BlockState::Open);
+    }
+
+    #[test]
+    fn block_state_open_when_ip_not_in_xdp_block_times() {
+        let store = make_store();
+        let now = chrono::Utc::now();
+        assert_eq!(
+            block_state_for_ip(Some(&store), "9.9.9.9", now),
+            BlockState::Open
+        );
+    }
+
+    #[test]
+    fn block_state_blocked_now_when_ttl_not_yet_elapsed() {
+        let store = make_store();
+        let now = chrono::Utc::now();
+        let blocked_at_ms = now.timestamp_millis() - 30_000; // 30s ago
+        let payload = serde_json::json!({
+            "blocked_at_ms": blocked_at_ms,
+            "ttl_secs": 3600,
+        });
+        store
+            .kv_set(
+                "xdp_block_times",
+                "1.2.3.4",
+                &serde_json::to_vec(&payload).unwrap(),
+            )
+            .expect("kv_set");
+        let state = block_state_for_ip(Some(&store), "1.2.3.4", now);
+        match state {
+            BlockState::BlockedNow {
+                since_ms,
+                ttl_secs,
+                expires_in_secs,
+            } => {
+                assert_eq!(since_ms, blocked_at_ms);
+                assert_eq!(ttl_secs, 3600);
+                // 3600 - 30 == 3570
+                assert_eq!(expires_in_secs, 3570);
+            }
+            other => panic!("expected BlockedNow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_state_blocked_historical_when_ttl_elapsed() {
+        let store = make_store();
+        let now = chrono::Utc::now();
+        // Blocked 2h ago with a 1h TTL → expired.
+        let blocked_at_ms = now.timestamp_millis() - 7_200_000;
+        let payload = serde_json::json!({
+            "blocked_at_ms": blocked_at_ms,
+            "ttl_secs": 3600,
+        });
+        store
+            .kv_set(
+                "xdp_block_times",
+                "1.2.3.4",
+                &serde_json::to_vec(&payload).unwrap(),
+            )
+            .expect("kv_set");
+        let state = block_state_for_ip(Some(&store), "1.2.3.4", now);
+        match state {
+            BlockState::BlockedHistorical { last_block_ms } => {
+                assert_eq!(last_block_ms, blocked_at_ms);
+            }
+            other => panic!("expected BlockedHistorical, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_state_serialises_with_kind_tag_for_frontend() {
+        // The front-end keys on `block_state.kind` to render the
+        // BlockedNow countdown vs BlockedHistorical "expired" badge.
+        // Anchor the wire format so a Serialize derive change does
+        // not silently break the badge.
+        let now_ms = 1_730_000_000_000;
+        let json_now = serde_json::to_string(&BlockState::BlockedNow {
+            since_ms: now_ms,
+            ttl_secs: 3600,
+            expires_in_secs: 3000,
+        })
+        .unwrap();
+        assert!(json_now.contains("\"kind\":\"blocked_now\""), "{json_now}");
+        assert!(json_now.contains("\"expires_in_secs\":3000"));
+
+        let json_hist = serde_json::to_string(&BlockState::BlockedHistorical {
+            last_block_ms: now_ms,
+        })
+        .unwrap();
+        assert!(
+            json_hist.contains("\"kind\":\"blocked_historical\""),
+            "{json_hist}"
+        );
+
+        let json_open = serde_json::to_string(&BlockState::Open).unwrap();
+        assert_eq!(json_open, r#"{"kind":"open"}"#);
     }
 
     #[test]

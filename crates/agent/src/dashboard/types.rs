@@ -256,6 +256,12 @@ pub(crate) struct AttackerSummary {
     pub(super) outcome: String,
     pub(super) incident_count: usize,
     pub(super) event_count: usize,
+    /// Phase 3 (audit RC-4): kernel-evidence block state. Separates
+    /// "decision was made" from "block currently active" from "block
+    /// expired". `None` only when the agent has no SQLite store wired
+    /// (test fixtures); production always emits one of the variants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) block_state: Option<crate::dashboard::threat_contract::BlockState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -337,6 +343,11 @@ pub(crate) struct JourneyResponse {
     /// D5 - logical attack chapters derived from entries
     pub(super) chapters: Vec<JourneyChapter>,
     pub(super) entries: Vec<JourneyEntry>,
+    /// Phase 3 (audit RC-4): kernel-evidence block state. Populated
+    /// only when subject_type == "ip" -- detector and user pivots have
+    /// no single IP to query against xdp_block_times.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) block_state: Option<crate::dashboard::threat_contract::BlockState>,
 }
 
 #[derive(Debug, Serialize)]
