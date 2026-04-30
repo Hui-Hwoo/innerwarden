@@ -84,7 +84,7 @@ pub fn parse_session(client_data: &[u8]) -> Option<SmbSession> {
                 }
             }
         }
-        // SMB2/3 magic
+        // SMB2 magic
         else if client_data[offset] == 0xFE
             && client_data[offset + 1] == b'S'
             && client_data[offset + 2] == b'M'
@@ -105,6 +105,15 @@ pub fn parse_session(client_data: &[u8]) -> Option<SmbSession> {
                     _ => {}
                 }
             }
+        }
+        // SMB3 transform/compression-style magic.
+        else if client_data[offset] == 0xFD
+            && client_data[offset + 1] == b'S'
+            && client_data[offset + 2] == b'M'
+            && client_data[offset + 3] == b'B'
+        {
+            session.version = SmbVersion::Smb3;
+            session.signals.push("smb3_transform".into());
         }
 
         // Move to next message
@@ -164,6 +173,40 @@ pub fn parse_session(client_data: &[u8]) -> Option<SmbSession> {
 mod tests {
     use super::*;
 
+    fn nb_message(payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u32;
+        let mut data = vec![
+            0x00,
+            ((len >> 16) & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            (len & 0xff) as u8,
+        ];
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn smb1_message(command: u8) -> Vec<u8> {
+        let mut payload = vec![0xFF, b'S', b'M', b'B', command];
+        payload.resize(32, 0);
+        nb_message(&payload)
+    }
+
+    fn smb2_message(command: u16) -> Vec<u8> {
+        let mut payload = vec![0xFE, b'S', b'M', b'B'];
+        payload.resize(14, 0);
+        let bytes = command.to_le_bytes();
+        payload[12] = bytes[0];
+        payload[13] = bytes[1];
+        payload.resize(64, 0);
+        nb_message(&payload)
+    }
+
+    fn smb3_transform_message() -> Vec<u8> {
+        let mut payload = vec![0xFD, b'S', b'M', b'B'];
+        payload.resize(64, 0);
+        nb_message(&payload)
+    }
+
     #[test]
     fn test_detect_psexec_named_pipes() {
         // Build a minimal SMB2 message with named pipe strings in the data
@@ -189,5 +232,46 @@ mod tests {
     fn test_no_smb() {
         let data = b"GET / HTTP/1.1\r\n\r\n";
         assert!(parse_session(data).is_none());
+    }
+
+    #[test]
+    fn empty_buffer_returns_none() {
+        assert!(parse_session(&[]).is_none());
+    }
+
+    #[test]
+    fn truncated_netbios_header_returns_none() {
+        assert!(parse_session(&[0x00, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn detects_smb1_negotiate_header() {
+        let session = parse_session(&smb1_message(0x75)).expect("smb1 session");
+
+        assert_eq!(session.version, SmbVersion::Smb1);
+        assert!(session.signals.contains(&"tree_connect".to_string()));
+    }
+
+    #[test]
+    fn detects_smb2_tree_connect_command() {
+        let session = parse_session(&smb2_message(0x0003)).expect("smb2 session");
+
+        assert_eq!(session.version, SmbVersion::Smb2);
+        assert!(session.signals.contains(&"tree_connect".to_string()));
+    }
+
+    #[test]
+    fn detects_smb3_transform_header() {
+        let session = parse_session(&smb3_transform_message()).expect("smb3 session");
+
+        assert_eq!(session.version, SmbVersion::Smb3);
+        assert!(session.signals.contains(&"smb3_transform".to_string()));
+    }
+
+    #[test]
+    fn garbage_first_byte_only_does_not_match() {
+        let data = nb_message(&[0xFE, b'N', b'O', b'P', 0, 0, 0, 0]);
+
+        assert!(parse_session(&data).is_none());
     }
 }

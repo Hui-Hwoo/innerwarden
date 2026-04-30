@@ -137,9 +137,18 @@ fn list_systemd_units() -> Vec<SystemdUnit> {
     };
 
     let text = String::from_utf8_lossy(&output.stdout);
+    parse_systemd_units(&text, get_unit_path)
+}
+
+fn parse_systemd_units(text: &str, fragment_path_for: impl Fn(&str) -> String) -> Vec<SystemdUnit> {
     let mut units = Vec::new();
 
     for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("UNIT ") || line.contains(" loaded units listed") {
+            continue;
+        }
+
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 4 {
             continue;
@@ -150,8 +159,7 @@ fn list_systemd_units() -> Vec<SystemdUnit> {
         let active_state = fields[2].to_string();
         let sub_state = fields[3].to_string();
 
-        // Get the fragment path
-        let fragment_path = get_unit_path(&name);
+        let fragment_path = fragment_path_for(&name);
 
         units.push(SystemdUnit {
             name,
@@ -189,5 +197,79 @@ mod tests {
         ));
         assert!(!is_suspicious_path("/etc/systemd/system/nginx.service"));
         assert!(!is_suspicious_path("/usr/lib/systemd/system/sshd.service"));
+    }
+
+    fn parse_fixture(text: &str) -> Vec<SystemdUnit> {
+        parse_systemd_units(text, |name| format!("/usr/lib/systemd/system/{name}"))
+    }
+
+    #[test]
+    fn parse_systemd_units_empty_input_returns_empty() {
+        assert!(parse_fixture("").is_empty());
+    }
+
+    #[test]
+    fn parse_systemd_units_single_line() {
+        let units = parse_fixture("ssh.service loaded active running OpenSSH server daemon\n");
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].name, "ssh.service");
+        assert_eq!(units[0].load_state, "loaded");
+        assert_eq!(units[0].active_state, "active");
+        assert_eq!(units[0].sub_state, "running");
+        assert_eq!(
+            units[0].fragment_path,
+            "/usr/lib/systemd/system/ssh.service"
+        );
+    }
+
+    #[test]
+    fn parse_systemd_units_realistic_multiline_fixture() {
+        let units = parse_fixture(
+            "\
+UNIT                         LOAD   ACTIVE SUB     DESCRIPTION
+ssh.service                  loaded active running OpenSSH server daemon
+docker.service               loaded active running Docker Application Container Engine
+fail2ban.service             loaded active exited  Fail2Ban Service
+3 loaded units listed.
+",
+        );
+
+        let names: Vec<&str> = units.iter().map(|unit| unit.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["ssh.service", "docker.service", "fail2ban.service"]
+        );
+    }
+
+    #[test]
+    fn parse_systemd_units_accepts_unit_without_description() {
+        let units = parse_fixture("minimal.service loaded inactive dead\n");
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].name, "minimal.service");
+        assert_eq!(units[0].sub_state, "dead");
+    }
+
+    #[test]
+    fn parse_systemd_units_unicode_description_survives_parsing() {
+        let units = parse_fixture("backup.service loaded active running Cópia diária\n");
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].name, "backup.service");
+        assert_eq!(units[0].active_state, "active");
+    }
+
+    #[test]
+    fn parse_systemd_units_skips_malformed_rows() {
+        let units = parse_fixture(
+            "\
+not-enough columns
+network.service loaded active running Network Manager
+",
+        );
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].name, "network.service");
     }
 }

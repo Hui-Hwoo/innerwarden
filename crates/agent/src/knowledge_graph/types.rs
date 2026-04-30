@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 
 pub type NodeId = u64;
 
@@ -21,7 +22,26 @@ pub enum NodeType {
     Campaign,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl fmt::Display for NodeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            NodeType::Process => "process",
+            NodeType::Ip => "ip",
+            NodeType::File => "file",
+            NodeType::User => "user",
+            NodeType::Domain => "domain",
+            NodeType::Port => "port",
+            NodeType::Container => "container",
+            NodeType::Device => "device",
+            NodeType::System => "system",
+            NodeType::Incident => "incident",
+            NodeType::Campaign => "campaign",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     Process {
         pid: u32,
@@ -262,7 +282,7 @@ pub enum Relation {
     BlockedBy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Edge {
     pub from: NodeId,
     pub to: NodeId,
@@ -314,4 +334,170 @@ pub struct GraphMetrics {
     pub avg_degree: f32,
     pub threat_intel_nodes: usize,
     pub incident_nodes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-04-20T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn sample_ip(addr: &str, risk_score: u8) -> Node {
+        Node::Ip {
+            addr: addr.to_string(),
+            is_internal: false,
+            datasets: vec!["test-feed".into()],
+            risk_score,
+            is_tor: false,
+            first_seen: ts(),
+            last_seen: ts(),
+            attempted_usernames: vec!["root".into()],
+        }
+    }
+
+    fn sample_incident() -> Node {
+        Node::Incident {
+            incident_id: "inc-1".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "SSH brute force".into(),
+            summary: "multiple failed logins".into(),
+            ts: ts(),
+            mitre_ids: vec!["T1110".into()],
+            decision: Some("block_ip".into()),
+            confidence: Some(0.91),
+            decision_reason: Some("repeated attempts".into()),
+            decision_target: Some("203.0.113.10".into()),
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        }
+    }
+
+    #[test]
+    fn ip_label_returns_address() {
+        assert_eq!(sample_ip("1.2.3.4", 10).label(), "1.2.3.4");
+    }
+
+    #[test]
+    fn process_label_has_pid_fallback_when_comm_empty() {
+        let node = Node::Process {
+            pid: 42,
+            ppid: 1,
+            comm: String::new(),
+            exe: None,
+            uid: 1000,
+            container_id: None,
+            start_ts: ts(),
+            exit_ts: None,
+        };
+
+        assert_eq!(node.label(), "(42)");
+    }
+
+    #[test]
+    fn incident_node_serde_round_trips() {
+        let node = sample_incident();
+        let json = serde_json::to_string(&node).expect("serialize incident node");
+        let decoded: Node = serde_json::from_str(&json).expect("deserialize incident node");
+
+        assert_eq!(decoded, node);
+    }
+
+    #[test]
+    fn edge_serde_round_trips_all_relation_variants() {
+        let relations = [
+            Relation::SpawnedBy,
+            Relation::PtraceAttached,
+            Relation::Signaled,
+            Relation::ConnectedTo,
+            Relation::AcceptedFrom,
+            Relation::ListensOn,
+            Relation::Wrote,
+            Relation::Read,
+            Relation::Executed,
+            Relation::Deleted,
+            Relation::Renamed,
+            Relation::Truncated,
+            Relation::Timestomped,
+            Relation::Mounted,
+            Relation::Resolved,
+            Relation::RunAs,
+            Relation::EscalatedTo,
+            Relation::SudoAs,
+            Relation::InContainer,
+            Relation::CreatedMemfd,
+            Relation::RedirectedFd,
+            Relation::MprotectExec,
+            Relation::LoggedInFrom,
+            Relation::ScannedPort,
+            Relation::HttpRequestTo,
+            Relation::HostedAt,
+            Relation::DownloadedFrom,
+            Relation::IntegrityChanged,
+            Relation::InsertedOn,
+            Relation::RemovedFrom,
+            Relation::LoadedModule,
+            Relation::LoadedBpf,
+            Relation::WroteMsr,
+            Relation::CalledEfi,
+            Relation::ChangedIoperm,
+            Relation::ChangedIopl,
+            Relation::EvalAcpi,
+            Relation::TimingAnomaly,
+            Relation::ChangedSysctl,
+            Relation::SyscallTableModified,
+            Relation::ExecBlocked,
+            Relation::IoUringSubmit,
+            Relation::IoUringCreate,
+            Relation::StartedOn,
+            Relation::DiedOn,
+            Relation::OomKilled,
+            Relation::SnapshotConnectedTo,
+            Relation::SnapshotListensOn,
+            Relation::TriggeredBy,
+            Relation::CorrelatedWith,
+            Relation::EscalatedFrom,
+            Relation::MemberOf,
+            Relation::BlockedBy,
+        ];
+
+        for relation in relations {
+            let edge = Edge::new(1, 2, relation, ts()).with_prop("source", "unit-test");
+            let json = serde_json::to_string(&edge).expect("serialize edge");
+            let decoded: Edge = serde_json::from_str(&json).expect("deserialize edge");
+
+            assert_eq!(decoded, edge);
+        }
+    }
+
+    #[test]
+    fn node_type_display_uses_lowercase_strings() {
+        assert_eq!(NodeType::Ip.to_string(), "ip");
+        assert_eq!(NodeType::Process.to_string(), "process");
+        assert_eq!(NodeType::Incident.to_string(), "incident");
+    }
+
+    #[test]
+    fn ip_nodes_can_share_label_without_full_struct_equality() {
+        let low_risk = sample_ip("203.0.113.10", 10);
+        let high_risk = sample_ip("203.0.113.10", 90);
+
+        assert_eq!(low_risk.label(), high_risk.label());
+        assert_ne!(low_risk, high_risk);
+    }
+
+    #[test]
+    fn edge_snapshot_classifier_matches_only_snapshot_relations() {
+        assert!(Edge::new(1, 2, Relation::SnapshotConnectedTo, ts()).is_snapshot());
+        assert!(Edge::new(1, 2, Relation::SnapshotListensOn, ts()).is_snapshot());
+        assert!(!Edge::new(1, 2, Relation::ConnectedTo, ts()).is_snapshot());
+    }
 }
