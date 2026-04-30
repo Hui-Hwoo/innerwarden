@@ -536,14 +536,29 @@ pub fn compute_fingerprints(hello: &ClientHello) -> TlsFingerprint {
         _ => "00",
     };
     let sni_flag = if hello.sni.is_empty() { "i" } else { "d" };
+    // JA4 ALPN field: first + last *character* of the first ALPN
+    // entry. Pre-fix this used byte-index slicing (`&a[..1]`,
+    // `&a[a.len() - 1..]`) which panics when the first or last
+    // codepoint is multi-byte UTF-8. Adversarial TLS ClientHellos can
+    // place arbitrary bytes in ALPN entries (the field is opaque per
+    // RFC 7301 §3.1; even though IANA-registered values are ASCII, an
+    // attacker is not required to honour the registry). Fuzz crash
+    // reproduced 2026-04-30: `cargo fuzz run tls_client_hello`
+    // surfaced "end byte index 1 is not a char boundary; it is inside
+    // '\u{fffd}'" at the same line. Use `chars()` so the boundary is
+    // always a codepoint boundary.
     let alpn_str = hello
         .alpn
         .first()
         .map(|a| {
-            if a.len() >= 2 {
-                format!("{}{}", &a[..1], &a[a.len() - 1..])
-            } else {
-                a.clone()
+            let first = a.chars().next();
+            let last = a.chars().next_back();
+            match (first, last) {
+                (Some(f), Some(l)) if f != l => format!("{f}{l}"),
+                // Single-char ALPN: emit it twice so the field is
+                // still 2 characters wide as JA4 expects.
+                (Some(f), _) => format!("{f}{f}"),
+                _ => "00".to_string(),
             }
         })
         .unwrap_or_else(|| "00".to_string());
@@ -746,6 +761,96 @@ mod tests {
 
         let fp = compute_fingerprints(&hello);
         assert!(fp.ja4.starts_with("t13i")); // TLS 1.3, no SNI (i)
+    }
+
+    #[test]
+    fn ja4_alpn_with_multibyte_utf8_does_not_panic() {
+        // Fuzz crash regression (2026-04-30): a TLS ClientHello whose
+        // ALPN entry started with a multi-byte UTF-8 codepoint
+        // ('\u{fffd}' in the fuzzer corpus) panicked the parser at
+        // tls_fingerprint.rs:544 because the byte-index slice
+        // `&a[..1]` landed inside the codepoint. The JA4 ALPN field
+        // is meant to be the first + last *character* of the entry,
+        // not the first + last byte.
+        //
+        // This test reproduces the crash case (multi-byte first/last
+        // codepoints) and asserts the parser produces a string
+        // instead of panicking.
+        let hello = ClientHello {
+            record_version: 0x0301,
+            handshake_version: 0x0303,
+            cipher_suites: vec![0xc02c],
+            extensions: vec![0x0000],
+            elliptic_curves: vec![],
+            ec_point_formats: vec![],
+            sni: "x".into(),
+            // First entry: 2-byte codepoint '\u{fffd}' followed by ascii.
+            // Pre-fix: panicked. Post-fix: yields a valid 2-char field.
+            alpn: vec!["\u{fffd}a".into()],
+            src_ip: "10.0.0.1".into(),
+            dst_ip: "1.1.1.1".into(),
+            src_port: 12345,
+            dst_port: 443,
+        };
+        let fp = compute_fingerprints(&hello);
+        assert!(fp.ja4.contains("_"), "JA4 must contain ALPN separator");
+        // The ALPN field is the suffix after the underscore.
+        let alpn_field = fp.ja4.split('_').next_back().unwrap();
+        assert!(!alpn_field.is_empty(), "ALPN field must not be empty");
+        // Two characters: first + last codepoint of the entry.
+        assert_eq!(alpn_field.chars().count(), 2);
+    }
+
+    #[test]
+    fn ja4_alpn_single_char_emits_two_chars() {
+        // Edge case from the fuzz fix: a single-character ALPN entry
+        // ('h' alone) produced just 'h' under the legacy len()-based
+        // logic. The JA4 ALPN field is documented as 2 chars wide;
+        // emit the same char twice so downstream consumers never see
+        // a 1-char field.
+        let hello = ClientHello {
+            record_version: 0x0301,
+            handshake_version: 0x0303,
+            cipher_suites: vec![0xc02c],
+            extensions: vec![0x0000],
+            elliptic_curves: vec![],
+            ec_point_formats: vec![],
+            sni: "x".into(),
+            alpn: vec!["h".into()],
+            src_ip: "10.0.0.1".into(),
+            dst_ip: "1.1.1.1".into(),
+            src_port: 12345,
+            dst_port: 443,
+        };
+        let fp = compute_fingerprints(&hello);
+        let alpn_field = fp.ja4.split('_').next_back().unwrap();
+        assert_eq!(
+            alpn_field, "hh",
+            "single-char ALPN must double-up to 2 chars"
+        );
+    }
+
+    #[test]
+    fn ja4_alpn_empty_list_falls_back_to_00() {
+        // No ALPN extension at all → "00" sentinel. Already covered
+        // by ja4_no_sni, but pinning this branch explicitly so a
+        // future refactor cannot drop it.
+        let hello = ClientHello {
+            record_version: 0x0301,
+            handshake_version: 0x0303,
+            cipher_suites: vec![0xc02c],
+            extensions: vec![0x0000],
+            elliptic_curves: vec![],
+            ec_point_formats: vec![],
+            sni: "x".into(),
+            alpn: vec![],
+            src_ip: "10.0.0.1".into(),
+            dst_ip: "1.1.1.1".into(),
+            src_port: 12345,
+            dst_port: 443,
+        };
+        let fp = compute_fingerprints(&hello);
+        assert!(fp.ja4.ends_with("_00"));
     }
 
     #[test]

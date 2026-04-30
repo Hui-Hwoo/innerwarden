@@ -15,28 +15,32 @@ async function loadActionConfig() {
     _allowlistLoaded = true;
     const badge = document.getElementById('modeBadge');
     const aiBadge = document.getElementById('aiBadge');
+    // 2026-04-30: header badges use lucide SVG icons (eye / shield-check
+    // / book-open / bot) so the dashboard has one visual vocabulary.
+    // setBadge writes via innerHTML because the SVG is part of the
+    // label; status-badge CSS handles flex+gap alignment.
+    var setBadge = function(el, iconName, text, cls) {
+      if (!el) return;
+      el.innerHTML = lucideIcon(iconName, { size: 14 }) +
+        '<span style="margin-left:6px">' + text + '</span>';
+      el.className = 'status-badge ' + cls;
+    };
     // Mode badge
-    if (badge) {
-      if (actionCfg.enabled) {
-        if (actionCfg.dry_run) {
-          badge.textContent = '👁 WATCHING';
-          badge.className = 'status-badge status-badge-watch';
-        } else {
-          badge.textContent = '🛡 PROTECTED';
-          badge.className = 'status-badge status-badge-guard';
-        }
+    if (actionCfg.enabled) {
+      if (actionCfg.dry_run) {
+        setBadge(badge, 'eye', 'WATCHING', 'status-badge-watch');
       } else {
-        badge.textContent = '📖 MONITOR';
-        badge.className = 'status-badge status-badge-read';
+        setBadge(badge, 'shield-check', 'PROTECTED', 'status-badge-guard');
       }
+    } else {
+      setBadge(badge, 'book-open', 'MONITOR', 'status-badge-read');
     }
     // AI badge
     if (aiBadge) {
       if (actionCfg.ai_enabled) {
         const label = actionCfg.ai_provider === 'anthropic' ? 'claude' :
                       actionCfg.ai_provider === 'ollama'    ? 'ollama' : 'openai';
-        aiBadge.textContent = '🤖 ' + label;
-        aiBadge.className = 'status-badge status-badge-ai-on';
+        setBadge(aiBadge, 'bot', label, 'status-badge-ai-on');
       } else {
         aiBadge.textContent = 'AI: off';
         aiBadge.className = 'status-badge status-badge-ai-off';

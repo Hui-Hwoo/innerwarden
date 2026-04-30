@@ -29,15 +29,15 @@ async function testHoneypot() {
     });
     const data = await resp.json();
     if (data.success) {
-      showToast('🍯 ' + data.message, 'ok');
+      showToast(lucideIcon('bug',{size:14}) + ' ' + data.message, 'ok');
     } else {
-      showToast('❌ ' + data.message, 'err');
+      showToast(lucideIcon('x-circle',{size:14}) + ' ' + data.message, 'err');
     }
   } catch (e) {
-    showToast('❌ Request failed: ' + e.message, 'err');
+    showToast(lucideIcon('x-circle',{size:14}) + ' Request failed: ' + e.message, 'err');
   } finally {
     btn.disabled = false;
-    btn.textContent = '🧪 Start test session';
+    btn.innerHTML = lucideIcon('flask-conical',{size:14}) + ' <span style="margin-left:6px">Start test session</span>';
   }
 }
 
@@ -53,17 +53,17 @@ function renderHoneypot(data) {
     'font-family:inherit" ' +
     'onmouseover="this.style.background=\'rgba(120,229,255,0.15)\'" ' +
     'onmouseout="this.style.background=\'rgba(120,229,255,0.08)\'">' +
-    '🧪 Start test session</button>' +
+    lucideIcon('flask-conical',{size:14}) + ' <span style="margin-left:6px">Start test session</span></button>' +
     '<span style="font-size:0.68rem;color:var(--muted);margin-left:10px">' +
     'Injects a test incident - the agent evaluates and triggers the honeypot on the next tick (≤2 s).' +
     '</span></div>';
 
   if (sessions.length === 0) {
-    return testBtn + '<div class="empty" style="padding:40px;text-align:center;opacity:0.5">🍯 No honeypot sessions yet.<br><span style="font-size:0.8rem">Sessions appear here when attackers interact with a honeypot listener.</span></div>';
+    return testBtn + '<div class="empty" style="padding:40px;text-align:center;opacity:0.5">' + lucideIcon('bug',{size:18}) + ' No honeypot sessions yet.<br><span style="font-size:0.8rem">Sessions appear here when attackers interact with a honeypot listener.</span></div>';
   }
 
   let html = testBtn + '<div style="padding:16px;max-width:900px;margin:0 auto">';
-  html += '<div style="font-size:1.1rem;font-weight:600;color:var(--accent);margin-bottom:16px">🍯 Honeypot Sessions (' + sessions.length + ')</div>';
+  html += '<div style="font-size:1.1rem;font-weight:600;color:var(--accent);margin-bottom:16px;display:flex;align-items:center;gap:8px">' + lucideIcon('bug',{size:18}) + ' Honeypot Sessions (' + sessions.length + ')</div>';
 
   for (const s of sessions) {
     const ip = s.target_ip || '-';
@@ -114,7 +114,7 @@ function renderHoneypot(data) {
     // IOCs
     if (iocs.length > 0) {
       html += '<div style="margin-top:10px">';
-      html += '<div style="font-size:0.75rem;font-weight:600;color:#f59e0b;margin-bottom:6px">⚠ Extracted IOCs</div>';
+      html += '<div style="font-size:0.75rem;font-weight:600;color:#f59e0b;margin-bottom:6px;display:flex;align-items:center;gap:6px">' + lucideIcon('alert-triangle',{size:12}) + ' Extracted IOCs</div>';
       html += '<div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.2);border-radius:6px;padding:10px">';
       for (const ioc of iocs) {
         html += '<div style="font-family:monospace;font-size:0.78rem;color:var(--warn);margin-bottom:3px">' + esc(ioc) + '</div>';

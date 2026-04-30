@@ -81,7 +81,7 @@ function renderReport(r) {
   const deltaClass = (d) => d > 0 ? 'up' : (d < 0 ? 'down' : '');
   const deltaSign = (d) => d > 0 ? '+' : '';
   const confColor = (v) => v >= 0.85 ? 'good' : v >= 0.7 ? 'warn' : 'bad';
-  const healthVal = (v) => v ? '<span class="health-ok">✓ OK</span>' : '<span class="health-fail">✗ Fail</span>';
+  const healthVal = (v) => v ? '<span class="health-ok" style="display:inline-flex;align-items:center;gap:4px">' + lucideIcon('check',{size:12}) + ' OK</span>' : '<span class="health-fail" style="display:inline-flex;align-items:center;gap:4px">' + lucideIcon('x',{size:12}) + ' Fail</span>';
 
   // Hero KPIs — the 3 numbers that matter most
   const hcRecent = rw.high_critical_incidents ?? 0;
@@ -205,10 +205,10 @@ function renderReport(r) {
     const isSqliteOnly = (f.file === 'events' && !f.exists);
     const existsCell = isSqliteOnly
       ? '<span class="health-ok" title="stored in innerwarden.db (spec 016)">SQLite</span>'
-      : (f.exists ? '<span class="health-ok">✓</span>' : '<span class="health-fail">✗</span>');
+      : (f.exists ? '<span class="health-ok">' + lucideIcon('check',{size:12}) + '</span>' : '<span class="health-fail">' + lucideIcon('x',{size:12}) + '</span>');
     const valid = isSqliteOnly
-      ? '<span class="health-ok">✓</span>'
-      : (f.jsonl_valid == null ? '-' : (f.jsonl_valid ? '<span class="health-ok">✓</span>' : '<span class="health-fail">✗</span>'));
+      ? '<span class="health-ok">' + lucideIcon('check',{size:12}) + '</span>'
+      : (f.jsonl_valid == null ? '-' : (f.jsonl_valid ? '<span class="health-ok">' + lucideIcon('check',{size:12}) + '</span>' : '<span class="health-fail">' + lucideIcon('x',{size:12}) + '</span>'));
     const linesCell = isSqliteOnly ? '(in db)' : (f.lines ?? '-');
     const sizeCell = isSqliteOnly
       ? '-'

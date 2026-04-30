@@ -400,7 +400,7 @@ function renderEmptyDiagnostic(targetEl) {
       var html = '';
       if (d.scope_mismatch) {
         html += '<div class="empty" style="padding:16px">';
-        html += '<div style="font-size:1.2rem;margin-bottom:6px">📅</div>';
+        html += '<div style="margin-bottom:6px">' + lucideIcon('clipboard-list',{size:20}) + '</div>';
         html += '<div style="margin-bottom:10px">No incidents on <b>' + esc(fd || d.date) + '</b>.</div>';
         html += '<div style="font-size:0.75rem;color:var(--muted);margin-bottom:8px">Pick a date with data:</div>';
         var chips = (d.available_dates || []).map(function(dd) {
@@ -411,7 +411,7 @@ function renderEmptyDiagnostic(targetEl) {
         html += '</div>';
       } else if (d.has_incidents && !d.has_entities) {
         html += '<div class="empty" style="padding:16px">';
-        html += '<div style="font-size:1.2rem;margin-bottom:6px">⚠️</div>';
+        html += '<div style="margin-bottom:6px">' + lucideIcon('alert-triangle',{size:20}) + '</div>';
         html += '<div style="margin-bottom:8px">' + d.incidents_in_scope + ' incident(s) found, but no IP/User entities linked.</div>';
         if (d.detector_pivot_count > 0) {
           html += '<button type="button" class="journey-btn" style="font-size:0.7rem" onclick="setThreatsPivot(\'detector\')">Switch to Detector pivot</button>';
@@ -419,7 +419,7 @@ function renderEmptyDiagnostic(targetEl) {
         html += '</div>';
       } else if (!d.has_incidents) {
         html += '<div class="empty" style="padding:16px">';
-        html += '<div style="font-size:1.2rem;margin-bottom:6px">✨</div>';
+        html += '<div style="margin-bottom:6px">' + lucideIcon('flame',{size:20}) + '</div>';
         html += '<div>No threats in scope. Either nothing fired today or the filter is too narrow.</div>';
         if (fs || fdet) {
           html += '<div style="margin-top:10px"><button type="button" class="journey-btn" style="font-size:0.7rem" onclick="clearThreatsFilters()">Clear filters</button></div>';

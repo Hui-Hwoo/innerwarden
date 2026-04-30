@@ -1,29 +1,71 @@
 name: Bug report
-description: Report a reproducible bug or regression
-labels:
-  - bug
+description: Something is broken or behaves differently than documented.
+title: "bug(<area>): <one-line summary>"
+labels: ["bug"]
 body:
-  - type: textarea
-    id: summary
+  - type: markdown
     attributes:
-      label: Summary
-      description: What happened, and what did you expect instead?
+      value: |
+        Thanks for taking the time to file a bug. The more detail you provide, the faster we can fix it.
+
+        **Before submitting:** if you suspect a security vulnerability, do NOT use this form. Follow the path in [SECURITY.md](https://github.com/InnerWarden/innerwarden/security/policy) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear, concrete description. "X did Y, but I expected Z."
+      placeholder: |
+        I ran `innerwarden scan` on Ubuntu 24.04 and the agent crashed with a panic when processing /var/log/auth.log.
     validations:
       required: true
+
   - type: textarea
-    id: steps
+    id: reproduce
     attributes:
-      label: Reproduction steps
-      description: Provide the smallest sequence of steps that reproduces the issue.
+      label: Steps to reproduce
+      description: Numbered steps a maintainer can follow to reproduce.
+      placeholder: |
+        1. `git clone … && make build`
+        2. `./target/debug/innerwarden-agent --data-dir ./data`
+        3. Send `tail -F /var/log/auth.log` into a journald shim
+        4. Observe panic in agent.log
     validations:
       required: true
+
   - type: textarea
-    id: environment
+    id: expected
     attributes:
-      label: Environment
-      description: Include OS, deployment mode, commit/version, and whether responder actions were enabled.
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: InnerWarden version
+      description: Output of `innerwarden --version`
+      placeholder: "v0.12.4"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "Ubuntu 24.04 x86_64 / macOS 14.5 arm64 / Rocky Linux 9.7"
+    validations:
+      required: true
+
   - type: textarea
-    id: validation
+    id: logs
     attributes:
-      label: Validation
-      description: Tell us what you already checked (`make test`, `make check`, logs, replay, etc.).
+      label: Relevant logs / output
+      description: Paste the panic, stack trace, or last few lines of `journalctl -u innerwarden-agent`. Wrap in triple backticks.
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help — recent config changes, similar issues you've found, etc.

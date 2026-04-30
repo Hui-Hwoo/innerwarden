@@ -36,7 +36,7 @@ async function loadIntel() {
       const lastSeen = p.last_seen ? new Date(p.last_seen).toLocaleDateString() : '\u2014';
       const patternLabels = { regular_scanner:'Regular Scanner', targeted:'Targeted Attack', opportunistic:'Opportunistic', unknown:'Unknown' };
       const pattern = patternLabels[patternRaw] || patternRaw.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
-      const patternBadge = pattern === 'Regular Scanner' ? '🔄' : pattern === 'Targeted Attack' ? '🎯' : pattern === 'Opportunistic' ? '🎲' : '❓';
+      const patternBadge = pattern === 'Regular Scanner' ? lucideIcon('refresh-ccw') : pattern === 'Targeted Attack' ? lucideIcon('target') : pattern === 'Opportunistic' ? lucideIcon('crosshair') : lucideIcon('alert-circle');
 
       html += `<tr style="border-bottom:1px solid var(--border);cursor:pointer;" onclick="showProfileDetail('${esc(p.ip)}')">
         <td style="padding:6px;">${riskBar}</td>
@@ -72,7 +72,7 @@ async function showProfileDetail(ip) {
 
     // Left: Identity + Timeline
     html += `<div class="kpi-card" style="padding:16px;">
-      <h3 style="margin:0 0 12px;">🎯 ${p.ip}</h3>
+      <h3 style="margin:0 0 12px;display:flex;align-items:center;gap:8px">${lucideIcon('target',{size:18})} ${p.ip}</h3>
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
         <div style="width:120px;height:12px;background:var(--border);border-radius:6px;overflow:hidden;">
           <div style="width:${p.risk_score}%;height:100%;background:${riskColor};"></div>
@@ -84,8 +84,8 @@ async function showProfileDetail(ip) {
         <tr><td style="padding:2px 8px;color:var(--dim);">ISP</td><td>${p.geo?.isp || '—'}</td></tr>
         <tr><td style="padding:2px 8px;color:var(--dim);">ASN</td><td>${p.geo?.asn || '—'}</td></tr>
         <tr><td style="padding:2px 8px;color:var(--dim);">AbuseIPDB</td><td>${p.abuseipdb_score ?? '—'}/100</td></tr>
-        <tr><td style="padding:2px 8px;color:var(--dim);">CrowdSec</td><td>${p.crowdsec_listed ? '⚠️ Listed' : '✅ Clean'}</td></tr>
-        <tr><td style="padding:2px 8px;color:var(--dim);">Tor</td><td>${p.is_tor ? '🧅 Yes' : 'No'}</td></tr>
+        <tr><td style="padding:2px 8px;color:var(--dim);">CrowdSec</td><td>${p.crowdsec_listed ? lucideIcon('alert-triangle',{size:12}) + ' Listed' : lucideIcon('check-circle',{size:12}) + ' Clean'}</td></tr>
+        <tr><td style="padding:2px 8px;color:var(--dim);">Tor</td><td>${p.is_tor ? lucideIcon('globe',{size:12}) + ' Yes' : 'No'}</td></tr>
         <tr><td style="padding:2px 8px;color:var(--dim);">First Seen</td><td>${p.first_seen ? new Date(p.first_seen).toLocaleString() : '—'}</td></tr>
         <tr><td style="padding:2px 8px;color:var(--dim);">Last Seen</td><td>${p.last_seen ? new Date(p.last_seen).toLocaleString() : '—'}</td></tr>
         <tr><td style="padding:2px 8px;color:var(--dim);">Days Active</td><td>${p.visit_count} days</td></tr>
@@ -95,7 +95,7 @@ async function showProfileDetail(ip) {
 
     // Right: Attack Profile
     html += `<div class="kpi-card" style="padding:16px;">
-      <h3 style="margin:0 0 12px;">⚔️ Attack Profile</h3>
+      <h3 style="margin:0 0 12px;display:flex;align-items:center;gap:8px">${lucideIcon('swords',{size:16})} Attack Profile</h3>
       <table style="font-size:0.8rem;"><tbody>
         <tr><td style="padding:2px 8px;color:var(--dim);">Incidents</td><td>${p.total_incidents}</td></tr>
         <tr><td style="padding:2px 8px;color:var(--dim);">Blocks</td><td>${p.total_blocks}</td></tr>
@@ -112,7 +112,7 @@ async function showProfileDetail(ip) {
 
     // DNA section
     html += `<div class="kpi-card" style="padding:16px;margin-top:16px;">
-      <h3 style="margin:0 0 12px;">🧬 Behavioral DNA</h3>
+      <h3 style="margin:0 0 12px;display:flex;align-items:center;gap:8px">${lucideIcon('dna',{size:16})} Behavioral DNA</h3>
       <div style="font-family:monospace;font-size:0.75rem;color:var(--dim);margin-bottom:8px;">Hash: ${p.dna?.hash || '—'}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;">
         <div><h4 style="font-size:0.8rem;color:var(--dim);margin:0 0 4px;">Hour Distribution</h4>
@@ -131,7 +131,7 @@ async function showProfileDetail(ip) {
     // Honeypot Intel
     if (p.honeypot_sessions > 0) {
       html += `<div class="kpi-card" style="padding:16px;margin-top:16px;">
-        <h3 style="margin:0 0 12px;">🍯 Honeypot Intel</h3>
+        <h3 style="margin:0 0 12px;display:flex;align-items:center;gap:8px">${lucideIcon('bug',{size:16})} Honeypot Intel</h3>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
           <div><h4 style="font-size:0.8rem;color:var(--dim);margin:0 0 4px;">Credentials Attempted</h4>
             <table style="font-size:0.75rem;"><tbody>
@@ -143,8 +143,8 @@ async function showProfileDetail(ip) {
           </div>
         </div>
         ${(p.iocs?.urls||[]).length > 0 ? `<h4 style="font-size:0.8rem;color:var(--dim);margin:12px 0 4px;">IOCs</h4>
-          ${(p.iocs.urls||[]).map(u=>`<div style="font-family:monospace;font-size:0.7rem;">🔗 ${esc(u)}</div>`).join('')}
-          ${(p.iocs.ips||[]).map(i=>`<div style="font-family:monospace;font-size:0.7rem;">🌐 ${esc(i)}</div>`).join('')}` : ''}
+          ${(p.iocs.urls||[]).map(u=>`<div style="font-family:monospace;font-size:0.7rem;display:flex;align-items:center;gap:6px">${lucideIcon('link',{size:12})} ${esc(u)}</div>`).join('')}
+          ${(p.iocs.ips||[]).map(i=>`<div style="font-family:monospace;font-size:0.7rem;display:flex;align-items:center;gap:6px">${lucideIcon('globe',{size:12})} ${esc(i)}</div>`).join('')}` : ''}
       </div>`;
     }
 
@@ -178,7 +178,7 @@ async function loadCampaigns() {
     const data = await loadJson('/api/campaigns');
     if (!data || !data.campaigns || data.campaigns.length === 0) {
       content.innerHTML = `<div style="text-align:center;padding:40px;">
-        <div style="font-size:2rem;margin-bottom:8px;">🔍</div>
+        <div style="margin-bottom:8px;">${lucideIcon('search',{size:32})}</div>
         <p style="color:var(--dim);">No campaigns detected yet.</p>
         <p style="font-size:0.8rem;color:var(--dim);">Campaigns are detected when multiple IPs share the same behavioral DNA, IOCs (C2 servers, malware URLs), or attack patterns.</p>
       </div>`;
@@ -195,9 +195,9 @@ async function loadCampaigns() {
 
     for (const c of data.campaigns) {
       const confColor = c.confidence === 'high' ? '#e74c3c' : c.confidence === 'medium' ? '#f39c12' : '#27ae60';
-      const typeIcon = c.correlation_type.includes('dna') && c.correlation_type.includes('ioc') ? '🧬+🔗'
-        : c.correlation_type.includes('dna') ? '🧬'
-        : c.correlation_type.includes('ioc') ? '🔗' : '📡';
+      const typeIcon = c.correlation_type.includes('dna') && c.correlation_type.includes('ioc') ? lucideIcon('dna') + lucideIcon('link')
+        : c.correlation_type.includes('dna') ? lucideIcon('dna')
+        : c.correlation_type.includes('ioc') ? lucideIcon('link') : lucideIcon('radio');
 
       html += `<div class="kpi-card" style="padding:16px;margin-bottom:12px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
@@ -259,7 +259,7 @@ async function loadChains() {
   try {
     const data = await loadJson('/api/correlation-chains');
     if (!data?.chains?.length) {
-      content.innerHTML = '<div style="text-align:center;padding:40px;"><div style="font-size:2rem;">⛓️</div><p style="color:var(--dim);">No attack chains detected yet.</p><p style="font-size:0.8rem;color:var(--dim);">Chains are multi-stage attacks that span multiple security layers (firmware, kernel, network, userspace).</p></div>';
+      content.innerHTML = '<div style="text-align:center;padding:40px;"><div>${lucideIcon('link',{size:32})}</div><p style="color:var(--dim);">No attack chains detected yet.</p><p style="font-size:0.8rem;color:var(--dim);">Chains are multi-stage attacks that span multiple security layers (firmware, kernel, network, userspace).</p></div>';
       if (status) status.textContent = '0 chains';
       return;
     }
@@ -295,7 +295,7 @@ async function loadBaseline() {
   try {
     const b = await loadJson('/api/baseline-status');
     let html = `<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px;">
-      <div class="kpi-card"><div class="kpi-value">${b.mature ? '✅ Active' : '📊 Training'}</div><div class="kpi-label">Status</div></div>
+      <div class="kpi-card"><div class="kpi-value">${b.mature ? lucideIcon('check-circle',{size:14}) + ' Active' : lucideIcon('bar-chart-3',{size:14}) + ' Training'}</div><div class="kpi-label">Status</div></div>
       <div class="kpi-card"><div class="kpi-value">${b.training_days||0}/7</div><div class="kpi-label">Training Days</div></div>
       <div class="kpi-card"><div class="kpi-value">${b.total_observations?.toLocaleString()||0}</div><div class="kpi-label">Observations</div></div>
       <div class="kpi-card"><div class="kpi-value">${Object.keys(b.process_lineages||{}).length||0}</div><div class="kpi-label">Known Lineages</div></div>
@@ -352,7 +352,7 @@ async function loadPlaybooks() {
   try {
     const data = await loadJson('/api/playbook-log');
     if (!data?.executions?.length) {
-      content.innerHTML = '<div style="text-align:center;padding:40px;"><div style="font-size:2rem;">📋</div><p style="color:var(--dim);">No playbook executions yet.</p><p style="font-size:0.8rem;color:var(--dim);">Playbooks trigger automatically when incidents match predefined patterns (ransomware, reverse shell, data exfil, etc.).</p></div>';
+      content.innerHTML = '<div style="text-align:center;padding:40px;"><div>${lucideIcon('clipboard-list',{size:32})}</div><p style="color:var(--dim);">No playbook executions yet.</p><p style="font-size:0.8rem;color:var(--dim);">Playbooks trigger automatically when incidents match predefined patterns (ransomware, reverse shell, data exfil, etc.).</p></div>';
       if (status) status.textContent = '0 executions';
       return;
     }

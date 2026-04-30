@@ -77,28 +77,29 @@ function renderStatus(s, collectors) {
   // GUARD = green (good, server protected), WATCH = yellow (caution, not acting), READ-ONLY = gray (passive)
   let guardIcon, guardLabel, guardDesc, guardColor, guardBorderColor, guardBg;
   if (s.mode === 'guard') {
-    guardIcon = '🛡';
+    guardIcon = lucideIcon('shield-check', { size: 32 });
     guardLabel = 'PROTECTED';
     guardDesc = 'Active protection - AI is blocking threats with live firewall rules';
     guardColor = 'var(--ok)';
     guardBorderColor = 'rgba(58,194,126,0.5)';
     guardBg = 'rgba(58,194,126,0.06)';
   } else if (s.mode === 'watch') {
-    guardIcon = '👁';
+    guardIcon = lucideIcon('eye', { size: 32 });
     guardLabel = 'WATCHING';
     guardDesc = 'Dry-run - AI is analysing threats but actions need manual approval or config change';
     guardColor = 'var(--warn)';
     guardBorderColor = 'rgba(255,184,77,0.4)';
     guardBg = 'rgba(255,184,77,0.04)';
   } else {
-    guardIcon = '📖';
+    guardIcon = lucideIcon('book-open', { size: 32 });
     guardLabel = 'MONITOR ONLY';
     guardDesc = 'Responder disabled - events are logged and reported, no automated response';
     guardColor = 'var(--muted)';
     guardBorderColor = 'var(--line)';
     guardBg = 'transparent';
   }
-  const aiLabel = s.ai_enabled ? '🤖 ' + esc(s.ai_provider || '') + ' / ' + esc(s.ai_model || '') : '- off';
+  const aiBotIcon = lucideIcon('bot', { size: 12 });
+  const aiLabel = s.ai_enabled ? aiBotIcon + ' ' + esc(s.ai_provider || '') + ' / ' + esc(s.ai_model || '') : '- off';
 
   let html = '<div class="report-section">' +
     '<div class="report-section-title">Protection Status</div>' +
@@ -114,10 +115,10 @@ function renderStatus(s, collectors) {
   html += '<div class="report-section" id="deepSecuritySection">' +
     '<div class="report-section-title">Deep Security Modules</div>' +
     '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">' +
-    '<div class="deep-card" id="ds-firmware"><div class="deep-icon">🔧</div><div class="deep-label">Firmware Layer</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
-    '<div class="deep-card" id="ds-hypervisor"><div class="deep-icon">🖥️</div><div class="deep-label">Hypervisor Layer</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
-    '<div class="deep-card" id="ds-killchain"><div class="deep-icon">⛓️</div><div class="deep-label">Kill Chain</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
-    '<div class="deep-card" id="ds-dna"><div class="deep-icon">🧬</div><div class="deep-label">Threat DNA</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
+    '<div class="deep-card" id="ds-firmware"><div class="deep-icon">' + lucideIcon('wrench', { size: 22 }) + '</div><div class="deep-label">Firmware Layer</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
+    '<div class="deep-card" id="ds-hypervisor"><div class="deep-icon">' + lucideIcon('monitor', { size: 22 }) + '</div><div class="deep-label">Hypervisor Layer</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
+    '<div class="deep-card" id="ds-killchain"><div class="deep-icon">' + lucideIcon('link', { size: 22 }) + '</div><div class="deep-label">Kill Chain</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
+    '<div class="deep-card" id="ds-dna"><div class="deep-icon">' + lucideIcon('dna', { size: 22 }) + '</div><div class="deep-label">Threat DNA</div><div class="deep-value" style="color:var(--muted)">Loading…</div></div>' +
     '</div></div>';
 
   // ── Section 2: Active Integrations grid ───────────────────────────────
@@ -216,7 +217,7 @@ function renderStatus(s, collectors) {
     const kcPatterns = kc.patterns || {};
     const patternList = Object.keys(kcPatterns).map(function(p) { return p + ': ' + kcPatterns[p]; }).join(', ');
     const kcCost = 'Native syscall correlation. Patterns: ' + (patternList || 'none detected yet');
-    return card('🔗', 'Kill Chain', kcOn, kcDesc, kcOn ? 'ON' : 'OFF', 'native', kcCost, '');
+    return card(lucideIcon('link'), 'Kill Chain', kcOn, kcDesc, kcOn ? 'ON' : 'OFF', 'native', kcCost, '');
   })();
 
   html += '<div class="report-section"><div class="report-section-title">Active Integrations</div>' +
@@ -224,46 +225,46 @@ function renderStatus(s, collectors) {
 
     // ── Core Protection (always visible, expanded) ──
     group('Core Protection', [
-      card('🤖', 'AI Analysis',   s.ai_enabled,     'Analyzes threats and selects the best response action',       s.ai_enabled ? 'ON' : 'OFF', 'native', 'Built into InnerWarden - no external service needed.', 'innerwarden enable ai'),
-      card('🛡️', 'IP Blocker',    resp.enabled,     'Automatically blocks IPs via UFW/iptables when AI decides',   resp.enabled ? 'ON' : 'OFF', 'native', 'Zero cost. Uses your existing firewall.',               'innerwarden enable block-ip'),
-      card('🪤', 'Honeypot',      hpMode !== 'off', 'Decoy server that captures and logs attacker behavior',       hpBadge,                     'native', 'listener mode activates on AI demand; always_on keeps it permanently open.', ''),
-      card('⚡', 'XDP Firewall',  !!s.ebpf_events,  'Wire-speed IP blocking at network driver - 10M+ pps drop',    s.ebpf_events ? 'ON' : 'OFF', 'native', 'Requires eBPF sensor + BPF filesystem mounted. Layered: XDP + firewall + Cloudflare + AbuseIPDB.', ''),
+      card(lucideIcon('bot'), 'AI Analysis',   s.ai_enabled,     'Analyzes threats and selects the best response action',       s.ai_enabled ? 'ON' : 'OFF', 'native', 'Built into InnerWarden - no external service needed.', 'innerwarden enable ai'),
+      card(lucideIcon('shield'), 'IP Blocker',    resp.enabled,     'Automatically blocks IPs via UFW/iptables when AI decides',   resp.enabled ? 'ON' : 'OFF', 'native', 'Zero cost. Uses your existing firewall.',               'innerwarden enable block-ip'),
+      card(lucideIcon('flask-conical'), 'Honeypot',      hpMode !== 'off', 'Decoy server that captures and logs attacker behavior',       hpBadge,                     'native', 'listener mode activates on AI demand; always_on keeps it permanently open.', ''),
+      card(lucideIcon('flame'), 'XDP Firewall',  !!s.ebpf_events,  'Wire-speed IP blocking at network driver - 10M+ pps drop',    s.ebpf_events ? 'ON' : 'OFF', 'native', 'Requires eBPF sensor + BPF filesystem mounted. Layered: XDP + firewall + Cloudflare + AbuseIPDB.', ''),
     ], true) +
 
     // ── Kernel Hardening (expanded — v0.6.0 features) ──
     group('Kernel Hardening', [
       kcCard,
-      card('🔒', 'Sensitive Path Guard', s.sensitive_write||true, 'LSM hook blocks writes to /etc/shadow, sudoers, authorized_keys, crontab', s.sensitive_write !== false ? 'ON' : 'OFF', 'native', 'Capability-based policy: per-cgroup and per-process write permissions via BPF maps.', ''),
-      card('⚡', 'io_uring Monitor',     s.io_uring||true,       'Detects io_uring syscall bypass evasion — invisible to most security tools', s.io_uring !== false ? 'ON' : 'OFF', 'native', 'Tracepoints on submit_sqe/submit_req + create. Alerts on CONNECT, ACCEPT, OPENAT, URING_CMD.', ''),
-      card('📦', 'Container Drift',      s.container_drift||true,'Detects binaries dropped after container start via overlayfs upper-layer',   s.container_drift !== false ? 'ON' : 'OFF', 'native', 'Overlayfs upper-layer drift check at execve using inode layout from BTF.', ''),
-      card('👑', 'Sudo Protection',      s.sudo_protection||false, 'Detects privilege abuse and suspends sudo access',  s.sudo_protection ? 'ON' : 'OFF', 'native', 'Detects 11 threat categories including SUID manipulation, SSH key injection, log tampering.', 'innerwarden enable sudo-protection'),
-      card('🔫', 'Execution Guard',      s.execution_guard||false, 'Structural AST analysis of shell commands - catches obfuscation', s.execution_guard ? 'ON' : 'OFF', 'native', 'tree-sitter-bash analysis. Detects reverse shells, curl|bash, hex obfuscation.', 'innerwarden enable execution-guard'),
-      card('🛡️', 'Shield (DDoS)',        integ.shield||false,    'Packet flood detection + Cloudflare edge push for volumetric attacks', integ.shield ? 'ON' : 'OFF', 'native', 'Detects SYN/UDP/ICMP floods. Pushes to Cloudflare edge when enabled.', ''),
-      card('🧬', 'Threat DNA',           integ.dna||false,       'Attacker fingerprinting and behavioral correlation across sessions',   integ.dna ? 'ON' : 'OFF', 'native', 'Always active. Tracks attack patterns, timing signatures, tool fingerprints.', ''),
+      card(lucideIcon('lock'), 'Sensitive Path Guard', s.sensitive_write||true, 'LSM hook blocks writes to /etc/shadow, sudoers, authorized_keys, crontab', s.sensitive_write !== false ? 'ON' : 'OFF', 'native', 'Capability-based policy: per-cgroup and per-process write permissions via BPF maps.', ''),
+      card(lucideIcon('flame'), 'io_uring Monitor',     s.io_uring||true,       'Detects io_uring syscall bypass evasion — invisible to most security tools', s.io_uring !== false ? 'ON' : 'OFF', 'native', 'Tracepoints on submit_sqe/submit_req + create. Alerts on CONNECT, ACCEPT, OPENAT, URING_CMD.', ''),
+      card(lucideIcon('server'), 'Container Drift',      s.container_drift||true,'Detects binaries dropped after container start via overlayfs upper-layer',   s.container_drift !== false ? 'ON' : 'OFF', 'native', 'Overlayfs upper-layer drift check at execve using inode layout from BTF.', ''),
+      card(lucideIcon('shield'), 'Sudo Protection',      s.sudo_protection||false, 'Detects privilege abuse and suspends sudo access',  s.sudo_protection ? 'ON' : 'OFF', 'native', 'Detects 11 threat categories including SUID manipulation, SSH key injection, log tampering.', 'innerwarden enable sudo-protection'),
+      card(lucideIcon('crosshair'), 'Execution Guard',      s.execution_guard||false, 'Structural AST analysis of shell commands - catches obfuscation', s.execution_guard ? 'ON' : 'OFF', 'native', 'tree-sitter-bash analysis. Detects reverse shells, curl|bash, hex obfuscation.', 'innerwarden enable execution-guard'),
+      card(lucideIcon('shield-check'), 'Shield (DDoS)',        integ.shield||false,    'Packet flood detection + Cloudflare edge push for volumetric attacks', integ.shield ? 'ON' : 'OFF', 'native', 'Detects SYN/UDP/ICMP floods. Pushes to Cloudflare edge when enabled.', ''),
+      card(lucideIcon('dna'), 'Threat DNA',           integ.dna||false,       'Attacker fingerprinting and behavioral correlation across sessions',   integ.dna ? 'ON' : 'OFF', 'native', 'Always active. Tracks attack patterns, timing signatures, tool fingerprints.', ''),
     ], true) +
 
     // ── Alerts & Notifications (collapsed) ──
     group('Alerts & Notifications', [
-      card('🔔', 'Telegram',  integ.telegram,     'Real-time alerts + inline approval buttons on your phone', integ.telegram ? 'ON' : 'OFF', 'external', 'Free. Best solo-operator channel - supports bidirectional approve/reject.', 'innerwarden notify telegram'),
-      card('💬', 'Slack',     integ.slack,         'Incident notifications to a Slack team channel',          integ.slack ? 'ON' : 'OFF',    'external', 'Free (requires workspace). Alongside Telegram doubles alert volume.',      'innerwarden notify slack'),
-      card('🔔', 'Web Push',  integ.web_push||false, 'Browser push notifications - no Telegram/Slack needed', integ.web_push ? 'ON' : 'OFF', 'native', 'VAPID-based. Subscribe from the dashboard bell icon. No external service.', ''),
-      card('🚨', 'PagerDuty', (s.webhook_format||'') === 'pagerduty', 'On-call alerts via PagerDuty Events API v2', (s.webhook_format||'') === 'pagerduty' ? 'ON' : 'OFF', 'external', 'Set webhook.format = \"pagerduty\" and webhook.url to PagerDuty endpoint.', 'innerwarden configure webhook'),
-      card('📟', 'Opsgenie',  (s.webhook_format||'') === 'opsgenie',  'On-call alerts via Opsgenie Alert API',      (s.webhook_format||'') === 'opsgenie' ? 'ON' : 'OFF',  'external', 'Set webhook.format = \"opsgenie\" and webhook.url to Opsgenie endpoint.', 'innerwarden configure webhook'),
+      card(lucideIcon('bot'), 'Telegram',  integ.telegram,     'Real-time alerts + inline approval buttons on your phone', integ.telegram ? 'ON' : 'OFF', 'external', 'Free. Best solo-operator channel - supports bidirectional approve/reject.', 'innerwarden notify telegram'),
+      card(lucideIcon('bot'), 'Slack',     integ.slack,         'Incident notifications to a Slack team channel',          integ.slack ? 'ON' : 'OFF',    'external', 'Free (requires workspace). Alongside Telegram doubles alert volume.',      'innerwarden notify slack'),
+      card(lucideIcon('bot'), 'Web Push',  integ.web_push||false, 'Browser push notifications - no Telegram/Slack needed', integ.web_push ? 'ON' : 'OFF', 'native', 'VAPID-based. Subscribe from the dashboard bell icon. No external service.', ''),
+      card(lucideIcon('alert-triangle'), 'PagerDuty', (s.webhook_format||'') === 'pagerduty', 'On-call alerts via PagerDuty Events API v2', (s.webhook_format||'') === 'pagerduty' ? 'ON' : 'OFF', 'external', 'Set webhook.format = \"pagerduty\" and webhook.url to PagerDuty endpoint.', 'innerwarden configure webhook'),
+      card(lucideIcon('alert-circle'), 'Opsgenie',  (s.webhook_format||'') === 'opsgenie',  'On-call alerts via Opsgenie Alert API',      (s.webhook_format||'') === 'opsgenie' ? 'ON' : 'OFF',  'external', 'Set webhook.format = \"opsgenie\" and webhook.url to Opsgenie endpoint.', 'innerwarden configure webhook'),
     ], false) +
 
     // ── Threat Intelligence (collapsed) ──
     group('Threat Intelligence', [
-      card('🌍', 'GeoIP',     integ.geoip,          'Adds country/ISP info to every threat - free, no key needed', integ.geoip ? 'ON' : 'OFF', 'native', 'Free. Calls ip-api.com (45 req/min). Best first enrichment to enable.', 'innerwarden integrate geoip'),
-      card('🔍', 'AbuseIPDB', integ.abuseipdb,      'IP reputation + delayed community reporting (5min grace)',    integ.abuseipdb ? 'ON' : 'OFF', 'external', 'Free plan: 1,000 req/day. Reports delayed 5 min for false-positive correction.', 'innerwarden integrate abuseipdb'),
-      card('🌐', 'CrowdSec',  integ.crowdsec||false, 'Community threat intelligence - known-bad IPs on incident',  integ.crowdsec ? 'ON' : 'OFF', 'external', 'Free. Requires CrowdSec LAPI running locally. Lookup-only.', 'innerwarden integrate crowdsec'),
-      card('🕸️', 'Mesh Network', integ.mesh||false,  'Collaborative defense - peers exchange block signals',       integ.mesh ? 'ON' : 'OFF', 'native', 'Decentralized threat intel sharing between InnerWarden instances.', 'innerwarden integrate mesh'),
+      card(lucideIcon('globe'), 'GeoIP',     integ.geoip,          'Adds country/ISP info to every threat - free, no key needed', integ.geoip ? 'ON' : 'OFF', 'native', 'Free. Calls ip-api.com (45 req/min). Best first enrichment to enable.', 'innerwarden integrate geoip'),
+      card(lucideIcon('search'), 'AbuseIPDB', integ.abuseipdb,      'IP reputation + delayed community reporting (5min grace)',    integ.abuseipdb ? 'ON' : 'OFF', 'external', 'Free plan: 1,000 req/day. Reports delayed 5 min for false-positive correction.', 'innerwarden integrate abuseipdb'),
+      card(lucideIcon('globe'), 'CrowdSec',  integ.crowdsec||false, 'Community threat intelligence - known-bad IPs on incident',  integ.crowdsec ? 'ON' : 'OFF', 'external', 'Free. Requires CrowdSec LAPI running locally. Lookup-only.', 'innerwarden integrate crowdsec'),
+      card(lucideIcon('link'), 'Mesh Network', integ.mesh||false,  'Collaborative defense - peers exchange block signals',       integ.mesh ? 'ON' : 'OFF', 'native', 'Decentralized threat intel sharing between InnerWarden instances.', 'innerwarden integrate mesh'),
     ], false) +
 
     // ── External Services (collapsed) ──
     group('External Services', [
-      card('☁️', 'Cloudflare',   integ.cloudflare,      'Pushes blocked IPs to Cloudflare edge after block-ip fires', integ.cloudflare ? 'ON' : 'OFF', 'external', 'Free plan supports IP Access Rules. Effective for DDoS edge-layer defense.', 'innerwarden integrate cloudflare'),
-      card('🚧', 'Fail2ban Sync', integ.fail2ban||false, 'Sync blocked IPs with fail2ban jails for unified bans',     integ.fail2ban ? 'ON' : 'OFF', 'external', 'Requires fail2ban installed. InnerWarden reads jails and pushes blocks.', 'innerwarden integrate fail2ban'),
-      card('📊', 'Prometheus',    true,                  'Metrics endpoint at /metrics - scrape with Prometheus/Grafana', 'ON', 'native', 'Always available when dashboard is active. No config needed.', ''),
+      card(lucideIcon('shield'), 'Cloudflare',   integ.cloudflare,      'Pushes blocked IPs to Cloudflare edge after block-ip fires', integ.cloudflare ? 'ON' : 'OFF', 'external', 'Free plan supports IP Access Rules. Effective for DDoS edge-layer defense.', 'innerwarden integrate cloudflare'),
+      card(lucideIcon('ban'), 'Fail2ban Sync', integ.fail2ban||false, 'Sync blocked IPs with fail2ban jails for unified bans',     integ.fail2ban ? 'ON' : 'OFF', 'external', 'Requires fail2ban installed. InnerWarden reads jails and pushes blocks.', 'innerwarden integrate fail2ban'),
+      card(lucideIcon('bar-chart-3'), 'Prometheus',    true,                  'Metrics endpoint at /metrics - scrape with Prometheus/Grafana', 'ON', 'native', 'Always available when dashboard is active. No config needed.', ''),
     ], false) +
 
     '</div>';
@@ -279,11 +280,11 @@ function renderStatus(s, collectors) {
   }
 
   const recommendations = [];
-  if (!integ.geoip)     recommendations.push({ icon:'🌍', text:'Enable GeoIP - free, zero noise, adds country/ISP to every AI decision', cmd:'innerwarden integrate geoip' });
-  if (!integ.telegram)  recommendations.push({ icon:'🔔', text:'Enable Telegram - real-time alerts with approve/reject buttons on your phone', cmd:'innerwarden notify telegram' });
-  if (!integ.abuseipdb) recommendations.push({ icon:'🔍', text:'Enable AbuseIPDB - free API key, enriches AI context with IP reputation score', cmd:'innerwarden integrate abuseipdb' });
-  if (!integ.cloudflare && resp.enabled) recommendations.push({ icon:'☁️', text:'Enable Cloudflare - push blocked IPs to the edge after every block-ip decision', cmd:'innerwarden integrate cloudflare' });
-  if (!integ.mesh) recommendations.push({ icon:'🕸️', text:'Enable Mesh - share threat intel with other InnerWarden instances', cmd:'innerwarden integrate mesh' });
+  if (!integ.geoip)     recommendations.push({ icon: lucideIcon('globe'), text:'Enable GeoIP - free, zero noise, adds country/ISP to every AI decision', cmd:'innerwarden integrate geoip' });
+  if (!integ.telegram)  recommendations.push({ icon: lucideIcon('bot'), text:'Enable Telegram - real-time alerts with approve/reject buttons on your phone', cmd:'innerwarden notify telegram' });
+  if (!integ.abuseipdb) recommendations.push({ icon: lucideIcon('search'), text:'Enable AbuseIPDB - free API key, enriches AI context with IP reputation score', cmd:'innerwarden integrate abuseipdb' });
+  if (!integ.cloudflare && resp.enabled) recommendations.push({ icon: lucideIcon('shield'), text:'Enable Cloudflare - push blocked IPs to the edge after every block-ip decision', cmd:'innerwarden integrate cloudflare' });
+  if (!integ.mesh) recommendations.push({ icon: lucideIcon('link'), text:'Enable Mesh - share threat intel with other InnerWarden instances', cmd:'innerwarden integrate mesh' });
 
   if (conflicts.length > 0 || recommendations.length > 0) {
     html += '<div class="report-section"><div class="report-section-title">Integration Advisor</div>' +
@@ -301,7 +302,7 @@ function renderStatus(s, collectors) {
 
     conflicts.forEach(c => {
       html += '<div class="advisor-block advisor-conflict">' +
-        '<div class="advisor-label warn">⚠ OVERLAP DETECTED</div>' +
+        '<div class="advisor-label warn" style="display:flex;align-items:center;gap:6px">' + lucideIcon('alert-triangle',{size:14}) + ' OVERLAP DETECTED</div>' +
         '<div class="advisor-pair">' + esc(c.a) + ' ↔ ' + esc(c.b) + '</div>' +
         '<div class="advisor-msg">' + esc(c.msg) + '</div>' +
         '</div>';
@@ -310,7 +311,7 @@ function renderStatus(s, collectors) {
     if (recommendations.length > 0) {
       const next = recommendations[0];
       html += '<div class="advisor-block advisor-rec">' +
-        '<div class="advisor-label ok">💡 RECOMMENDED NEXT STEP</div>' +
+        '<div class="advisor-label ok" style="display:flex;align-items:center;gap:6px">' + lucideIcon('flame',{size:14}) + ' RECOMMENDED NEXT STEP</div>' +
         '<div class="advisor-pair">' + next.icon + ' ' + esc(next.text) + '</div>' +
         '<div class="advisor-cmd">$ ' + esc(next.cmd) + '</div>' +
         '</div>';
@@ -327,9 +328,9 @@ function renderStatus(s, collectors) {
   // ── Section 3: Sensor Collectors ──────────────────────────────────────
   if (collectors.length > 0) {
     const colIcons = {
-      auth_log:'🔑', journald:'📋', docker:'🐳', nginx_access:'🌐', nginx_error:'⚠️',
-      exec_audit:'🔎', ebpf:'⚡',
-      syslog_firewall:'🧱', firmware_integrity:'🔧', cloudtrail:'☁️', macos_log:'🍎',      };
+      auth_log: lucideIcon('lock'), journald: lucideIcon('clipboard-list'), docker: lucideIcon('server'), nginx_access: lucideIcon('globe'), nginx_error: lucideIcon('alert-triangle'),
+      exec_audit: lucideIcon('search'), ebpf: lucideIcon('flame'),
+      syslog_firewall: lucideIcon('shield'), firmware_integrity: lucideIcon('wrench'), cloudtrail: lucideIcon('globe'), macos_log: lucideIcon('cpu'),      };
     const colStyle =
       '.col-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:4px}' +
       '.col-row{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px 14px;display:flex;align-items:center;gap:10px}' +
@@ -359,7 +360,7 @@ function renderStatus(s, collectors) {
       '<div class="col-grid">';
 
     collectors.forEach(c => {
-      const icon = colIcons[c.id] || '📦';
+      const icon = colIcons[c.id] || lucideIcon('server');
       const kindBadge = c.kind === 'native'
         ? '<span class="col-kind-native">NATIVE</span>'
         : '<span class="col-kind-ext">EXTERNAL</span>';
@@ -397,8 +398,8 @@ function renderStatus(s, collectors) {
     // events.jsonl no longer used — events go to SQLite (spec 016)
     const isSqlite = (k === 'events' && !exists);
     const statusLabel = isSqlite
-      ? '<span class="health-ok">✓ SQLite</span>'
-      : exists ? '<span class="health-ok">✓ Present</span>'
+      ? '<span class="health-ok" style="display:inline-flex;align-items:center;gap:4px">' + lucideIcon('check',{size:12}) + ' SQLite</span>'
+      : exists ? '<span class="health-ok" style="display:inline-flex;align-items:center;gap:4px">' + lucideIcon('check',{size:12}) + ' Present</span>'
       : '<span style="color:var(--muted)">- Absent</span>';
     html += '<tr>' +
       '<td style="font-family:\'JetBrains Mono\',monospace;font-size:0.72rem">' + esc(k) + (isSqlite ? ' (db)' : '.jsonl') + '</td>' +

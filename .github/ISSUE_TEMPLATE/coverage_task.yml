@@ -1,0 +1,53 @@
+name: Test coverage task
+description: A specific file needs more unit / integration tests to hit our 80% coverage target.
+title: "test(<area>): raise <path/to/file.rs> coverage to 80%"
+labels: ["test", "help wanted"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when proposing a coverage-only task that doesn't change behaviour. Maintainers will add the `good first issue` label once they confirm the scope is newcomer-friendly.
+
+  - type: input
+    id: file
+    attributes:
+      label: File path
+      placeholder: "crates/agent/src/<module>/<file>.rs"
+    validations:
+      required: true
+
+  - type: input
+    id: current-coverage
+    attributes:
+      label: Current coverage (lines covered / total)
+      description: From `cargo tarpaulin --skip-clean --out Stdout` or the codecov dashboard.
+      placeholder: "146/193 (75.65%)"
+
+  - type: textarea
+    id: missing-branches
+    attributes:
+      label: Suggested tests to add
+      description: Concrete branches / functions that aren't currently covered. Bullet list works well.
+      placeholder: |
+        - [ ] `fn_name_a` with empty input
+        - [ ] error path when `feature_x_disabled`
+        - [ ] panic-on-overflow guard
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Estimated scope
+      options:
+        - Single PR (≤200 LOC of test code)
+        - 2-3 PRs (file is large or covers multiple subsystems)
+        - Needs refactor before tests can be written
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes / gotchas
+      description: Anything that would help a newcomer (mocks needed, fixtures elsewhere, etc.)

@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Security policy
-    url: https://github.com/InnerWarden/innerwarden/blob/main/SECURITY.md
-    about: Please review the security reporting guidance before posting security-sensitive issues.
+  - name: Question / Discussion
+    url: https://github.com/InnerWarden/innerwarden/discussions
+    about: For open-ended questions, design discussions, or "is this a bug?" please post in Discussions instead of opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/InnerWarden/innerwarden/security/policy
+    about: Do not file public issues for vulnerabilities. Follow the disclosure path in SECURITY.md.

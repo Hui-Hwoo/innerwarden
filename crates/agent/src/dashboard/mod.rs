@@ -391,6 +391,7 @@ pub async fn serve(
         .route("/", get(index))
         .route("/app.css", get(serve_css))
         .route("/js/api.js", get(serve_js_api))
+        .route("/js/icons.js", get(serve_js_icons))
         .route("/js/helpers.js", get(serve_js_helpers))
         .route("/js/state.js", get(serve_js_state))
         .route("/js/nav.js", get(serve_js_nav))
@@ -731,6 +732,7 @@ macro_rules! js_handler {
 }
 
 js_handler!(serve_js_api, JS_API);
+js_handler!(serve_js_icons, JS_ICONS);
 js_handler!(serve_js_helpers, JS_HELPERS);
 js_handler!(serve_js_state, JS_STATE);
 js_handler!(serve_js_nav, JS_NAV);
@@ -759,6 +761,7 @@ js_handler!(serve_js_sse, JS_SSE);
 const INDEX_HTML: &str = include_str!("frontend/html/index.html");
 const APP_CSS: &str = include_str!("frontend/css/app.css");
 const JS_API: &str = include_str!("frontend/js/api.js");
+const JS_ICONS: &str = include_str!("frontend/js/icons.js");
 const JS_HELPERS: &str = include_str!("frontend/js/helpers.js");
 const JS_STATE: &str = include_str!("frontend/js/state.js");
 const JS_NAV: &str = include_str!("frontend/js/nav.js");
@@ -1102,6 +1105,118 @@ mod tests {
         assert!(APP_CSS.contains(".pending-cell-warn"));
         assert!(APP_CSS.contains(".kpi-pair-line"));
         assert!(APP_CSS.contains(".outcome-allowlisted"));
+    }
+
+    #[test]
+    fn icons_module_loaded_before_consumers_and_exposes_lucide_icon() {
+        // 2026-04-30: shared icon vocabulary lives in
+        // frontend/js/icons.js. Every consumer expects
+        // `window.lucideIcon(name)` to be defined at script execution
+        // time, so icons.js must be in the <script> chain before any
+        // consumer file. Anchor pins the wiring against a future
+        // refactor that drops the include.
+        assert!(
+            INDEX_HTML.contains("<script src=\"/js/icons.js\"></script>"),
+            "icons.js must be wired into index.html"
+        );
+        assert!(
+            INDEX_HTML.contains("<script src=\"/js/icons.js\"></script>\n<script src=\"/js/helpers.js\"></script>"),
+            "icons.js must load BEFORE helpers.js (consumers expect window.lucideIcon to be defined)"
+        );
+        // The module must export the helper.
+        assert!(JS_ICONS.contains("window.lucideIcon"));
+        // And it must contain the canonical names every consumer
+        // currently calls. If a consumer adds a new icon name, it
+        // must be added to the SHAPES table in icons.js — pin the
+        // names that are in active use so a typo in either side
+        // surfaces as a test failure rather than a silent missing
+        // icon at runtime.
+        for name in [
+            "shield-check",
+            "shield",
+            "ban",
+            "eye",
+            "book-open",
+            "check",
+            "check-circle",
+            "x",
+            "x-circle",
+            "alert-circle",
+            "alert-triangle",
+            "activity",
+            "radio",
+            "search",
+            "refresh-ccw",
+            "bar-chart-3",
+            "clipboard-list",
+            "bug",
+            "handshake",
+            "target",
+            "crosshair",
+            "swords",
+            "dna",
+            "link",
+            "globe",
+            "flask-conical",
+            "bot",
+            "cpu",
+            "monitor",
+            "server",
+            "wrench",
+            "broom",
+            "circle-dashed",
+            "circle-dot",
+            "flame",
+            "lock",
+        ] {
+            let needle = format!("'{name}'");
+            assert!(
+                JS_ICONS.contains(&needle),
+                "icons.js SHAPES must define '{name}' — referenced by a consumer"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_consumers_use_lucide_icon_not_emoji() {
+        // 2026-04-30: every dashboard JS file that previously rendered
+        // emoji icons now calls lucideIcon(...). Anchor pins the
+        // contract: each consumer must mention lucideIcon at least
+        // once, and must NOT contain the emojis it used to render.
+        // A future refactor that re-introduces emoji is caught.
+        for (file_label, src, must_have_emoji_count_zero) in [
+            ("home.js", JS_HOME, true),
+            ("threats.js", JS_THREATS, true),
+            ("status.js", JS_STATUS, true),
+            ("intel.js", JS_INTEL, true),
+            ("monthly.js", JS_MONTHLY, true),
+            ("honeypot.js", JS_HONEYPOT, true),
+            ("compliance.js", JS_COMPLIANCE, true),
+            ("responses.js", JS_RESPONSES, true),
+            ("journey.js", JS_JOURNEY, true),
+            ("reports.js", JS_REPORTS, true),
+            ("helpers.js", JS_HELPERS, true),
+            ("actions.js", JS_ACTIONS, true),
+        ] {
+            assert!(
+                src.contains("lucideIcon("),
+                "{file_label} must call lucideIcon() — emoji icons should be gone"
+            );
+            if must_have_emoji_count_zero {
+                // Spot-check: the surrogate-pair escapes used by the
+                // pre-fix code MUST NOT appear in the rendered string
+                // bodies. (We allow them inside comments and JSDoc;
+                // the test bundles raw bytes so it's an over-strict
+                // match — for the canary set below we check shapes
+                // we know were in user-facing strings only.)
+                for emoji in ["\u{1F6E1}", "\u{1F441}", "\u{1F36F}", "\u{1F916}"] {
+                    assert!(
+                        !src.contains(emoji),
+                        "{file_label} still contains emoji {emoji:?} — should be lucide SVG"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

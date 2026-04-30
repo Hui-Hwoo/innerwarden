@@ -141,7 +141,8 @@ function computeHomeState(payload) {
       state: 'health_alert',
       maxSeverity: 'critical',
       heroClass: 'status-hero alert-critical',
-      heroIcon: '\u26A0',
+      // 2026-04-30: heroIcon now lucide SVG; renderer injects via innerHTML.
+      heroIcon: lucideIcon('alert-triangle', { size: 28 }),
       heroTitle: 'System Health Alert',
       heroSub: reasons[0],
       healthAlertReasons: reasons
@@ -160,7 +161,7 @@ function computeHomeState(payload) {
       state: 'backed_up',
       maxSeverity: 'medium',
       heroClass: 'status-hero alert-medium',
-      heroIcon: '⏳',
+      heroIcon: lucideIcon('circle-dashed', { size: 28 }),
       heroTitle: 'Heavy attack volume',
       heroSub: 'System is catching up — give it a few minutes. ' +
         (healthVerb.pending_in_flight || 0) + ' threats being analyzed now.',
@@ -178,7 +179,7 @@ function computeHomeState(payload) {
       state: 'abandoned_backlog',
       maxSeverity: 'medium',
       heroClass: 'status-hero alert-medium',
-      heroIcon: '🧹',
+      heroIcon: lucideIcon('broom', { size: 28 }),
       heroTitle: 'Cleaning up old backlog',
       heroSub: abN + ' threat' + (abN === 1 ? '' : 's') +
         ' from earlier without a decision. Auto-cleanup runs every 10 minutes. ' +
@@ -204,7 +205,7 @@ function computeHomeState(payload) {
       state: 'ai_responding',
       maxSeverity: maxSeverity(activeList),
       heroClass: 'status-hero alert-high',
-      heroIcon: '\uD83D\uDC41',
+      heroIcon: lucideIcon('eye', { size: 28 }),
       heroTitle: 'Detection Mode',
       heroSub: n + ' threat' + (n === 1 ? '' : 's') + ' detected. AI is watching only \u2014 enable Guard mode for automatic protection.',
       healthAlertReasons: []
@@ -241,7 +242,7 @@ function computeHomeState(payload) {
     state: 'protection_active',
     maxSeverity: 'info',
     heroClass: 'status-hero alert-info',
-    heroIcon: '✅',
+    heroIcon: lucideIcon('shield-check', { size: 28 }),
     heroTitle: heroTitle,
     heroSub: subText,
     healthAlertReasons: []
@@ -258,7 +259,9 @@ function updateHomeBanner(status, homeState) {
   if (!hero || !icon || !title || !sub) return;
 
   hero.className  = homeState.heroClass;
-  icon.textContent  = homeState.heroIcon;
+  // 2026-04-30: heroIcon is now an SVG string (lucide), not a single
+  // emoji codepoint. Use innerHTML so the markup renders.
+  icon.innerHTML    = homeState.heroIcon;
   title.textContent = homeState.heroTitle;
   sub.textContent   = homeState.heroSub;
 

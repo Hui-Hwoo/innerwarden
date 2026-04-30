@@ -13,9 +13,9 @@ function kindBadge(entry) {
       if (d.dry_run)        return `<span class="bk bk-decision-dry">DRY RUN</span>`;
       return `<span class="bk bk-decision">EXECUTED</span>`;
     }
-    case 'honeypot_ssh':    return `<span class="bk bk-honeypot">🍯 SSH</span>`;
-    case 'honeypot_http':   return `<span class="bk bk-honeypot">🍯 HTTP</span>`;
-    case 'honeypot_banner': return `<span class="bk bk-honeypot">🍯 BANNER</span>`;
+    case 'honeypot_ssh':    return `<span class="bk bk-honeypot" style="display:inline-flex;align-items:center;gap:4px">${lucideIcon('bug',{size:12})} SSH</span>`;
+    case 'honeypot_http':   return `<span class="bk bk-honeypot" style="display:inline-flex;align-items:center;gap:4px">${lucideIcon('bug',{size:12})} HTTP</span>`;
+    case 'honeypot_banner': return `<span class="bk bk-honeypot" style="display:inline-flex;align-items:center;gap:4px">${lucideIcon('bug',{size:12})} BANNER</span>`;
     default: return `<span class="bk bk-event">${esc(entry.kind)}</span>`;
   }
 }
@@ -177,7 +177,7 @@ function renderKillChainTimeline(evidence) {
 
   return '<div class="kill-chain-timeline">' +
     '<div class="kc-header">' +
-      '<span class="kc-pattern">🔗 ' + esc(pattern) + '</span>' +
+      '<span class="kc-pattern" style="display:inline-flex;align-items:center;gap:4px">' + lucideIcon('link',{size:12}) + ' ' + esc(pattern) + '</span>' +
       '<span class="kc-status ' + statusCls + '">' + esc(status) + '</span>' +
     '</div>' +
     (proc ? '<div class="kc-process">' + esc(proc) + esc(pid) + '</div>' : '') +
@@ -306,7 +306,7 @@ async function askAiExplain(subjectType, subjectValue) {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
     resultEl.innerHTML =
-      '<div style="font-size:0.68rem;font-weight:700;color:var(--accent);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px">\uD83E\uDD16 AI Explanation</div>' +
+      '<div style="font-size:0.68rem;font-weight:700;color:var(--accent);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px;display:flex;align-items:center;gap:6px">' + lucideIcon('bot',{size:14}) + ' AI Explanation</div>' +
       '<div style="font-size:0.8rem;color:var(--text);line-height:1.6">' + esc(data.explanation || 'No explanation available.') + '</div>';
   } catch (e) {
     resultEl.innerHTML =
@@ -613,7 +613,7 @@ async function loadJourney(subjectType, subjectValue) {
       const actionLabel = (dec.action_type || '').replace(/_/g, ' ');
       html += '<div style="padding:14px 16px;margin-bottom:12px;border-radius:10px;background:rgba(74,222,128,0.04);border:1px solid rgba(74,222,128,0.15)">' +
         '<div style="font-size:0.68rem;font-weight:700;color:var(--ok);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px">' +
-        (wasExecuted ? '\uD83E\uDD16 AI Decision — ' + esc(actionLabel) + ' (' + conf + '% confidence)' : '\uD83E\uDD16 AI Analysis') +
+        (wasExecuted ? lucideIcon('bot',{size:14}) + ' AI Decision — ' + esc(actionLabel) + ' (' + conf + '% confidence)' : lucideIcon('bot',{size:14}) + ' AI Analysis') +
         '</div>' +
         '<div style="font-size:0.78rem;color:var(--text);line-height:1.6">' + esc(dec.reason || '') + '</div>' +
       '</div>';
@@ -623,9 +623,9 @@ async function loadJourney(subjectType, subjectValue) {
     html += '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">' +
       '<button type="button" class="journey-btn" style="background:rgba(120,229,255,0.08);border-color:var(--accent);color:var(--accent)" ' +
         'onclick="askAiExplain(\'' + esc(subjectType) + '\',\'' + esc(subjectValue) + '\')">' +
-        '\uD83E\uDD16 Ask AI to explain</button>' +
+        lucideIcon('bot',{size:14}) + ' Ask AI to explain</button>' +
       '<button type="button" class="journey-btn" onclick="toggleTimeline()">' +
-        '\uD83D\uDCCB Show ' + j.entries.length + ' technical entries</button>' +
+        lucideIcon('clipboard-list',{size:14}) + ' Show ' + j.entries.length + ' technical entries</button>' +
     '</div>';
     html += '<div id="aiExplainResult" style="display:none;padding:14px 16px;margin-bottom:12px;border-radius:10px;background:rgba(120,229,255,0.04);border:1px solid rgba(120,229,255,0.12)"></div>';
 

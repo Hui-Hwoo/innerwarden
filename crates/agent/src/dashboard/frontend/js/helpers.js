@@ -156,17 +156,32 @@ function aggregateIncidents(incidents) {
 function syncModeBadgeFromHealth(overview, modeCfg) {
   var badge = document.getElementById('modeBadge');
   if (!badge) return;
+  // 2026-04-30: lucide SVG icons replace the emoji for the four
+  // states. setBadgeWithIcon mirrors the helper in actions.js — both
+  // write the same html shape so the CSS gap/alignment is consistent.
+  var setBadgeWithIcon = function(iconName, text, cls, title) {
+    badge.innerHTML = lucideIcon(iconName, { size: 14 }) +
+      '<span style="margin-left:6px">' + text + '</span>';
+    badge.className = 'status-badge ' + cls;
+    badge.title = title || '';
+  };
   var health = overview && overview.snapshot && overview.snapshot.health;
   if (health && health.kind === 'ai_not_responding') {
-    badge.textContent = '⚠ AI NOT RESPONDING';
-    badge.className = 'status-badge status-badge-alert';
-    badge.title = 'AI provider/classifier is not answering. See system health.';
+    setBadgeWithIcon(
+      'alert-triangle',
+      'AI NOT RESPONDING',
+      'status-badge-alert',
+      'AI provider/classifier is not answering. See system health.'
+    );
     return;
   }
   if (health && (health.kind === 'backed_up' || health.kind === 'abandoned_backlog')) {
-    badge.textContent = '⏳ CATCHING UP';
-    badge.className = 'status-badge status-badge-medium';
-    badge.title = 'AI is processing a backlog. Current protection is unaffected.';
+    setBadgeWithIcon(
+      'circle-dashed',
+      'CATCHING UP',
+      'status-badge-medium',
+      'AI is processing a backlog. Current protection is unaffected.'
+    );
     return;
   }
   // Steady state: restore the mode badge from cached actionCfg.
@@ -174,17 +189,13 @@ function syncModeBadgeFromHealth(overview, modeCfg) {
   if (modeCfg) {
     if (modeCfg.enabled) {
       if (modeCfg.dry_run) {
-        badge.textContent = '👁 WATCHING';
-        badge.className = 'status-badge status-badge-watch';
+        setBadgeWithIcon('eye', 'WATCHING', 'status-badge-watch');
       } else {
-        badge.textContent = '🛡 PROTECTED';
-        badge.className = 'status-badge status-badge-guard';
+        setBadgeWithIcon('shield-check', 'PROTECTED', 'status-badge-guard');
       }
     } else {
-      badge.textContent = '📖 MONITOR';
-      badge.className = 'status-badge status-badge-read';
+      setBadgeWithIcon('book-open', 'MONITOR', 'status-badge-read');
     }
-    badge.title = '';
   }
 }
 
@@ -215,7 +226,7 @@ function blockStateBadgeHtml(state) {
   if (!state || !state.kind) return '';
   if (state.kind === 'blocked_now') {
     var ttl = Number(state.expires_in_secs);
-    var label = '🛡️ KERNEL';
+    var label = lucideIcon('shield-check',{size:12}) + ' KERNEL';
     var tip = 'Kernel-level block currently active.';
     if (Number.isFinite(ttl) && ttl > 0) {
       var humanTtl = ttl >= 3600
@@ -229,7 +240,7 @@ function blockStateBadgeHtml(state) {
     return '<span class="card-badge badge-kernel-active" title="' + tip + '">' + label + '</span>';
   }
   if (state.kind === 'blocked_historical') {
-    return '<span class="card-badge badge-kernel-expired" title="Kernel-level block has expired (TTL elapsed). The agent remembers issuing it but the kernel no longer enforces it.">⚠️ EXPIRED</span>';
+    return '<span class="card-badge badge-kernel-expired" title="Kernel-level block has expired (TTL elapsed). The agent remembers issuing it but the kernel no longer enforces it.">' + lucideIcon('alert-triangle',{size:12}) + ' EXPIRED</span>';
   }
   return '';
 }
@@ -421,19 +432,19 @@ function refreshThreatsDiagnostic() {
       hint.style.display = 'none';
       hint.textContent = '';
       if (!d.has_incidents && !d.scope_mismatch) {
-        icon.textContent = '✨';
+        icon.innerHTML = lucideIcon('flame',{size:24});
         msg.textContent = 'No threats in scope. Either nothing fired today or the filter is too narrow.';
         return;
       }
       if (!d.has_incidents && d.scope_mismatch) {
-        icon.textContent = '📅';
+        icon.innerHTML = lucideIcon('clipboard-list',{size:24});
         msg.textContent = 'No incidents on this date. The graph has incidents on other days.';
         hint.textContent = 'Try the previous day in the Date filter.';
         hint.style.display = '';
         return;
       }
       if (d.has_incidents && !d.has_entities) {
-        icon.textContent = '⚠️';
+        icon.innerHTML = lucideIcon('alert-triangle',{size:24});
         msg.textContent = d.incidents_in_scope + ' incident(s) found, but no IP/User entities linked.';
         if (d.detector_pivot_count > 0) {
           hint.textContent = 'Try the Detector pivot to drill in by detection rule.';
@@ -441,12 +452,12 @@ function refreshThreatsDiagnostic() {
         }
         return;
       }
-      icon.textContent = '🔍';
+      icon.innerHTML = lucideIcon('search',{size:24});
       msg.textContent = 'Select a threat to investigate';
     })
     .catch(function() {
       // Diagnostic endpoint unavailable: keep the original generic copy.
-      icon.textContent = '🔍';
+      icon.innerHTML = lucideIcon('search',{size:24});
       msg.textContent = 'Select a threat to investigate';
       hint.style.display = 'none';
     });

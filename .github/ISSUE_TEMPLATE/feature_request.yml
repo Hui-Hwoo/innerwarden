@@ -1,24 +1,53 @@
-name: Feature request
-description: Suggest an improvement or new capability
-labels:
-  - enhancement
+name: Feature request / Enhancement
+description: Propose a new feature, detector, integration, or improvement.
+title: "feat(<area>): <one-line summary>"
+labels: ["enhancement", "help wanted"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an enhancement. **For non-trivial features, please open a Discussion first** so we can align on scope before someone writes code.
+
   - type: textarea
     id: problem
     attributes:
-      label: Problem
-      description: What problem are you trying to solve?
+      label: What problem does this solve?
+      description: Who is affected and how? "As an operator running InnerWarden on X, I currently have to do Y, which is painful because Z."
     validations:
       required: true
+
   - type: textarea
     id: proposal
     attributes:
       label: Proposed solution
-      description: Describe the behavior you want and any constraints.
+      description: A concrete description of the change. Include API / config / dashboard surface if relevant.
     validations:
       required: true
+
   - type: textarea
-    id: safety
+    id: alternatives
     attributes:
-      label: Safety and rollout considerations
-      description: Mention any privacy, auto-response, privileged execution, or migration impact.
+      label: Alternatives considered
+      description: What else did you look at? Why is this proposal preferable?
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - sensor (collectors, detectors)
+        - agent (AI router, decisions, response skills)
+        - ctl (CLI)
+        - dashboard (frontend / API)
+        - integrations (Telegram, Slack, Splunk, etc.)
+        - documentation
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: References, similar features in other tools, screenshots, etc.

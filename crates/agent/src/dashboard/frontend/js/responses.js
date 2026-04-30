@@ -50,7 +50,7 @@ async function loadResponses() {
     // Drift warning banner when we know state is out of sync with kernel.
     if (hasDrift) {
       html += `<div style="padding:10px 14px;margin-bottom:14px;border-left:3px solid #e74c3c;background:#e74c3c10;border-radius:3px;font-size:0.85rem;">
-        <strong style="color:#e74c3c">⚠ State drift detected.</strong>
+        <strong style="color:#e74c3c;display:inline-flex;align-items:center;gap:4px">${lucideIcon('alert-triangle',{size:14})} State drift detected.</strong>
         ${orphaned > 0 ? `<span>${orphaned} orphaned response(s) — rule may still be active in kernel/firewall. Check WARN logs for stderr.</span>` : ''}
         ${failed > 0 ? `<span>${failed} response(s) mid-retry.</span>` : ''}
       </div>`;

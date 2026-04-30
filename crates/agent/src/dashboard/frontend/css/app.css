@@ -110,7 +110,12 @@
     .status-badge {
       font-size: 0.65rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
       border-radius: 999px; padding: 3px 10px; border: 1px solid;
+      display: inline-flex; align-items: center;
     }
+    /* 2026-04-30: lucide SVG icons live inside .status-badge so they
+       inherit currentColor and stay vertically centred with the
+       label. */
+    .status-badge svg { width: 14px; height: 14px; stroke: currentColor; }
     .status-badge-guard { color: var(--ok);     border-color: rgba(58,194,126,0.5);  background: rgba(58,194,126,0.09); }
     .status-badge-watch { color: var(--warn);   border-color: rgba(255,184,77,0.4);  background: rgba(255,184,77,0.06); }
     .status-badge-read  { color: var(--muted);  border-color: var(--line);            background: transparent; }

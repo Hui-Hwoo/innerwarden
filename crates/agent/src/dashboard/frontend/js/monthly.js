@@ -106,7 +106,7 @@ async function loadMonthly() {
       html += `<h3 style="margin:20px 0 8px;">Detected Campaigns (${r.campaigns.length})</h3>`;
       r.campaigns.forEach(c => {
         const confColor = c.confidence === 'high' ? '#e74c3c' : c.confidence === 'medium' ? '#f39c12' : '#27ae60';
-        const typeIcon = (c.correlation_type||'').includes('dna') ? '🧬' : '🔗';
+        const typeIcon = (c.correlation_type||'').includes('dna') ? lucideIcon('dna') : lucideIcon('link');
         html += `<div class="kpi-card" style="padding:12px;margin-bottom:8px;">
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <div><span style="font-weight:600;">${c.campaign_id}</span> <span>${typeIcon}</span>

@@ -4,7 +4,7 @@ const _baseTitle = document.title;
 function updateTabBadge(delta) {
   _unseenAlerts = Math.max(0, _unseenAlerts + delta);
   if (_unseenAlerts > 0) {
-    document.title = '(' + _unseenAlerts + ' \uD83D\uDD34) ' + _baseTitle;
+    document.title = '(' + _unseenAlerts + ') ' + _baseTitle;  // 2026-04-30: dropped the red-circle emoji from page title for visual consistency with the lucide vocabulary used elsewhere.
   } else {
     document.title = _baseTitle;
   }

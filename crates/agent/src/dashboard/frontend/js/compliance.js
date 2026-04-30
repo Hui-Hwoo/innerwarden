@@ -30,7 +30,7 @@ async function loadCompliance() {
         chainKpi.textContent = 'Empty';
         chainKpi.style.color = 'var(--muted)';
       } else if (chain.intact) {
-        chainKpi.textContent = '\u2713 Intact';
+        chainKpi.innerHTML = lucideIcon('check',{size:14}) + ' <span style="margin-left:4px">Intact</span>';
         chainKpi.style.color = 'var(--ok)';
       } else {
         chainKpi.textContent = '\u2717 Broken';
@@ -44,8 +44,8 @@ async function loadCompliance() {
       const intactBadge = chain.length === 0
         ? '<span style="color:var(--muted)">No decisions recorded today</span>'
         : chain.intact
-          ? '<span style="color:var(--ok);font-weight:700">\u2713 Chain integrity verified</span>'
-          : '<span style="color:var(--warn);font-weight:700">\u26A0 Verification failed \u2014 review recent changes</span>';
+          ? '<span style="color:var(--ok);font-weight:700;display:inline-flex;align-items:center;gap:6px">' + lucideIcon('check-circle',{size:14}) + ' Chain integrity verified</span>'
+          : '<span style="color:var(--warn);font-weight:700;display:inline-flex;align-items:center;gap:6px">' + lucideIcon('alert-triangle',{size:14}) + ' Verification failed \u2014 review recent changes</span>';
       chainEl.innerHTML =
         '<div style="display:flex;flex-direction:column;gap:8px">' +
         '<div>' + intactBadge + '</div>' +
