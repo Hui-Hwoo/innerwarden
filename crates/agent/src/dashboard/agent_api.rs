@@ -617,18 +617,17 @@ pub(super) async fn api_prometheus_metrics(
 }
 
 /// Pure helper extracted from `api_prometheus_metrics` so the heavy work
-/// runs on the blocking pool and stays unit-testable. Same logic as
-/// before — only the scope of the synchronous calls changed. The single
-/// `now` parameter replaces the two separate clock reads the handler
-/// used to make (legacy `resolve_date(None)` used `Local::now()` for the
-/// telemetry snapshot date and `Utc::now()` for the spec 024 window);
-/// `resolve_date(None)` is preserved intentionally to keep the telemetry
-/// filename behavior byte-identical.
+/// runs on the blocking pool and stays unit-testable. The telemetry
+/// snapshot file is named with a LOCAL date (see `crate::telemetry`
+/// writer at line 154 / 167), so this path uses `resolve_date_local`
+/// to keep the filename byte-identical with what the writer just
+/// produced. The dashboard's SQLite queries use the UTC-based
+/// `resolve_date` (see helpers.rs).
 pub(super) fn build_prometheus_metrics_text(
     state: &DashboardState,
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
-    let date = resolve_date(None);
+    let date = resolve_date_local(None);
 
     // Read latest telemetry snapshot (small file, already cached)
     let telem = crate::telemetry::read_latest_snapshot(&state.data_dir, &date);

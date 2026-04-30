@@ -180,6 +180,46 @@ impl Store {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM decisions", [], |row| row.get(0))?;
         Ok(count as u64)
     }
+
+    /// Return `block_ip` decisions whose `ts` falls on the given UTC date,
+    /// in `(ts_iso, target_ip, incident_id, data_json)` form, ordered by
+    /// id ascending so the caller sees them in append order.
+    ///
+    /// This replaces the legacy `decisions-YYYY-MM-DD.jsonl` reconciler
+    /// path (RC-2 surface): the JSONL was a parallel write target whose
+    /// schema, ordering, and date convention drifted from the SQLite
+    /// canonical path. Boot-time reconcilers now consume this helper.
+    pub fn block_ip_decisions_for_date(
+        &self,
+        date: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT ts, target_ip, incident_id, data \
+             FROM decisions \
+             WHERE action_type = 'block_ip' AND ts LIKE ?1 \
+             ORDER BY id",
+        )?;
+        let pattern = format!("{date}%");
+        let rows = stmt.query_map(params![pattern], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (ts, ip, iid, data) = row?;
+            // Keep rows even when target_ip is empty so the caller can
+            // surface a warning; the legacy JSONL reconciler used a
+            // similar guard (`continue` when missing) and the test
+            // anchors expect that semantic.
+            out.push((ts, ip, iid, data));
+        }
+        Ok(out)
+    }
 }
 
 /// Compute SHA-256 hash for hash chain: `SHA-256(prev_hash || data)`.

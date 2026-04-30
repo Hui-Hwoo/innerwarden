@@ -1154,7 +1154,11 @@ mod tests {
 
     #[test]
     fn resolve_date_falls_back_to_today_on_invalid_values() {
-        let today = chrono::Local::now()
+        // 2026-04-30: resolve_date is now UTC. SQLite stores ts as
+        // ISO-UTC; matching "today" against Local::now broke the
+        // dashboard between 00:00 and 01:00 BST when UTC was still
+        // "yesterday". See helpers.rs::resolve_date docstring.
+        let today = chrono::Utc::now()
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();

@@ -911,6 +911,15 @@ pub(super) fn build_pivots_from_graph(
                     {
                         continue;
                     }
+                    // RC-2 follow-up (2026-04-30): drop the "unknown"
+                    // placeholder on the User pivot for the same reason
+                    // as build_pivots_from_sqlite — it is the literal
+                    // string used when a detector cannot resolve a real
+                    // account, and surfacing it as a user account
+                    // pollutes the pivot.
+                    if node_type == NodeType::User && label.eq_ignore_ascii_case("unknown") {
+                        continue;
+                    }
                     pivot_data
                         .entry(edge.to)
                         .or_insert_with(|| (label, Vec::new()))
@@ -1167,7 +1176,17 @@ pub(super) fn build_pivots_from_sqlite(
                                 return None;
                             }
                             let value = e.get("value").and_then(|v| v.as_str())?;
-                            if value.is_empty() {
+                            // RC-2 follow-up (2026-04-30): drop the
+                            // "unknown" placeholder. Some legacy
+                            // detector paths (and a still-deploying
+                            // execution_guard fix) emit User entities
+                            // with value="unknown" when they cannot
+                            // resolve a real account. Treating the
+                            // placeholder as a user produced a
+                            // dominant bogus bucket on the pivot.
+                            // Defense-in-depth alongside the source
+                            // fix in execution_guard.rs.
+                            if value.is_empty() || value.eq_ignore_ascii_case("unknown") {
                                 return None;
                             }
                             Some(value.to_string())
@@ -4809,6 +4828,83 @@ mod tests {
             .expect("user pivot returns Some");
         let names: Vec<&str> = users.iter().map(|p| p.value.as_str()).collect();
         assert_eq!(names, vec!["alice"], "only user from critical incident");
+    }
+
+    #[test]
+    fn build_pivots_from_sqlite_user_drops_unknown_placeholder() {
+        // RC-2 follow-up (2026-04-30): incidents whose User EntityRef
+        // is the literal string "unknown" (sentinel for "could not
+        // resolve a real account") must NOT appear in the User pivot.
+        // Prod showed 11 incidents whose only user entity was
+        // "unknown" — the operator saw a dominant bogus bucket. This
+        // anchor reproduces the case (mixed real + placeholder users)
+        // and pins the dashboard fix.
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let date = "2026-04-30";
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+        let inc_real = Incident {
+            ts: chrono::DateTime::parse_from_rfc3339("2026-04-30T01:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            host: "h".into(),
+            incident_id: "real:1".into(),
+            severity: Severity::High,
+            title: "real user".into(),
+            summary: "x".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("203.0.113.10"), EntityRef::user("root")],
+        };
+        let inc_placeholder = Incident {
+            ts: chrono::DateTime::parse_from_rfc3339("2026-04-30T02:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            host: "h".into(),
+            incident_id: "ph:1".into(),
+            severity: Severity::High,
+            title: "placeholder user".into(),
+            summary: "x".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("203.0.113.11"), EntityRef::user("unknown")],
+        };
+        // Mixed-case placeholder must also be dropped.
+        let inc_uppercase = Incident {
+            ts: chrono::DateTime::parse_from_rfc3339("2026-04-30T03:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            host: "h".into(),
+            incident_id: "ph:2".into(),
+            severity: Severity::High,
+            title: "uppercase placeholder".into(),
+            summary: "x".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("203.0.113.12"), EntityRef::user("Unknown")],
+        };
+        store.insert_incident(&inc_real).expect("insert real");
+        store
+            .insert_incident(&inc_placeholder)
+            .expect("insert placeholder");
+        store
+            .insert_incident(&inc_uppercase)
+            .expect("insert uppercase placeholder");
+
+        let no_filter = InvestigationFilters::from_query(None, None);
+        let users = build_pivots_from_sqlite(&store, date, PivotKind::User, &no_filter, 100)
+            .expect("user pivot returns Some");
+        let names: Vec<&str> = users.iter().map(|p| p.value.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["root"],
+            "only the real account survives — both 'unknown' and 'Unknown' filtered"
+        );
     }
 
     #[test]

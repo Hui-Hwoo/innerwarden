@@ -361,7 +361,43 @@ pub(super) fn determine_outcome(
     "unknown".to_string()
 }
 
+/// Resolves the operator-supplied date filter to a canonical UTC
+/// `YYYY-MM-DD` string. UTC, not Local.
+///
+/// **Why UTC.** SQLite stores incident `ts` and decision `ts` as UTC
+/// ISO-8601 (the writers use `chrono::Utc::now()` everywhere). When the
+/// dashboard calls `WHERE ts LIKE '<date>%'` the comparison happens in
+/// UTC, so "today" must mean "today in UTC" or the query misses
+/// incidents recorded in the last hour. Pre-fix this used
+/// `chrono::Local::now()` and a UK operator (BST = UTC+1) loading the
+/// dashboard between 00:00 and 01:00 BST saw `Today` rendered as the
+/// next UTC day → the SQLite query returned 0 rows even though
+/// incidents had landed seconds earlier.
+///
+/// The telemetry-filename path (which DOES use a Local date because the
+/// writer also uses Local) calls `resolve_date_local` instead — see
+/// that helper for the historical reason.
 pub(super) fn resolve_date(raw: Option<&str>) -> String {
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let Some(candidate) = raw else {
+        return today;
+    };
+    if candidate.len() != 10 {
+        return today;
+    }
+    if chrono::NaiveDate::parse_from_str(candidate, "%Y-%m-%d").is_ok() {
+        return candidate.to_string();
+    }
+    today
+}
+
+/// Local-clock variant for paths that interoperate with files written
+/// by Local-now writers (chiefly the telemetry snapshot). Do NOT use
+/// this for SQLite queries — see `resolve_date` for the correct helper.
+pub(super) fn resolve_date_local(raw: Option<&str>) -> String {
     let today = chrono::Local::now()
         .date_naive()
         .format("%Y-%m-%d")
@@ -692,7 +728,11 @@ mod tests {
 
     #[test]
     fn test_resolve_date_edge_cases() {
-        let today = chrono::Local::now()
+        // resolve_date is now UTC-based — see the helper's docstring
+        // for why. The test must use Utc::now() for the same reason
+        // or it will fail outside UTC=Local timezones (e.g. on a UK
+        // operator's machine after midnight BST).
+        let today = chrono::Utc::now()
             .date_naive()
             .format("%Y-%m-%d")
             .to_string();
@@ -700,6 +740,19 @@ mod tests {
         assert_eq!(resolve_date(Some("invalid-date-format")), today);
         assert_eq!(resolve_date(Some("2024-05")), today); // Incomplete
         assert_eq!(resolve_date(Some("2024-05-15")), "2024-05-15");
+    }
+
+    #[test]
+    fn test_resolve_date_local_keeps_local_now() {
+        // resolve_date_local is the legacy Local-clock variant kept
+        // for the telemetry filename path (writer also uses Local).
+        // Pin its behaviour so a future "consolidation" doesn't merge
+        // it with resolve_date and silently break telemetry filenames.
+        let today_local = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(resolve_date_local(None), today_local);
     }
 
     #[test]

@@ -327,7 +327,20 @@ impl ResponseLifecycle {
         store: Option<&innerwarden_store::Store>,
     ) -> Self {
         if let Some(mut lifecycle) = Self::try_load_v2(data_dir, store) {
-            Self::hydrate_from_decisions_jsonl(&mut lifecycle, data_dir);
+            // RC-2 follow-up (2026-04-30): the canonical decisions are
+            // in SQLite. When a Store is wired the boot reconciler
+            // reads from there; the JSONL fallback only fires when no
+            // SQLite handle is available (test paths and historical
+            // configs without a store). The two reconcilers are
+            // intentionally separate functions because their failure
+            // modes differ — SQLite cannot be silently absent in prod,
+            // so a missing store is a developer signal not a routine
+            // skip.
+            if let Some(sq) = store {
+                Self::hydrate_from_decisions_sqlite(&mut lifecycle, sq);
+            } else {
+                Self::hydrate_from_decisions_jsonl(&mut lifecycle, data_dir);
+            }
             if !lifecycle.active.is_empty() || !lifecycle.history.is_empty() {
                 info!(
                     active = lifecycle.active.len(),
@@ -494,7 +507,14 @@ impl ResponseLifecycle {
             }
         }
 
-        Self::hydrate_from_decisions_jsonl(&mut lifecycle, data_dir);
+        // Same SQLite-first reconciliation as the v2 path. JSONL only
+        // when no Store handle is present (legacy / test). See the v2
+        // load branch above for the rationale.
+        if let Some(sq) = store {
+            Self::hydrate_from_decisions_sqlite(&mut lifecycle, sq);
+        } else {
+            Self::hydrate_from_decisions_jsonl(&mut lifecycle, data_dir);
+        }
 
         if !lifecycle.active.is_empty() || !lifecycle.history.is_empty() {
             info!(
@@ -708,6 +728,97 @@ impl ResponseLifecycle {
         }
         if added > 0 {
             info!(added, "hydrated response lifecycle from today's decisions");
+        }
+    }
+
+    /// SQLite counterpart of `hydrate_from_decisions_jsonl`. Same
+    /// semantic — pick up today's `block_ip` decisions that are NOT
+    /// already tracked in `lifecycle.active` so always-on-honeypot and
+    /// dashboard-manual paths surface on `/api/responses` after a
+    /// restart. Reads from the canonical SQLite `decisions` table
+    /// (RC-2 follow-up 2026-04-30) instead of the parallel JSONL file
+    /// the legacy reconciler scanned.
+    ///
+    /// Why the body mirrors the JSONL one almost verbatim: the
+    /// invariants are exactly the same — skip empty target_ip, skip
+    /// invalid targets, skip already-expired, skip already-tracked,
+    /// derive backend from skill_id. The only meaningful difference is
+    /// the row source (SQLite vs JSONL), so the duplication is
+    /// intentional rather than premature abstraction.
+    fn hydrate_from_decisions_sqlite(lifecycle: &mut Self, store: &innerwarden_store::Store) {
+        let now = Utc::now();
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let rows = match store.block_ip_decisions_for_date(&today) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "block_ip_decisions_for_date failed during hydration");
+                return;
+            }
+        };
+        let tracked_targets: std::collections::HashSet<String> =
+            lifecycle.active.iter().map(|r| r.target.clone()).collect();
+        let mut added = 0usize;
+        for (ts_iso, ip, incident_id, data_json) in rows {
+            if ip.is_empty() || tracked_targets.contains(&ip) {
+                continue;
+            }
+            if !crate::decision_block_ip::is_valid_block_target(&ip) {
+                tracing::warn!(
+                    target = %ip,
+                    "skipping invalid target while hydrating from SQLite decisions"
+                );
+                continue;
+            }
+            if lifecycle.active.iter().any(|r| r.target == ip) {
+                continue;
+            }
+            let ts = ts_iso.parse::<DateTime<Utc>>().unwrap_or(now);
+            let ttl = 3600i64;
+            let expires_at = ts + chrono::Duration::seconds(ttl);
+            if expires_at <= now {
+                continue;
+            }
+            // skill_id lives inside the JSON `data` blob; bare-column
+            // schema does not surface it. Parse defensively — a row
+            // missing the field still yields a usable ufw default.
+            let skill_id = serde_json::from_str::<serde_json::Value>(&data_json)
+                .ok()
+                .and_then(|v| v.get("skill_id").and_then(|s| s.as_str()).map(String::from))
+                .unwrap_or_else(|| "block-ip-ufw".to_string());
+            let backend = if skill_id.contains("xdp") {
+                ResponseBackend::Xdp
+            } else if skill_id.contains("iptables") {
+                ResponseBackend::Iptables
+            } else if skill_id.contains("nftables") {
+                ResponseBackend::Nftables
+            } else {
+                ResponseBackend::Ufw
+            };
+            let id = format!("resp-{}", lifecycle.next_id);
+            lifecycle.next_id += 1;
+            lifecycle.active.push(ActiveResponse {
+                id,
+                response_type: ResponseType::BlockIp,
+                backend,
+                target: ip,
+                incident_id,
+                created_at: ts,
+                ttl_secs: ttl,
+                expires_at,
+                revert_handle: None,
+                state: LifecycleState::Active,
+            });
+            lifecycle.total_registered += 1;
+            added += 1;
+        }
+        if added > 0 {
+            info!(
+                added,
+                "hydrated response lifecycle from sqlite decisions (RC-2 canonical path)"
+            );
         }
     }
 
@@ -2496,5 +2607,189 @@ mod tests {
             captured.contains("error="),
             "error field missing, got: {captured}"
         );
+    }
+
+    // ── RC-2 follow-up (2026-04-30): SQLite-backed reconciler anchors ──
+    //
+    // The legacy `hydrate_from_decisions_jsonl` reads from a parallel
+    // JSONL file whose date convention (Local-now) drifted from the
+    // SQLite canonical path (Utc-stored). The new
+    // `hydrate_from_decisions_sqlite` reads from `decisions` table and
+    // is the path `load_snapshot` uses when a Store is present. These
+    // anchors lock both the SoT contract and the dedup behaviour.
+
+    fn insert_block_ip_decision(
+        store: &innerwarden_store::Store,
+        ts_iso: &str,
+        target: &str,
+        incident_id: &str,
+        skill_id: Option<&str>,
+    ) {
+        let data = serde_json::json!({
+            "skill_id": skill_id.unwrap_or("block-ip-ufw"),
+            "ts": ts_iso,
+            "incident_id": incident_id,
+            "action_type": "block_ip",
+            "target_ip": target,
+        });
+        let row = innerwarden_store::decisions::DecisionRow {
+            ts: ts_iso.to_string(),
+            incident_id: incident_id.to_string(),
+            action_type: "block_ip".to_string(),
+            target_ip: Some(target.to_string()),
+            target_user: None,
+            confidence: 0.9,
+            auto_executed: true,
+            reason: Some("test".to_string()),
+            data: serde_json::to_string(&data).expect("serialize"),
+        };
+        store.insert_decision(&row).expect("insert decision");
+    }
+
+    #[test]
+    fn hydrate_from_decisions_sqlite_picks_up_unregistered_block_ip() {
+        // RC-2 anchor: a block_ip decision recorded directly through
+        // the canonical SQLite path (e.g. by an always-on honeypot or
+        // dashboard manual action that bypassed `register`) must be
+        // surfaced as an active response after restart.
+        use chrono::Timelike;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let recent_ts = now - chrono::Duration::seconds(60);
+        insert_block_ip_decision(
+            &store,
+            &recent_ts.to_rfc3339(),
+            "203.0.113.10",
+            "ssh:bf:1",
+            Some("block-ip-ufw"),
+        );
+
+        let mut lifecycle = ResponseLifecycle::new();
+        ResponseLifecycle::hydrate_from_decisions_sqlite(&mut lifecycle, &store);
+
+        assert_eq!(lifecycle.active.len(), 1, "active block must be hydrated");
+        assert_eq!(lifecycle.active[0].target, "203.0.113.10");
+        assert_eq!(lifecycle.active[0].backend, ResponseBackend::Ufw);
+        assert_eq!(
+            lifecycle.total_registered, 1,
+            "counter must move so the dashboard tile reports the catch-up"
+        );
+    }
+
+    #[test]
+    fn hydrate_from_decisions_sqlite_does_not_duplicate_already_tracked() {
+        // The reconciler must skip targets the v2 snapshot already
+        // restored — otherwise `total_registered` double-counts and
+        // the dashboard active list shows two `resp-N` rows for the
+        // same IP.
+        use chrono::Timelike;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let recent_ts = now - chrono::Duration::seconds(60);
+        insert_block_ip_decision(
+            &store,
+            &recent_ts.to_rfc3339(),
+            "203.0.113.20",
+            "ssh:bf:2",
+            None,
+        );
+
+        let mut lifecycle = ResponseLifecycle::new();
+        // Pretend the v2 snapshot already restored this target.
+        lifecycle.active.push(ActiveResponse {
+            id: "resp-pre".into(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.20".into(),
+            incident_id: "ssh:bf:2".into(),
+            created_at: recent_ts,
+            ttl_secs: 3600,
+            expires_at: recent_ts + chrono::Duration::seconds(3600),
+            revert_handle: None,
+            state: LifecycleState::Active,
+        });
+        lifecycle.total_registered = 1;
+
+        ResponseLifecycle::hydrate_from_decisions_sqlite(&mut lifecycle, &store);
+
+        assert_eq!(
+            lifecycle.active.len(),
+            1,
+            "must not duplicate the already-tracked target"
+        );
+        assert_eq!(
+            lifecycle.total_registered, 1,
+            "counter must not double-count"
+        );
+    }
+
+    #[test]
+    fn hydrate_from_decisions_sqlite_skips_expired_blocks() {
+        // A block_ip decision older than its 1h TTL is already past
+        // expiry. The reconciler must not resurrect it as `Active` —
+        // otherwise the operator sees stale "active" rows the kernel
+        // already removed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+
+        let stale_ts = Utc::now() - chrono::Duration::hours(2);
+        insert_block_ip_decision(
+            &store,
+            &stale_ts.to_rfc3339(),
+            "203.0.113.30",
+            "ssh:bf:3",
+            None,
+        );
+
+        let mut lifecycle = ResponseLifecycle::new();
+        ResponseLifecycle::hydrate_from_decisions_sqlite(&mut lifecycle, &store);
+
+        assert_eq!(
+            lifecycle.active.len(),
+            0,
+            "expired blocks must not be re-surfaced as active"
+        );
+    }
+
+    #[test]
+    fn hydrate_from_decisions_sqlite_derives_backend_from_skill_id() {
+        // The legacy JSONL reconciler walked the JSON entry to read
+        // `skill_id` and pick a ResponseBackend. The SQLite path keeps
+        // the same derivation by parsing the `data` blob — anchor
+        // covers the four known skills (xdp / iptables / nftables /
+        // default ufw) so a future schema change that drops skill_id
+        // from the data JSON is caught.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+        let now = Utc::now() - chrono::Duration::seconds(60);
+
+        for (target, skill, expected) in [
+            ("203.0.113.40", "block-ip-xdp", ResponseBackend::Xdp),
+            (
+                "203.0.113.41",
+                "block-ip-iptables",
+                ResponseBackend::Iptables,
+            ),
+            (
+                "203.0.113.42",
+                "block-ip-nftables",
+                ResponseBackend::Nftables,
+            ),
+            ("203.0.113.43", "block-ip-ufw", ResponseBackend::Ufw),
+        ] {
+            insert_block_ip_decision(&store, &now.to_rfc3339(), target, "inc", Some(skill));
+            let mut lifecycle = ResponseLifecycle::new();
+            ResponseLifecycle::hydrate_from_decisions_sqlite(&mut lifecycle, &store);
+            let row = lifecycle
+                .active
+                .iter()
+                .find(|r| r.target == target)
+                .unwrap_or_else(|| panic!("no active row for {target}"));
+            assert_eq!(row.backend, expected, "backend mismatch for skill={skill}");
+        }
     }
 }
