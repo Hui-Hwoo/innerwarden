@@ -67,6 +67,7 @@ async function loadHome() {
     renderCriticalBanner(topCritical);
     renderReviewBanner(overview);
     renderActivityStrip(overview, totalEventsScanned);
+    renderOnboardingTip(overview);
     renderHealthLine(status, sensors, overview, softStale);
     renderDetailsPanel(overview, status, sensors);
 
@@ -101,6 +102,33 @@ function findTopOpenCritical(items) {
   return open[0] || null;
 }
 
+// Audit 5.5: render an entity reference as a clickable pivot link
+// in the Home banner. Both IP and User entities navigate into the
+// Threats view on the matching pivot. Returns plain text for unknown
+// types so the banner sub-line still renders something legible.
+function homeBannerEntityLink(entity) {
+  if (!entity || !entity.type || !entity.value) return '';
+  var t = String(entity.type).toLowerCase();
+  var v = String(entity.value);
+  if (t === 'ip' || t === 'user') {
+    return '<a href="#threats" class="home-alert-link" ' +
+      'data-pivot="' + esc(t) + '" data-subject="' + esc(v) + '" ' +
+      'onclick="event.preventDefault();homeBannerOpenPivot(\'' + esc(t) + '\',\'' + esc(v) + '\')">' +
+      esc(v) + '</a>';
+  }
+  return esc(v);
+}
+
+function homeBannerOpenPivot(pivot, subject) {
+  if (typeof state !== 'undefined') {
+    state.pivot = pivot;
+    state.selected = { type: pivot, value: subject };
+  }
+  showView('investigate');
+  if (typeof updatePivotUi === 'function') updatePivotUi();
+  if (typeof loadJourney === 'function') loadJourney(pivot, subject);
+}
+
 function renderCriticalBanner(top) {
   var banner = document.getElementById('homeCriticalBanner');
   if (!banner) return;
@@ -121,17 +149,25 @@ function renderCriticalBanner(top) {
     titleEl.textContent = sev + ': ' + label;
   }
   if (subEl) {
-    var ipEntity = (top.entities || []).find(function(e) {
+    var entities = top.entities || [];
+    var ipEntity = entities.find(function(e) {
       return e && (e.type === 'Ip' || e.type === 'ip');
     });
-    var ip = ipEntity ? ipEntity.value : '';
+    var userEntity = entities.find(function(e) {
+      return e && (e.type === 'User' || e.type === 'user');
+    });
     var ageSec = top.ts ? Math.max(0, Math.floor((Date.now() - new Date(top.ts).getTime()) / 1000)) : null;
     var ageText = fmtAgo(ageSec);
+
+    // Audit 5.5: IP and User mentions in the banner sub-line are now
+    // clickable. Each link pivots Threats into the matching subject
+    // so the operator no longer has to manually drive the pivot tab.
     var parts = [];
-    if (ip) parts.push(ip);
-    if (ageText) parts.push(ageText);
-    if (top.title) parts.push(top.title);
-    subEl.textContent = parts.join(' · ');
+    if (ipEntity) parts.push(homeBannerEntityLink(ipEntity));
+    if (userEntity) parts.push(homeBannerEntityLink(userEntity));
+    if (ageText) parts.push(esc(ageText));
+    if (top.title) parts.push(esc(top.title));
+    subEl.innerHTML = parts.join(' · ');
   }
 }
 
@@ -360,13 +396,49 @@ function toggleHomeDetails() {
   var isHidden = panel.hasAttribute('hidden');
   if (isHidden) {
     panel.removeAttribute('hidden');
+    // Audit 3.6: defensive against any inline `display:none` lurking
+    // from prior state — the `hidden` attribute alone is not always
+    // sufficient when style.display has been set explicitly.
+    panel.style.display = '';
     btn.textContent = 'Hide details';
     btn.setAttribute('aria-expanded', 'true');
+    // Audit 3.6: scroll the freshly-revealed panel into view so the
+    // operator sees the content land instead of wondering whether
+    // the toggle worked.
+    if (typeof panel.scrollIntoView === 'function') {
+      panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
   } else {
     panel.setAttribute('hidden', '');
     btn.textContent = 'Show details';
     btn.setAttribute('aria-expanded', 'false');
   }
+}
+
+// Audit 5.10: onboarding / clean-day tip. Surfaces a quiet info row
+// when today has produced zero attackers and zero review-queue items
+// so a fresh-install or quiet-day operator sees the agent IS alive
+// and watching, not silently broken.
+function renderOnboardingTip(overview) {
+  var tip = document.getElementById('homeOnboardingTip');
+  if (!tip) return;
+  var snap = overview && overview.snapshot;
+  var flagged = 0;
+  var awaiting = 0;
+  if (snap) {
+    flagged =
+      (snap.buckets.blocked.unique_attackers || 0) +
+      (snap.buckets.observing.unique_attackers || 0) +
+      (snap.buckets.honeypot.unique_attackers || 0) +
+      (snap.buckets.attention.unique_attackers || 0) +
+      (snap.buckets.allowlisted.unique_attackers || 0);
+    awaiting = snap.buckets.attention.unique_attackers || 0;
+  } else {
+    flagged = overview && overview.handled_ips_today || 0;
+    awaiting = overview && overview.attention_count || 0;
+  }
+  var quiet = flagged === 0 && awaiting === 0;
+  tip.style.display = quiet ? '' : 'none';
 }
 
 // ── State machine ────────────────────────────────────────────────────

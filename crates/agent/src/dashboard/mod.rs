@@ -3060,4 +3060,253 @@ mod tests {
             "over-limit body must yield 413"
         );
     }
+
+    // ── Audit 2026-05-01 follow-ups ───────────────────────────────────
+    //
+    // Each anchor below pins one of the dashboard QA-audit fixes that
+    // ship in this batch. Together they catch silent regressions at
+    // the bundle boundary (HTML / JS / CSS / Rust constants) where a
+    // future refactor is most likely to drop the contract without any
+    // unit-test coverage noticing.
+
+    #[test]
+    fn index_html_carries_alert_stack_container() {
+        // Audit 4.8: a stack container must exist so `showAlertToast`
+        // has somewhere to append toasts. Single-toast behaviour is
+        // not enough — that was the regression the audit caught.
+        assert!(
+            INDEX_HTML.contains("id=\"alertStack\""),
+            "alert stack container missing — toast burst will collapse to a single overwriting toast (audit 4.8)"
+        );
+        // The legacy single-toast div MUST stay for action confirmations
+        // (showToast in actions.js). Those are a different concern.
+        assert!(INDEX_HTML.contains("id=\"toast\""));
+    }
+
+    #[test]
+    fn app_css_defines_alert_stack_styles() {
+        for cls in [
+            ".alert-stack",
+            ".alert-toast",
+            ".alert-toast.visible",
+            ".alert-toast-critical",
+            ".alert-toast-high",
+            ".alert-overflow",
+        ] {
+            assert!(
+                APP_CSS.contains(cls),
+                "alert-stack styling rule {cls} missing — toasts render unstyled (audit 4.8)"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_js_caps_alert_stack_and_overflows() {
+        // Audit 4.8 contract: a hard cap on visible toasts and a
+        // surfaced overflow badge. Both must be present at the bundle
+        // boundary or a future refactor can silently regress to the
+        // pre-fix wall-of-toasts behaviour.
+        assert!(
+            JS_SSE.contains("ALERT_STACK_MAX_VISIBLE"),
+            "sse.js must declare ALERT_STACK_MAX_VISIBLE — caps toast burst"
+        );
+        assert!(JS_SSE.contains("_alertStackOverflow"));
+        assert!(JS_SSE.contains("alert-overflow"));
+        // Each toast must be its own element under the stack so a
+        // dismiss does not rip the whole stack out (regression risk).
+        assert!(JS_SSE.contains("querySelectorAll('.alert-toast')"));
+    }
+
+    #[test]
+    fn sse_js_pivots_alert_into_open_journey() {
+        // Audit 2.10: when the operator already has the journey
+        // open, an alert for that IP must reload the journey instead
+        // of stacking a redundant toast on top of the page they are
+        // looking at.
+        assert!(
+            JS_SSE.contains("_journeyOpenForIp"),
+            "sse.js must define _journeyOpenForIp — pivots alert into open journey (audit 2.10)"
+        );
+        // The branch that calls loadJourney must be reachable.
+        assert!(JS_SSE.contains("loadJourney('ip', alertIp)"));
+    }
+
+    #[test]
+    fn honeypot_js_separates_engaged_from_listener_only_sessions() {
+        // Audit 2.9: honeypot tab USED to display 178 sessions all
+        // with 0 commands / 0 auth attempts and read like "honeypot
+        // is busy" when actually the attackers walked away. Anchor
+        // pins the engagement banner copy + the filter toggle so a
+        // refactor cannot quietly drop the honesty surface.
+        assert!(JS_HONEYPOT.contains("function _honeypotIsEngaged"));
+        assert!(JS_HONEYPOT.contains("toggleHoneypotEngagedFilter"));
+        assert!(
+            JS_HONEYPOT.contains("Honeypot engagement:"),
+            "engagement banner copy missing — operator can't tell engaged vs listener-only (audit 2.9)"
+        );
+        // The explanatory copy is the load-bearing part — a future
+        // copy edit must keep the engaged/unengaged definition
+        // visible to the non-technical operator.
+        assert!(JS_HONEYPOT.contains("Engaged = attacker typed"));
+        assert!(JS_HONEYPOT.contains("Unengaged ="));
+    }
+
+    #[test]
+    fn home_activity_strip_carries_unit_and_timezone_labels() {
+        // Audit 3.7 partial: the "29K -> 6 -> 5 -> 1" funnel had no
+        // unit/timezone labels. The redesigned activity strip now
+        // labels each cell ("events watched" / "flagged as
+        // suspicious" / "stopped automatically" / "awaiting review")
+        // AND includes a time-window line "since midnight UTC".
+        // Anchor pins those labels so a future copy edit doesn't
+        // silently regress the audit fix.
+        for label in [
+            "events watched",
+            "flagged as suspicious",
+            "stopped automatically",
+            "awaiting review",
+        ] {
+            assert!(
+                INDEX_HTML.contains(label),
+                "activity strip label '{label}' missing — audit 3.7 unit hint regression"
+            );
+        }
+        // The timezone marker must remain on the activity-strip
+        // sub-line so the operator never reads a count without a
+        // window context.
+        assert!(JS_HOME.contains("since midnight UTC"));
+    }
+
+    #[test]
+    fn index_html_carries_onboarding_tip() {
+        // Audit 5.10: clean-day tip surface. The bundle MUST include
+        // the container so home.js has somewhere to toggle visibility.
+        assert!(
+            INDEX_HTML.contains("id=\"homeOnboardingTip\""),
+            "Home onboarding tip container missing (audit 5.10)"
+        );
+        assert!(INDEX_HTML.contains("home-onboarding-title"));
+    }
+
+    #[test]
+    fn home_js_renders_onboarding_tip_when_quiet() {
+        // The renderer must read both bucket sums + attention count
+        // and toggle display accordingly. Anchor pins the function
+        // name so a refactor that drops the call from loadHome lights
+        // up CI immediately.
+        assert!(JS_HOME.contains("function renderOnboardingTip"));
+        assert!(JS_HOME.contains("renderOnboardingTip(overview)"));
+    }
+
+    #[test]
+    fn home_js_critical_banner_pivots_user_links() {
+        // Audit 5.5: IP and User mentions in the critical banner
+        // sub-line are now clickable. Anchor pins the helper that
+        // generates the link AND the call sites in
+        // renderCriticalBanner.
+        assert!(JS_HOME.contains("function homeBannerEntityLink"));
+        assert!(JS_HOME.contains("function homeBannerOpenPivot"));
+        // Both branches (ip / user) must be present so the operator
+        // pivots correctly regardless of which entity surfaces.
+        assert!(JS_HOME.contains("homeBannerEntityLink(ipEntity)"));
+        assert!(JS_HOME.contains("homeBannerEntityLink(userEntity)"));
+    }
+
+    #[test]
+    fn app_css_defines_onboarding_and_details_heading() {
+        assert!(APP_CSS.contains(".home-onboarding-tip"));
+        assert!(APP_CSS.contains(".home-onboarding-link"));
+        // Audit 3.6: the visible heading inside the details panel
+        // must be styled or it reads as plain unstyled text.
+        assert!(APP_CSS.contains(".home-details-heading"));
+        // Audit 5.5: the home-alert pivot link must have a
+        // distinguishing style so it reads as a clickable target,
+        // not plain text.
+        assert!(APP_CSS.contains(".home-alert-banner .home-alert-link"));
+    }
+
+    #[test]
+    fn home_js_toggle_details_is_defensive_about_display() {
+        // Audit 3.6: the toggle MUST also clear inline display:none
+        // (defensive against earlier state) AND scroll the panel
+        // into view. Both are belt-and-braces fixes for the audit
+        // report "no content appears".
+        let start = JS_HOME
+            .find("function toggleHomeDetails")
+            .expect("toggleHomeDetails");
+        let body = &JS_HOME[start..start + 1500];
+        assert!(
+            body.contains("panel.style.display = ''"),
+            "toggleHomeDetails must clear inline display so the panel actually shows (audit 3.6)"
+        );
+        assert!(
+            body.contains("scrollIntoView"),
+            "toggleHomeDetails must scrollIntoView when expanding (audit 3.6)"
+        );
+    }
+
+    #[test]
+    fn index_html_carries_modal_preview_block() {
+        // Audit 4.7: the action modal must surface a preview block
+        // BEFORE the operator confirms. The block-IP path used to
+        // commit silently. Anchor pins the ID so a future refactor
+        // can't drop the surface without lighting up CI.
+        assert!(
+            INDEX_HTML.contains("id=\"modalPreview\""),
+            "action modal missing #modalPreview — operator commits without seeing the command (audit 4.7)"
+        );
+        assert!(INDEX_HTML.contains("aria-live=\"polite\""));
+    }
+
+    #[test]
+    fn app_css_defines_modal_preview_styles() {
+        assert!(APP_CSS.contains(".modal-preview"));
+        assert!(APP_CSS.contains(".modal-preview.visible"));
+        assert!(APP_CSS.contains(".modal-preview.danger"));
+        // The code block must have monospace styling so the command
+        // reads as a literal copy-paste, not prose.
+        assert!(APP_CSS.contains(".modal-preview code"));
+    }
+
+    #[test]
+    fn actions_js_renders_modal_preview() {
+        assert!(JS_ACTIONS.contains("buildActionPreviewHtml"));
+        assert!(JS_ACTIONS.contains("refreshActionPreview"));
+        // The block-IP branch must dispatch on every supported backend
+        // so the operator never sees an empty preview just because
+        // their config picked, e.g., nftables.
+        for backend in ["ufw", "iptables", "nftables", "xdp", "pf"] {
+            assert!(
+                JS_ACTIONS.contains(&format!("case '{backend}':")),
+                "buildActionPreviewHtml must handle backend '{backend}' (audit 4.7)"
+            );
+        }
+        // closeActionModal MUST clear the preview surface so the next
+        // open does not flash stale content.
+        let close_start = JS_ACTIONS
+            .find("function closeActionModal")
+            .expect("closeActionModal");
+        let body = &JS_ACTIONS[close_start..close_start + 600];
+        assert!(
+            body.contains("previewEl.innerHTML = ''"),
+            "closeActionModal must clear modalPreview content (audit 4.7)"
+        );
+    }
+
+    #[test]
+    fn sse_js_renders_connection_state_with_age() {
+        // Audit 5.12: the header refresh status surfaces "last event
+        // N s ago" + an amber/red colour after the agent has been
+        // silent for too long. Each constant pins one threshold so a
+        // refactor cannot quietly inflate them.
+        assert!(JS_SSE.contains("CONN_AMBER_AFTER_SECS"));
+        assert!(JS_SSE.contains("CONN_RED_AFTER_SECS"));
+        assert!(JS_SSE.contains("_renderConnectionStatus"));
+        // The age-since-last-event ticker must run on a setInterval
+        // so the colour flips even without new SSE events arriving.
+        assert!(JS_SSE.contains("setInterval(_renderConnectionStatus"));
+        // Hard-fail label must be present so the operator sees a
+        // distinct "no data" verb instead of just "reconnecting".
+        assert!(JS_SSE.contains("NO DATA"));
+    }
 }

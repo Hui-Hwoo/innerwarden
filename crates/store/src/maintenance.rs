@@ -44,9 +44,17 @@ impl Store {
     }
 
     /// Run incremental vacuum (reclaim N free pages).
+    ///
+    /// `PRAGMA incremental_vacuum(N)` returns rows on some SQLite builds
+    /// (one row per reclaimed page), so calling `execute()` raises
+    /// `ExecuteReturnedResults`. Use `query()` and drain the iterator —
+    /// this works regardless of whether the build emits rows.
+    /// Regression: prod 2026-05-01 20:11 UTC log spam.
     pub fn incremental_vacuum(&self, pages: u32) -> Result<()> {
         let conn = self.conn()?;
-        conn.execute(&format!("PRAGMA incremental_vacuum({pages})"), [])?;
+        let mut stmt = conn.prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
         Ok(())
     }
 
@@ -763,6 +771,46 @@ mod tests {
             ratio_after < 0.01,
             "VACUUM must drain freelist, got {ratio_after:.3}"
         );
+    }
+
+    /// 2026-05-01 prod regression: `PRAGMA incremental_vacuum(N)` returns
+    /// rows on some SQLite builds (the freed page count) so the previous
+    /// `conn.execute(...)` raised `ExecuteReturnedResults` every hour
+    /// once the env_filter fix in PR #382 made WARN logs visible.
+    /// The fix swaps to `query()` and drains the iterator. This test
+    /// reproduces the prod scenario: a real on-disk Store with
+    /// `auto_vacuum=INCREMENTAL`, padded then bulk-deleted to create a
+    /// freelist, then `incremental_vacuum(5000)` MUST return Ok.
+    #[test]
+    fn incremental_vacuum_succeeds_on_real_db_with_freelist() {
+        let td = tempfile::TempDir::new().unwrap();
+        let store = Store::open(td.path()).unwrap();
+
+        for i in 0..400 {
+            let ev = Event {
+                ts: Utc::now(),
+                host: format!("h-{i}"),
+                source: "test".into(),
+                kind: "test.incvac".into(),
+                severity: Severity::Low,
+                summary: format!("e-{i}"),
+                details: serde_json::json!({ "pad": "x".repeat(4096) }),
+                tags: vec![],
+                entities: vec![],
+            };
+            store.insert_event(&ev).unwrap();
+        }
+        store.wal_checkpoint().unwrap();
+        let conn = store.conn().unwrap();
+        conn.execute("DELETE FROM events", []).unwrap();
+        drop(conn);
+        store.wal_checkpoint().unwrap();
+        assert!(store.free_page_ratio().unwrap() > 0.05);
+
+        // Must NOT raise ExecuteReturnedResults.
+        store.incremental_vacuum(5000).unwrap();
+        // And calling it again on a near-empty freelist is still Ok.
+        store.incremental_vacuum(1000).unwrap();
     }
 
     #[test]

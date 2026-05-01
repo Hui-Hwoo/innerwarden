@@ -56,6 +56,61 @@ async function loadActionConfig() {
   }
 }
 
+// Audit 4.7: render a read-only preview of the exact command the
+// agent will run, so the operator sees the scope before confirming.
+// Pure function for testability — given config + intent, returns the
+// rendered HTML.
+function buildActionPreviewHtml(cfg, intent) {
+  if (!cfg || !intent) return '';
+  var backend = (cfg.block_backend || 'auto').toLowerCase();
+  var live = !cfg.dry_run;
+  if (intent.type === 'block_ip') {
+    var cmd;
+    switch (backend) {
+      case 'ufw':       cmd = 'sudo ufw deny from ' + intent.ip; break;
+      case 'iptables':  cmd = 'sudo iptables -I INPUT -s ' + intent.ip + ' -j DROP'; break;
+      case 'nftables':  cmd = 'sudo nft add element inet innerwarden blocked { ' + intent.ip + ' }'; break;
+      case 'xdp':       cmd = 'XDP map insert ' + intent.ip + ' (kernel-level wire-speed)'; break;
+      case 'pf':        cmd = 'pfctl -t innerwarden_block -T add ' + intent.ip; break;
+      default:          cmd = '[' + backend + '] block ' + intent.ip;
+    }
+    var meta = live
+      ? 'LIVE — runs immediately. Audit-trail entry written before execution.'
+      : 'DRY RUN — preview only, no firewall change. Audit-trail entry recorded as simulated.';
+    return '<span class="preview-label">Command to run</span>' +
+      '<code>' + esc(cmd) + '</code>' +
+      '<div class="preview-meta">' + esc(meta) + '</div>';
+  }
+  if (intent.type === 'suspend_user') {
+    var dur = intent.durationSecs || 3600;
+    var humanDur = dur >= 3600
+      ? Math.floor(dur / 3600) + 'h'
+      : Math.floor(dur / 60) + 'm';
+    var cmd2 = 'sudo passwd --lock ' + intent.user + '   # restore after ' + humanDur;
+    var meta2 = live
+      ? 'LIVE — locks the account immediately for ' + humanDur + '. Reverts automatically.'
+      : 'DRY RUN — preview only, no password change. Logged as simulated.';
+    return '<span class="preview-label">Account lockdown</span>' +
+      '<code>' + esc(cmd2) + '</code>' +
+      '<div class="preview-meta">' + esc(meta2) + '</div>';
+  }
+  return '';
+}
+
+function refreshActionPreview() {
+  if (!pendingAction || !actionCfg) return;
+  var previewEl = document.getElementById('modalPreview');
+  if (!previewEl) return;
+  var intent = Object.assign({}, pendingAction);
+  if (intent.type === 'suspend_user') {
+    var durEl = document.getElementById('modalDuration');
+    intent.durationSecs = parseInt((durEl && durEl.value) || '3600', 10);
+  }
+  previewEl.innerHTML = buildActionPreviewHtml(actionCfg, intent);
+  previewEl.classList.toggle('visible', !!previewEl.innerHTML);
+  previewEl.classList.toggle('danger', !actionCfg.dry_run);
+}
+
 function showActionModal(type, ip, user) {
   if (!actionCfg || !actionCfg.enabled) return;
   pendingAction = { type, ip, user };
@@ -80,6 +135,15 @@ function showActionModal(type, ip, user) {
     document.getElementById('modalConfirm').textContent = actionCfg.dry_run ? 'Simulate Suspend' : 'Suspend User';
   }
 
+  // Audit 4.7: render the preview before opening, then re-render
+  // when the suspend duration field changes.
+  refreshActionPreview();
+  var durEl = document.getElementById('modalDuration');
+  if (durEl && !durEl._previewWired) {
+    durEl.addEventListener('input', refreshActionPreview);
+    durEl._previewWired = true;
+  }
+
   document.getElementById('modalReason').value = '';
   document.getElementById('modalReason').style.borderColor = '';
   modal.classList.add('open');
@@ -88,6 +152,11 @@ function showActionModal(type, ip, user) {
 
 function closeActionModal() {
   document.getElementById('actionModal').classList.remove('open');
+  var previewEl = document.getElementById('modalPreview');
+  if (previewEl) {
+    previewEl.classList.remove('visible', 'danger');
+    previewEl.innerHTML = '';
+  }
   pendingAction = null;
 }
 

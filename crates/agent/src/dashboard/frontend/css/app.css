@@ -1085,6 +1085,50 @@
       box-shadow: 0 0 0 2px rgba(120,229,255,0.09);
     }
     .modal-textarea { min-height: 72px; }
+    /* Audit 4.7: preview block above the reason input. Shows the
+       exact backend command that will run + the scope (duration,
+       audit trail). Read-only by design — operator must abort via
+       Cancel if the preview is wrong. */
+    .modal-preview {
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px dashed var(--line);
+      background: rgba(120, 229, 255, 0.04);
+      font-size: 0.72rem;
+      color: var(--muted);
+      line-height: 1.5;
+      display: none;
+    }
+    .modal-preview.visible { display: block; }
+    .modal-preview .preview-label {
+      display: block;
+      font-size: 0.6rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+    .modal-preview code {
+      display: block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.74rem;
+      color: var(--text);
+      background: rgba(0, 0, 0, 0.18);
+      border-radius: 4px;
+      padding: 6px 8px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .modal-preview .preview-meta {
+      margin-top: 6px;
+      font-size: 0.66rem;
+    }
+    .modal-preview.danger {
+      border-color: rgba(244, 63, 94, 0.28);
+      background: rgba(244, 63, 94, 0.04);
+    }
     .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; flex-wrap: wrap; }
     .btn-cancel {
       background: transparent; border: 1px solid var(--line2); color: var(--muted);
@@ -1128,6 +1172,54 @@
     .toast.visible { opacity: 1; transform: translateY(0); pointer-events: auto; }
     .toast.ok  { border-left: 3px solid var(--ok);    color: var(--text); }
     .toast.err { border-left: 3px solid var(--danger); color: var(--text); }
+
+    /* Real-time alert stack (audit 4.8). Lives below the action toast,
+       holds up to ALERT_STACK_MAX_VISIBLE concurrent alerts plus an
+       overflow badge. Each alert is rendered standalone so the bursts
+       drain naturally without piling into a single permanent toast. */
+    .alert-stack {
+      position: fixed; top: 60px; right: 16px; z-index: 199;
+      display: flex; flex-direction: column; gap: 8px;
+      max-width: 360px; pointer-events: none;
+    }
+    .alert-toast {
+      position: relative; pointer-events: auto;
+      background: var(--bg1); border: 1px solid var(--line2);
+      border-radius: 12px; padding: 11px 36px 11px 16px;
+      font-size: 0.82rem; box-shadow: 0 6px 28px rgba(0,0,0,0.55);
+      opacity: 0; transform: translateY(-6px);
+      transition: opacity 0.2s ease, transform 0.2s ease;
+      line-height: 1.35;
+    }
+    .alert-toast.visible { opacity: 1; transform: translateY(0); }
+    .alert-toast.alert-toast-critical { border-left: 3px solid #f43f5e; }
+    .alert-toast.alert-toast-high     { border-left: 3px solid #f97316; }
+    .alert-toast .alert-toast-body {
+      display: flex; align-items: center; gap: 8px; cursor: pointer;
+    }
+    .alert-toast .alert-toast-sev {
+      font-weight: 700; font-size: 0.7rem; letter-spacing: 0.04em;
+    }
+    .alert-toast .alert-toast-title { flex: 1; color: var(--text); }
+    .alert-toast .alert-toast-target {
+      color: #78e5ff; font-size: 0.72rem; font-family: 'JetBrains Mono', monospace;
+    }
+    .alert-toast .alert-toast-close {
+      position: absolute; top: 4px; right: 8px;
+      background: none; border: none; color: var(--muted);
+      font-size: 1.05rem; cursor: pointer; padding: 2px 6px;
+    }
+    .alert-toast .alert-toast-close:hover { color: var(--text); }
+    .alert-overflow {
+      pointer-events: auto; cursor: pointer;
+      background: rgba(244, 63, 94, 0.10); color: var(--danger);
+      border: 1px solid rgba(244, 63, 94, 0.32); border-radius: 999px;
+      padding: 5px 12px; font-size: 0.7rem; font-weight: 600;
+      align-self: flex-end;
+    }
+    .alert-overflow:hover {
+      background: rgba(244, 63, 94, 0.16);
+    }
     /* D9 - inline entity search */
     .search-wrap { padding: 6px 12px 2px; }
     #entitySearch {
@@ -1317,6 +1409,20 @@
       color: var(--muted);
       margin-top: 3px;
     }
+    /* Audit 5.5: clickable IP / user span inside the banner sub-line.
+       Inherits the banner colour but underlines on hover so it's
+       discoverable as a pivot link. */
+    .home-alert-banner .home-alert-link {
+      color: var(--accent);
+      font-family: 'JetBrains Mono', monospace;
+      text-decoration: none;
+      border-bottom: 1px dashed transparent;
+    }
+    .home-alert-banner .home-alert-link:hover,
+    .home-alert-banner .home-alert-link:focus-visible {
+      border-bottom-color: var(--accent);
+      outline: none;
+    }
     .home-alert-banner .home-alert-cta {
       flex-shrink: 0;
       padding: 6px 14px;
@@ -1457,7 +1563,66 @@
 
     /* Details panel: collapsed by default, holds metadata + per-detector
        breakdowns + sensor list for the routine-scan persona. */
-    .home-details { margin-top: 8px; }
+    .home-details {
+      margin-top: 8px;
+      padding-top: 12px;
+      border-top: 1px dashed var(--line);
+    }
+    /* Audit 3.6: heading inside the expanded panel so the operator
+       sees an unambiguous "Technical details" label after toggling.
+       Pre-fix the toggle revealed only a dashed meta row that read
+       as ambient chrome — the audit operator reported "no content". */
+    .home-details-heading {
+      font-size: 0.66rem;
+      font-weight: 700;
+      letter-spacing: 0.10em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 12px;
+    }
+    /* Audit 5.10: clean-day onboarding tip. Renders only when the
+       day has produced zero attackers AND zero review-queue items.
+       Visual tier sits below the activity strip but above the
+       briefing — quietly explains that the agent is watching. */
+    .home-onboarding-tip {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      border-radius: 12px;
+      border: 1px dashed var(--line);
+      background: rgba(120, 229, 255, 0.04);
+    }
+    .home-onboarding-tip .home-onboarding-icon {
+      color: var(--accent);
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+    }
+    .home-onboarding-tip .home-onboarding-body { flex: 1; min-width: 0; }
+    .home-onboarding-tip .home-onboarding-title {
+      font-size: 0.82rem;
+      color: var(--text);
+      font-weight: 600;
+    }
+    .home-onboarding-tip .home-onboarding-sub {
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .home-onboarding-tip .home-onboarding-link {
+      flex-shrink: 0;
+      color: var(--accent);
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-decoration: none;
+      border: 1px solid currentColor;
+      padding: 5px 12px;
+      border-radius: 8px;
+    }
+    .home-onboarding-tip .home-onboarding-link:hover {
+      background: rgba(120, 229, 255, 0.08);
+    }
     .home-meta-row {
       display: flex;
       gap: 18px;

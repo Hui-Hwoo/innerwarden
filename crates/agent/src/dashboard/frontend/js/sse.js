@@ -4,7 +4,7 @@ const _baseTitle = document.title;
 function updateTabBadge(delta) {
   _unseenAlerts = Math.max(0, _unseenAlerts + delta);
   if (_unseenAlerts > 0) {
-    document.title = '(' + _unseenAlerts + ') ' + _baseTitle;  // 2026-04-30: dropped the red-circle emoji from page title for visual consistency with the lucide vocabulary used elsewhere.
+    document.title = '(' + _unseenAlerts + ') ' + _baseTitle;
   } else {
     document.title = _baseTitle;
   }
@@ -16,7 +16,55 @@ document.addEventListener('visibilitychange', function() {
   }
 });
 
-// ── Alert toast ──────────────────────────────────────────────────────
+// ── Alert toast stack (audit 4.8) ────────────────────────────────────
+// Cap visible toasts at MAX_VISIBLE; FIFO eviction. New toasts past
+// the cap collapse into a "+N more" badge that links to the threats
+// view. Each toast has its own auto-dismiss timer (15 s) so a burst
+// drains naturally instead of becoming a manual-close wall.
+//
+// Audit 2.10: when an alert arrives for the IP whose journey is
+// currently open in the Threats view, suppress the toast and reload
+// the journey instead. The operator already has the right page on
+// screen, no need to interrupt them.
+var ALERT_STACK_MAX_VISIBLE = 3;
+var _alertStackOverflow = 0;
+
+function _renderAlertStackOverflow() {
+  var stack = document.getElementById('alertStack');
+  if (!stack) return;
+  var existing = stack.querySelector('.alert-overflow');
+  if (_alertStackOverflow <= 0) {
+    if (existing) existing.remove();
+    return;
+  }
+  if (!existing) {
+    existing = document.createElement('button');
+    existing.type = 'button';
+    existing.className = 'alert-overflow';
+    existing.setAttribute('aria-label', 'View additional alerts in threats view');
+    existing.onclick = function() {
+      _alertStackOverflow = 0;
+      _renderAlertStackOverflow();
+      showView('investigate');
+    };
+    stack.appendChild(existing);
+  }
+  existing.textContent = '+' + _alertStackOverflow + ' more — open threats';
+}
+
+// Returns true when the threats view is showing the journey for `ip`
+// so the alert can land into the open page instead of as a toast.
+function _journeyOpenForIp(ip) {
+  if (!ip) return false;
+  var threatsView = document.getElementById('viewInvestigate');
+  if (!threatsView || threatsView.style.display === 'none') return false;
+  var sel = (typeof state !== 'undefined') ? state.selected : null;
+  if (!sel || !sel.value) return false;
+  var t = String(sel.type || '').toLowerCase();
+  if (t !== 'ip') return false;
+  return String(sel.value) === String(ip);
+}
+
 function showAlertToast(alert) {
   var alertIp = alert.entity_value || '';
   if (state.hideAllowlisted && alertIp && (isPrivateIp(alertIp) || isIpTrusted(alertIp))) return;
@@ -26,43 +74,151 @@ function showAlertToast(alert) {
   const sev = (alert.severity || 'medium').toLowerCase();
   const isGrave = sev === 'critical' || sev === 'high';
 
-  // Only show toast for uncontained high/critical threats.
-  // Contained threats and low-severity noise stay silent — dashboard updates live.
+  // Only surface uncontained high/critical threats. Contained threats
+  // and low-severity noise stay silent; dashboard updates live.
   if (isContained || !isGrave) return;
 
   if (document.hidden) updateTabBadge(1);
 
+  var etype = alert.entity_type || 'ip';
+  // Audit 2.10: pivot directly into the open journey when the
+  // operator is already looking at it. Reload to fold the new entry
+  // into the existing timeline instead of stacking a redundant toast.
+  if (alertIp && etype.toLowerCase() === 'ip' && _journeyOpenForIp(alertIp)) {
+    if (typeof loadJourney === 'function') {
+      loadJourney('ip', alertIp);
+    }
+    return;
+  }
+
+  const stack = document.getElementById('alertStack');
+  if (!stack) return;
+  const visible = stack.querySelectorAll('.alert-toast');
+  if (visible.length >= ALERT_STACK_MAX_VISIBLE) {
+    _alertStackOverflow++;
+    _renderAlertStackOverflow();
+    return;
+  }
+
   const title = alert.title || 'Incident detected';
-  const evalue = alert.entity_value || '';
-  const etype  = alert.entity_type  || 'ip';
-  const toastEl = document.getElementById('toast');
   const sevLabel = sev.toUpperCase();
   const sevColor = sev === 'critical' ? '#f43f5e' : '#f97316';
 
+  const toastEl = document.createElement('div');
+  toastEl.className = 'alert-toast alert-toast-' + sev + ' visible';
+  toastEl.setAttribute('role', 'alert');
   toastEl.innerHTML =
-    `<div style="display:flex;align-items:center;gap:8px;cursor:pointer" ` +
-    `onclick="dismissToast();showView('investigate');` +
-    (evalue ? `handleCardClickByValue('${esc(etype)}','${esc(evalue)}')` : '') + `">` +
-    `<span style="color:${sevColor};font-weight:700">${esc(sevLabel)}</span>` +
-    `<span style="flex:1">${esc(title)}</span>` +
-    (evalue ? `<span style="color:#78e5ff;font-size:0.75rem">${esc(evalue)} \u2192</span>` : '') +
-    `</div>` +
-    `<button onclick="event.stopPropagation();dismissToast()" ` +
-    `style="position:absolute;top:4px;right:8px;background:none;border:none;` +
-    `color:var(--muted);font-size:1.1rem;cursor:pointer;padding:2px 6px">&times;</button>`;
-  toastEl.className = 'toast err visible';
+    '<div class="alert-toast-body">' +
+      '<span class="alert-toast-sev" style="color:' + sevColor + '">' + esc(sevLabel) + '</span>' +
+      '<span class="alert-toast-title">' + esc(title) + '</span>' +
+      (alertIp ? '<span class="alert-toast-target">' + esc(alertIp) + ' →</span>' : '') +
+    '</div>' +
+    '<button class="alert-toast-close" type="button" aria-label="Dismiss alert">&times;</button>';
 
-  clearTimeout(toastEl._timer);
-  toastEl._timer = setTimeout(() => toastEl.classList.remove('visible'), 15000);
+  toastEl._dismiss = function() {
+    if (toastEl._timer) clearTimeout(toastEl._timer);
+    toastEl.remove();
+  };
+  toastEl.querySelector('.alert-toast-body').addEventListener('click', function() {
+    toastEl._dismiss();
+    showView('investigate');
+    if (alertIp) handleCardClickByValue(etype, alertIp);
+  });
+  toastEl.querySelector('.alert-toast-close').addEventListener('click', function(ev) {
+    ev.stopPropagation();
+    toastEl._dismiss();
+  });
+
+  // Critical alerts require explicit acknowledgement; high alerts
+  // auto-fade after 15 s like before.
+  if (sev !== 'critical') {
+    toastEl._timer = setTimeout(function() { toastEl._dismiss(); }, 15000);
+  }
+
+  stack.insertBefore(toastEl, stack.querySelector('.alert-overflow') || null);
 }
 
+// Backwards-compat: older callers may still invoke dismissToast().
+// Drains the alert stack and hides the action toast.
 function dismissToast() {
+  const stack = document.getElementById('alertStack');
+  if (stack) {
+    stack.querySelectorAll('.alert-toast').forEach(function(t) {
+      if (t._timer) clearTimeout(t._timer);
+      t.remove();
+    });
+    _alertStackOverflow = 0;
+    _renderAlertStackOverflow();
+  }
   const toastEl = document.getElementById('toast');
   if (toastEl) {
     toastEl.classList.remove('visible');
     clearTimeout(toastEl._timer);
   }
 }
+
+// ── Real-time connection state (audit 5.12) ──────────────────────────
+// The header already toggles between LIVE and reconnecting based on
+// the SSE handshake. The audit asks for richer signal: how long since
+// the last event, and a hard-fail badge when the agent has been
+// silent for several minutes. We track the timestamp of the last
+// observed SSE message in `window._lastSSEEventTs` (any kind of
+// event counts as a heartbeat for connection-liveness purposes) and
+// a 5 s ticker repaints the header.
+var CONN_AMBER_AFTER_SECS = 60;     // amber "stalling" cue
+var CONN_RED_AFTER_SECS   = 300;    // hard-fail "silent" cue
+var _connStateMode = 'unknown';     // 'live' | 'reconnecting' | 'unknown'
+
+function _markSseEvent() {
+  window._lastSSEEventTs = Date.now();
+  _renderConnectionStatus();
+}
+
+function _setConnState(mode) {
+  _connStateMode = mode;
+  _renderConnectionStatus();
+}
+
+function _renderConnectionStatus() {
+  var el = document.getElementById('refreshStatus');
+  if (!el) return;
+  var lastTs = window._lastSSEEventTs;
+  var nowMs = Date.now();
+  var ageSecs = lastTs ? Math.max(0, Math.floor((nowMs - lastTs) / 1000)) : null;
+
+  var color, label, ageHtml = '';
+  if (_connStateMode === 'reconnecting') {
+    color = '#888';
+    label = 'reconnecting';
+  } else if (ageSecs == null) {
+    color = '#78e5ff';
+    label = 'LIVE';
+  } else if (ageSecs >= CONN_RED_AFTER_SECS) {
+    color = '#f43f5e';
+    label = 'NO DATA';
+  } else if (ageSecs >= CONN_AMBER_AFTER_SECS) {
+    color = '#f59e0b';
+    label = 'STALLING';
+  } else {
+    color = '#78e5ff';
+    label = 'LIVE';
+  }
+
+  if (ageSecs != null) {
+    var ageText;
+    if (ageSecs < 60) ageText = ageSecs + 's';
+    else if (ageSecs < 3600) ageText = Math.floor(ageSecs / 60) + 'm';
+    else ageText = Math.floor(ageSecs / 3600) + 'h';
+    ageHtml = '<span style="color:var(--muted);font-size:0.65rem;margin-left:6px">last event ' + ageText + ' ago</span>';
+  }
+
+  el.innerHTML = '<span style="color:' + color + ';font-size:0.75rem;font-weight:600" title="Real-time connection state">● ' + label + '</span>' + ageHtml;
+}
+
+// Background ticker repaints the header every 5 s so the operator
+// sees the age tick over and the colour flip on schedule even when
+// no new events arrive.
+setInterval(_renderConnectionStatus, 5000);
 
 // ── Entity search ────────────────────────────────────────────────────
 function applyEntitySearch() {
@@ -194,8 +350,8 @@ refreshLeft(false).then(() => {
         if (!res.ok || !res.body) throw new Error('SSE connect failed');
         clearTimeout(fallbackTimer);
         clearInterval(fallbackTimer);
-        const el = document.getElementById('refreshStatus');
-        if (el) el.innerHTML = '<span style="color:#78e5ff;font-size:0.85rem">&#9679; LIVE</span>';
+        _setConnState('live');
+        _markSseEvent();
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
@@ -210,6 +366,7 @@ refreshLeft(false).then(() => {
               if (line.startsWith('event: ')) {
                 lastEvent = line.slice(7).trim();
               } else if (line.startsWith('data: ')) {
+                _markSseEvent();
                 if (lastEvent === 'refresh') {
                   // Throttle: at most 1 refresh per 5 seconds to avoid 429s
                   var now = Date.now();
@@ -236,8 +393,7 @@ refreshLeft(false).then(() => {
   }
 
   function scheduleReconnect() {
-    const el = document.getElementById('refreshStatus');
-    if (el) el.innerHTML = '<span style="color:#888;font-size:0.7rem">&#9679; reconnecting</span>';
+    _setConnState('reconnecting');
     armFallback();
     reconnectTimer = setTimeout(connect, 3000);
   }

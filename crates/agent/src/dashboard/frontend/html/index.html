@@ -147,6 +147,21 @@
       </div>
     </div>
 
+    <!-- 4b. ONBOARDING / CLEAN-DAY TIP (audit 5.10): only renders
+         when the day has produced zero attackers AND zero items in
+         the review queue. Gives the operator context that the agent
+         is alive and watching without surfacing fake activity. -->
+    <div class="home-section home-onboarding-tip" id="homeOnboardingTip" style="display:none">
+      <div class="home-onboarding-icon" aria-hidden="true">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+      </div>
+      <div class="home-onboarding-body">
+        <div class="home-onboarding-title">No threats today — everything is being watched.</div>
+        <div class="home-onboarding-sub" id="homeOnboardingSub">Sensors are streaming events. Detections appear here as soon as the AI sees them.</div>
+      </div>
+      <a class="home-onboarding-link" href="#sensors" onclick="event.preventDefault();showView('sensors')">Check sensors &rarr;</a>
+    </div>
+
     <!-- 5. AI INTELLIGENCE BRIEFING: always visible per operator
          request. Single narrative paragraph from AI summarising the
          day. Works as the "what really happened" view for the
@@ -174,6 +189,12 @@
          the per-detector breakdown, pending buckets, sensor list,
          mode/heartbeat metadata. Hidden by default. -->
     <div class="home-details" id="homeDetailsPanel" hidden>
+      <!-- Audit 3.6: when the toggle expands the panel, this heading
+           plus the dashed border below make the "where the technical
+           detail is" boundary unambiguous. The audit operator
+           reported clicking the toggle and "no content appearing"
+           because the meta row alone read as page chrome. -->
+      <div class="home-details-heading">Technical details</div>
       <!-- Pending breakdown — only renders cells with count > 0 -->
       <div class="home-section" id="homePendingPanel" style="display:none">
         <div class="home-section-title">
@@ -411,6 +432,11 @@
     <div class="modal-box" onclick="event.stopPropagation()">
       <div class="modal-title" id="modalTitle">Action</div>
       <div class="modal-subtitle" id="modalSubtitle"></div>
+      <!-- Audit 4.7: show the operator the exact command/scope that
+           will execute. The block-IP path used to commit silently
+           with no preview. The preview is read-only and updates
+           when scope inputs change. -->
+      <div class="modal-preview" id="modalPreview" aria-live="polite"></div>
       <div class="modal-field">
         <label class="modal-label" for="modalReason">Reason <span style="color:var(--danger)">*</span></label>
         <textarea class="modal-textarea" id="modalReason" rows="3" placeholder="Describe why you are taking this action - recorded in the audit trail…"></textarea>
@@ -474,8 +500,10 @@
 
   <!-- Graph view removed — stats moved to Health, visual was unusable at scale -->
 
-  <!-- Toast notification -->
+  <!-- Action toast (single, action confirmations) -->
   <div class="toast" id="toast"></div>
+  <!-- Real-time alert stack (max 3 visible, FIFO; "+N more" badge after) -->
+  <div class="alert-stack" id="alertStack" aria-live="polite" aria-atomic="false"></div>
 
 </div>
 

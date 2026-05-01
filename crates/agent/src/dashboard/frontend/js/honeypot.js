@@ -41,8 +41,30 @@ async function testHoneypot() {
   }
 }
 
+// Audit 2.9: tell engaged sessions apart from listener-only ones.
+// "Engaged" = the attacker actually typed something or tried to log
+// in. The bug surface was a wall of 178 sessions with 0 commands /
+// 0 auth attempts, which read like "honeypot is busy" but actually
+// meant "honeypot collected nothing".
+function _honeypotIsEngaged(s) {
+  return ((s && s.commands_count) || 0) > 0 ||
+         ((s && s.auth_attempts) || 0) > 0;
+}
+
+var _honeypotShowEngagedOnly = false;
+
+function toggleHoneypotEngagedFilter() {
+  _honeypotShowEngagedOnly = !_honeypotShowEngagedOnly;
+  loadHoneypot();
+}
+
 function renderHoneypot(data) {
-  const sessions = data.sessions || [];
+  const allSessions = data.sessions || [];
+  const engagedCount = allSessions.filter(_honeypotIsEngaged).length;
+  const unengagedCount = allSessions.length - engagedCount;
+  const sessions = _honeypotShowEngagedOnly
+    ? allSessions.filter(_honeypotIsEngaged)
+    : allSessions;
 
   // Test button shown regardless of whether sessions exist
   const testBtn = '<div style="padding:16px 16px 0;max-width:900px;margin:0 auto">' +
@@ -58,12 +80,55 @@ function renderHoneypot(data) {
     'Injects a test incident - the agent evaluates and triggers the honeypot on the next tick (≤2 s).' +
     '</span></div>';
 
-  if (sessions.length === 0) {
-    return testBtn + '<div class="empty" style="padding:40px;text-align:center;opacity:0.5">' + lucideIcon('bug',{size:18}) + ' No honeypot sessions yet.<br><span style="font-size:0.8rem">Sessions appear here when attackers interact with a honeypot listener.</span></div>';
+  // Audit 2.9: explanatory banner with engaged-vs-unengaged split
+  // and a filter toggle. Only renders when there is at least one
+  // session — empty state has its own copy below.
+  let engagementBanner = '';
+  if (allSessions.length > 0) {
+    const filterLabel = _honeypotShowEngagedOnly
+      ? 'Show all sessions'
+      : 'Show only engaged sessions';
+    const engagedPctText = allSessions.length > 0
+      ? Math.round((engagedCount / allSessions.length) * 100) + '%'
+      : '0%';
+    engagementBanner = '<div id="honeypotEngagementBanner" style="padding:14px 16px;max-width:900px;margin:12px auto 0;border:1px dashed var(--line);border-radius:10px;background:rgba(120,229,255,0.04)">' +
+      '<div style="font-size:0.78rem;color:var(--text);font-weight:600;margin-bottom:6px">' +
+      'Honeypot engagement: ' + esc(engagedCount) + ' engaged · ' + esc(unengagedCount) + ' unengaged · ' + esc(engagedPctText) + ' engagement rate' +
+      '</div>' +
+      '<div style="font-size:0.7rem;color:var(--muted);line-height:1.5;margin-bottom:8px">' +
+      'Engaged = attacker typed at least one command or sent an authentication attempt. ' +
+      'Unengaged = a listener was hit (port scan, banner grab) but the attacker walked away ' +
+      'before the fake shell exchange. Unengaged sessions still confirm the honeypot listener is alive.' +
+      '</div>' +
+      '<button type="button" id="honeypotEngagedFilterBtn" onclick="toggleHoneypotEngagedFilter()" ' +
+      'style="background:transparent;border:1px solid var(--accent);color:var(--accent);' +
+      'border-radius:8px;font-size:0.7rem;font-weight:600;padding:5px 12px;cursor:pointer">' +
+      esc(filterLabel) + '</button>' +
+      '</div>';
   }
 
-  let html = testBtn + '<div style="padding:16px;max-width:900px;margin:0 auto">';
-  html += '<div style="font-size:1.1rem;font-weight:600;color:var(--accent);margin-bottom:16px;display:flex;align-items:center;gap:8px">' + lucideIcon('bug',{size:18}) + ' Honeypot Sessions (' + sessions.length + ')</div>';
+  if (sessions.length === 0) {
+    if (allSessions.length === 0) {
+      return testBtn + '<div class="empty" style="padding:40px;text-align:center;opacity:0.5">' + lucideIcon('bug',{size:18}) + ' No honeypot sessions yet.<br><span style="font-size:0.8rem">Sessions appear here when attackers interact with a honeypot listener.</span></div>';
+    }
+    // Filter is on but no engaged sessions. Tell the operator why
+    // the list looks empty under the filter — different empty-state
+    // from "agent never recorded anything".
+    return testBtn + engagementBanner +
+      '<div class="empty" style="padding:40px;text-align:center;opacity:0.6">' +
+      lucideIcon('bug',{size:18}) +
+      ' No engaged sessions in this dataset.<br>' +
+      '<span style="font-size:0.8rem">' + esc(allSessions.length) +
+      ' listener-only session' + (allSessions.length === 1 ? '' : 's') +
+      ' recorded; none progressed to commands or auth attempts.</span>' +
+      '</div>';
+  }
+
+  let html = testBtn + engagementBanner + '<div style="padding:16px;max-width:900px;margin:0 auto">';
+  const titleSuffix = _honeypotShowEngagedOnly
+    ? ' (' + sessions.length + ' engaged of ' + allSessions.length + ' total)'
+    : ' (' + sessions.length + ')';
+  html += '<div style="font-size:1.1rem;font-weight:600;color:var(--accent);margin-bottom:16px;display:flex;align-items:center;gap:8px">' + lucideIcon('bug',{size:18}) + ' Honeypot Sessions' + titleSuffix + '</div>';
 
   for (const s of sessions) {
     const ip = s.target_ip || '-';
