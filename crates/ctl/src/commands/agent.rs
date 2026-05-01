@@ -49,6 +49,57 @@ pub(crate) fn parse_selection_indices(input: &str, max: usize) -> Option<Vec<usi
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum InstallCommandOutcome {
+    Success,
+    Exit(Option<i32>),
+    SpawnError(String),
+    NotRunnable,
+}
+
+fn run_install_command(cmd: &str) -> InstallCommandOutcome {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.len() < 2 {
+        return InstallCommandOutcome::NotRunnable;
+    }
+
+    match std::process::Command::new(parts[0])
+        .args(&parts[1..])
+        .status()
+    {
+        Ok(status) if status.success() => InstallCommandOutcome::Success,
+        Ok(status) => InstallCommandOutcome::Exit(status.code()),
+        Err(err) => InstallCommandOutcome::SpawnError(err.to_string()),
+    }
+}
+
+fn report_install_outcome(agent_name: &str, cmd: &str, outcome: InstallCommandOutcome) {
+    match outcome {
+        InstallCommandOutcome::Success => {
+            println!("  \x1b[32m✓\x1b[0m {agent_name} installed");
+            println!("  \x1b[32m✓\x1b[0m Connected to InnerWarden (agent-guard active)");
+            println!("  \x1b[32m✓\x1b[0m Protection: warn mode (alerts you, doesn't block)");
+            println!();
+            println!(
+                "  Your agent is ready. Start it with: {}",
+                agent_name.to_lowercase()
+            );
+            println!();
+            println!(
+                "  \x1b[2m💡 Tip: run 'innerwarden agent status' to see what your agent is doing\x1b[0m"
+            );
+        }
+        InstallCommandOutcome::Exit(code) => {
+            eprintln!("  \x1b[31m✗\x1b[0m Installation failed (exit code {code:?})",);
+        }
+        InstallCommandOutcome::SpawnError(err) => {
+            eprintln!("  \x1b[31m✗\x1b[0m Failed to run installer: {err}");
+            eprintln!("  Try installing manually: {cmd}");
+        }
+        InstallCommandOutcome::NotRunnable => {}
+    }
+}
+
 pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()> {
     use innerwarden_agent_guard::signatures::{Kind, SignatureIndex, KNOWN};
 
@@ -152,40 +203,7 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
 
                             if let Some(cmd) = sig.install_cmd {
                                 println!("  Running: {cmd}");
-                                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                                if parts.len() >= 2 {
-                                    let status = std::process::Command::new(parts[0])
-                                        .args(&parts[1..])
-                                        .status();
-                                    match status {
-                                        Ok(s) if s.success() => {
-                                            println!("  \x1b[32m✓\x1b[0m {} installed", sig.name);
-                                            println!(
-                                                "  \x1b[32m✓\x1b[0m Connected to InnerWarden (agent-guard active)"
-                                            );
-                                            println!("  \x1b[32m✓\x1b[0m Protection: warn mode (alerts you, doesn't block)");
-                                            println!();
-                                            println!(
-                                                "  Your agent is ready. Start it with: {}",
-                                                sig.name.to_lowercase()
-                                            );
-                                            println!();
-                                            println!("  \x1b[2m💡 Tip: run 'innerwarden agent status' to see what your agent is doing\x1b[0m");
-                                        }
-                                        Ok(s) => {
-                                            eprintln!(
-                                                "  \x1b[31m✗\x1b[0m Installation failed (exit code {:?})",
-                                                s.code()
-                                            );
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "  \x1b[31m✗\x1b[0m Failed to run installer: {e}"
-                                            );
-                                            eprintln!("  Try installing manually: {cmd}");
-                                        }
-                                    }
-                                }
+                                report_install_outcome(sig.name, cmd, run_install_command(cmd));
                             }
                             println!();
                             Ok(())
@@ -492,6 +510,9 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
     use tempfile::TempDir;
 
     fn test_cli(temp: &TempDir) -> Cli {
@@ -502,6 +523,43 @@ mod tests {
         cli.dry_run = true;
         std::fs::create_dir_all(&cli.data_dir).expect("test should create data dir");
         cli
+    }
+
+    #[cfg(unix)]
+    fn write_executable(temp: &TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp.path().join(name);
+        std::fs::write(&path, body).expect("test should write fake executable");
+        let mut perms = std::fs::metadata(&path)
+            .expect("fake executable metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("test should chmod fake executable");
+        path
+    }
+
+    fn start_one_shot_json_server(
+        response_body: &'static str,
+    ) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test should bind local server");
+        let addr = listener.local_addr().expect("test should read local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test should accept request");
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).expect("test should read request");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("test should write response");
+            request
+        });
+        (addr.to_string(), handle)
     }
 
     #[test]
@@ -528,10 +586,29 @@ bind = "0.0.0.0:9999"
     }
 
     #[test]
+    fn resolve_dashboard_url_reads_dashboard_bind_and_ignores_empty_values() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        std::fs::write(
+            &cli.agent_config,
+            r#"[dashboard]
+bind = ""
+dashboard_bind = "127.0.0.1:8788"
+"#,
+        )
+        .expect("test should write agent config");
+
+        let url = resolve_dashboard_url(&cli);
+        assert_eq!(url, "http://127.0.0.1:8788");
+    }
+
+    #[test]
     fn parse_selection_indices_handles_all_dedup_and_invalid_cases() {
         assert_eq!(parse_selection_indices("all", 3), Some(vec![1, 2, 3]));
+        assert_eq!(parse_selection_indices(" ALL ", 2), Some(vec![1, 2]));
         assert_eq!(parse_selection_indices("1,2,2,3", 3), Some(vec![1, 2, 3]));
         assert_eq!(parse_selection_indices("", 3), None);
+        assert_eq!(parse_selection_indices("all", 0), None);
         assert_eq!(parse_selection_indices("0", 3), None);
         assert_eq!(parse_selection_indices("4", 3), None);
         assert_eq!(parse_selection_indices("x", 3), None);
@@ -557,6 +634,55 @@ bind = "0.0.0.0:9999"
             }),
         )
         .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_install_command_reports_success_failure_spawn_error_and_short_command() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let ok = write_executable(&temp, "ok-installer", "#!/bin/sh\nexit 0\n");
+        let fail = write_executable(&temp, "fail-installer", "#!/bin/sh\nexit 7\n");
+
+        assert_eq!(
+            run_install_command(&format!("{} --unit", ok.display())),
+            InstallCommandOutcome::Success
+        );
+        assert_eq!(
+            run_install_command(&format!("{} --unit", fail.display())),
+            InstallCommandOutcome::Exit(Some(7))
+        );
+        assert!(matches!(
+            run_install_command(&format!("{}/missing --unit", temp.path().display())),
+            InstallCommandOutcome::SpawnError(_)
+        ));
+        assert_eq!(
+            run_install_command("single-word"),
+            InstallCommandOutcome::NotRunnable
+        );
+    }
+
+    #[test]
+    fn report_install_outcome_covers_all_status_variants() {
+        report_install_outcome(
+            "OpenClaw",
+            "npm install -g @anthropic-ai/openclaw",
+            InstallCommandOutcome::Success,
+        );
+        report_install_outcome(
+            "OpenClaw",
+            "npm install -g @anthropic-ai/openclaw",
+            InstallCommandOutcome::Exit(Some(7)),
+        );
+        report_install_outcome(
+            "OpenClaw",
+            "npm install -g @anthropic-ai/openclaw",
+            InstallCommandOutcome::SpawnError("missing npm".to_string()),
+        );
+        report_install_outcome(
+            "OpenClaw",
+            "npm install -g @anthropic-ai/openclaw",
+            InstallCommandOutcome::NotRunnable,
+        );
     }
 
     #[test]
@@ -595,6 +721,32 @@ dashboard_bind = "127.0.0.1:1"
     }
 
     #[test]
+    fn cmd_agent_connect_with_pid_uses_dashboard_when_reachable() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let (addr, handle) = start_one_shot_json_server(r#"{"agent_id":"ag-test"}"#);
+        std::fs::write(
+            &cli.agent_config,
+            format!("[dashboard]\ndashboard_bind = \"{addr}\"\n"),
+        )
+        .expect("test should write agent config");
+
+        assert!(cmd_agent(
+            &cli,
+            Some(&AgentCommand::Connect {
+                pid: Some(std::process::id()),
+                name: None,
+                label: None,
+            }),
+        )
+        .is_ok());
+
+        let request = handle.join().expect("server thread should finish");
+        assert!(request.contains("POST /api/agent-guard/connect"));
+        assert!(!cli.data_dir.join("agent-connections.jsonl").exists());
+    }
+
+    #[test]
     fn cmd_agent_disconnect_is_non_fatal_when_dashboard_unreachable() {
         let temp = TempDir::new().expect("test should create temp dir");
         let cli = test_cli(&temp);
@@ -613,5 +765,28 @@ dashboard_bind = "127.0.0.1:1"
             }),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn cmd_agent_disconnect_posts_to_dashboard_when_reachable() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let (addr, handle) = start_one_shot_json_server(r#"{}"#);
+        std::fs::write(
+            &cli.agent_config,
+            format!("[dashboard]\ndashboard_bind = \"{addr}\"\n"),
+        )
+        .expect("test should write agent config");
+
+        assert!(cmd_agent(
+            &cli,
+            Some(&AgentCommand::Disconnect {
+                id: "ag-0001".to_string(),
+            }),
+        )
+        .is_ok());
+
+        let request = handle.join().expect("server thread should finish");
+        assert!(request.contains("POST /api/agent-guard/disconnect"));
     }
 }
