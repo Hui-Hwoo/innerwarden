@@ -34,13 +34,7 @@ pub fn cmd_smm(json: bool) -> Result<()> {
         println!("  \x1b[35;1m══ Correlated Threats ══\x1b[0m");
         println!();
         for threat in &report.correlated_threats {
-            let color = if threat.confidence >= 0.9 {
-                "\x1b[31;1m"
-            } else if threat.confidence >= 0.7 {
-                "\x1b[31m"
-            } else {
-                "\x1b[33m"
-            };
+            let color = correlated_threat_color(threat.confidence);
             println!(
                 "  {color}⚡ [{id}] {name} ({conf:.0}% confidence)\x1b[0m",
                 id = threat.id,
@@ -57,26 +51,7 @@ pub fn cmd_smm(json: bool) -> Result<()> {
     }
 
     // Summary.
-    let secure = report
-        .checks
-        .iter()
-        .filter(|c| c.status == innerwarden_smm::CheckStatus::Secure)
-        .count();
-    let warnings = report
-        .checks
-        .iter()
-        .filter(|c| c.status == innerwarden_smm::CheckStatus::Warning)
-        .count();
-    let critical = report
-        .checks
-        .iter()
-        .filter(|c| c.status == innerwarden_smm::CheckStatus::Critical)
-        .count();
-    let unavailable = report
-        .checks
-        .iter()
-        .filter(|c| c.status == innerwarden_smm::CheckStatus::Unavailable)
-        .count();
+    let counts = smm_status_counts(&report.checks);
 
     println!("  ──────────────────────────────────────────");
     println!(
@@ -85,10 +60,14 @@ pub fn cmd_smm(json: bool) -> Result<()> {
          \x1b[31m{critical} critical\x1b[0m  \
          \x1b[90m{unavailable} unavailable\x1b[0m  \
          \x1b[35m{corr} correlated\x1b[0m",
+        secure = counts.secure,
+        warnings = counts.warnings,
+        critical = counts.critical,
+        unavailable = counts.unavailable,
         corr = report.correlated_threats.len(),
     );
 
-    if critical > 0 || !report.correlated_threats.is_empty() {
+    if counts.critical > 0 || !report.correlated_threats.is_empty() {
         println!();
         if report.trust_score < 0.1 {
             println!(
@@ -146,11 +125,7 @@ pub fn cmd_smm_drift() -> Result<()> {
     }
 
     for d in &drift.drifts {
-        let (icon, color) = match d.severity {
-            innerwarden_smm::baseline::DriftSeverity::Info => ("~", "\x1b[36m"),
-            innerwarden_smm::baseline::DriftSeverity::Suspicious => ("?", "\x1b[33m"),
-            innerwarden_smm::baseline::DriftSeverity::Critical => ("!", "\x1b[31m"),
-        };
+        let (icon, color) = drift_severity_icon(d.severity);
         println!(
             "  {color}{icon}\x1b[0m {}: {color}{}\x1b[0m",
             d.component, d.detail
@@ -214,13 +189,7 @@ pub fn cmd_hypervisor(json: bool) -> Result<()> {
         );
         println!();
         for p in &positive_probes {
-            let color = if p.score >= 80 {
-                "\x1b[36m"
-            } else if p.score >= 50 {
-                "\x1b[33m"
-            } else {
-                "\x1b[90m"
-            };
+            let color = probe_score_color(p.score);
             println!(
                 "  {color}[{score:>3}] {id}: {detail}\x1b[0m",
                 score = p.score,
@@ -232,32 +201,17 @@ pub fn cmd_hypervisor(json: bool) -> Result<()> {
     }
 
     // Summary.
-    let secure = report
-        .checks
-        .iter()
-        .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Secure)
-        .count();
-    let warnings = report
-        .checks
-        .iter()
-        .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Warning)
-        .count();
-    let critical = report
-        .checks
-        .iter()
-        .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Critical)
-        .count();
-    let unavail = report
-        .checks
-        .iter()
-        .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Unavailable)
-        .count();
+    let counts = hypervisor_status_counts(&report.checks);
 
     println!("  ──────────────────────────────────────────");
     println!(
         "  \x1b[32m{secure} secure\x1b[0m  \x1b[33m{warnings} warnings\x1b[0m  \
          \x1b[31m{critical} critical\x1b[0m  \x1b[90m{unavail} unavailable\x1b[0m  \
          \x1b[36m{probes} probes ({evidence} positive)\x1b[0m",
+        secure = counts.secure,
+        warnings = counts.warnings,
+        critical = counts.critical,
+        unavail = counts.unavailable,
         probes = report.probe_results.len(),
         evidence = report.vm_verdict.evidence_count,
     );
@@ -266,6 +220,86 @@ pub fn cmd_hypervisor(json: bool) -> Result<()> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusCounts {
+    secure: usize,
+    warnings: usize,
+    critical: usize,
+    unavailable: usize,
+}
+
+fn correlated_threat_color(confidence: f64) -> &'static str {
+    if confidence >= 0.9 {
+        "\x1b[31;1m"
+    } else if confidence >= 0.7 {
+        "\x1b[31m"
+    } else {
+        "\x1b[33m"
+    }
+}
+
+fn drift_severity_icon(
+    severity: innerwarden_smm::baseline::DriftSeverity,
+) -> (&'static str, &'static str) {
+    match severity {
+        innerwarden_smm::baseline::DriftSeverity::Info => ("~", "\x1b[36m"),
+        innerwarden_smm::baseline::DriftSeverity::Suspicious => ("?", "\x1b[33m"),
+        innerwarden_smm::baseline::DriftSeverity::Critical => ("!", "\x1b[31m"),
+    }
+}
+
+fn probe_score_color(score: u32) -> &'static str {
+    if score >= 80 {
+        "\x1b[36m"
+    } else if score >= 50 {
+        "\x1b[33m"
+    } else {
+        "\x1b[90m"
+    }
+}
+
+fn smm_status_counts(checks: &[innerwarden_smm::CheckResult]) -> StatusCounts {
+    StatusCounts {
+        secure: checks
+            .iter()
+            .filter(|c| c.status == innerwarden_smm::CheckStatus::Secure)
+            .count(),
+        warnings: checks
+            .iter()
+            .filter(|c| c.status == innerwarden_smm::CheckStatus::Warning)
+            .count(),
+        critical: checks
+            .iter()
+            .filter(|c| c.status == innerwarden_smm::CheckStatus::Critical)
+            .count(),
+        unavailable: checks
+            .iter()
+            .filter(|c| c.status == innerwarden_smm::CheckStatus::Unavailable)
+            .count(),
+    }
+}
+
+fn hypervisor_status_counts(checks: &[innerwarden_hypervisor::CheckResult]) -> StatusCounts {
+    StatusCounts {
+        secure: checks
+            .iter()
+            .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Secure)
+            .count(),
+        warnings: checks
+            .iter()
+            .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Warning)
+            .count(),
+        critical: checks
+            .iter()
+            .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Critical)
+            .count(),
+        unavailable: checks
+            .iter()
+            .filter(|c| c.status == innerwarden_hypervisor::CheckStatus::Unavailable)
+            .count(),
+    }
+}
 
 trait StatusIcon {
     fn status_icon(&self) -> (&'static str, &'static str);
@@ -345,6 +379,121 @@ fn format_trust(score: f64) -> String {
 mod tests {
     use super::*;
 
+    fn smm_check(status: innerwarden_smm::CheckStatus) -> innerwarden_smm::CheckResult {
+        innerwarden_smm::CheckResult {
+            id: "id",
+            name: "name",
+            status,
+            confidence: 0.5,
+            detail: "detail".to_string(),
+        }
+    }
+
+    fn hypervisor_check(
+        status: innerwarden_hypervisor::CheckStatus,
+    ) -> innerwarden_hypervisor::CheckResult {
+        innerwarden_hypervisor::CheckResult {
+            id: "id",
+            name: "name",
+            status,
+            confidence: 0.5,
+            detail: "detail".to_string(),
+        }
+    }
+
+    #[test]
+    fn cmd_smm_json_smoke_renders_audit_report() {
+        cmd_smm(true).unwrap();
+    }
+
+    #[test]
+    fn cmd_smm_text_smoke_renders_audit_report() {
+        cmd_smm(false).unwrap();
+    }
+
+    #[test]
+    fn cmd_hypervisor_json_smoke_renders_audit_report() {
+        cmd_hypervisor(true).unwrap();
+    }
+
+    #[test]
+    fn cmd_hypervisor_text_smoke_renders_audit_report() {
+        cmd_hypervisor(false).unwrap();
+    }
+
+    #[test]
+    fn smm_status_counts_tallies_every_status_variant() {
+        let counts = smm_status_counts(&[
+            smm_check(innerwarden_smm::CheckStatus::Secure),
+            smm_check(innerwarden_smm::CheckStatus::Warning),
+            smm_check(innerwarden_smm::CheckStatus::Warning),
+            smm_check(innerwarden_smm::CheckStatus::Critical),
+            smm_check(innerwarden_smm::CheckStatus::Unavailable),
+        ]);
+
+        assert_eq!(
+            counts,
+            StatusCounts {
+                secure: 1,
+                warnings: 2,
+                critical: 1,
+                unavailable: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn hypervisor_status_counts_tallies_every_status_variant() {
+        let counts = hypervisor_status_counts(&[
+            hypervisor_check(innerwarden_hypervisor::CheckStatus::Secure),
+            hypervisor_check(innerwarden_hypervisor::CheckStatus::Secure),
+            hypervisor_check(innerwarden_hypervisor::CheckStatus::Warning),
+            hypervisor_check(innerwarden_hypervisor::CheckStatus::Critical),
+            hypervisor_check(innerwarden_hypervisor::CheckStatus::Unavailable),
+        ]);
+
+        assert_eq!(
+            counts,
+            StatusCounts {
+                secure: 2,
+                warnings: 1,
+                critical: 1,
+                unavailable: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn correlated_threat_color_uses_confidence_thresholds() {
+        assert_eq!(correlated_threat_color(0.95), "\x1b[31;1m");
+        assert_eq!(correlated_threat_color(0.70), "\x1b[31m");
+        assert_eq!(correlated_threat_color(0.69), "\x1b[33m");
+    }
+
+    #[test]
+    fn drift_severity_icon_maps_all_severities() {
+        assert_eq!(
+            drift_severity_icon(innerwarden_smm::baseline::DriftSeverity::Info),
+            ("~", "\x1b[36m")
+        );
+        assert_eq!(
+            drift_severity_icon(innerwarden_smm::baseline::DriftSeverity::Suspicious),
+            ("?", "\x1b[33m")
+        );
+        assert_eq!(
+            drift_severity_icon(innerwarden_smm::baseline::DriftSeverity::Critical),
+            ("!", "\x1b[31m")
+        );
+    }
+
+    #[test]
+    fn probe_score_color_uses_score_thresholds() {
+        assert_eq!(probe_score_color(95), "\x1b[36m");
+        assert_eq!(probe_score_color(80), "\x1b[36m");
+        assert_eq!(probe_score_color(50), "\x1b[33m");
+        assert_eq!(probe_score_color(49), "\x1b[90m");
+    }
+
     #[test]
     fn hypervisor_environment_label_formats_all_variants() {
         // Ensures each environment variant maps to the intended operator-facing label text.
@@ -420,28 +569,20 @@ mod tests {
     #[test]
     fn smm_status_icon_maps_each_status() {
         // Confirms SMM check rendering keeps stable icons for every CheckStatus variant.
-        let mk = |status| innerwarden_smm::CheckResult {
-            id: "id",
-            name: "name",
-            status,
-            confidence: 0.5,
-            detail: "detail".to_string(),
-        };
-
         assert_eq!(
-            mk(innerwarden_smm::CheckStatus::Secure).status_icon(),
+            smm_check(innerwarden_smm::CheckStatus::Secure).status_icon(),
             ("✓", "\x1b[32m")
         );
         assert_eq!(
-            mk(innerwarden_smm::CheckStatus::Warning).status_icon(),
+            smm_check(innerwarden_smm::CheckStatus::Warning).status_icon(),
             ("⚠", "\x1b[33m")
         );
         assert_eq!(
-            mk(innerwarden_smm::CheckStatus::Critical).status_icon(),
+            smm_check(innerwarden_smm::CheckStatus::Critical).status_icon(),
             ("✗", "\x1b[31m")
         );
         assert_eq!(
-            mk(innerwarden_smm::CheckStatus::Unavailable).status_icon(),
+            smm_check(innerwarden_smm::CheckStatus::Unavailable).status_icon(),
             ("–", "\x1b[90m")
         );
     }
