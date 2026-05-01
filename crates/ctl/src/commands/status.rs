@@ -457,6 +457,33 @@ pub(crate) fn cmd_sensor_status(cli: &Cli, data_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn test_cli(temp: &TempDir) -> Cli {
+        Cli {
+            sensor_config: temp.path().join("sensor.toml"),
+            agent_config: temp.path().join("agent.toml"),
+            data_dir: temp.path().join("data"),
+            dry_run: true,
+            command: None,
+        }
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("test should create parent directory");
+        }
+        std::fs::write(path, content).expect("test should write fixture");
+    }
+
+    fn today() -> String {
+        epoch_secs_to_date(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+    }
 
     #[test]
     fn resolve_report_date_expands_relative_keywords() {
@@ -555,6 +582,129 @@ mod tests {
         let description = layer["description"].as_str().expect("description");
         assert!(description.contains(&techniques.len().to_string()));
         assert!(techniques.len() >= 40);
+    }
+
+    #[test]
+    fn cmd_navigator_writes_layer_to_requested_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let output = temp.path().join("navigator.json");
+
+        cmd_navigator(output.to_str()).expect("navigator export should succeed");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output).expect("navigator json"))
+                .expect("valid navigator json");
+        assert_eq!(written["name"], "InnerWarden Detection Coverage");
+        assert!(written["techniques"].as_array().expect("techniques").len() >= 40);
+    }
+
+    #[test]
+    fn cmd_report_handles_missing_summaries_and_lists_available_dates() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("reports");
+        std::fs::create_dir_all(&data_dir).expect("reports dir");
+
+        cmd_report(&cli, "today", &data_dir).expect("missing report without files is ok");
+
+        write_file(&data_dir.join("summary-2026-04-16.md"), "# Daily\nbody\n");
+        write_file(&data_dir.join("summary-2026-04-15.md"), "# Daily\nbody\n");
+        cmd_report(&cli, "2026-04-14", &data_dir).expect("missing report with alternatives is ok");
+    }
+
+    #[test]
+    fn cmd_report_reads_summary_from_agent_configured_data_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("agent-data");
+        write_file(
+            &cli.agent_config,
+            &format!("[output]\ndata_dir = \"{}\"\n", data_dir.display()),
+        );
+        write_file(
+            &data_dir.join("summary-2026-04-16.md"),
+            "# InnerWarden\n---\n## Highlights\n### Finding\nAll clear\n",
+        );
+
+        cmd_report(&cli, "2026-04-16", Path::new("/var/lib/innerwarden"))
+            .expect("configured report should render");
+    }
+
+    #[test]
+    fn cmd_status_global_reads_config_data_and_empty_modules() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("status-data");
+        let today = today();
+        write_file(
+            &cli.agent_config,
+            &format!(
+                "[output]\ndata_dir = \"{}\"\n[ai]\nenabled = true\nprovider = \"ollama\"\n[responder]\nenabled = true\ndry_run = false\n",
+                data_dir.display()
+            ),
+        );
+        write_file(
+            &cli.sensor_config,
+            "[collectors.exec_audit]\nenabled = true\n",
+        );
+        write_file(&data_dir.join(format!("events-{today}.jsonl")), "{}\n{}\n");
+        write_file(
+            &data_dir.join(format!("incidents-{today}.jsonl")),
+            "{\"title\":\"Suspicious login\",\"ts\":\"2026-04-16T10:00:00Z\"}\n",
+        );
+        let modules_dir = temp.path().join("modules");
+        std::fs::create_dir_all(&modules_dir).expect("modules dir");
+
+        let registry = CapabilityRegistry::default_all();
+        cmd_status_global(&cli, &registry, &modules_dir).expect("global status should render");
+    }
+
+    #[test]
+    fn cmd_sensor_status_handles_missing_and_empty_telemetry() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("sensor-data");
+
+        cmd_sensor_status(&cli, &data_dir).expect("missing telemetry is ok");
+
+        write_file(
+            &data_dir.join(format!("telemetry-{}.jsonl", today())),
+            "{\"events_by_collector\":{},\"incidents_by_detector\":{},\"errors_by_component\":{}}\n",
+        );
+        cmd_sensor_status(&cli, &data_dir).expect("empty telemetry maps are ok");
+    }
+
+    #[test]
+    fn cmd_sensor_status_renders_populated_snapshot_branches() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("sensor-data");
+        write_file(
+            &data_dir.join(format!("telemetry-{}.jsonl", today())),
+            "{\"events_by_collector\":{\"exec\":5,\"nginx\":2},\"incidents_by_detector\":{\"sudo_abuse\":3},\"ai_sent_count\":4,\"ai_decision_count\":2,\"avg_decision_latency_ms\":123.4,\"real_execution_count\":1,\"dry_run_execution_count\":2,\"gate_pass_count\":7,\"errors_by_component\":{\"sensor\":1}}\n",
+        );
+
+        cmd_sensor_status(&cli, &data_dir).expect("populated telemetry should render");
+    }
+
+    #[test]
+    fn cmd_metrics_reports_missing_empty_and_populated_telemetry() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("metrics-data");
+
+        let missing = cmd_metrics(&cli, &data_dir).expect_err("missing telemetry should error");
+        assert!(missing.to_string().contains("cannot read"));
+
+        let telemetry = data_dir.join(format!("telemetry-{}.jsonl", today()));
+        write_file(&telemetry, "\n\n");
+        cmd_metrics(&cli, &data_dir).expect("empty telemetry file is reported");
+
+        write_file(
+            &telemetry,
+            "{\"ts\":0}\n{\"events_by_collector\":{\"exec\":2,\"nginx\":8},\"incidents_by_detector\":{\"ssh\":1},\"decisions_by_action\":{\"block_ip\":1,\"ignore\":2},\"avg_decision_latency_ms\":45.6,\"ai_sent_count\":3,\"ai_decision_count\":2,\"gate_pass_count\":4,\"real_execution_count\":1,\"dry_run_execution_count\":5}\n",
+        );
+        cmd_metrics(&cli, &data_dir).expect("populated telemetry metrics should render");
     }
 }
 
