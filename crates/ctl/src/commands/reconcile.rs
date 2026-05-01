@@ -31,12 +31,7 @@ pub(crate) fn cmd_reconcile_blocks(_cli: &Cli, _data_dir: &Path, apply: bool) ->
     let rules = parse_ufw_rules(&ufw_out);
 
     let safelist = safelist_cidrs();
-    let matches: Vec<(UfwRule, String)> = rules
-        .iter()
-        .filter_map(|r| {
-            match_safelist(&r.target, &safelist).map(|hit| (r.clone(), hit.to_string()))
-        })
-        .collect();
+    let matches = safelist_matches(&rules, &safelist);
 
     println!("Reconcile block-list against cloud safelist");
     println!("  ufw DENY rules scanned:        {}", rules.len());
@@ -78,6 +73,15 @@ pub(crate) fn cmd_reconcile_blocks(_cli: &Cli, _data_dir: &Path, apply: bool) ->
     }
     println!("\ndone. cleaned {cleaned}, failed {failed}");
     Ok(())
+}
+
+fn safelist_matches(rules: &[UfwRule], safelist: &[ipnet::IpNet]) -> Vec<(UfwRule, String)> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            match_safelist(&rule.target, safelist).map(|hit| (rule.clone(), hit.to_string()))
+        })
+        .collect()
 }
 
 fn run_ufw_status() -> Result<String> {
@@ -344,6 +348,56 @@ mod tests {
         assert!(match_safelist("147.154.245.65", &list).is_some());
         assert!(match_safelist("140.91.26.100", &list).is_some());
         assert!(match_safelist("138.1.16.172", &list).is_some());
+    }
+
+    #[test]
+    fn safelist_matches_telegram_edge_ranges() {
+        let list = safelist_cidrs();
+        assert!(match_safelist("149.154.167.220", &list).is_some());
+        assert!(match_safelist("91.108.56.42", &list).is_some());
+        assert!(match_safelist("95.161.70.10", &list).is_some());
+    }
+
+    #[test]
+    fn reconcile_empty_ufw_output_produces_empty_cleanup_plan() {
+        let rules = parse_ufw_rules("");
+        let list = safelist_cidrs();
+        assert!(safelist_matches(&rules, &list).is_empty());
+    }
+
+    #[test]
+    fn reconcile_mixed_rules_only_lists_safelisted_targets() {
+        let rules = parse_ufw_rules(
+            "\
+[  1] Anywhere                   DENY IN     104.16.198.238             # innerwarden
+[  2] Anywhere                   DENY IN     8.8.8.8                    # innerwarden
+[  3] Anywhere                   DENY IN     147.154.245.65             # innerwarden
+[  4] Anywhere                   DENY IN     203.0.113.42               # innerwarden
+",
+        );
+        let list = safelist_cidrs();
+        let matches = safelist_matches(&rules, &list);
+
+        let targets: Vec<&str> = matches
+            .iter()
+            .map(|(rule, _)| rule.target.as_str())
+            .collect();
+
+        assert_eq!(targets, vec!["104.16.198.238", "147.154.245.65"]);
+    }
+
+    #[test]
+    fn reconcile_cidr_rules_report_the_containing_safelist_range() {
+        let rules = vec![UfwRule {
+            index: 17,
+            target: "104.16.0.0/16".to_string(),
+        }];
+        let list = safelist_cidrs();
+        let matches = safelist_matches(&rules, &list);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0.index, 17);
+        assert_eq!(matches[0].1, "104.16.0.0/13");
     }
 
     #[test]
