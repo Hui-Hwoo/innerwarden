@@ -144,6 +144,7 @@ mod observation_verify;
 mod orphan_recovery;
 mod pcap_capture;
 mod playbook;
+mod playbook_executor;
 mod process;
 mod process_health;
 #[allow(dead_code)]

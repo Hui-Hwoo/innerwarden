@@ -431,6 +431,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             trusted_ips: cfg.allowlist.trusted_ips.clone(),
             trusted_users: cfg.allowlist.trusted_users.clone(),
             ai_personality: cfg.telegram.bot.personality.clone(),
+            playbook_executor_enabled: cfg.playbook.enabled,
         };
         let dashboard_data_dir = cli.data_dir.clone();
         let dashboard_bind = cli.dashboard_bind.clone();

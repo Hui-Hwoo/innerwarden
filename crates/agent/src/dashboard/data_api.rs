@@ -575,12 +575,15 @@ pub(super) fn read_degraded_signals(state: &super::state::DashboardState) -> Deg
                 .unwrap_or(0);
         }
     }
-    // Playbook executor constant (true = missing). The flag flips to
-    // false when `tracked-spec-playbook-execution` lands an actual
-    // step runner; until then every PlaybookExecution stays
-    // `pending` forever. Documented in
+    // Playbook executor flag, dynamic from the action config
+    // (sourced from `cfg.playbook.enabled` at dashboard init).
+    // Pre-2026-05-01 this was a constant `true` because no
+    // executor existed; with `tracked-spec-playbook-execution`
+    // the operator can flip the executor on (`[playbook] enabled
+    // = true` in agent.toml), which clears the corresponding
+    // reason from the Degraded banner. Documented in
     // `.claude-local/AUDIT_2026-05-01_dashboard.md` finding 1.5.
-    signals.playbook_executor_missing = true;
+    signals.playbook_executor_missing = !state.action_cfg.playbook_executor_enabled;
     signals
 }
 

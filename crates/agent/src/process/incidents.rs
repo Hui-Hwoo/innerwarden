@@ -690,7 +690,8 @@ pub(crate) async fn process_incidents(
             );
         }
 
-        incident_playbook::maybe_evaluate_and_persist_playbook(incident, data_dir, state);
+        incident_playbook::maybe_evaluate_and_persist_playbook(incident, data_dir, cfg, state)
+            .await;
 
         incident_action_report::maybe_send_post_execution_telegram_report(
             incident,
