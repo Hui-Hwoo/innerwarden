@@ -6,6 +6,8 @@ use innerwarden_core::audit::{append_admin_action, current_operator, AdminAction
 
 use crate::{config_editor, prompt, require_sudo, restart_agent, write_env_key, Cli};
 
+type RestartHook = fn(&Cli);
+
 fn has_min_secret_length(value: &str, min: usize) -> bool {
     value.len() >= min
 }
@@ -31,10 +33,45 @@ fn append_cron_line(current_crontab: &str, cron_line: &str) -> String {
     }
 }
 
+fn print_geoip_probe_status(probe: impl FnOnce() -> bool) -> Result<()> {
+    print!("  Checking ip-api.com connectivity... ");
+    std::io::stdout().flush()?;
+    if probe() {
+        println!("ok");
+    } else {
+        println!("unreachable (will enable anyway - retried at runtime)");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn geoip_probe_reaches_ip_api() -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn geoip_probe_reaches_ip_api() -> bool {
+    ureq::get("http://ip-api.com/json/8.8.8.8?fields=status")
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
+        .call()
+        .is_ok()
+}
+
 pub(crate) fn cmd_configure_abuseipdb(
     cli: &Cli,
     api_key_arg: Option<&str>,
     auto_block_arg: Option<u8>,
+) -> Result<()> {
+    cmd_configure_abuseipdb_with_restart(cli, api_key_arg, auto_block_arg, Some(restart_agent))
+}
+
+fn cmd_configure_abuseipdb_with_restart(
+    cli: &Cli,
+    api_key_arg: Option<&str>,
+    auto_block_arg: Option<u8>,
+    restart: Option<RestartHook>,
 ) -> Result<()> {
     if !cli.dry_run {
         require_sudo(cli);
@@ -117,7 +154,9 @@ pub(crate) fn cmd_configure_abuseipdb(
         println!("  [ok] agent.toml: abuseipdb.enabled = true (auto-block disabled)");
     }
 
-    restart_agent(cli);
+    if let Some(restart) = restart {
+        restart(cli);
+    }
     println!();
     if threshold > 0 {
         println!("AbuseIPDB enabled.");
@@ -147,6 +186,14 @@ pub(crate) fn cmd_configure_abuseipdb(
 }
 
 pub(crate) fn cmd_configure_geoip(cli: &Cli) -> Result<()> {
+    cmd_configure_geoip_with_options(cli, Some(restart_agent), true)
+}
+
+fn cmd_configure_geoip_with_options(
+    cli: &Cli,
+    restart: Option<RestartHook>,
+    probe_connectivity: bool,
+) -> Result<()> {
     if !cli.dry_run {
         require_sudo(cli);
     }
@@ -162,22 +209,16 @@ pub(crate) fn cmd_configure_geoip(cli: &Cli) -> Result<()> {
     println!("GeoIP adds country and ISP context to AI analysis. No API key needed.");
     println!("Uses ip-api.com (free, 45 lookups/min).\n");
 
-    print!("  Checking ip-api.com connectivity... ");
-    std::io::stdout().flush()?;
-    match ureq::get("http://ip-api.com/json/8.8.8.8?fields=status")
-        .config()
-        .timeout_global(Some(std::time::Duration::from_secs(5)))
-        .build()
-        .call()
-    {
-        Ok(_) => println!("ok"),
-        Err(_) => println!("unreachable (will enable anyway - retried at runtime)"),
+    if probe_connectivity {
+        print_geoip_probe_status(geoip_probe_reaches_ip_api)?;
     }
 
     config_editor::write_bool(&cli.agent_config, "geoip", "enabled", true)?;
     println!("  [ok] agent.toml: geoip.enabled = true");
 
-    restart_agent(cli);
+    if let Some(restart) = restart {
+        restart(cli);
+    }
 
     let mut audit = AdminActionEntry {
         ts: chrono::Utc::now(),
@@ -202,6 +243,15 @@ pub(crate) fn cmd_configure_cloudflare(
     cli: &Cli,
     zone_id_arg: Option<&str>,
     api_token_arg: Option<&str>,
+) -> Result<()> {
+    cmd_configure_cloudflare_with_restart(cli, zone_id_arg, api_token_arg, Some(restart_agent))
+}
+
+fn cmd_configure_cloudflare_with_restart(
+    cli: &Cli,
+    zone_id_arg: Option<&str>,
+    api_token_arg: Option<&str>,
+    restart: Option<RestartHook>,
 ) -> Result<()> {
     if !cli.dry_run {
         require_sudo(cli);
@@ -276,7 +326,9 @@ pub(crate) fn cmd_configure_cloudflare(
     config_editor::write_bool(&cli.agent_config, "cloudflare", "auto_push_blocks", true)?;
     println!("  [ok] agent.toml: cloudflare.enabled = true, zone_id set, auto_push_blocks = true");
 
-    restart_agent(cli);
+    if let Some(restart) = restart {
+        restart(cli);
+    }
 
     let mut audit = AdminActionEntry {
         ts: chrono::Utc::now(),
@@ -301,7 +353,21 @@ pub(crate) fn cmd_configure_cloudflare(
 }
 
 pub(crate) fn cmd_configure_watchdog(cli: &Cli, interval_mins: u64) -> Result<()> {
-    if std::env::consts::OS == "macos" {
+    cmd_configure_watchdog_for_os(cli, interval_mins, std::env::consts::OS == "macos")
+}
+
+fn cmd_configure_watchdog_for_os(cli: &Cli, interval_mins: u64, is_macos: bool) -> Result<()> {
+    cmd_configure_watchdog_with_bins(cli, interval_mins, is_macos, None, "crontab")
+}
+
+fn cmd_configure_watchdog_with_bins(
+    cli: &Cli,
+    interval_mins: u64,
+    is_macos: bool,
+    innerwarden_bin: Option<&str>,
+    crontab_bin: &str,
+) -> Result<()> {
+    if is_macos {
         println!("On macOS, use a launchd plist instead of cron.");
         println!(
             "Create /Library/LaunchDaemons/com.innerwarden.watchdog.plist with an interval of {}s.",
@@ -311,8 +377,9 @@ pub(crate) fn cmd_configure_watchdog(cli: &Cli, interval_mins: u64) -> Result<()
         return Ok(());
     }
 
-    let bin = which_bin("innerwarden")
-        .map(|p| p.display().to_string())
+    let bin = innerwarden_bin
+        .map(|p| p.to_string())
+        .or_else(|| which_bin("innerwarden").map(|p| p.display().to_string()))
         .unwrap_or_else(|| "/usr/local/bin/innerwarden".to_string());
     let cron_line = build_watchdog_cron_line(interval_mins, &bin);
 
@@ -322,7 +389,7 @@ pub(crate) fn cmd_configure_watchdog(cli: &Cli, interval_mins: u64) -> Result<()
         return Ok(());
     }
 
-    let current = std::process::Command::new("crontab")
+    let current = std::process::Command::new(crontab_bin)
         .arg("-l")
         .output()
         .ok()
@@ -345,7 +412,7 @@ pub(crate) fn cmd_configure_watchdog(cli: &Cli, interval_mins: u64) -> Result<()
 
     let new_crontab = append_cron_line(&current, &cron_line);
 
-    let mut child = std::process::Command::new("crontab")
+    let mut child = std::process::Command::new(crontab_bin)
         .arg("-")
         .stdin(std::process::Stdio::piped())
         .spawn()
@@ -400,6 +467,45 @@ fn which_bin(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn make_cli(tmp: &TempDir, dry_run: bool) -> Cli {
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        Cli {
+            sensor_config: tmp.path().join("config.toml"),
+            agent_config: tmp.path().join("agent.toml"),
+            data_dir,
+            dry_run,
+            command: None,
+        }
+    }
+
+    fn make_cli_without_data_dir(tmp: &TempDir) -> Cli {
+        Cli {
+            sensor_config: tmp.path().join("config.toml"),
+            agent_config: tmp.path().join("agent.toml"),
+            data_dir: tmp.path().join("missing-data-dir"),
+            dry_run: false,
+            command: None,
+        }
+    }
+
+    fn noop_restart_agent(_cli: &Cli) {}
+
+    fn read_audit_log(cli: &Cli) -> String {
+        let path = std::fs::read_dir(&cli.data_dir)
+            .expect("read data dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("admin-actions-"))
+            })
+            .expect("admin action log should exist");
+        std::fs::read_to_string(path).expect("read audit log")
+    }
 
     #[test]
     fn has_min_secret_length_enforces_minimum_length() {
@@ -459,5 +565,247 @@ mod tests {
         let current = "0 0 * * * backup\n";
         let merged = append_cron_line(current, cron_line);
         assert_eq!(merged, format!("0 0 * * * backup\n{cron_line}\n"));
+    }
+
+    #[test]
+    fn print_geoip_probe_status_handles_success_and_failure() {
+        print_geoip_probe_status(|| true).expect("successful probe status should render");
+        print_geoip_probe_status(|| false).expect("failed probe status should render");
+    }
+
+    #[test]
+    fn cmd_configure_abuseipdb_dry_run_accepts_valid_key_and_threshold() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, true);
+
+        cmd_configure_abuseipdb(&cli, Some("0123456789abcdef"), Some(90))
+            .expect("dry-run abuseipdb config should pass");
+    }
+
+    #[test]
+    fn cmd_configure_abuseipdb_rejects_short_key() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, true);
+
+        let err = cmd_configure_abuseipdb(&cli, Some("short"), Some(80))
+            .expect_err("short key should fail");
+
+        assert!(err.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn cmd_configure_abuseipdb_writes_config_env_and_audit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, false);
+
+        cmd_configure_abuseipdb_with_restart(
+            &cli,
+            Some("0123456789abcdef"),
+            Some(90),
+            Some(noop_restart_agent),
+        )
+        .expect("abuseipdb config should write files");
+
+        let env = std::fs::read_to_string(tmp.path().join("agent.env")).expect("read env");
+        assert_eq!(env, "ABUSEIPDB_API_KEY=0123456789abcdef\n");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("[abuseipdb]"));
+        assert!(agent.contains("enabled = true"));
+        assert!(agent.contains("auto_block_threshold = 90"));
+
+        let audit = read_audit_log(&cli);
+        assert!(audit.contains("\"target\":\"abuseipdb\""));
+        assert!(audit.contains("\"auto_block_threshold\":90"));
+    }
+
+    #[test]
+    fn cmd_configure_abuseipdb_writes_zero_threshold() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, false);
+
+        cmd_configure_abuseipdb_with_restart(&cli, Some("0123456789abcdef"), Some(0), None)
+            .expect("abuseipdb zero threshold should write files");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("auto_block_threshold = 0"));
+    }
+
+    #[test]
+    fn cmd_configure_geoip_dry_run_returns_ok() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, true);
+
+        cmd_configure_geoip(&cli).expect("dry-run geoip should pass");
+    }
+
+    #[test]
+    fn cmd_configure_geoip_writes_config_and_audit_without_probe() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, false);
+
+        cmd_configure_geoip_with_options(&cli, Some(noop_restart_agent), false)
+            .expect("geoip config should write files");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("[geoip]"));
+        assert!(agent.contains("enabled = true"));
+
+        let audit = read_audit_log(&cli);
+        assert!(audit.contains("\"target\":\"geoip\""));
+    }
+
+    #[test]
+    fn cmd_configure_geoip_tolerates_audit_write_failure() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli_without_data_dir(&tmp);
+
+        cmd_configure_geoip_with_options(&cli, None, false)
+            .expect("geoip config should not fail when audit write fails");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("[geoip]"));
+        assert!(agent.contains("enabled = true"));
+    }
+
+    #[test]
+    fn cmd_configure_geoip_writes_config_with_probe_enabled() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, false);
+
+        cmd_configure_geoip_with_options(&cli, None, true)
+            .expect("geoip config should write files when probe is enabled");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("[geoip]"));
+        assert!(agent.contains("enabled = true"));
+    }
+
+    #[test]
+    fn cmd_configure_cloudflare_dry_run_accepts_valid_inputs() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, true);
+
+        cmd_configure_cloudflare(&cli, Some("zoneid0123456789"), Some("token0123456789"))
+            .expect("dry-run cloudflare config should pass");
+    }
+
+    #[test]
+    fn cmd_configure_cloudflare_rejects_short_zone_or_token() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, true);
+
+        let zone_err = cmd_configure_cloudflare(&cli, Some("short"), Some("token0123456789"))
+            .expect_err("short zone should fail");
+        assert!(zone_err.to_string().contains("Zone ID looks too short"));
+
+        let token_err = cmd_configure_cloudflare(&cli, Some("zoneid0123456789"), Some("short"))
+            .expect_err("short token should fail");
+        assert!(token_err.to_string().contains("API token looks too short"));
+    }
+
+    #[test]
+    fn cmd_configure_cloudflare_writes_config_env_and_audit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, false);
+
+        cmd_configure_cloudflare_with_restart(
+            &cli,
+            Some("zoneid0123456789"),
+            Some("token0123456789"),
+            Some(noop_restart_agent),
+        )
+        .expect("cloudflare config should write files");
+
+        let env = std::fs::read_to_string(tmp.path().join("agent.env")).expect("read env");
+        assert_eq!(env, "CLOUDFLARE_API_TOKEN=token0123456789\n");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("read agent config");
+        assert!(agent.contains("[cloudflare]"));
+        assert!(agent.contains("enabled = true"));
+        assert!(agent.contains("zone_id = \"zoneid0123456789\""));
+        assert!(agent.contains("auto_push_blocks = true"));
+
+        let audit = read_audit_log(&cli);
+        assert!(audit.contains("\"target\":\"cloudflare\""));
+        assert!(audit.contains("\"zone_id\":\"zoneid0123456789\""));
+    }
+
+    #[test]
+    fn cmd_configure_watchdog_for_os_documents_macos_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, true);
+
+        cmd_configure_watchdog_for_os(&cli, 5, true).expect("macos watchdog guidance should pass");
+    }
+
+    #[test]
+    fn cmd_configure_watchdog_for_os_dry_run_builds_cron_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, true);
+
+        cmd_configure_watchdog_for_os(&cli, 5, false)
+            .expect("non-macos dry-run watchdog cron should pass");
+    }
+
+    #[test]
+    fn cmd_configure_watchdog_public_wrapper_returns_ok_in_dry_run() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp, true);
+
+        cmd_configure_watchdog(&cli, 5).expect("watchdog wrapper should pass");
+    }
+
+    #[test]
+    fn which_bin_finds_binary_on_path_and_returns_none_when_missing() {
+        assert!(which_bin("sh").is_some() || which_bin("zsh").is_some());
+        assert_eq!(which_bin("missing"), None);
+    }
+
+    #[test]
+    fn cmd_configure_watchdog_for_os_installs_with_fake_crontab() {
+        let tmp = TempDir::new().expect("tempdir");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+
+        let innerwarden = bin_dir.join("innerwarden");
+        std::fs::write(&innerwarden, "#!/bin/sh\nexit 0\n").expect("write fake innerwarden");
+        let crontab_capture = tmp.path().join("captured-crontab");
+        let crontab = bin_dir.join("crontab");
+        std::fs::write(
+            &crontab,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-l\" ]; then exit 1; fi\n/bin/cat > {}\n",
+                crontab_capture.display()
+            ),
+        )
+        .expect("write fake crontab");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&innerwarden, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod innerwarden");
+            std::fs::set_permissions(&crontab, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod crontab");
+        }
+
+        let cli = make_cli(&tmp, false);
+        cmd_configure_watchdog_with_bins(
+            &cli,
+            7,
+            false,
+            Some(innerwarden.to_str().expect("utf8 fake innerwarden")),
+            crontab.to_str().expect("utf8 fake crontab"),
+        )
+        .expect("watchdog install should use fake crontab");
+
+        let captured = std::fs::read_to_string(crontab_capture).expect("read captured crontab");
+        assert!(captured.contains("*/7 * * * *"));
+        assert!(captured.contains("innerwarden watchdog --notify"));
+
+        let audit = read_audit_log(&cli);
+        assert!(audit.contains("\"target\":\"watchdog\""));
+        assert!(audit.contains("\"interval_mins\":7"));
     }
 }
