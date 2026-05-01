@@ -74,19 +74,13 @@ pub(crate) async fn try_handle_auto_rule(
     let detector = incident_detector(&incident.incident_id);
 
     // Find matching rule
-    let rule = match AUTO_RULES.iter().find(|r| r.detector == detector) {
+    let rule = match matching_auto_rule(detector) {
         Some(r) => r,
         None => return false,
     };
 
     // Extract primary IP
-    let primary_ip = incident
-        .entities
-        .iter()
-        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
-        .map(|e| e.value.as_str());
-
-    let Some(ip) = primary_ip else {
+    let Some(ip) = primary_incident_ip(incident) else {
         return false;
     };
 
@@ -243,6 +237,18 @@ pub(crate) async fn try_handle_auto_rule(
     !execution_result.starts_with("skipped")
 }
 
+fn matching_auto_rule(detector: &str) -> Option<&'static AutoRule> {
+    AUTO_RULES.iter().find(|rule| rule.detector == detector)
+}
+
+fn primary_incident_ip(incident: &innerwarden_core::incident::Incident) -> Option<&str> {
+    incident
+        .entities
+        .iter()
+        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+        .map(|e| e.value.as_str())
+}
+
 /// Check if an IP is RFC 1918 / loopback / link-local / ULA (public wrapper).
 pub(crate) fn is_internal_ip_pub(ip: &str) -> bool {
     is_internal_ip(ip)
@@ -281,6 +287,24 @@ fn is_internal_ip(ip: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use innerwarden_core::entities::EntityRef;
+    use innerwarden_core::event::Severity;
+    use innerwarden_core::incident::Incident;
+
+    fn incident(incident_id: &str, entities: Vec<EntityRef>) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: incident_id.to_string(),
+            severity: Severity::High,
+            title: "test incident".to_string(),
+            summary: "synthetic auto-rule fixture".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities,
+        }
+    }
 
     #[test]
     fn internal_ip_detection() {
@@ -328,5 +352,79 @@ mod tests {
             !detectors.contains(&"packet_flood"),
             "packet_flood must not auto-block; review the AI pipeline path"
         );
+    }
+
+    #[test]
+    fn matching_auto_rule_accepts_detector_prefix_from_incident_id() {
+        let inc = incident(
+            "ssh_bruteforce:203.0.113.10:window",
+            vec![EntityRef::ip("203.0.113.10")],
+        );
+        let detector = incident_detector(&inc.incident_id);
+        let rule = matching_auto_rule(detector).expect("ssh brute force should match");
+        assert_eq!(rule.detector, "ssh_bruteforce");
+        assert_eq!(rule.duration_label, "24h");
+    }
+
+    #[test]
+    fn matching_auto_rule_accepts_exact_detector_id() {
+        let rule = matching_auto_rule("web_scan").expect("web scan rule should exist");
+        assert_eq!(rule.detector, "web_scan");
+        assert_eq!(rule.duration_label, "12h");
+    }
+
+    #[test]
+    fn matching_auto_rule_rejects_unknown_and_noisy_detectors() {
+        assert!(matching_auto_rule("unknown_detector").is_none());
+        assert!(matching_auto_rule("packet_flood").is_none());
+        assert!(matching_auto_rule("packet_flood:rate_anomaly").is_none());
+    }
+
+    #[test]
+    fn primary_incident_ip_returns_first_ip_entity() {
+        let inc = incident(
+            "port_scan:203.0.113.10",
+            vec![
+                EntityRef::user("root"),
+                EntityRef::ip("203.0.113.10"),
+                EntityRef::ip("198.51.100.7"),
+            ],
+        );
+        assert_eq!(primary_incident_ip(&inc), Some("203.0.113.10"));
+    }
+
+    #[test]
+    fn primary_incident_ip_returns_none_without_ip_entity() {
+        let inc = incident(
+            "port_scan:no-ip",
+            vec![EntityRef::user("root"), EntityRef::service("ssh")],
+        );
+        assert_eq!(primary_incident_ip(&inc), None);
+    }
+
+    #[test]
+    fn auto_rule_internal_ip_guard_covers_ipv4_and_ipv6_boundaries() {
+        for ip in [
+            "10.1.2.3",
+            "172.20.1.1",
+            "192.168.42.9",
+            "127.0.0.1",
+            "fe80::1",
+            "fd00::5",
+        ] {
+            assert!(is_internal_ip(ip), "{ip} should be internal");
+        }
+        for ip in [
+            "11.1.2.3",
+            "172.15.255.255",
+            "172.32.0.1",
+            "203.0.113.10",
+            "2001:db8::1",
+        ] {
+            assert!(
+                !is_internal_ip(ip),
+                "{ip} should not be treated as internal"
+            );
+        }
     }
 }
