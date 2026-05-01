@@ -522,6 +522,28 @@ mod tests {
     }
 
     #[test]
+    fn configured_block_backend_defaults_when_responder_section_absent() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let config = temp.path().join("agent.toml");
+        write_agent_config(&config, "[ai]\nenabled = true\n");
+
+        let backend = configured_block_backend(&config);
+
+        assert_eq!(backend, "ufw");
+    }
+
+    #[test]
+    fn configured_block_backend_defaults_when_toml_is_malformed() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let config = temp.path().join("agent.toml");
+        write_agent_config(&config, "[responder\nblock_backend = \"pf\"\n");
+
+        let backend = configured_block_backend(&config);
+
+        assert_eq!(backend, "ufw");
+    }
+
+    #[test]
     fn block_command_args_maps_supported_backends() {
         // Exercises each block backend arm to guard command construction before subprocess execution.
         assert_eq!(
