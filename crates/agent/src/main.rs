@@ -117,6 +117,7 @@ mod incident_playbook;
 mod incident_post_decision;
 mod incident_prelude;
 mod incident_reputation;
+mod incident_untouchable;
 mod ioc;
 mod ip_reputation;
 mod killchain_inline;

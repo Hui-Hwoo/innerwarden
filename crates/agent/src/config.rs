@@ -614,6 +614,33 @@ pub struct AiConfig {
     #[serde(default = "default_protected_ips")]
     pub protected_ips: Vec<String>,
 
+    /// Untouchable detector classes — AI is not allowed to silently
+    /// dismiss/ignore at Critical severity for these classes
+    /// (kill_chain, reverse_shell with eBPF evidence, ransomware,
+    /// data_exfil_ebpf, multi-stage cross-layer chains). The
+    /// override forces the decision to `RequestConfirmation` so the
+    /// operator sees it instead of the AI's auto-dismiss winning.
+    ///
+    /// Surfaced 2026-05-01 dashboard QA audit finding 1.3 — AI
+    /// auto-dismissed a `kill_chain DATA_EXFIL + reverse_shell` at
+    /// 100% confidence with rationale "ssh is a known operator/system
+    /// tool". The detector evidence was eBPF kernel-level
+    /// fd-redirect-to-socket. Auto-dismissing kernel-level evidence
+    /// is the failure mode a security tool must never have.
+    ///
+    /// Modes:
+    /// - `"enforce"` (default) — override fires, decision becomes
+    ///   `RequestConfirmation`, original AI reasoning preserved in
+    ///   the annotation suffix.
+    /// - `"shadow"` — override is logged as a WARN counter but the
+    ///   decision is left as-is. Use this for the first 24h after a
+    ///   classifier-rule change to compare false-positive rates
+    ///   before flipping to enforce.
+    /// - `"off"` — disable entirely (not recommended; only here so
+    ///   an operator can roll back without redeploying).
+    #[serde(default = "default_untouchable_override_mode")]
+    pub untouchable_override_mode: String,
+
     /// Minimum incident severity sent to AI analysis.
     /// "medium" (default) = Medium/High/Critical go to AI.
     /// "high" = only High/Critical go to AI (more conservative, fewer API calls).
@@ -831,6 +858,10 @@ fn default_ai_min_severity() -> String {
     "medium".to_string()
 }
 
+fn default_untouchable_override_mode() -> String {
+    "enforce".to_string()
+}
+
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
@@ -847,6 +878,7 @@ impl Default for AiConfig {
             circuit_breaker_threshold: 0,
             circuit_breaker_cooldown_secs: default_circuit_breaker_cooldown_secs(),
             protected_ips: default_protected_ips(),
+            untouchable_override_mode: default_untouchable_override_mode(),
             min_severity: default_ai_min_severity(),
             batch_triage: false,
             batch_window_secs: default_batch_window_secs(),

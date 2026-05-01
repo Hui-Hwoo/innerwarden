@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 
+use innerwarden_core::event::Severity;
 use tracing::{info, warn};
 
 use crate::{
     adaptive_block_ttl_secs, ai, allowlist, config, decision_cooldown_key_for_decision,
-    state_store, AgentState, LocalIpReputation,
+    incident_untouchable, state_store, AgentState, LocalIpReputation,
 };
 
 /// Apply post-decision safeguards and state updates before execution.
@@ -17,6 +18,54 @@ pub(crate) fn apply_post_decision_safeguards(
     decision: &mut ai::AiDecision,
     blocked_set: &mut HashSet<String>,
 ) {
+    // Untouchable detector class override (2026-05-01 dashboard QA
+    // audit finding 1.3). If the AI proposes Dismiss/Ignore on an
+    // incident whose detector class is "untouchable" (kill_chain,
+    // reverse_shell with eBPF evidence, ransomware, data_exfil_ebpf,
+    // multi-stage cross-layer chain) AND severity is Critical, the
+    // agent overrides to RequestConfirmation so the operator sees
+    // it. Auto-dismissing kernel-level evidence at 100% confidence
+    // is the failure mode the audit caught (AI dismissed
+    // kill_chain DATA_EXFIL + reverse_shell with rationale "ssh is
+    // a known operator/system tool").
+    //
+    // Mode is operator-configurable: enforce | shadow | off. Default
+    // is enforce. Shadow logs the would-have-fired override without
+    // touching the decision so a 24h diff against enforce is
+    // possible before flipping a classifier rule.
+    let mode = cfg.ai.untouchable_override_mode.as_str();
+    if mode != "off" {
+        if let Some(class) = incident_untouchable::classify(incident) {
+            let proposed_dismiss = incident_untouchable::is_dismiss_like(&decision.action);
+            let critical = matches!(incident.severity, Severity::Critical);
+            if proposed_dismiss && critical {
+                let proposed_action = decision.action.name();
+                if mode == "shadow" {
+                    warn!(
+                        incident_id = %incident.incident_id,
+                        class = class.as_str(),
+                        proposed_action,
+                        confidence = decision.confidence,
+                        "ai_untouchable_override: would force RequestConfirmation (shadow mode, decision unchanged)"
+                    );
+                } else {
+                    warn!(
+                        incident_id = %incident.incident_id,
+                        class = class.as_str(),
+                        proposed_action,
+                        confidence = decision.confidence,
+                        "ai_untouchable_override: forcing RequestConfirmation over Critical kernel-level evidence"
+                    );
+                    incident_untouchable::override_to_confirmation(
+                        decision,
+                        class,
+                        &incident.incident_id,
+                    );
+                }
+            }
+        }
+    }
+
     // Protected IP sandbox: if AI tries to block a protected IP (RFC 1918,
     // loopback, or operator-configured ranges), downgrade to ignore.
     if let ai::AiAction::BlockIp { ip, .. } = &decision.action {
