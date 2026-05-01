@@ -1,6 +1,8 @@
 // Auto-extracted from mod.rs — dashboard sse handlers
 
 use super::*;
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
 use tracing::warn;
 
@@ -37,9 +39,6 @@ fn open_live_incident_jsonl_or_warn(path: &std::path::Path) -> Option<std::fs::F
 /// Polls today's incidents and decisions JSONL files every 2 s.
 /// Broadcasts a `"refresh"` SSE payload whenever either file grows.
 pub(super) async fn watch_for_new_entries(data_dir: PathBuf, tx: EventTx) {
-    use std::collections::HashMap;
-    use std::io::{Read, Seek, SeekFrom};
-
     // Track byte offsets so we can read only new lines.
     let mut offsets: HashMap<String, u64> = HashMap::new();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -51,85 +50,93 @@ pub(super) async fn watch_for_new_entries(data_dir: PathBuf, tx: EventTx) {
         }
 
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        poll_new_entries(&data_dir, &tx, &mut offsets, &today);
+    }
+}
 
-        // Check decisions + incidents for growth → generic refresh signal.
-        let refresh_files = [
-            format!("incidents-{today}.jsonl"),
-            format!("decisions-{today}.jsonl"),
-        ];
-        let mut changed = false;
-        for name in &refresh_files {
-            let path = data_dir.join(name);
-            let current = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            let prev = offsets.entry(name.clone()).or_insert(current);
-            if current > *prev {
-                *prev = current;
-                changed = true;
-            }
+fn poll_new_entries(
+    data_dir: &std::path::Path,
+    tx: &EventTx,
+    offsets: &mut HashMap<String, u64>,
+    today: &str,
+) {
+    // Check decisions + incidents for growth → generic refresh signal.
+    let refresh_files = [
+        format!("incidents-{today}.jsonl"),
+        format!("decisions-{today}.jsonl"),
+    ];
+    let mut changed = false;
+    for name in &refresh_files {
+        let path = data_dir.join(name);
+        let current = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let prev = offsets.entry(name.clone()).or_insert(current);
+        if current > *prev {
+            *prev = current;
+            changed = true;
         }
-        if changed {
-            // Spec 037 I-13 PR-7 (K-class): broadcast `send` returns
-            // `Err` only when there are zero subscribers — the
-            // expected steady state when no operator is viewing the
-            // dashboard. Logging this failure would amount to a
-            // periodic "no clients connected" message; intentionally
-            // silent.
-            let _ = tx.send(SsePayload {
-                kind: "refresh".to_string(),
-                data: None,
-            });
-        }
+    }
+    if changed {
+        // Spec 037 I-13 PR-7 (K-class): broadcast `send` returns
+        // `Err` only when there are zero subscribers — the
+        // expected steady state when no operator is viewing the
+        // dashboard. Logging this failure would amount to a
+        // periodic "no clients connected" message; intentionally
+        // silent.
+        let _ = tx.send(SsePayload {
+            kind: "refresh".to_string(),
+            data: None,
+        });
+    }
 
-        // D8 - read new incident lines and emit `alert` for High/Critical.
-        let inc_name = format!("incidents-{today}.jsonl");
-        let inc_path = data_dir.join(&inc_name);
-        let alert_key = format!("alert:{inc_name}");
-        let alert_offset = offsets.entry(alert_key.clone()).or_insert(0);
+    // D8 - read new incident lines and emit `alert` for High/Critical.
+    let inc_name = format!("incidents-{today}.jsonl");
+    let inc_path = data_dir.join(&inc_name);
+    let alert_key = format!("alert:{inc_name}");
+    let alert_offset = offsets.entry(alert_key.clone()).or_insert(0);
 
-        if let Some(mut f) = open_live_incident_jsonl_or_warn(&inc_path) {
-            let file_len = f.seek(SeekFrom::End(0)).unwrap_or(0);
-            if file_len > *alert_offset {
-                // Spec 037 I-13 PR-7 (K-class): the seek is paired
-                // with the `read_to_string(..).is_ok()` check on the
-                // very next statement — the read's `is_ok` branch
-                // gate IS the cascade guard. If the seek silently
-                // fails (race with file rotation, malformed offset),
-                // the read either fails too (skipped via `is_ok`) or
-                // reads from the file's current cursor (graceful
-                // fall-through). Intentionally silent.
-                let _ = f.seek(SeekFrom::Start(*alert_offset));
-                let mut buf = String::new();
-                if f.read_to_string(&mut buf).is_ok() {
-                    *alert_offset = file_len;
-                    for line in buf.lines() {
-                        if let Ok(inc) = serde_json::from_str::<Incident>(line) {
-                            if matches!(inc.severity, Severity::High | Severity::Critical) {
-                                let (etype, evalue) = extract_alert_entity(&inc);
+    if let Some(mut f) = open_live_incident_jsonl_or_warn(&inc_path) {
+        let file_len = f.seek(SeekFrom::End(0)).unwrap_or(0);
+        if file_len > *alert_offset {
+            // Spec 037 I-13 PR-7 (K-class): the seek is paired
+            // with the `read_to_string(..).is_ok()` check on the
+            // very next statement — the read's `is_ok` branch
+            // gate IS the cascade guard. If the seek silently
+            // fails (race with file rotation, malformed offset),
+            // the read either fails too (skipped via `is_ok`) or
+            // reads from the file's current cursor (graceful
+            // fall-through). Intentionally silent.
+            let _ = f.seek(SeekFrom::Start(*alert_offset));
+            let mut buf = String::new();
+            if f.read_to_string(&mut buf).is_ok() {
+                *alert_offset = file_len;
+                for line in buf.lines() {
+                    if let Ok(inc) = serde_json::from_str::<Incident>(line) {
+                        if matches!(inc.severity, Severity::High | Severity::Critical) {
+                            let (etype, evalue) = extract_alert_entity(&inc);
 
-                                let payload = serde_json::json!({
-                                    "severity":     format!("{:?}", inc.severity).to_lowercase(),
-                                    "title":        inc.title,
-                                    "entity_type":  etype,
-                                    "entity_value": evalue,
-                                });
-                                // Spec 037 I-13 PR-7 (K-class):
-                                // same broadcast `send` semantics as
-                                // the refresh send above — `Err`
-                                // only when there are zero
-                                // subscribers. Intentionally silent.
-                                let _ = tx.send(SsePayload {
-                                    kind: "alert".to_string(),
-                                    data: Some(payload),
-                                });
-                            }
+                            let payload = serde_json::json!({
+                                "severity":     format!("{:?}", inc.severity).to_lowercase(),
+                                "title":        inc.title,
+                                "entity_type":  etype,
+                                "entity_value": evalue,
+                            });
+                            // Spec 037 I-13 PR-7 (K-class):
+                            // same broadcast `send` semantics as
+                            // the refresh send above — `Err`
+                            // only when there are zero
+                            // subscribers. Intentionally silent.
+                            let _ = tx.send(SsePayload {
+                                kind: "alert".to_string(),
+                                data: Some(payload),
+                            });
                         }
                     }
                 }
-            } else {
-                // File shrunk (rotation) - reset offset.
-                if file_len < *alert_offset {
-                    *alert_offset = 0;
-                }
+            }
+        } else {
+            // File shrunk (rotation) - reset offset.
+            if file_len < *alert_offset {
+                *alert_offset = 0;
             }
         }
     }
@@ -209,6 +216,56 @@ mod tests {
     use chrono::Utc;
     use innerwarden_core::entities::{EntityRef, EntityType};
     use innerwarden_core::incident::Incident;
+    use std::collections::HashMap;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::Path;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    fn incident_path(dir: &Path, today: &str) -> std::path::PathBuf {
+        dir.join(format!("incidents-{today}.jsonl"))
+    }
+
+    fn sample_incident(title: &str, severity: Severity) -> Incident {
+        Incident {
+            ts: Utc::now(),
+            host: "test".to_string(),
+            incident_id: format!("incident-{title}"),
+            severity,
+            title: title.to_string(),
+            summary: "Test".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef {
+                r#type: EntityType::Ip,
+                value: "203.0.113.10".to_string(),
+            }],
+        }
+    }
+
+    fn append_jsonl(path: &Path, line: &str) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("test should open jsonl file");
+        writeln!(file, "{line}").expect("test should append jsonl line");
+    }
+
+    fn append_incident(path: &Path, title: &str, severity: Severity) {
+        let line = serde_json::to_string(&sample_incident(title, severity))
+            .expect("test incident should serialize");
+        append_jsonl(path, &line);
+    }
+
+    fn poll_today(dir: &Path, tx: &EventTx, offsets: &mut HashMap<String, u64>, today: &str) {
+        poll_new_entries(dir, tx, offsets, today);
+    }
+
+    fn assert_no_sse(rx: &mut tokio::sync::broadcast::Receiver<SsePayload>) {
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
 
     #[test]
     fn test_extract_alert_entity() {
@@ -307,5 +364,139 @@ mod tests {
             captured.contains("error="),
             "error field missing, got: {captured}"
         );
+    }
+
+    #[test]
+    fn poll_empty_incidents_file_emits_no_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = "2026-05-01";
+        fs::write(incident_path(dir.path(), today), "").expect("seed empty incident log");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut offsets = HashMap::new();
+
+        poll_today(dir.path(), &tx, &mut offsets, today);
+
+        assert_no_sse(&mut rx);
+    }
+
+    #[test]
+    fn appending_incident_emits_refresh_then_alert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = "2026-05-01";
+        let path = incident_path(dir.path(), today);
+        fs::write(&path, "").expect("seed empty incident log");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut offsets = HashMap::new();
+        poll_today(dir.path(), &tx, &mut offsets, today);
+
+        append_incident(&path, "High Alert", Severity::High);
+        poll_today(dir.path(), &tx, &mut offsets, today);
+
+        let refresh = rx.try_recv().expect("refresh event should be sent");
+        assert_eq!(refresh.kind, "refresh");
+        assert!(refresh.data.is_none());
+
+        let alert = rx.try_recv().expect("alert event should be sent");
+        assert_eq!(alert.kind, "alert");
+        let data = alert.data.expect("alert should have payload");
+        assert_eq!(data["severity"], "high");
+        assert_eq!(data["title"], "High Alert");
+        assert_eq!(data["entity_type"], "ip");
+        assert_eq!(data["entity_value"], "203.0.113.10");
+        assert_no_sse(&mut rx);
+    }
+
+    #[test]
+    fn appending_multiple_incidents_emits_alerts_in_file_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = "2026-05-01";
+        let path = incident_path(dir.path(), today);
+        fs::write(&path, "").expect("seed empty incident log");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut offsets = HashMap::new();
+        poll_today(dir.path(), &tx, &mut offsets, today);
+
+        append_incident(&path, "First", Severity::High);
+        append_incident(&path, "Second", Severity::Critical);
+        append_incident(&path, "Low Noise", Severity::Low);
+        poll_today(dir.path(), &tx, &mut offsets, today);
+
+        assert_eq!(rx.try_recv().expect("refresh").kind, "refresh");
+        let first = rx.try_recv().expect("first alert").data.unwrap();
+        let second = rx.try_recv().expect("second alert").data.unwrap();
+        assert_eq!(first["title"], "First");
+        assert_eq!(first["severity"], "high");
+        assert_eq!(second["title"], "Second");
+        assert_eq!(second["severity"], "critical");
+        assert_no_sse(&mut rx);
+    }
+
+    #[test]
+    fn malformed_jsonl_line_is_skipped_and_stream_continues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = "2026-05-01";
+        let path = incident_path(dir.path(), today);
+        fs::write(&path, "").expect("seed empty incident log");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut offsets = HashMap::new();
+        poll_today(dir.path(), &tx, &mut offsets, today);
+
+        append_jsonl(&path, "{\"severity\":\"high\"");
+        append_incident(&path, "Still Delivered", Severity::High);
+        poll_today(dir.path(), &tx, &mut offsets, today);
+
+        assert_eq!(rx.try_recv().expect("refresh").kind, "refresh");
+        let alert = rx.try_recv().expect("valid alert should still be sent");
+        assert_eq!(alert.kind, "alert");
+        assert_eq!(alert.data.unwrap()["title"], "Still Delivered");
+        assert_no_sse(&mut rx);
+    }
+
+    #[test]
+    fn new_subscriber_does_not_replay_seen_incidents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = "2026-05-01";
+        let path = incident_path(dir.path(), today);
+        fs::write(&path, "").expect("seed empty incident log");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut offsets = HashMap::new();
+        poll_today(dir.path(), &tx, &mut offsets, today);
+        append_incident(&path, "Already Seen", Severity::High);
+        poll_today(dir.path(), &tx, &mut offsets, today);
+        while rx.try_recv().is_ok() {}
+
+        let mut reopened = tx.subscribe();
+        poll_today(dir.path(), &tx, &mut offsets, today);
+
+        assert_no_sse(&mut reopened);
+    }
+
+    #[test]
+    fn file_rotation_requires_second_poll_after_offset_reset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = "2026-05-01";
+        let path = incident_path(dir.path(), today);
+        fs::write(&path, "").expect("seed empty incident log");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut offsets = HashMap::new();
+        poll_today(dir.path(), &tx, &mut offsets, today);
+        append_incident(
+            &path,
+            "Old Incident With A Much Longer Title To Make Rotation Shrink",
+            Severity::High,
+        );
+        poll_today(dir.path(), &tx, &mut offsets, today);
+        while rx.try_recv().is_ok() {}
+
+        let rotated = serde_json::to_string(&sample_incident("New", Severity::High))
+            .expect("test incident should serialize");
+        fs::write(&path, format!("{rotated}\n")).expect("replace rotated incident log");
+        poll_today(dir.path(), &tx, &mut offsets, today);
+        assert_no_sse(&mut rx);
+
+        poll_today(dir.path(), &tx, &mut offsets, today);
+        let alert = rx.try_recv().expect("rotated incident should be emitted");
+        assert_eq!(alert.kind, "alert");
+        assert_eq!(alert.data.unwrap()["title"], "New");
     }
 }
