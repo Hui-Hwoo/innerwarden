@@ -262,9 +262,13 @@ pub(crate) fn cmd_configure_telegram(
 /// Try to get the chat_id by long-polling for new messages.
 /// First clears any pending updates, then waits for a fresh message.
 fn discover_telegram_chat_id(token: &str) -> Option<String> {
+    discover_telegram_chat_id_from_api_base("https://api.telegram.org", token)
+}
+
+fn discover_telegram_chat_id_from_api_base(api_base: &str, token: &str) -> Option<String> {
+    let api_base = api_base.trim_end_matches('/');
     // Step 1: Clear old updates by fetching with offset -1
-    let clear_url =
-        format!("https://api.telegram.org/bot{token}/getUpdates?offset=-1&limit=1&timeout=0");
+    let clear_url = format!("{api_base}/bot{token}/getUpdates?offset=-1&limit=1&timeout=0");
     let mut next_offset = 0i64;
     if let Ok(resp) = ureq::get(&clear_url).call() {
         if let Ok(json) = resp.into_body().read_json::<serde_json::Value>() {
@@ -277,11 +281,14 @@ fn discover_telegram_chat_id(token: &str) -> Option<String> {
     }
 
     // Step 2: Long-poll for a NEW message (timeout=5s per request)
-    let poll_url = format!(
-        "https://api.telegram.org/bot{token}/getUpdates?offset={next_offset}&limit=1&timeout=5"
-    );
+    let poll_url =
+        format!("{api_base}/bot{token}/getUpdates?offset={next_offset}&limit=1&timeout=5");
     let resp = ureq::get(&poll_url).call().ok()?;
     let json: serde_json::Value = resp.into_body().read_json().ok()?;
+    telegram_chat_id_from_updates(&json)
+}
+
+fn telegram_chat_id_from_updates(json: &serde_json::Value) -> Option<String> {
     json["result"]
         .as_array()?
         .first()?
@@ -295,16 +302,24 @@ fn discover_telegram_chat_id(token: &str) -> Option<String> {
 /// Send a test Telegram message to confirm the configuration works.
 fn send_telegram_test(token: &str, chat_id: &str) -> Result<()> {
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    send_telegram_test_to_url(&url, chat_id)
+}
+
+fn send_telegram_test_to_url(url: &str, chat_id: &str) -> Result<()> {
     let body = serde_json::json!({
         "chat_id": chat_id,
         "text": "✅ <b>InnerWarden connected</b>\n\nYou'll receive alerts here when High or Critical threats are detected on your server.\n\n<b>Commands:</b>\n/menu - interactive button menu\n/status - system overview\n/incidents - last incidents\n/decisions - last decisions\n/ask &lt;question&gt; - ask the AI\n\nOr just type a question in plain text.",
         "parse_mode": "HTML"
     });
-    let resp = ureq::post(&url)
+    let resp = ureq::post(url)
         .header("Content-Type", "application/json")
         .send(body.to_string())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let json: serde_json::Value = resp.into_body().read_json()?;
+    validate_telegram_send_response(&json)
+}
+
+fn validate_telegram_send_response(json: &serde_json::Value) -> Result<()> {
     if json["ok"].as_bool() != Some(true) {
         anyhow::bail!(
             "{}",
@@ -554,6 +569,24 @@ fn send_webhook_test(url: &str) -> Result<u16> {
 // innerwarden configure dashboard
 // ---------------------------------------------------------------------------
 
+fn find_innerwarden_agent_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("INNERWARDEN_AGENT_BIN") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    for path in &[
+        "/usr/local/bin/innerwarden-agent",
+        "/usr/bin/innerwarden-agent",
+    ] {
+        if Path::new(path).exists() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    which_bin("innerwarden-agent")
+}
+
 pub(crate) fn cmd_configure_dashboard(
     cli: &Cli,
     user: &str,
@@ -572,27 +605,12 @@ pub(crate) fn cmd_configure_dashboard(
     // Otherwise let the agent binary handle prompting (hidden input + confirm = 2 prompts total).
     let hash = if let Some(password) = password_arg {
         // Non-interactive path: pipe password to agent subprocess.
-        let agent_bin = cli
-            .agent_config
-            .parent()
-            .and_then(|_| {
-                for path in &[
-                    "/usr/local/bin/innerwarden-agent",
-                    "/usr/bin/innerwarden-agent",
-                ] {
-                    if Path::new(path).exists() {
-                        return Some(PathBuf::from(path));
-                    }
-                }
-                None
-            })
-            .or_else(|| which_bin("innerwarden-agent"))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "innerwarden-agent not found - run ./install.sh first or generate hash manually:\
+        let agent_bin = find_innerwarden_agent_bin().ok_or_else(|| {
+            anyhow::anyhow!(
+                "innerwarden-agent not found - run ./install.sh first or generate hash manually:\
                     \n  innerwarden-agent --dashboard-generate-password-hash"
-                )
-            })?;
+            )
+        })?;
 
         let output = std::process::Command::new(&agent_bin)
             .arg("--dashboard-generate-password-hash")
@@ -625,27 +643,12 @@ pub(crate) fn cmd_configure_dashboard(
         println!("The dashboard requires a login to protect your security data.");
         println!("Choose a strong password (min 8 chars).\n");
 
-        let agent_bin = cli
-            .agent_config
-            .parent()
-            .and_then(|_| {
-                for path in &[
-                    "/usr/local/bin/innerwarden-agent",
-                    "/usr/bin/innerwarden-agent",
-                ] {
-                    if Path::new(path).exists() {
-                        return Some(PathBuf::from(path));
-                    }
-                }
-                None
-            })
-            .or_else(|| which_bin("innerwarden-agent"))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "innerwarden-agent not found - run ./install.sh first or generate hash manually:\
+        let agent_bin = find_innerwarden_agent_bin().ok_or_else(|| {
+            anyhow::anyhow!(
+                "innerwarden-agent not found - run ./install.sh first or generate hash manually:\
                     \n  innerwarden-agent --dashboard-generate-password-hash"
-                )
-            })?;
+            )
+        })?;
 
         // Inherit stdin/stderr so rpassword can read from the terminal directly.
         let output = std::process::Command::new(&agent_bin)
@@ -742,18 +745,9 @@ fn ensure_dashboard_flag_in_service(cli: &Cli) {
     if content.contains("--dashboard") {
         return;
     }
-    // Patch ExecStart line to append --dashboard
-    let patched = content
-        .lines()
-        .map(|line| {
-            if line.trim_start().starts_with("ExecStart=") && !line.contains("--dashboard") {
-                format!("{line} --dashboard")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let Some(patched) = add_dashboard_flag_to_service_content(&content) else {
+        return;
+    };
 
     if cli.dry_run {
         println!("  [dry-run] would add --dashboard to {service_path}");
@@ -770,6 +764,28 @@ fn ensure_dashboard_flag_in_service(cli: &Cli) {
             "  [warn] could not update {service_path} - add --dashboard to ExecStart manually"
         );
     }
+}
+
+fn add_dashboard_flag_to_service_content(content: &str) -> Option<String> {
+    if content.contains("--dashboard") {
+        return None;
+    }
+
+    let mut changed = false;
+    let patched = content
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("ExecStart=") {
+                changed = true;
+                format!("{line} --dashboard")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    changed.then_some(patched)
 }
 
 fn which_bin(name: &str) -> Option<PathBuf> {
@@ -968,12 +984,10 @@ pub(crate) fn cmd_notify_web_push_setup(cli: &Cli, subject: Option<&str>) -> Res
     println!("Setting up Web Push notifications (RFC 8291 / VAPID)...");
     println!();
 
-    let existing_key = write_str(&cli.agent_config, "web_push", "vapid_public_key", "");
     let has_existing = cli.agent_config.exists() && {
         let content = std::fs::read_to_string(&cli.agent_config).unwrap_or_default();
         content.contains("vapid_public_key") && !content.contains(r#"vapid_public_key = """#)
     };
-    drop(existing_key);
 
     if has_existing {
         println!("⚠  VAPID keys are already configured.");
@@ -1161,6 +1175,8 @@ pub(crate) fn cmd_configure_digest(cli: &Cli, hour_str: &str) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn test_cli(temp: &TempDir) -> Cli {
@@ -1171,6 +1187,94 @@ mod tests {
         cli.dry_run = true;
         std::fs::create_dir_all(&cli.data_dir).expect("test should create data dir");
         cli
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("test should create parent directory");
+        }
+        std::fs::write(path, content).expect("test should write fixture");
+    }
+
+    fn serve_status(status: u16, requests: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let addr = listener.local_addr().expect("server address");
+        std::thread::spawn(move || {
+            for _ in 0..requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let reason = if status == 200 { "OK" } else { "Accepted" };
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/hook")
+    }
+
+    fn serve_json_bodies(bodies: Vec<&'static str>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let addr = listener.local_addr().expect("server address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request_text = String::from_utf8_lossy(&request[..read]);
+                if let Some(line) = request_text.lines().next() {
+                    seen.lock()
+                        .expect("request log lock")
+                        .push(line.to_string());
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_agent(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("innerwarden-agent");
+        write_file(&path, body);
+        let mut perms = std::fs::metadata(&path)
+            .expect("fake agent metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("fake agent executable");
+        path
+    }
+
+    fn with_agent_bin<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+        static AGENT_BIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = AGENT_BIN_ENV_LOCK
+            .lock()
+            .expect("agent env test lock should not be poisoned");
+        let prior = std::env::var_os("INNERWARDEN_AGENT_BIN");
+        std::env::set_var("INNERWARDEN_AGENT_BIN", path);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prior {
+            Some(value) => std::env::set_var("INNERWARDEN_AGENT_BIN", value),
+            None => std::env::remove_var("INNERWARDEN_AGENT_BIN"),
+        }
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     #[test]
@@ -1300,6 +1404,79 @@ mod tests {
     }
 
     #[test]
+    fn telegram_chat_id_from_updates_reads_first_message_chat() {
+        let json = serde_json::json!({
+            "result": [
+                { "message": { "chat": { "id": -1001234567890i64 } } }
+            ]
+        });
+        assert_eq!(
+            telegram_chat_id_from_updates(&json).as_deref(),
+            Some("-1001234567890")
+        );
+        assert!(telegram_chat_id_from_updates(&serde_json::json!({"result": []})).is_none());
+    }
+
+    #[test]
+    fn discover_telegram_chat_id_from_api_base_uses_clear_offset_then_poll() {
+        let (base_url, requests) = serve_json_bodies(vec![
+            r#"{"result":[{"update_id":41}]}"#,
+            r#"{"result":[{"message":{"chat":{"id":123456789}}}]}"#,
+        ]);
+
+        assert_eq!(
+            discover_telegram_chat_id_from_api_base(&base_url, "123:abc").as_deref(),
+            Some("123456789")
+        );
+        let requests = requests.lock().expect("request log lock");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("offset=-1"));
+        assert!(requests[1].contains("offset=42"));
+    }
+
+    #[test]
+    fn validate_telegram_send_response_accepts_ok_and_surfaces_errors() {
+        validate_telegram_send_response(&serde_json::json!({"ok": true}))
+            .expect("ok telegram response should pass");
+
+        let err = validate_telegram_send_response(
+            &serde_json::json!({"ok": false, "description": "bad chat"}),
+        )
+        .expect_err("telegram error should be surfaced");
+        assert!(err.to_string().contains("bad chat"));
+
+        let err = validate_telegram_send_response(&serde_json::json!({"ok": false}))
+            .expect_err("telegram error without description should use fallback");
+        assert!(err.to_string().contains("unknown error"));
+    }
+
+    #[test]
+    fn send_telegram_test_to_url_posts_expected_payload_and_checks_json() {
+        let (url, requests) = serve_json_bodies(vec![r#"{"ok":true}"#]);
+        send_telegram_test_to_url(&url, "-100123").expect("ok telegram response should pass");
+        assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
+        let (url, _) = serve_json_bodies(vec![r#"{"ok":false,"description":"bad token"}"#]);
+        let err = send_telegram_test_to_url(&url, "-100123")
+            .expect_err("telegram API failure should fail test send");
+        assert!(err.to_string().contains("bad token"));
+    }
+
+    #[test]
+    fn find_innerwarden_agent_bin_uses_env_override_when_present() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let agent = temp.path().join("innerwarden-agent");
+        write_file(&agent, "#!/bin/sh\n");
+
+        with_agent_bin(&agent, || {
+            assert_eq!(
+                find_innerwarden_agent_bin().as_deref(),
+                Some(agent.as_path())
+            );
+        });
+    }
+
+    #[test]
     fn generate_vapid_keys_ctl_returns_pem_and_public_key() {
         let (private_pem, public_b64) = generate_vapid_keys_ctl().expect("keygen should succeed");
         assert!(private_pem.contains("BEGIN PRIVATE KEY"));
@@ -1320,6 +1497,259 @@ mod tests {
         let temp = TempDir::new().expect("test should create temp dir");
         let cli = test_cli(&temp);
         cmd_configure_budget(&cli, 42).expect("dry-run budget config should succeed");
+    }
+
+    #[test]
+    fn cmd_configure_telegram_dry_run_validates_inputs_and_audits() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_configure_telegram(
+            &cli,
+            Some("123456789:ABCdef_token"),
+            Some("-1001234567890"),
+            true,
+        )
+        .expect("dry-run telegram config should succeed");
+
+        let err = cmd_configure_telegram(&cli, Some("bad-token"), Some("123"), true)
+            .expect_err("bad token should be rejected");
+        assert!(err.to_string().contains("token looks wrong"));
+
+        let err =
+            cmd_configure_telegram(&cli, Some("123456789:ABCdef_token"), Some("chat_123"), true)
+                .expect_err("bad chat id should be rejected");
+        assert!(err.to_string().contains("chat ID must be a number"));
+    }
+
+    #[test]
+    fn cmd_configure_slack_dry_run_validates_url_and_severity() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_configure_slack(
+            &cli,
+            Some("https://hooks.slack.com/services/T000/B000/XXX"),
+            "critical",
+            true,
+        )
+        .expect("dry-run slack config should succeed");
+
+        let err = cmd_configure_slack(&cli, Some("https://example.com/hook"), "high", true)
+            .expect_err("non-slack URL should fail");
+        assert!(err.to_string().contains("hooks.slack.com"));
+
+        let err = cmd_configure_slack(
+            &cli,
+            Some("https://hooks.slack.com/services/T000/B000/XXX"),
+            "urgent",
+            true,
+        )
+        .expect_err("bad severity should fail");
+        assert!(err.to_string().contains("min-severity"));
+    }
+
+    #[test]
+    fn cmd_configure_webhook_dry_run_validates_url_and_severity() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_configure_webhook(
+            &cli,
+            Some("https://example.com/innerwarden"),
+            "medium",
+            true,
+        )
+        .expect("dry-run webhook config should succeed");
+
+        let err = cmd_configure_webhook(&cli, Some("ftp://example.com/hook"), "high", true)
+            .expect_err("bad scheme should fail");
+        assert!(err.to_string().contains("URL must start"));
+
+        let err = cmd_configure_webhook(&cli, Some("https://example.com/hook"), "urgent", true)
+            .expect_err("bad severity should fail");
+        assert!(err.to_string().contains("min-severity"));
+    }
+
+    #[test]
+    fn send_slack_and_webhook_tests_accept_local_http_success() {
+        let slack_url = serve_status(200, 1);
+        send_slack_test(&slack_url).expect("local slack-style endpoint should accept post");
+
+        let webhook_url = serve_status(202, 1);
+        let status = send_webhook_test(&webhook_url).expect("local webhook should accept post");
+        assert_eq!(status, 202);
+    }
+
+    #[test]
+    fn send_slack_and_webhook_tests_surface_connection_errors() {
+        let closed_url = "http://127.0.0.1:1/hook";
+        assert!(send_slack_test(closed_url).is_err());
+        assert!(send_webhook_test(closed_url).is_err());
+    }
+
+    #[test]
+    fn cmd_test_alert_reports_missing_and_successful_local_channels() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_test_alert(&cli, None).expect("no configured channels should be reported");
+        cmd_test_alert(&cli, Some("telegram")).expect("missing telegram is reported");
+        cmd_test_alert(&cli, Some("slack")).expect("missing slack is reported");
+        cmd_test_alert(&cli, Some("webhook")).expect("missing webhook is reported");
+
+        let url = serve_status(200, 2);
+        let env_file = cli
+            .agent_config
+            .parent()
+            .expect("agent parent")
+            .join("agent.env");
+        write_file(&env_file, &format!("SLACK_WEBHOOK_URL=\"{url}\"\n"));
+        write_file(
+            &cli.agent_config,
+            &format!("[webhook]\nenabled = true\nurl = \"{url}\"\n"),
+        );
+
+        cmd_test_alert(&cli, None).expect("configured local slack and webhook should pass");
+    }
+
+    #[test]
+    fn cmd_test_alert_bails_when_configured_local_channels_fail() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let closed_url = "http://127.0.0.1:1/hook";
+
+        let env_file = cli
+            .agent_config
+            .parent()
+            .expect("agent parent")
+            .join("agent.env");
+        write_file(&env_file, &format!("SLACK_WEBHOOK_URL=\"{closed_url}\"\n"));
+        let err = cmd_test_alert(&cli, Some("slack"))
+            .expect_err("configured slack failure should fail command");
+        assert!(err.to_string().contains("One or more channels failed"));
+
+        write_file(
+            &cli.agent_config,
+            &format!("[webhook]\nenabled = true\nurl = \"{closed_url}\"\n"),
+        );
+        let err = cmd_test_alert(&cli, Some("webhook"))
+            .expect_err("configured webhook failure should fail command");
+        assert!(err.to_string().contains("One or more channels failed"));
+    }
+
+    #[test]
+    fn cmd_notify_web_push_setup_writes_config_env_and_audit() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_notify_web_push_setup(&cli, Some("mailto:security@example.com"))
+            .expect("web push setup should generate keys");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("agent config");
+        assert!(agent.contains("[web_push]"));
+        assert!(agent.contains("enabled = true"));
+        assert!(agent.contains("mailto:security@example.com"));
+
+        let env_file = cli
+            .agent_config
+            .parent()
+            .expect("agent parent")
+            .join("agent.env");
+        let env = std::fs::read_to_string(env_file).expect("agent env");
+        assert!(env.contains("INNERWARDEN_VAPID_PRIVATE_KEY="));
+        assert!(env.contains("BEGIN PRIVATE KEY"));
+
+        let audit_written = std::fs::read_dir(&cli.data_dir)
+            .expect("audit dir")
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("admin-actions-"))
+            });
+        assert!(audit_written);
+    }
+
+    #[test]
+    fn cmd_notify_web_push_setup_keeps_existing_keys_on_default_answer() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        write_file(
+            &cli.agent_config,
+            "[web_push]\nvapid_public_key = \"existing-key\"\n",
+        );
+
+        cmd_notify_web_push_setup(&cli, None)
+            .expect("existing key branch should keep configuration by default");
+
+        let agent = std::fs::read_to_string(&cli.agent_config).expect("agent config");
+        assert!(agent.contains("existing-key"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_configure_dashboard_dry_run_uses_agent_hash_output() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let agent = write_fake_agent(
+            temp.path(),
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '$argon2id$v=19$m=1,t=1,p=1$abc$def'\n",
+        );
+
+        with_agent_bin(&agent, || {
+            cmd_configure_dashboard(&cli, "admin", Some("correct horse battery staple"))
+                .expect("dashboard dry-run should accept fake agent hash");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_configure_dashboard_interactive_path_uses_agent_stdout() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let agent = write_fake_agent(
+            temp.path(),
+            "#!/bin/sh\nprintf '%s\\n' '$argon2id$v=19$m=1,t=1,p=1$abc$def'\n",
+        );
+
+        with_agent_bin(&agent, || {
+            cmd_configure_dashboard(&cli, "admin", None)
+                .expect("dashboard dry-run interactive path should accept fake agent hash");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_configure_dashboard_reports_agent_failures_and_bad_output() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        let failing = write_fake_agent(temp.path(), "#!/bin/sh\nexit 42\n");
+        let err = with_agent_bin(&failing, || {
+            cmd_configure_dashboard(&cli, "admin", Some("password"))
+                .expect_err("failing agent should surface an error")
+        });
+        assert!(err.to_string().contains("agent binary failed"));
+
+        let bad_output = write_fake_agent(temp.path(), "#!/bin/sh\nprintf '%s\\n' 'not-a-hash'\n");
+        let err = with_agent_bin(&bad_output, || {
+            cmd_configure_dashboard(&cli, "admin", Some("password"))
+                .expect_err("bad hash output should surface an error")
+        });
+        assert!(err.to_string().contains("unexpected output"));
+    }
+
+    #[test]
+    fn add_dashboard_flag_to_service_content_patches_execstart_when_missing() {
+        let content = "[Service]\nEnvironmentFile=/etc/innerwarden/agent.env\nExecStart=/usr/bin/innerwarden-agent\n";
+        let patched = add_dashboard_flag_to_service_content(content)
+            .expect("service content with ExecStart should be patched");
+        assert!(patched.contains("ExecStart=/usr/bin/innerwarden-agent --dashboard"));
+
+        assert!(add_dashboard_flag_to_service_content(&patched).is_none());
+        assert!(add_dashboard_flag_to_service_content("[Service]\nRestart=always\n").is_none());
     }
 }
 
