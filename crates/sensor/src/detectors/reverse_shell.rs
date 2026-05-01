@@ -28,6 +28,17 @@ struct PidNetworkEvent {
     ts: DateTime<Utc>,
     dst_ip: String,
     dst_port: u16,
+    /// 2026-05-01: comm captured at THIS event's time. Pre-fix the
+    /// reverse_shell incident only carried the comm of the
+    /// fd_redirect event, which arrives slightly after the connect
+    /// — and on prod (incident reverse_shell:ebpf_reverse_shell:
+    /// 3815134:2026-05-01T01:51Z) the fd_redirect comm came back
+    /// as garbage bytes ("\u{0}..\u{5}") even though the connect's
+    /// comm was correctly "ssh". Storing comm at connect-time means
+    /// the NSS-init exclusion below has reliable signal even when
+    /// the kernel's task->comm has been overwritten by the time
+    /// fd_redirect fires.
+    comm: String,
 }
 
 impl ReverseShellDetector {
@@ -155,6 +166,7 @@ impl ReverseShellDetector {
             ts: now,
             dst_ip: dst_ip.clone(),
             dst_port,
+            comm: comm.to_string(),
         });
 
         // Only check on fd_redirect — that's the final step
@@ -181,18 +193,28 @@ impl ReverseShellDetector {
         let has_bind = pid_events.iter().any(|e| e.kind == "network.bind_listen");
         let has_listen = pid_events.iter().any(|e| e.kind == "network.listen");
 
-        let (pattern, target_ip, target_port) = if has_connect {
+        let (pattern, target_ip, target_port, source_comm) = if has_connect {
             // Reverse shell detected
             let conn = pid_events
                 .iter()
                 .find(|e| e.kind == "network.outbound_connect")?;
-            ("ebpf_reverse_shell", conn.dst_ip.clone(), conn.dst_port)
+            (
+                "ebpf_reverse_shell",
+                conn.dst_ip.clone(),
+                conn.dst_port,
+                conn.comm.clone(),
+            )
         } else if has_bind && has_listen {
             // Bind shell detected
             let bind = pid_events
                 .iter()
                 .find(|e| e.kind == "network.bind_listen")?;
-            ("ebpf_bind_shell", bind.dst_ip.clone(), bind.dst_port)
+            (
+                "ebpf_bind_shell",
+                bind.dst_ip.clone(),
+                bind.dst_port,
+                bind.comm.clone(),
+            )
         } else {
             return None;
         };
@@ -202,6 +224,38 @@ impl ReverseShellDetector {
         // Note: we only filter own_ips, NOT all internal IPs — a reverse shell
         // to another internal host is real lateral movement and must alert.
         if !target_ip.is_empty() && super::is_own_ip(&target_ip) {
+            return None;
+        }
+
+        // 2026-05-01: NSS-init operator-tool exclusion. The ssh client
+        // (and scp/sftp/rsync/git-over-ssh) does `dup2(socket,
+        // stdin/stdout)` to multiplex shell I/O over the SSH socket.
+        // From the kernel's POV this is bit-identical to a reverse
+        // shell — connect+fd_redirect — but the operator running
+        // `git fetch` is not under attack.
+        //
+        // The exclusion is INTENTIONALLY NARROW:
+        //   - source_comm comes from the CONNECT event (reliable;
+        //     fd_redirect's comm was observed corrupted in prod
+        //     incident 2026-05-01 01:51 UTC).
+        //   - target_port must be 22 (SSH) — anything else (4444,
+        //     1337, random high-port C2) is real reverse-shell
+        //     territory and STILL fires.
+        //   - source_comm prefix must match a known SSH-family
+        //     client. An attacker renaming their malicious binary
+        //     to "ssh" still has to also pick port 22, AND the
+        //     downstream agent dismiss filter still requires UID
+        //     in operator range.
+        //
+        // Aligned with `data_exfil_ebpf::NSS_INIT_CLI_TOOLS` so a
+        // single git+ssh+github FP doesn't fire a different detector
+        // every time we close one path.
+        const REVERSE_SHELL_NSS_TOOLS: &[&str] =
+            &["ssh", "scp", "sftp", "rsync", "git", "git-remote"];
+        let comm_match = REVERSE_SHELL_NSS_TOOLS
+            .iter()
+            .any(|p| source_comm == *p || source_comm.starts_with(p));
+        if comm_match && target_port == 22 {
             return None;
         }
 
@@ -258,7 +312,12 @@ impl ReverseShellDetector {
                 "kind": "reverse_shell",
                 "pattern": pattern,
                 "detection": "ebpf_sequence",
+                // 2026-05-01: emit BOTH the fd_redirect-time comm
+                // (legacy field, may be corrupted on some kernels)
+                // AND the connect-time comm (reliable). Downstream
+                // dismiss filters should prefer source_comm.
                 "comm": comm,
+                "source_comm": source_comm,
                 "pid": pid,
                 "target_ip": target_ip,
                 "target_port": target_port,
@@ -673,6 +732,109 @@ mod tests {
             tags: vec!["ebpf".to_string()],
             entities: vec![],
         }
+    }
+
+    fn connect_event_with_comm(
+        pid: u32,
+        dst_ip: &str,
+        dst_port: u16,
+        comm: &str,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        Event {
+            ts,
+            host: "test".to_string(),
+            source: "ebpf".to_string(),
+            kind: "network.outbound_connect".to_string(),
+            severity: Severity::Info,
+            summary: format!("connect to {dst_ip}:{dst_port}"),
+            details: serde_json::json!({
+                "pid": pid, "uid": 1001, "comm": comm,
+                "dst_ip": dst_ip, "dst_port": dst_port,
+            }),
+            tags: vec!["ebpf".to_string()],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_does_not_fire_on_ssh_to_port_22() {
+        // 2026-05-01 (PR #047): operator-reported FP. `git fetch` /
+        // direct ssh to a server multiplexes shell I/O over the SSH
+        // socket via dup2(socket, stdin/stdout) — bit-identical to a
+        // reverse shell from the kernel's POV, but the operator is
+        // not under attack. Sensor must filter when comm is in the
+        // NSS-init operator-tool set AND target_port is 22.
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        det.process(&connect_event_with_comm(
+            7000,
+            "20.26.156.215",
+            22,
+            "ssh",
+            now,
+        ));
+        let inc = det.process(&fd_redirect_event(7000, 5, 0, now + Duration::seconds(1)));
+        assert!(
+            inc.is_none(),
+            "ssh + connect + fd_redirect on port 22 must be suppressed"
+        );
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_still_fires_on_ssh_to_non_22_port() {
+        // The exclusion is INTENTIONALLY narrow: only port 22.
+        // Real reverse shells use 4444 / 1337 / random high-ports
+        // — those must STILL fire even with comm=ssh (an attacker
+        // can rename their binary, but they can't make the kernel
+        // misreport the destination port).
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        det.process(&connect_event_with_comm(7001, "10.0.0.1", 4444, "ssh", now));
+        let inc = det
+            .process(&fd_redirect_event(7001, 5, 0, now + Duration::seconds(1)))
+            .expect("ssh to non-22 port must still fire");
+        assert_eq!(inc.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_still_fires_on_unknown_comm_to_port_22() {
+        // Defensive: an unknown binary doing connect+fd_redirect on
+        // port 22 is suspicious enough to warrant the alert. Only
+        // known operator-tool comms get the exclusion.
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        det.process(&connect_event_with_comm(
+            7002,
+            "10.0.0.5",
+            22,
+            "evil-tool",
+            now,
+        ));
+        let inc = det
+            .process(&fd_redirect_event(7002, 5, 0, now + Duration::seconds(1)))
+            .expect("unknown comm to port 22 must still fire");
+        assert_eq!(inc.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_evidence_carries_source_comm() {
+        // Anchor for downstream consumers (incident_autodismiss):
+        // evidence must include `source_comm` (captured at connect
+        // time, reliable) alongside the legacy `comm` field. Prod
+        // observed `comm` returned as garbage bytes from
+        // fd_redirect's task lookup; source_comm gives consumers a
+        // dependable signal.
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        det.process(&connect_event_with_comm(
+            7003, "10.0.0.7", 4444, "evil", now,
+        ));
+        let inc = det
+            .process(&fd_redirect_event(7003, 5, 0, now + Duration::seconds(1)))
+            .unwrap();
+        let ev = inc.evidence.as_array().unwrap().first().unwrap();
+        assert_eq!(ev.get("source_comm").and_then(|v| v.as_str()), Some("evil"));
     }
 
     #[test]

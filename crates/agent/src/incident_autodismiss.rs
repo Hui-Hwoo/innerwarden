@@ -121,7 +121,15 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
 ) -> bool {
     // Sensor detectors that emit the NSS-init pattern. Add detector
     // prefixes here when extending the suppression to a new sensor.
-    const SENSOR_NSS_INIT_DETECTORS: &[&str] = &["data_exfil_ebpf"];
+    //
+    // 2026-05-01: added "reverse_shell" — the eBPF reverse-shell
+    // detector fires on `connect + dup2(socket, stdin/stdout)`, which
+    // is bit-identical to ssh client multiplexing I/O over an SSH
+    // socket. `git fetch git@github.com` therefore triggers a
+    // Critical reverse_shell incident with comm=ssh / target_port=22
+    // / target_ip=github.com (Azure 20.x). Same FP class as the
+    // kill_chain DATA_EXFIL and data_exfil_ebpf paths.
+    const SENSOR_NSS_INIT_DETECTORS: &[&str] = &["data_exfil_ebpf", "reverse_shell"];
     // Mirror of `NSS_INIT_CLI_TOOLS` in
     // `crates/sensor/src/detectors/data_exfil_ebpf.rs`. Keep this list
     // in lock-step — a tool prefix in one side but not the other
@@ -162,25 +170,60 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
         Some(v) => v,
         None => return false,
     };
-    let comm = evidence.get("comm").and_then(|v| v.as_str()).unwrap_or("");
-    let sensitive_file = evidence
-        .get("sensitive_file")
+    // 2026-05-01: prefer `source_comm` (connect-time, reliable) over
+    // `comm` (fd_redirect-time, observed corrupted in prod for the
+    // reverse_shell detector). Falls back to `comm` for older sensor
+    // builds that don't emit source_comm yet.
+    let comm = evidence
+        .get("source_comm")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| evidence.get("comm").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let dst_ip = evidence
+        .get("dst_ip")
+        .or_else(|| evidence.get("target_ip"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if sensitive_file != "/etc/passwd" {
+    let pid = evidence.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // Detector-specific signatures. Each is a NARROW positive — wide
+    // enough to catch the operator-tool FP, never wide enough to
+    // dismiss a real attacker shape.
+    let signature_match = match detector {
+        "data_exfil_ebpf" => {
+            // ssh + read("/etc/passwd") + outbound connect.
+            // /etc/passwd is the NSS user-lookup file every libc
+            // binary opens at startup; world-readable; no secrets.
+            evidence
+                .get("sensitive_file")
+                .and_then(|v| v.as_str())
+                .map(|f| f == "/etc/passwd")
+                .unwrap_or(false)
+        }
+        "reverse_shell" => {
+            // ssh client + connect + dup2(socket, stdin/stdout) on
+            // port 22. Sensor already does this filter pre-emit
+            // (PR #047 reverse_shell.rs), but a sensor that predates
+            // the fix may still emit; agent dismisses defensively.
+            let target_port = evidence
+                .get("target_port")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            target_port == 22
+        }
+        _ => false,
+    };
+    if !signature_match {
         return false;
     }
+
     let comm_match = NSS_INIT_TOOL_PREFIXES
         .iter()
         .any(|prefix| comm == *prefix || comm.starts_with(prefix));
     if !comm_match {
         return false;
     }
-    let dst_ip = evidence
-        .get("dst_ip")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let pid = evidence.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
     info!(
         incident_id = %incident.incident_id,
         detector,
@@ -195,14 +238,29 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
         .iter()
         .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
         .map(|e| e.value.clone());
-    let reason = format!(
-        "Auto-dismissed: {detector} fired on {comm} reading /etc/passwd \
-         then connecting to {dst_ip}. /etc/passwd is the NSS user-lookup \
-         file every libc binary opens at startup; this is the \
-         standard CLI startup signature, not data exfiltration. Mirrors \
-         the sensor's NSS_INIT_CLI_TOOLS suppression \
-         (data_exfil_ebpf.rs)."
-    );
+    let reason = match detector {
+        "data_exfil_ebpf" => format!(
+            "Auto-dismissed: {detector} fired on {comm} reading /etc/passwd \
+             then connecting to {dst_ip}. /etc/passwd is the NSS user-lookup \
+             file every libc binary opens at startup; this is the \
+             standard CLI startup signature, not data exfiltration. Mirrors \
+             the sensor's NSS_INIT_CLI_TOOLS suppression \
+             (data_exfil_ebpf.rs)."
+        ),
+        "reverse_shell" => format!(
+            "Auto-dismissed: {detector} fired on {comm} (connect + \
+             dup2(socket, stdin/stdout)) to {dst_ip}:22. ssh client multiplexes \
+             shell I/O over the SSH socket, which is bit-identical to a \
+             reverse-shell at the kernel level. Real reverse shells use \
+             non-22 ports (4444, 1337, ...). Mirrors the sensor's NSS-init \
+             suppression in reverse_shell.rs."
+        ),
+        _ => format!(
+            "Auto-dismissed: {detector} fired on {comm} (NSS-init \
+             operator-tool pattern). Defense-in-depth for sensor \
+             NSS_INIT_CLI_TOOLS suppression."
+        ),
+    };
     let entry = crate::decisions::DecisionEntry {
         ts: chrono::Utc::now(),
         incident_id: incident.incident_id.clone(),
@@ -400,6 +458,110 @@ mod tests {
         assert!(
             !dismissed,
             "non-NSS-init detector must not be auto-dismissed by this filter"
+        );
+    }
+
+    fn make_reverse_shell_incident(
+        source_comm: Option<&str>,
+        comm: &str,
+        target_ip: &str,
+        target_port: u64,
+    ) -> innerwarden_core::incident::Incident {
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::incident::Incident;
+        let mut ev = serde_json::json!({
+            "kind": "reverse_shell",
+            "pattern": "ebpf_reverse_shell",
+            "detection": "ebpf_sequence",
+            "comm": comm,
+            "pid": 5555,
+            "target_ip": target_ip,
+            "target_port": target_port,
+            "redirected_fd": 0,
+        });
+        if let Some(sc) = source_comm {
+            ev["source_comm"] = serde_json::Value::String(sc.to_string());
+        }
+        Incident {
+            ts: Utc::now(),
+            host: "test-host".into(),
+            incident_id: format!(
+                "reverse_shell:ebpf_reverse_shell:5555:{}",
+                Utc::now().format("%Y-%m-%dT%H:%MZ")
+            ),
+            severity: innerwarden_core::event::Severity::Critical,
+            title: format!("Reverse shell via eBPF: {comm} -> {target_ip}:{target_port}"),
+            summary: "test".into(),
+            evidence: serde_json::Value::Array(vec![ev]),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip(target_ip)],
+        }
+    }
+
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_matches_reverse_shell_ssh_port_22() {
+        // 2026-05-01 (PR #047): operator hit a Critical reverse_shell
+        // FP on `git fetch git@github.com` because ssh client's
+        // dup2(socket, stdin/stdout) is bit-identical to a reverse
+        // shell signature at the kernel level. Agent dismisses it
+        // when comm=ssh-family AND target_port=22 — defense-in-depth
+        // for the sensor-side suppression added in the same PR.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_reverse_shell_incident(Some("ssh"), "ssh", "20.26.156.215", 22);
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            dismissed,
+            "ssh + reverse_shell + port 22 MUST be auto-dismissed"
+        );
+    }
+
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_does_not_match_reverse_shell_non_22_port() {
+        // The exclusion is narrow: only port 22 (SSH). Real reverse
+        // shells use 4444 / 1337 / etc. — those must reach AI router.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_reverse_shell_incident(Some("ssh"), "ssh", "10.0.0.5", 4444);
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            !dismissed,
+            "reverse_shell on non-22 port must reach AI router (real reverse shell)"
+        );
+    }
+
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_does_not_match_reverse_shell_unknown_comm() {
+        // Unknown comm + port 22 still fires — only known operator
+        // tools get the exclusion.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_reverse_shell_incident(Some("evil-tool"), "evil-tool", "10.0.0.5", 22);
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(!dismissed, "unknown comm to port 22 must reach AI router");
+    }
+
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_prefers_source_comm_over_corrupted_comm() {
+        // Prod observation 2026-05-01: the sensor's reverse_shell
+        // detector emitted comm="\u{0}\u{5}" (corrupted bytes from
+        // task->comm at fd_redirect time). The new `source_comm`
+        // field captures comm at CONNECT time, which is reliable.
+        // Agent must use source_comm preferentially.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_reverse_shell_incident(
+            Some("ssh"),
+            "\u{0}\u{5}\u{ff}", // corrupted task->comm
+            "20.26.156.215",
+            22,
+        );
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            dismissed,
+            "agent must use source_comm when comm is corrupted"
         );
     }
 
