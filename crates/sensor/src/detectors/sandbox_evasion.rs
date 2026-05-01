@@ -283,6 +283,41 @@ mod tests {
         }
     }
 
+    fn cmdline_exec(pid: u32, cmdline: &str, ts: DateTime<Utc>) -> Event {
+        Event {
+            ts,
+            host: "test".into(),
+            source: "exec_audit".into(),
+            kind: "shell.command_exec".into(),
+            severity: Severity::Info,
+            summary: String::new(),
+            details: serde_json::json!({
+                "pid": pid,
+                "cmdline": cmdline,
+                "comm": "suspicious_bin",
+            }),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
+    fn prctl_event(pid: u32, ts: DateTime<Utc>) -> Event {
+        Event {
+            ts,
+            host: "test".into(),
+            source: "ebpf".into(),
+            kind: "process.prctl".into(),
+            severity: Severity::Info,
+            summary: String::new(),
+            details: serde_json::json!({
+                "pid": pid,
+                "comm": "suspicious_bin",
+            }),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_detects_vm_check_burst() {
         let mut det = SandboxEvasionDetector::new("host1", 3, 60);
@@ -316,5 +351,140 @@ mod tests {
         let now = Utc::now();
         // Single check is normal (sysadmin running lspci)
         assert!(det.process(&cmd_exec(1234, "lspci", now)).is_none());
+    }
+
+    #[test]
+    fn detects_vm_command_from_cmdline_fallback() {
+        let mut det = SandboxEvasionDetector::new("host1", 1, 60);
+        let now = Utc::now();
+
+        let inc = det
+            .process(&cmdline_exec(1234, "/usr/bin/dmidecode --type bios", now))
+            .expect("vm command in cmdline should trigger at threshold 1");
+
+        assert_eq!(inc.severity, Severity::High);
+        let checks = inc
+            .evidence
+            .get("check_types")
+            .and_then(|v| v.as_array())
+            .expect("incident should include check types");
+        assert!(checks
+            .iter()
+            .any(|check| check.as_str().is_some_and(|s| s.starts_with("vm_command:"))));
+    }
+
+    #[test]
+    fn detects_analysis_process_lookup() {
+        let mut det = SandboxEvasionDetector::new("host1", 1, 60);
+        let now = Utc::now();
+
+        let inc = det
+            .process(&cmd_exec(1234, "pgrep -af strace", now))
+            .expect("analysis process lookup should trigger");
+
+        assert_eq!(
+            inc.evidence["check_types"][0],
+            serde_json::json!("analysis_process_check")
+        );
+    }
+
+    #[test]
+    fn detects_tracerpid_and_prctl_checks() {
+        let mut det = SandboxEvasionDetector::new("host1", 2, 60);
+        let now = Utc::now();
+
+        assert!(det
+            .process(&cmd_exec(1234, "grep TracerPid /proc/self/status", now))
+            .is_none());
+        let inc = det
+            .process(&prctl_event(1234, now + Duration::seconds(1)))
+            .expect("anti-debug plus prctl should reach threshold");
+
+        let checks = inc.evidence["check_types"]
+            .as_array()
+            .expect("check_types should be an array");
+        assert!(checks.contains(&serde_json::json!("anti_debug_check")));
+        assert!(checks.contains(&serde_json::json!("ptrace_check")));
+    }
+
+    #[test]
+    fn ignores_events_without_pid() {
+        let mut det = SandboxEvasionDetector::new("host1", 1, 60);
+        let mut ev = cmd_exec(0, "systemd-detect-virt", Utc::now());
+        ev.details.as_object_mut().unwrap().remove("pid");
+
+        assert!(det.process(&ev).is_none());
+    }
+
+    #[test]
+    fn skips_innerwarden_processes() {
+        let mut det = SandboxEvasionDetector::new("host1", 1, 60);
+        let mut ev = file_read(1234, "/sys/class/dmi/id/product_name", Utc::now());
+        ev.details["uid"] = serde_json::json!(998);
+        ev.details["comm"] = serde_json::json!("tokio-rt-worker");
+
+        assert!(det.process(&ev).is_none());
+    }
+
+    #[test]
+    fn repeated_same_check_does_not_reach_unique_threshold() {
+        let mut det = SandboxEvasionDetector::new("host1", 2, 60);
+        let now = Utc::now();
+
+        assert!(det
+            .process(&file_read(1234, "/sys/class/dmi/id/product_name", now))
+            .is_none());
+        assert!(det
+            .process(&file_read(
+                1234,
+                "/sys/class/dmi/id/product_name",
+                now + Duration::seconds(1)
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn cooldown_suppresses_duplicate_alerts_until_window_expires() {
+        let mut det = SandboxEvasionDetector::new("host1", 2, 60);
+        let now = Utc::now();
+
+        assert!(det
+            .process(&file_read(1234, "/sys/class/dmi/id/product_name", now))
+            .is_none());
+        assert!(det
+            .process(&cmd_exec(
+                1234,
+                "systemd-detect-virt",
+                now + Duration::seconds(1)
+            ))
+            .is_some());
+        assert!(det
+            .process(&prctl_event(1234, now + Duration::seconds(2)))
+            .is_none());
+
+        assert!(det
+            .process(&file_read(
+                1234,
+                "/sys/class/dmi/id/sys_vendor",
+                now + Duration::seconds(61)
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn stale_checks_are_pruned_before_threshold_count() {
+        let mut det = SandboxEvasionDetector::new("host1", 2, 60);
+        let now = Utc::now();
+
+        assert!(det
+            .process(&file_read(1234, "/sys/class/dmi/id/product_name", now))
+            .is_none());
+        assert!(det
+            .process(&cmd_exec(
+                1234,
+                "systemd-detect-virt",
+                now + Duration::seconds(61)
+            ))
+            .is_none());
     }
 }
