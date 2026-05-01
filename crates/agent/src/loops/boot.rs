@@ -598,6 +598,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     // incident-driven sends).
                     let audit_path = cli.data_dir.join("telegram-sent.jsonl");
                     c.set_audit_jsonl_path(audit_path.clone());
+                    // 2026-05-01: parallel durable record of FAILED
+                    // sends. Operator queries this file to find
+                    // messages that the system intended to send but
+                    // could not (HTTP transport, JSON parse, API
+                    // ok=false). See client.rs::audit_failed_send.
+                    c.set_failed_jsonl_path(cli.data_dir.join("telegram-failed.jsonl"));
                     if cfg.telegram.dev_mode {
                         c.dev_mode = true;
                         info!("Telegram dev mode ON — FP review button on every notification");

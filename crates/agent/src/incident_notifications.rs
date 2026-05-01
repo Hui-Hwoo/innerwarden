@@ -4,7 +4,7 @@ use tracing::{info, warn};
 
 use crate::agent_context::guardian_mode;
 use crate::config::ChannelFilterLevel;
-use crate::notification_pipeline::{self, GroupAction};
+use crate::notification_pipeline::{self, FeedbackEvent, GroupAction, SuppressReason};
 use crate::{config, state_store, web_push, webhook, AgentState};
 
 pub(crate) struct NotificationThresholds {
@@ -85,6 +85,7 @@ pub(crate) async fn dispatch_incident_notifications(
             incident_id = %incident.incident_id,
             "notification cooldown: suppressing duplicate alert"
         );
+        record_suppressed(data_dir, incident, SuppressReason::Cooldown);
         return;
     }
 
@@ -95,6 +96,7 @@ pub(crate) async fn dispatch_incident_notifications(
             incident_id = %incident.incident_id,
             "notification suppressed: environment profile (cloud/timing)"
         );
+        record_suppressed(data_dir, incident, SuppressReason::Environment);
         return;
     }
 
@@ -258,6 +260,7 @@ pub(crate) async fn dispatch_incident_notifications(
                 incident_id = %incident.incident_id,
                 "notification grouped: suppressing individual alert"
             );
+            record_suppressed(data_dir, incident, SuppressReason::Grouped);
         }
     }
 
@@ -266,6 +269,48 @@ pub(crate) async fn dispatch_incident_notifications(
         state
             .store
             .set_cooldown(state_store::CooldownTable::Notification, k, now);
+    }
+}
+
+/// 2026-05-01: persist a `Suppressed` feedback event when the
+/// pre-send gate (cooldown / environment / grouped) drops a
+/// notification candidate. The previous audit only recorded `sent`
+/// / `ignored` / `action` — operator question "auditar o que
+/// funciona" had no way to distinguish the three suppression
+/// mechanisms beyond mining INFO logs.
+///
+/// Best-effort: a write failure logs WARN but does not change the
+/// caller's behaviour. The notification was already correctly
+/// suppressed; the audit gap is recoverable from the journald log.
+fn record_suppressed(
+    data_dir: &Path,
+    incident: &innerwarden_core::incident::Incident,
+    reason: SuppressReason,
+) {
+    use innerwarden_core::entities::EntityType;
+    let detector = incident
+        .incident_id
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    // Pick the primary entity for indexing. Mirrors the on_notification_sent
+    // path which keys on (detector, entity_type) — so suppressed events
+    // align with sent events when an audit tool joins by that pair.
+    let (entity_type, _entity_value) = incident
+        .entities
+        .first()
+        .map(|e| (e.r#type.clone(), e.value.clone()))
+        .unwrap_or((EntityType::Ip, String::new()));
+    let event = FeedbackEvent::Suppressed {
+        ts: chrono::Utc::now(),
+        detector,
+        entity_type,
+        incident_id: incident.incident_id.clone(),
+        reason,
+    };
+    if let Err(e) = notification_pipeline::feedback_store::append(data_dir, &event) {
+        warn!("feedback_store append (suppressed) failed: {e:#}");
     }
 }
 

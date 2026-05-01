@@ -510,6 +510,20 @@ pub(crate) fn is_admin_routine(
 const IGNORE_WINDOW_SECS: i64 = 86_400; // 24h
 const IGNORE_THRESHOLD: u32 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SuppressReason {
+    /// Cooldown table already has this detector+entity within the
+    /// notification window. Subsequent alert is the same threat.
+    Cooldown,
+    /// Environment-aware suppression: cloud timing anomaly, admin
+    /// routine, etc. (`notification_pipeline::should_suppress_for_environment`).
+    Environment,
+    /// Grouping engine identified this as a non-first incident in
+    /// a burst. The group summary will fire later.
+    Grouped,
+}
+
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum FeedbackEvent {
@@ -531,6 +545,22 @@ pub(crate) enum FeedbackEvent {
         detector: String,
         entity_type: EntityType,
         action: String,
+    },
+    /// 2026-05-01: pre-send suppression. Notification was NOT sent —
+    /// the operator should know why. Operator's question
+    /// "auditar o que funciona" (audit what works) needed this — the
+    /// previous audit only had `sent` / `ignored` / `action`, no way
+    /// to tell cooldown from grouping from environment when the
+    /// gate dropped a candidate. The `reason` field distinguishes
+    /// the three suppression mechanisms so the operator (or a tuning
+    /// tool) can see "the gate is too aggressive on Cooldown but
+    /// correct on Grouped" without mining INFO logs.
+    Suppressed {
+        ts: DateTime<Utc>,
+        detector: String,
+        entity_type: EntityType,
+        incident_id: String,
+        reason: SuppressReason,
     },
 }
 
@@ -701,6 +731,13 @@ impl FeedbackTracker {
             } => {
                 let key = (detector.clone(), entity_type.clone());
                 self.ignored_tally.remove(&key);
+            }
+            FeedbackEvent::Suppressed { .. } => {
+                // Pre-send suppression does not affect the
+                // ignored-tally state machine — the notification
+                // never reached the operator, so we can't classify
+                // it as ignored. Replayed only for completeness of
+                // the JSONL audit trail.
             }
         }
     }
@@ -1718,5 +1755,104 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert!(matches!(loaded[0], FeedbackEvent::Sent { .. }));
         assert!(matches!(loaded[1], FeedbackEvent::Action { .. }));
+    }
+
+    /// 2026-05-01: regression for the audit gap. Pre-fix the
+    /// notification-feedback.jsonl carried only `sent` / `ignored`
+    /// / `action` — operator could not distinguish cooldown from
+    /// grouping from environment-aware suppression. The new
+    /// `Suppressed { reason }` variant covers the three pre-send
+    /// gates.
+    #[test]
+    fn feedback_event_suppressed_round_trip_through_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![
+            FeedbackEvent::Suppressed {
+                ts: Utc::now(),
+                detector: "ssh_bruteforce".into(),
+                entity_type: EntityType::Ip,
+                incident_id: "ssh:bf:1".into(),
+                reason: SuppressReason::Cooldown,
+            },
+            FeedbackEvent::Suppressed {
+                ts: Utc::now(),
+                detector: "proto_anomaly".into(),
+                entity_type: EntityType::Ip,
+                incident_id: "proto:1".into(),
+                reason: SuppressReason::Grouped,
+            },
+            FeedbackEvent::Suppressed {
+                ts: Utc::now(),
+                detector: "data_exfil_cmd".into(),
+                entity_type: EntityType::Ip,
+                incident_id: "exfil:1".into(),
+                reason: SuppressReason::Environment,
+            },
+        ];
+        feedback_store::append_many(dir.path(), &events).unwrap();
+        let loaded = feedback_store::load(dir.path());
+        assert_eq!(loaded.len(), 3);
+        let reasons: Vec<SuppressReason> = loaded
+            .iter()
+            .filter_map(|e| match e {
+                FeedbackEvent::Suppressed { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                SuppressReason::Cooldown,
+                SuppressReason::Grouped,
+                SuppressReason::Environment,
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_event_suppressed_serializes_reason_as_snake_case() {
+        // The JSONL file is operator-readable. Serialization must
+        // produce stable lowercase snake_case so a future audit tool
+        // can grep without language-specific quirks.
+        let event = FeedbackEvent::Suppressed {
+            ts: Utc::now(),
+            detector: "x".into(),
+            entity_type: EntityType::Ip,
+            incident_id: "x:1".into(),
+            reason: SuppressReason::Cooldown,
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(
+            line.contains("\"kind\":\"suppressed\""),
+            "kind tag must be snake_case 'suppressed', got: {line}"
+        );
+        assert!(
+            line.contains("\"reason\":\"cooldown\""),
+            "reason must be snake_case 'cooldown', got: {line}"
+        );
+    }
+
+    #[test]
+    fn replay_event_does_not_double_count_suppressed() {
+        // A Suppressed event represents a notification that NEVER
+        // reached the operator. It must NOT bump the ignored_tally
+        // (that semantic is for sent-then-ignored), otherwise the
+        // demote-to-daily-briefing path triggers on threats the
+        // operator never saw.
+        let mut tracker = FeedbackTracker::new();
+        let event = FeedbackEvent::Suppressed {
+            ts: Utc::now(),
+            detector: "ssh_bruteforce".into(),
+            entity_type: EntityType::Ip,
+            incident_id: "ssh:bf:1".into(),
+            reason: SuppressReason::Cooldown,
+        };
+        tracker.replay_event(&event, Utc::now());
+        let key = ("ssh_bruteforce".to_string(), EntityType::Ip);
+        assert_eq!(
+            tracker.ignored_tally.get(&key).copied().unwrap_or(0),
+            0,
+            "Suppressed events must not increment ignored_tally"
+        );
     }
 }

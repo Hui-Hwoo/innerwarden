@@ -53,6 +53,16 @@ pub struct TelegramClient {
     /// tool at without relying on journalctl retention. Set via
     /// `set_audit_jsonl_path` from the boot wiring.
     audit_jsonl: Option<PathBuf>,
+    /// 2026-05-01: parallel JSONL of every send that FAILED (HTTP
+    /// error, JSON parse error, Telegram API non-ok). Lives at
+    /// `data_dir/telegram-failed.jsonl`. Pre-fix the integrity
+    /// alerts and daily digests and manual approvals that hit a
+    /// transient HTTP failure were silently lost. The WARN log was
+    /// the only trace and journald rotation killed it within days.
+    /// Now the operator has a durable record of "what was meant to
+    /// send but didn't", which is the input for any retry/replay
+    /// tool. Each line: `{ts, method, text, chat_id, error}`.
+    failed_jsonl: Option<PathBuf>,
 }
 
 /// 2026-05-01: append a single JSON record as one line to `path`.
@@ -126,6 +136,7 @@ impl TelegramClient {
             mock_outbox,
             telegram_sent_counter: None,
             audit_jsonl: None,
+            failed_jsonl: None,
         })
     }
 
@@ -135,6 +146,14 @@ impl TelegramClient {
     /// audit is journald-only.
     pub fn set_audit_jsonl_path(&mut self, path: PathBuf) {
         self.audit_jsonl = Some(path);
+    }
+
+    /// Wire the durable failed-send log path (typically
+    /// `data_dir/telegram-failed.jsonl`). Called once at boot. When
+    /// unset, send failures only emit a WARN log (lossy under log
+    /// rotation).
+    pub fn set_failed_jsonl_path(&mut self, path: PathBuf) {
+        self.failed_jsonl = Some(path);
     }
 
     /// Returns true when this client is intercepting outbound HTTP to a mock
@@ -1582,27 +1601,39 @@ impl TelegramClient {
         }
 
         let url = self.api_url(method);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("Telegram {method} failed ({})", sanitize_url(&url)))?
-            .json::<serde_json::Value>()
-            .await
-            .with_context(|| {
-                format!(
+        // 2026-05-01: capture send failures into telegram-failed.jsonl
+        // before propagating the error. Three failure modes are caught:
+        //   1. HTTP transport failure (network, TLS, timeout)
+        //   2. Response body not valid JSON
+        //   3. Telegram API returns ok=false (rate limit, bad token,
+        //      chat not found, etc.)
+        // Each writes one record so the operator can audit "what was
+        // meant to send but didn't" without scraping journald.
+        let raw_resp = match self.http.post(&url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                self.audit_failed_send(method, &body, &format!("http error: {e}"));
+                return Err(anyhow::Error::new(e)
+                    .context(format!("Telegram {method} failed ({})", sanitize_url(&url))));
+            }
+        };
+        let resp = match raw_resp.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(e) => {
+                self.audit_failed_send(method, &body, &format!("json parse error: {e}"));
+                return Err(anyhow::Error::new(e).context(format!(
                     "Telegram {method} JSON parse failed ({})",
                     sanitize_url(&url)
-                )
-            })?;
+                )));
+            }
+        };
 
         if !resp["ok"].as_bool().unwrap_or(false) {
             let desc = resp["description"]
                 .as_str()
                 .unwrap_or("unknown Telegram error");
             warn!(method, url = %sanitize_url(&url), "Telegram API error: {desc}");
+            self.audit_failed_send(method, &body, &format!("api ok=false: {desc}"));
         } else if method == "sendMessage" {
             if let Some(counter) = &self.telegram_sent_counter {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1610,6 +1641,37 @@ impl TelegramClient {
         }
 
         Ok(resp)
+    }
+
+    /// Append a failed-send record to `data_dir/telegram-failed.jsonl`.
+    /// Best-effort; a write failure here logs WARN but does not
+    /// propagate (the call already failed for a different reason and
+    /// hiding that reason behind a logging failure helps no one).
+    fn audit_failed_send(&self, method: &str, body: &serde_json::Value, error: &str) {
+        let Some(path) = &self.failed_jsonl else {
+            return;
+        };
+        if method != "sendMessage" {
+            // Only sendMessage failures are operator-visible; don't
+            // pollute the file with reaction / poll / typing errors.
+            return;
+        }
+        let text = body["text"].as_str().unwrap_or("");
+        let record = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "method": method,
+            "chat_id": self.chat_id,
+            "text": text,
+            "has_keyboard": body.get("reply_markup").is_some(),
+            "error": error,
+        });
+        if let Err(e) = append_jsonl_line(path, &record) {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "telegram failed-send jsonl write failed (non-fatal)"
+            );
+        }
     }
 }
 
@@ -1841,6 +1903,7 @@ mod tests {
             mock_outbox: None,
             telegram_sent_counter: None,
             audit_jsonl: None,
+            failed_jsonl: None,
         })
     }
 
@@ -3056,5 +3119,54 @@ mod tests {
         let parsed2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(parsed1["a"], 1);
         assert_eq!(parsed2["a"], 2);
+    }
+
+    /// 2026-05-01: regression for the silent-failure gap. Pre-fix, a
+    /// telegram send that hit an HTTP error logged WARN to journald
+    /// and dropped the message — operator had no durable record of
+    /// "what was meant to send but didn't". The integrity alerts +
+    /// daily digests + manual approvals on a transient network blip
+    /// were lost within journald's rotation window.
+    ///
+    /// Test setup: route the client through a non-routable URL so
+    /// the send fails. Confirm `telegram-failed.jsonl` captures
+    /// the original message + the error.
+    #[tokio::test]
+    async fn telegram_failed_jsonl_records_http_failure() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Don't enable mock mode — we WANT the real HTTP path so the
+        // failure path executes. Point the client at a non-routable
+        // address that will refuse the connection immediately.
+        let mut client = TelegramClient::new("dummy-token", "dummy-chat", None)?;
+        let failed_path = dir.path().join("telegram-failed.jsonl");
+        client.set_failed_jsonl_path(failed_path.clone());
+        // Point the http client at a non-existent loopback port to
+        // force a connection refused. The TelegramClient uses
+        // `api.telegram.org` by default, but we override the
+        // resolution by replacing self.http with a client that
+        // resolves api.telegram.org to an unused localhost port.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .resolve(
+                "api.telegram.org",
+                std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            )
+            .build()?;
+        client.http = http;
+        // Send must error.
+        let result = client.send_text_message("operator integrity alert").await;
+        assert!(result.is_err(), "send to dead address must fail");
+        // The failed-jsonl file must exist with one record.
+        let content = std::fs::read_to_string(&failed_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one failure record per failed send");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0])?;
+        assert_eq!(parsed["method"], "sendMessage");
+        assert_eq!(parsed["text"], "operator integrity alert");
+        assert!(parsed["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("http error"));
+        Ok(())
     }
 }
