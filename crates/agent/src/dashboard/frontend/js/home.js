@@ -211,7 +211,17 @@ function openTopCritical(event) {
     matchType(['process']);
   if (pivotEntity) {
     var pivotKind = String(pivotEntity.type).toLowerCase();
-    setTimeout(function() { loadJourney(pivotKind, pivotEntity.value); }, 30);
+    // 2026-05-02 audit (release ladder f.): pass the incident_id to
+    // loadJourney so the timeline opens scrolled to the matching
+    // chapter and flashes a highlight on it. Pre-fix Review pivoted
+    // by IP only, which landed the operator at the top of a (often
+    // long) journey for that IP — the operator could see the right
+    // attacker but had to scan to find which incident the alert was
+    // actually about.
+    var focusIncidentId = top.incident_id || null;
+    setTimeout(function() {
+      loadJourney(pivotKind, pivotEntity.value, focusIncidentId);
+    }, 30);
   } else {
     // No actionable subject on this incident — reset the journey
     // panel to the empty state so a previously-loaded journey for

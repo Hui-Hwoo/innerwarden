@@ -489,8 +489,19 @@ function renderEntryGroup(group, gIdx) {
   // Singleton (no incident dedup) — render exactly the legacy way.
   // Preserves the operator-visible appearance for events that don't
   // belong to any incident.
+  //
+  // 2026-05-02 (release ladder f. — Home critical-alert deeplink):
+  // wrap singletons that carry a group key (i.e. an incident_id) in
+  // a thin <div data-group-key> so the deeplink scroll-to-incident
+  // selector in loadJourney finds them. Without this, the deeplink
+  // only matched grouped (multi-member) incidents and silently
+  // missed the singleton cases.
   if (!group.members || group.members.length === 0) {
-    return renderEntry(group.lead, gIdx);
+    var inner = renderEntry(group.lead, gIdx);
+    if (group.key) {
+      return '<div class="tl-singleton" data-group-key="' + esc(group.key) + '">' + inner + '</div>';
+    }
+    return inner;
   }
   const memberCount = group.members.length;
   const memberHtml = group.members
@@ -539,7 +550,7 @@ function toggleEntry(idx) {
 }
 
 
-async function loadJourney(subjectType, subjectValue) {
+async function loadJourney(subjectType, subjectValue, focusIncidentId) {
   state.selected = { type: subjectType, value: subjectValue };
   syncFiltersFromUi();
   syncUrl();
@@ -877,6 +888,26 @@ async function loadJourney(subjectType, subjectValue) {
 
     html += '</div></div>';
     document.getElementById('journeyContent').innerHTML = html;
+
+    // 2026-05-02 audit (release ladder f.): if a specific incident_id
+    // was passed (typically from Home's critical-alert "Review →"
+    // banner), find the matching group in the rendered timeline and
+    // scroll it into view + flash a highlight. Falls back silently
+    // when the incident_id isn't in the visible groups (e.g. the
+    // operator filtered it out via the journey filters).
+    if (focusIncidentId) {
+      var safeKey = (window.CSS && CSS.escape) ? CSS.escape(focusIncidentId) : focusIncidentId;
+      var match = document.querySelector(
+        'div.tl-group[data-group-key="' + safeKey + '"], div.tl-singleton[data-group-key="' + safeKey + '"]'
+      );
+      if (match) {
+        match.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        match.classList.add('tl-deeplink-flash');
+        setTimeout(function() {
+          if (match) match.classList.remove('tl-deeplink-flash');
+        }, 2400);
+      }
+    }
 
     // Load mini-graph for this subject
     loadJourneyGraph(subjectType, subjectValue);

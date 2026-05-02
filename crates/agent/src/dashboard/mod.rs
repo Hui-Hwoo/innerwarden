@@ -29,6 +29,9 @@ mod threat_contract;
 #[cfg(test)]
 mod consistency_block_counts;
 
+#[cfg(test)]
+mod consistency_incidents_today;
+
 #[allow(unused_imports)]
 use actions::*;
 #[allow(unused_imports)]
@@ -3314,6 +3317,66 @@ mod tests {
         );
         // The branch that calls loadJourney must be reachable.
         assert!(JS_SSE.contains("loadJourney('ip', alertIp)"));
+    }
+
+    #[test]
+    fn home_critical_banner_deeplink_passes_incident_id_to_journey() {
+        // 2026-05-02 audit (release ladder f.): when the operator
+        // clicks "Review →" on the Home critical-alert banner, the
+        // resulting Threats journey must scroll to the specific
+        // incident the banner referred to and flash a highlight on
+        // it. Pre-fix the click pivoted by IP only, leaving the
+        // operator at the top of a long journey for that IP.
+
+        // Home: openTopCritical extracts top.incident_id and passes it
+        // as the third arg to loadJourney.
+        assert!(
+            JS_HOME.contains("var focusIncidentId = top.incident_id || null"),
+            "home.js::openTopCritical must extract incident_id from the cached top critical \
+             alert (audit release ladder f.)"
+        );
+        assert!(
+            JS_HOME.contains("loadJourney(pivotKind, pivotEntity.value, focusIncidentId)"),
+            "home.js must thread focusIncidentId through to loadJourney as the third arg"
+        );
+
+        // Journey: loadJourney accepts the third arg, scrolls the
+        // matching group into view, and applies the flash class.
+        assert!(
+            JS_JOURNEY
+                .contains("async function loadJourney(subjectType, subjectValue, focusIncidentId)"),
+            "journey.js::loadJourney must accept focusIncidentId as its third parameter"
+        );
+        assert!(
+            JS_JOURNEY.contains("scrollIntoView({ behavior: 'smooth', block: 'center' })"),
+            "journey.js must scroll the matched incident into view on deeplink"
+        );
+        assert!(
+            JS_JOURNEY.contains("tl-deeplink-flash"),
+            "journey.js must apply the deeplink flash class so the operator's eye lands on \
+             the correct incident"
+        );
+
+        // Singletons must be wrappable so the selector finds them too.
+        assert!(
+            JS_JOURNEY.contains("div class=\"tl-singleton\" data-group-key="),
+            "journey.js::renderEntryGroup must wrap singleton incident entries with a \
+             data-group-key attribute so the deeplink selector matches them"
+        );
+
+        // Selector matches both grouped and singleton incidents.
+        assert!(
+            JS_JOURNEY.contains("div.tl-group[data-group-key=")
+                && JS_JOURNEY.contains("div.tl-singleton[data-group-key="),
+            "journey.js deeplink selector must match both .tl-group and .tl-singleton — \
+             singleton incidents (no related entries) deeplink the same way as grouped ones"
+        );
+
+        // CSS keyframe animation defined.
+        assert!(
+            APP_CSS.contains("@keyframes tlDeeplinkFlash"),
+            "app.css must define the tlDeeplinkFlash keyframe animation"
+        );
     }
 
     #[test]

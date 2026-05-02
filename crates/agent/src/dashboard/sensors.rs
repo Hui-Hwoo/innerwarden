@@ -74,6 +74,20 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
     build_sensors_payload(&state.knowledge_graph, &state.data_dir, None)
 }
 
+/// Test-only re-export of `build_sensors_payload` for the cross-surface
+/// SoT anchor in `consistency_incidents_today.rs`. Production code
+/// reaches this through `api_sensors` / `api_sensors_inner`; routing
+/// the test through the public function avoids a `pub(super)` visibility
+/// bump on the implementation that would leak into release builds.
+#[cfg(test)]
+pub(super) fn tests_only_call_build_sensors_payload(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    data_dir: &std::path::Path,
+    snapshot: Option<&super::types::OverviewSnapshot>,
+) -> serde_json::Value {
+    build_sensors_payload(kg, data_dir, snapshot)
+}
+
 fn build_sensors_payload(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &std::path::Path,
