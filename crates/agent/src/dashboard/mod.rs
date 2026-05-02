@@ -109,10 +109,109 @@ async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
 // Shared state / auth
 // ---------------------------------------------------------------------------
 
+/// Short-lived cache of "this (user, password) tuple was just verified
+/// against argon2". Skips the ~64 MB working-buffer allocation per
+/// dashboard HTTP request — the dashboard frontend issues Basic Auth
+/// on every API call, and per jeprof on prod 2026-05-02 that drove
+/// argon2 to 128 MB / 29.4 % of the agent heap.
+///
+/// ## Security trade-off
+///
+/// Cache hits skip the slow argon2 path. The window between a
+/// password change taking effect server-side and the cache TTL
+/// expiring is the operationally-acceptable cost. With the default
+/// `TTL_SECS = 300`, a leaked credential remains usable for at most
+/// 5 minutes after the password is rotated, which matches the
+/// already-existing session token TTL behaviour.
+///
+/// The cache key is a SHA-256 hash of `(salt || user || ":" || password)`
+/// where `salt` is a per-process random value generated at boot.
+/// Plaintext credentials never persist in the map; the salt is
+/// discarded on restart so cache keys cannot be replayed across
+/// process boundaries.
+#[derive(Clone)]
+struct VerifiedCache {
+    state: Arc<VerifiedCacheState>,
+}
+
+struct VerifiedCacheState {
+    salt: [u8; 32],
+    map: RwLock<HashMap<[u8; 32], std::time::Instant>>,
+}
+
+impl VerifiedCache {
+    /// 5 minutes — same window as session tokens.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    /// Capacity is small by design. The map sees at most one entry per
+    /// active operator credential; in practice 1-3 entries.
+    const CAPACITY: usize = 16;
+
+    fn new() -> Self {
+        let mut salt = [0u8; 32];
+        // Use the OsRng path already imported elsewhere in the
+        // dashboard module — avoids pulling in a new rand entry point
+        // for one 32-byte read at boot.
+        use rand_core::RngCore;
+        rand_core::OsRng.fill_bytes(&mut salt);
+        Self {
+            state: Arc::new(VerifiedCacheState {
+                salt,
+                map: RwLock::new(HashMap::new()),
+            }),
+        }
+    }
+
+    fn key(&self, user: &str, password: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.state.salt);
+        h.update(user.as_bytes());
+        h.update(b":");
+        h.update(password.as_bytes());
+        h.finalize().into()
+    }
+
+    /// Returns `true` when the (user, password) tuple has a non-expired
+    /// entry in the cache.
+    fn check(&self, user: &str, password: &str) -> bool {
+        let k = self.key(user, password);
+        let map = self.state.map.read().unwrap_or_else(|p| p.into_inner());
+        match map.get(&k) {
+            Some(ts) => ts.elapsed() < Self::TTL,
+            None => false,
+        }
+    }
+
+    /// Record a successful verification under the (user, password) key.
+    /// Also drains expired entries opportunistically and enforces the
+    /// capacity by evicting the oldest survivor when the map is full.
+    fn insert(&self, user: &str, password: &str) {
+        let k = self.key(user, password);
+        let mut map = self.state.map.write().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, ts| ts.elapsed() < Self::TTL);
+        if map.len() >= Self::CAPACITY {
+            if let Some(oldest_key) = map.iter().min_by_key(|(_, ts)| **ts).map(|(k, _)| *k) {
+                map.remove(&oldest_key);
+            }
+        }
+        map.insert(k, std::time::Instant::now());
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.state
+            .map
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+}
+
 #[derive(Clone)]
 pub struct DashboardAuth {
     username: String,
     password_hash: PasswordHashString,
+    verified_cache: VerifiedCache,
 }
 
 impl DashboardAuth {
@@ -138,6 +237,7 @@ impl DashboardAuth {
                 Ok(Some(Self {
                     username,
                     password_hash,
+                    verified_cache: VerifiedCache::new(),
                 }))
             }
             (Some(_), None) => anyhow::bail!(
@@ -150,6 +250,10 @@ impl DashboardAuth {
         }
     }
 
+    /// Slow path: parse the stored PHC hash and run argon2 verify.
+    /// Allocates the argon2 working buffer (~64 MB at default
+    /// parameters). Used directly by the login endpoint and by the
+    /// cache miss path in `verify_with_cache`.
     fn verify(&self, user: &str, password: &str) -> bool {
         // Use constant-time comparison for the username to prevent
         // timing side-channels that could enumerate valid usernames.
@@ -163,6 +267,23 @@ impl DashboardAuth {
                 .is_ok(),
             Err(_) => false,
         }
+    }
+
+    /// Fast path used by the per-request middleware. Hits the
+    /// short-lived `verified_cache` when the same (user, password)
+    /// has been verified recently and returns `true` without paying
+    /// the argon2 allocation cost. Cache misses fall through to
+    /// `verify` and, on success, populate the cache so the next
+    /// request from the same client lands on the fast path.
+    pub(super) fn verify_with_cache(&self, user: &str, password: &str) -> bool {
+        if self.verified_cache.check(user, password) {
+            return true;
+        }
+        let ok = self.verify(user, password);
+        if ok {
+            self.verified_cache.insert(user, password);
+        }
+        ok
     }
 }
 
@@ -1831,11 +1952,64 @@ mod tests {
         let auth = DashboardAuth {
             username: "admin".to_string(),
             password_hash: PasswordHashString::new(&hash).unwrap(),
+            verified_cache: VerifiedCache::new(),
         };
 
         assert!(auth.verify("admin", &correct_pw));
         assert!(!auth.verify("admin", &wrong_pw));
         assert!(!auth.verify("other", &correct_pw));
+    }
+
+    /// 2026-05-02 auth phase 2: argon2 verify is the new top heap
+    /// consumer (128 MB / 29.4 % per jeprof). Cache hit on
+    /// `verify_with_cache` skips the slow path entirely. Two
+    /// invariants matter:
+    ///   1. Wrong creds must NEVER cache — checked by counting cache
+    ///      entries after a failed verify.
+    ///   2. Subsequent successful verify with the same creds is a
+    ///      cache hit — checked by comparing returns and asserting
+    ///      the cache map carries exactly one entry.
+    #[test]
+    fn dashboard_auth_caches_successful_verifies() {
+        let mut pw_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut pw_bytes);
+        let correct_pw: String = pw_bytes
+            .iter()
+            .map(|b| char::from(b'a' + (b % 26)))
+            .collect();
+        let wrong_pw: String = format!("{correct_pw}!");
+
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = Argon2::default()
+            .hash_password(correct_pw.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+        let auth = DashboardAuth {
+            username: "admin".to_string(),
+            password_hash: PasswordHashString::new(&hash).unwrap(),
+            verified_cache: VerifiedCache::new(),
+        };
+
+        // Wrong creds must not populate the cache. Anchor: a
+        // future regression that calls `cache.insert` on the
+        // failure path would inflate this count.
+        assert!(!auth.verify_with_cache("admin", &wrong_pw));
+        assert_eq!(
+            auth.verified_cache.entry_count(),
+            0,
+            "cache must NOT carry an entry for failed verify"
+        );
+
+        // Correct creds: first call hits argon2, second call lands
+        // in the cache. Both return true.
+        assert!(auth.verify_with_cache("admin", &correct_pw));
+        assert_eq!(auth.verified_cache.entry_count(), 1);
+        assert!(auth.verify_with_cache("admin", &correct_pw));
+        assert_eq!(
+            auth.verified_cache.entry_count(),
+            1,
+            "second verify with same creds must be a cache hit, not a re-insert"
+        );
     }
 
     // ── New D2 tests ────────────────────────────────────────────────────

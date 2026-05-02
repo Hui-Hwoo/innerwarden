@@ -248,7 +248,10 @@ pub(super) async fn require_auth(
     let Some((user, password)) = parse_basic_auth(raw_header) else {
         return unauthorized_response();
     };
-    if !auth.verify(&user, &password) {
+    // Per-request hot path: skip the ~64 MB argon2 working buffer
+    // when the same credentials have been verified in the last
+    // 5 minutes. Falls back to the slow path on cache miss.
+    if !auth.verify_with_cache(&user, &password) {
         let blocked = check_and_record_failed_login(&client_ip);
         if blocked {
             warn!(
@@ -339,8 +342,11 @@ pub(super) async fn api_auth_login(
         return unauthorized_response();
     };
 
-    // Verify credentials
-    if !auth.verify(&user, &password) {
+    // Verify credentials. The login endpoint is rare in practice
+    // (one call per session) but uses the cached verifier for
+    // consistency: if the operator just authed via the per-request
+    // middleware path, this hit is free.
+    if !auth.verify_with_cache(&user, &password) {
         let blocked = check_and_record_failed_login(&client_ip);
         if blocked {
             warn!(
