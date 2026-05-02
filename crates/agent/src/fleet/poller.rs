@@ -58,7 +58,7 @@ pub fn spawn(state: FleetState, cfg: Arc<FleetConfig>) -> tokio::task::JoinHandl
         loop {
             ticker.tick().await;
             for host in &cfg.hosts {
-                match poll_one(&client, host).await {
+                match poll_with_refresh(&client, host, &state).await {
                     Ok(overview) => {
                         // The spoke's own SystemHealth flips this
                         // entry into `Degraded` so the fleet card
@@ -85,24 +85,60 @@ pub fn spawn(state: FleetState, cfg: Arc<FleetConfig>) -> tokio::task::JoinHandl
     })
 }
 
-/// Probe one spoke. Pure helper for unit-testability: given a
-/// reqwest client + a host config, returns the parsed overview
-/// snapshot on success and an error on every failure mode (timeout,
-/// DNS, transport, non-2xx, missing required fields).
-///
-/// The body is parsed defensively: missing optional fields default
-/// to zero / None so a manager talking to an older or newer spoke
-/// version still produces a usable `FleetHostOverview`. Only the
-/// `date` field is required.
-async fn poll_one(
+/// Phase 4: poll a spoke and transparently refresh the bearer token
+/// on 401. The retry happens at most once per cycle: a second 401
+/// with a freshly-issued token signals a real auth failure (operator
+/// rotated the password without updating the env, the spoke's user
+/// store changed, etc.) and is surfaced as `Down` rather than
+/// looped on.
+async fn poll_with_refresh(
     client: &reqwest::Client,
     host: &FleetHostConfig,
+    state: &FleetState,
+) -> anyhow::Result<FleetHostOverview> {
+    let bearer = state.bearer_for(&host.id);
+    match poll_one_with_bearer(client, host, bearer.as_deref()).await {
+        Ok(overview) => Ok(overview),
+        Err(e) => {
+            // Only the 401 path triggers refresh — every other
+            // failure (timeout, transport, 5xx, parse) propagates
+            // unchanged so the caller marks the host Down.
+            let msg = format!("{e:#}");
+            if !msg.contains("HTTP 401") {
+                return Err(e);
+            }
+            // Refresh requires both username + password env vars.
+            // Hosts using a static `token_env` only stay in their
+            // current state if the token expires; the operator
+            // upgrades them by adding username/password env vars.
+            if host.username_env.is_empty() || host.password_env.is_empty() {
+                return Err(e);
+            }
+            let user = std::env::var(&host.username_env).unwrap_or_default();
+            let pass = std::env::var(&host.password_env).unwrap_or_default();
+            if user.is_empty() || pass.is_empty() {
+                return Err(e);
+            }
+            let new_bearer = login_to_spoke(client, host, &user, &pass).await?;
+            state.set_bearer(&host.id, new_bearer.clone());
+            poll_one_with_bearer(client, host, Some(&new_bearer)).await
+        }
+    }
+}
+
+/// Probe one spoke with an explicit bearer (or none). Splits the
+/// auth concern out of `poll_one` so the refresh path can call it
+/// twice with different tokens.
+async fn poll_one_with_bearer(
+    client: &reqwest::Client,
+    host: &FleetHostConfig,
+    bearer: Option<&str>,
 ) -> anyhow::Result<FleetHostOverview> {
     let url = format!("{}/api/overview", host.url.trim_end_matches('/'));
     let mut req = client.get(&url);
-    if !host.token_env.is_empty() {
-        if let Ok(token) = std::env::var(&host.token_env) {
-            req = req.bearer_auth(token);
+    if let Some(t) = bearer {
+        if !t.is_empty() {
+            req = req.bearer_auth(t);
         }
     }
     let resp = req.send().await?;
@@ -112,6 +148,51 @@ async fn poll_one(
     }
     let body: serde_json::Value = resp.json().await?;
     parse_overview(&body).ok_or_else(|| anyhow::anyhow!("malformed /api/overview body from {url}"))
+}
+
+/// Phase 4: refresh the bearer token by calling
+/// `POST /api/auth/login` with Basic Auth credentials. Returns the
+/// fresh token on success; propagates a structured error on
+/// transport / 401 / malformed-body so the caller can decide
+/// whether to mark the host Down.
+async fn login_to_spoke(
+    client: &reqwest::Client,
+    host: &FleetHostConfig,
+    user: &str,
+    pass: &str,
+) -> anyhow::Result<String> {
+    let url = format!("{}/api/auth/login", host.url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .basic_auth(user, Some(pass))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("login HTTP {} from {}", status.as_u16(), url);
+    }
+    let body: serde_json::Value = resp.json().await?;
+    body.get("token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("login response missing token field from {url}"))
+}
+
+/// Phase 1 entry point preserved for unit tests. Reads the bearer
+/// token from `host.token_env` (if set) and delegates to
+/// `poll_one_with_bearer`. New callers should use
+/// `poll_with_refresh` to get the Phase 4 retry-on-401 behaviour.
+#[cfg(test)]
+async fn poll_one(
+    client: &reqwest::Client,
+    host: &FleetHostConfig,
+) -> anyhow::Result<FleetHostOverview> {
+    let bearer = if !host.token_env.is_empty() {
+        std::env::var(&host.token_env).ok()
+    } else {
+        None
+    };
+    poll_one_with_bearer(client, host, bearer.as_deref()).await
 }
 
 /// Defensive extractor: turn the spoke's `OverviewResponse` JSON
@@ -147,6 +228,8 @@ mod tests {
             id: id.into(),
             url: url.into(),
             token_env: String::new(),
+            username_env: String::new(),
+            password_env: String::new(),
         }
     }
 
@@ -316,5 +399,149 @@ mod tests {
         });
         let o = parse_overview(&body).expect("parses");
         assert_eq!(o.health_kind.as_deref(), Some("ai_not_responding"));
+    }
+
+    // ── Phase 4: login_to_spoke + retry-on-401 ───────────────────────
+
+    #[tokio::test]
+    async fn login_to_spoke_returns_token_on_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/auth/login")
+            .with_status(200)
+            .with_body(r#"{"token":"new-bearer-abc","expires_in_minutes":480}"#)
+            .create_async()
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let h = host("test", &server.url());
+        let token = login_to_spoke(&client, &h, "admin", "secret")
+            .await
+            .expect("login ok");
+        assert_eq!(token, "new-bearer-abc");
+    }
+
+    #[tokio::test]
+    async fn login_to_spoke_returns_err_on_401() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/auth/login")
+            .with_status(401)
+            .create_async()
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let h = host("test", &server.url());
+        let r = login_to_spoke(&client, &h, "wrong", "creds").await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn login_to_spoke_returns_err_when_token_missing() {
+        // A misbehaving spoke (or schema drift) returning 200 with a
+        // body that lacks `token` must surface a structured error so
+        // the caller does not cache an empty bearer.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/auth/login")
+            .with_status(200)
+            .with_body(r#"{"expires_in_minutes":480}"#)
+            .create_async()
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let h = host("test", &server.url());
+        let r = login_to_spoke(&client, &h, "admin", "secret").await;
+        assert!(r.is_err());
+        assert!(format!("{:#}", r.unwrap_err()).contains("missing token"));
+    }
+
+    #[tokio::test]
+    async fn poll_with_refresh_caches_bearer_after_401_retry() {
+        // Anchor the Phase 4 contract: the first /api/overview call
+        // hits 401, the manager refreshes the bearer via /api/auth/login,
+        // the retry succeeds, and the new bearer lands in the cache.
+        let mut server = mockito::Server::new_async().await;
+        // First overview call — no bearer, 401.
+        let _m_first = server
+            .mock("GET", "/api/overview")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(401)
+            .create_async()
+            .await;
+        // Login succeeds.
+        let _m_login = server
+            .mock("POST", "/api/auth/login")
+            .with_status(200)
+            .with_body(r#"{"token":"refreshed-token","expires_in_minutes":480}"#)
+            .create_async()
+            .await;
+        // Retry overview call carrying the new bearer.
+        let _m_second = server
+            .mock("GET", "/api/overview")
+            .match_header("authorization", "Bearer refreshed-token")
+            .with_status(200)
+            .with_body(r#"{"date":"2026-05-02","events_count":5}"#)
+            .create_async()
+            .await;
+
+        // Stash creds in env vars the host config references.
+        std::env::set_var("FLEET_TEST_USER_4", "admin");
+        std::env::set_var("FLEET_TEST_PASS_4", "secret");
+        let host_cfg = FleetHostConfig {
+            id: "test-refresh".into(),
+            url: server.url(),
+            token_env: String::new(),
+            username_env: "FLEET_TEST_USER_4".into(),
+            password_env: "FLEET_TEST_PASS_4".into(),
+        };
+        let state = FleetState::from_config(std::slice::from_ref(&host_cfg));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let r = poll_with_refresh(&client, &host_cfg, &state).await;
+        assert!(r.is_ok(), "refresh path should produce an overview: {r:?}");
+        // Bearer cached — subsequent polls reuse it without calling
+        // login again. The Phase 4 invariant.
+        assert_eq!(
+            state.bearer_for("test-refresh").as_deref(),
+            Some("refreshed-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_refresh_does_not_retry_when_creds_missing() {
+        // Anchor: a host configured with `token_env` only (no
+        // username/password) that hits 401 must NOT loop on login.
+        // It propagates the error so the host is marked Down.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/overview")
+            .with_status(401)
+            .expect_at_most(1)
+            .create_async()
+            .await;
+        let host_cfg = FleetHostConfig {
+            id: "no-refresh".into(),
+            url: server.url(),
+            token_env: String::new(),
+            username_env: String::new(),
+            password_env: String::new(),
+        };
+        let state = FleetState::from_config(std::slice::from_ref(&host_cfg));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let r = poll_with_refresh(&client, &host_cfg, &state).await;
+        assert!(r.is_err(), "401 without creds must NOT retry");
+        assert!(state.bearer_for("no-refresh").is_none());
     }
 }

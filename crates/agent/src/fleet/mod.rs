@@ -101,6 +101,11 @@ pub enum HostState {
 #[derive(Clone)]
 pub struct FleetState {
     inner: Arc<RwLock<HashMap<String, HostStatus>>>,
+    /// Phase 4: in-memory bearer-token cache, keyed by host id. Set
+    /// from `token_env` at boot; refreshed by `login_to_spoke` on
+    /// 401. Plaintext credentials never touch disk; the cache
+    /// resets on process restart.
+    bearer_cache: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl FleetState {
@@ -112,6 +117,7 @@ impl FleetState {
     /// over the next poll cycle.
     pub fn from_config(hosts: &[crate::config::FleetHostConfig]) -> Self {
         let mut map = HashMap::new();
+        let mut bearers = HashMap::new();
         for host in hosts {
             map.insert(
                 host.id.clone(),
@@ -124,10 +130,38 @@ impl FleetState {
                     overview: None,
                 },
             );
+            // Phase 4: prime the bearer cache from `token_env` if
+            // the operator pre-loaded a token. Login-refresh fills
+            // entries lazily for hosts that only set username +
+            // password env vars.
+            if !host.token_env.is_empty() {
+                if let Ok(tok) = std::env::var(&host.token_env) {
+                    if !tok.trim().is_empty() {
+                        bearers.insert(host.id.clone(), tok);
+                    }
+                }
+            }
         }
         Self {
             inner: Arc::new(RwLock::new(map)),
+            bearer_cache: Arc::new(RwLock::new(bearers)),
         }
+    }
+
+    /// Phase 4: read the active bearer token for a host, if any.
+    /// `None` means "no token cached" — the poller will attempt
+    /// login if username/password env vars are configured.
+    pub(crate) fn bearer_for(&self, host_id: &str) -> Option<String> {
+        let map = self.bearer_cache.read().unwrap_or_else(|p| p.into_inner());
+        map.get(host_id).cloned()
+    }
+
+    /// Phase 4: store a freshly-issued bearer token after a
+    /// successful login refresh. Subsequent polls use this token
+    /// until the next 401.
+    pub(crate) fn set_bearer(&self, host_id: &str, token: String) {
+        let mut map = self.bearer_cache.write().unwrap_or_else(|p| p.into_inner());
+        map.insert(host_id.to_string(), token);
     }
 
     /// Returns the current cache as an owned `Vec`, sorted by host id
@@ -254,6 +288,8 @@ mod tests {
             id: id.into(),
             url: url.into(),
             token_env: String::new(),
+            username_env: String::new(),
+            password_env: String::new(),
         }
     }
 

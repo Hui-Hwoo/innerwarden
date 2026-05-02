@@ -241,14 +241,26 @@ pub struct FleetHostConfig {
     pub id: String,
     /// Full URL of the spoke's dashboard, e.g.
     /// `https://prod-eu.example.com:8787`. The poller appends
-    /// `/api/status` to this base.
+    /// `/api/overview` to this base.
     pub url: String,
-    /// Name of the env var holding the bearer token for this spoke.
-    /// Phase 1 reads the token at boot only; Phase 4 wires login
-    /// refresh on 401. Empty string means "no auth header" — useful
-    /// for local testing against an open dashboard.
+    /// Name of the env var holding the **initial** bearer token for
+    /// this spoke. The poller uses this on first contact and falls
+    /// back to login (`username_env` / `password_env`) on 401.
+    /// Empty string means "no initial bearer" — typical when only
+    /// the username/password are set and the manager logs in at
+    /// boot.
     #[serde(default)]
     pub token_env: String,
+    /// Phase 4: env var holding the Basic Auth username for
+    /// session-token refresh. Set together with `password_env` to
+    /// enable the manager to call `POST /api/auth/login` on the
+    /// spoke and re-issue a bearer when the cached one rejects.
+    #[serde(default)]
+    pub username_env: String,
+    /// Phase 4: env var holding the Basic Auth password.
+    /// Plaintext password lives in the env; never on disk.
+    #[serde(default)]
+    pub password_env: String,
 }
 
 impl Default for FleetConfig {
@@ -3519,8 +3531,31 @@ approval_ttl_secs = 300
         assert_eq!(cfg.fleet.hosts[0].url, "https://eu.example.com:8787");
         assert_eq!(cfg.fleet.hosts[0].token_env, "FLEET_TOKEN_EU");
         assert_eq!(cfg.fleet.hosts[1].id, "prod-us");
-        // Missing token_env defaults to empty string, not an error.
+        // Missing token_env / username_env / password_env default to
+        // empty string, not an error. Phase 4 reads username +
+        // password env vars only when they are set; an unconfigured
+        // host stays in static-bearer mode.
         assert!(cfg.fleet.hosts[1].token_env.is_empty());
+        assert!(cfg.fleet.hosts[1].username_env.is_empty());
+        assert!(cfg.fleet.hosts[1].password_env.is_empty());
+    }
+
+    /// Spec 038 Phase 4: the manager consumes a host with
+    /// username/password env vars instead of a static bearer when
+    /// the operator wants automatic login refresh on 401.
+    #[test]
+    fn fleet_phase4_login_refresh_config_parses() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            "[fleet]\nenabled = true\n\
+             [[fleet.hosts]]\nid = \"prod-eu\"\nurl = \"https://eu.example.com:8787\"\nusername_env = \"FLEET_USER_EU\"\npassword_env = \"FLEET_PASS_EU\""
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.fleet.hosts[0].username_env, "FLEET_USER_EU");
+        assert_eq!(cfg.fleet.hosts[0].password_env, "FLEET_PASS_EU");
+        assert!(cfg.fleet.hosts[0].token_env.is_empty());
     }
 
     #[test]

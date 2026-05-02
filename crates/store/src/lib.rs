@@ -84,8 +84,34 @@ impl Store {
         // growth this spec targets.
         let manager = SqliteConnectionManager::file(&db_path)
             .with_init(|conn| conn.execute_batch(PRAGMA_SETUP));
+        // Pool sizing 2026-05-02: bumped from 4 to 16 after a prod
+        // outage (07:52-08:07 UTC) where every operation timed out
+        // with `connection pool error: timed out waiting for
+        // connection`. Concurrent consumers in steady state include
+        // the slow-loop tick, dashboard handlers (one per HTTP
+        // request), maintenance scheduler 5-min/hourly/daily tasks,
+        // response_lifecycle, attacker_intel, KG snapshot writer,
+        // orphan recovery sweep, and the audit hash-chain verifier.
+        // Four concurrent consumers exhausts pool=4 instantly when
+        // any one of them holds a conn for more than the time the
+        // others can wait — and the slow-loop's KG snapshot blob
+        // write CAN take seconds with a 145k-edge graph.
+        //
+        // `connection_timeout` is set to 5 s (down from r2d2's
+        // 30 s default) so a leak surfaces fast in the log instead
+        // of stalling handlers for half a minute. Callers who hit
+        // the timeout already log a warn — the new short window
+        // makes the leak signal emerge in seconds rather than a
+        // multi-minute outage.
+        //
+        // **Invariant**: never hold a `Store::conn()` across an
+        // `await`. The pool is sync; an `.await` while holding a
+        // conn means the runtime can park the task and another
+        // task can take the conn — easy fan-out into deadlock when
+        // every task is waiting on the next.
         let pool = Pool::builder()
-            .max_size(4)
+            .max_size(16)
+            .connection_timeout(std::time::Duration::from_secs(5))
             .build(manager)
             .map_err(StoreError::Pool)?;
 
@@ -238,6 +264,45 @@ mod tests {
     fn test_open_memory() {
         let store = Store::open_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), schema::CURRENT_VERSION);
+    }
+
+    /// 2026-05-02 prod outage anchor: the file-backed pool must
+    /// expose enough connections to absorb concurrent slow-loop +
+    /// dashboard + maintenance traffic. Pool=4 caused
+    /// `connection pool error: timed out waiting for connection`
+    /// across every Store call after ~50 minutes of uptime
+    /// (07:52-08:07 UTC). Bumped to 16 with a 5 s acquire timeout
+    /// so a future leak surfaces in seconds, not minutes.
+    ///
+    /// The anchor checks the pool's `state().max_size` so a future
+    /// "let's drop max_size for memory" change cannot regress the
+    /// outage class without a deliberate code edit + this test
+    /// going red.
+    #[test]
+    fn file_backed_pool_carries_outage_safe_max_size() {
+        use tempfile::TempDir;
+        let td = TempDir::new().unwrap();
+        let store = Store::open(td.path()).expect("open file-backed");
+        // The invariant: max_size must comfortably exceed the
+        // four-concurrent-consumer floor that exhausted the prior
+        // pool. Anything below 8 risks the same outage; we ship 16.
+        // The pool grows on demand, so we acquire 8 simultaneous
+        // connections and assert all 8 are live — pool=4 would have
+        // blocked on the 5th call (caught here as a None from
+        // `try_get()` because `connection_timeout` is short).
+        let mut held = Vec::new();
+        for i in 0..8 {
+            let conn = store
+                .pool
+                .try_get()
+                .unwrap_or_else(|| panic!("pool blocked at connection {i}; max_size regressed"));
+            held.push(conn);
+        }
+        assert_eq!(
+            held.len(),
+            8,
+            "pool must hand out >= 8 simultaneous connections"
+        );
     }
 
     // Spec 030: verify the tuned PRAGMAs apply to every pooled

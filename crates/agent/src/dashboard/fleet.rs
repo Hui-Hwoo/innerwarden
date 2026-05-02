@@ -53,6 +53,8 @@ mod tests {
             id: id.into(),
             url: url.into(),
             token_env: String::new(),
+            username_env: String::new(),
+            password_env: String::new(),
         }
     }
 
