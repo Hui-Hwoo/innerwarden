@@ -389,7 +389,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     );
     info!(router = %ai_router.describe(), "AI router ready");
 
-    if cli.dashboard {
+    // Dashboard spawn is gated by both the CLI flag AND the config
+    // toggle. CLI `--dashboard` is the historical opt-in; the config
+    // field (default `true`) lets the operator switch the dashboard
+    // off without changing the systemd unit's ExecStart line — useful
+    // for headless deployments that share a binary with interactive
+    // installs. Skipping the spawn block also avoids the
+    // agent-guard regex compile (~36 MB live per jeprof 2026-05-02)
+    // and the HTTP/TLS runtime, cutting roughly 50-70 MB RSS.
+    if cli.dashboard && cfg.dashboard.enabled {
         let auth = dashboard::DashboardAuth::try_from_env()?;
         let action_cfg = dashboard::DashboardActionConfig {
             enabled: cfg.responder.enabled,

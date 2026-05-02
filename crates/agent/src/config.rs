@@ -206,6 +206,17 @@ pub struct ConfigSigningConfig {
 /// Dashboard config - trusted proxy IPs and other dashboard-related settings.
 #[derive(Debug, Deserialize)]
 pub struct DashboardConfig {
+    /// Master switch for the embedded dashboard server. Combined with
+    /// the `--dashboard` CLI flag via AND: both must be set for the
+    /// dashboard to spawn. Default: `true`, so existing deploys that
+    /// rely on `--dashboard` alone are unchanged. Operators running
+    /// `innerwarden-agent --dashboard` for ad-hoc checks but who
+    /// want a permanent "headless agent" config can set this to
+    /// `false`. The dashboard load also lazy-allocates the agent-
+    /// guard regex engine (~36 MB live, per jeprof 2026-05-02) and
+    /// the HTTP/TLS runtime — disabling it cuts ~50-70 MB RSS.
+    #[serde(default = "default_dashboard_enabled")]
+    pub enabled: bool,
     /// List of trusted reverse-proxy IPs. Only when the connecting IP is in
     /// this list will X-Forwarded-For / X-Real-IP headers be honoured.
     /// Example: `["127.0.0.1", "::1", "10.0.0.1"]`
@@ -222,11 +233,16 @@ pub struct DashboardConfig {
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
+            enabled: default_dashboard_enabled(),
             trusted_proxies: vec![],
             session_timeout_minutes: default_session_timeout_minutes(),
             max_sessions: default_max_sessions(),
         }
     }
+}
+
+fn default_dashboard_enabled() -> bool {
+    true
 }
 
 fn default_session_timeout_minutes() -> u64 {
@@ -2793,6 +2809,14 @@ mod tests {
     #[test]
     fn defaults_when_no_file() {
         let cfg = load(Path::new("/nonexistent/agent.toml")).unwrap();
+        // Dashboard defaults to enabled so existing deploys that drive
+        // the spawn purely via the `--dashboard` CLI flag stay
+        // unchanged. Operators who want a permanent headless agent
+        // toggle this to false in the config.
+        assert!(
+            cfg.dashboard.enabled,
+            "DashboardConfig.enabled must default to true (back-compat with pre-config-toggle deploys)"
+        );
         assert!(cfg.narrative.enabled);
         assert_eq!(cfg.narrative.keep_days, 7);
         assert!(!cfg.webhook.enabled);
@@ -3368,6 +3392,31 @@ approval_ttl_secs = 300
             (cfg.ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
             "load() must apply clamp so autonomous execution can fire"
         );
+    }
+
+    /// 2026-05-02 follow-up: operators running a shared binary on
+    /// multiple hosts (some with dashboard, some headless) want the
+    /// toggle in TOML, not in the systemd ExecStart line. The boot
+    /// path AND-gates `cli.dashboard && cfg.dashboard.enabled` so
+    /// the config field has real effect: setting `enabled = false`
+    /// keeps the agent-guard regex compile, HTTP/TLS runtime, and
+    /// session machinery off (~50-70 MB RSS).
+    #[test]
+    fn dashboard_enabled_can_be_overridden_to_false() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "[dashboard]\nenabled = false").unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert!(
+            !cfg.dashboard.enabled,
+            "TOML `[dashboard].enabled = false` must parse and propagate"
+        );
+        // Other dashboard defaults must not regress when only the
+        // toggle is overridden.
+        assert_eq!(
+            cfg.dashboard.session_timeout_minutes,
+            default_session_timeout_minutes()
+        );
+        assert_eq!(cfg.dashboard.max_sessions, default_max_sessions());
     }
 
     #[test]

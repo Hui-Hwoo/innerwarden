@@ -32,7 +32,13 @@ echo "=== Deploy $component to production ==="
 # running services do not depend on.
 #
 # Targets and rationale:
-#   - jeprof/                 jemalloc heap profiles, dev-only.
+#   - jeprof/                 jemalloc heap profiles. Preserved across
+#                             deploys (the directory itself is recreated
+#                             with proper ownership so jemalloc can keep
+#                             writing); dumps older than 7 days are
+#                             pruned. Wholesale wipe lost the operator's
+#                             pre-deploy baseline during memory work
+#                             2026-05-02.
 #   - target/release/incremental
 #                             cargo's incremental compile cache. Safe
 #                             to drop; release builds rebuild it.
@@ -58,7 +64,14 @@ echo "[0/4] Pre-deploy cleanup (free disk before pulling/building)..."
 $SSH 'set -e
   before=$(df -h / | awk "NR==2 {print \$4}")
   echo "  before: $before free on /"
-  sudo rm -rf /var/lib/innerwarden/jeprof 2>/dev/null || true
+  # Preserve the jeprof directory across deploys so the operator
+  # can compare heap profiles pre- and post-binary-update. Recreate
+  # with the right ownership in case it disappeared (e.g. fresh box,
+  # manual cleanup) and prune dumps older than 7 days.
+  sudo mkdir -p /var/lib/innerwarden/jeprof 2>/dev/null || true
+  sudo chown innerwarden:innerwarden /var/lib/innerwarden/jeprof 2>/dev/null || true
+  sudo chmod 750 /var/lib/innerwarden/jeprof 2>/dev/null || true
+  sudo find /var/lib/innerwarden/jeprof -type f -mtime +7 -delete 2>/dev/null || true
   sudo rm -rf /home/ubuntu/innerwarden/target/release/incremental 2>/dev/null || true
   sudo find /var/lib/innerwarden -maxdepth 1 -name "graph-snapshot-*.json*" -mtime +5 -delete 2>/dev/null || true
   if [ -d /var/lib/innerwarden/pcap ]; then
