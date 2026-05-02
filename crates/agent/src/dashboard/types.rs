@@ -209,16 +209,16 @@ pub(crate) struct ReportQuery {
 /// don't break. The frontend has migrated to read `snapshot.*`.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OverviewSnapshot {
-    pub(super) date: String,
-    pub(super) generated_at: chrono::DateTime<Utc>,
-    pub(super) health: SystemHealth,
-    pub(super) buckets: OutcomeBuckets,
-    pub(super) pending: PendingBreakdown,
+    pub(crate) date: String,
+    pub(crate) generated_at: chrono::DateTime<Utc>,
+    pub(crate) health: SystemHealth,
+    pub(crate) buckets: OutcomeBuckets,
+    pub(crate) pending: PendingBreakdown,
     /// Total events scanned today (sensor counter, not date-filtered
     /// in the lossy KG sense — comes from telemetry snapshot which
     /// the sensor maintains independently of the agent's KG).
-    pub(super) events_today: usize,
-    pub(super) top_detectors: Vec<DetectorCount>,
+    pub(crate) events_today: usize,
+    pub(crate) top_detectors: Vec<DetectorCount>,
 }
 
 /// Operator-readable verb. The front-end maps each variant to a
@@ -282,29 +282,29 @@ pub(crate) enum SystemHealth {
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct BucketStats {
     /// Number of *incidents* in this bucket today.
-    pub(super) incidents: usize,
+    pub(crate) incidents: usize,
     /// Number of *distinct attacker IPs* in this bucket today. Always
     /// `<= incidents` (one attacker can fire many incidents).
-    pub(super) unique_attackers: usize,
+    pub(crate) unique_attackers: usize,
     /// Severity histogram — ordered map keyed by the canonical
     /// severity string ("critical", "high", "medium", "low", "info").
-    pub(super) severities: std::collections::BTreeMap<String, usize>,
+    pub(crate) severities: std::collections::BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct OutcomeBuckets {
-    pub(super) blocked: BucketStats,
-    pub(super) observing: BucketStats,
-    pub(super) honeypot: BucketStats,
-    pub(super) dismissed: BucketStats,
+    pub(crate) blocked: BucketStats,
+    pub(crate) observing: BucketStats,
+    pub(crate) honeypot: BucketStats,
+    pub(crate) dismissed: BucketStats,
     /// Incidents that matched the operator's allowlist (static config
     /// or dynamic /etc/innerwarden/allowlist.toml). Pre-Phase-7 these
     /// silently inflated `attention` because they had no decision; now
     /// they have a dedicated bucket the operator can audit.
-    pub(super) allowlisted: BucketStats,
+    pub(crate) allowlisted: BucketStats,
     /// Incidents that *do* need attention — see `pending` for the
     /// reason-by-reason breakdown.
-    pub(super) attention: BucketStats,
+    pub(crate) attention: BucketStats,
 }
 
 /// Why a "needs attention" incident is sitting without a final
@@ -385,8 +385,8 @@ pub(crate) struct OverviewResponse {
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct DetectorCount {
-    pub(super) detector: String,
-    pub(super) count: usize,
+    pub(crate) detector: String,
+    pub(crate) count: usize,
 }
 
 #[derive(Debug, Serialize)]

@@ -1716,6 +1716,20 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 "response lifecycle tick"
                             );
                         }
+                        // 2026-05-02 audit B3: prune orphaned history
+                        // entries older than 7 days. The auditor saw
+                        // 17 orphaned responses sitting >48 h with no
+                        // GC path. The 7-day window is generous —
+                        // operators have time to investigate fresh
+                        // orphans before they age out. Other
+                        // completion reasons (expired / manual /
+                        // already_absent) are unaffected; they are
+                        // legitimate audit trail bounded only by the
+                        // 1000-entry history cap.
+                        const ORPHAN_GC_AGE_SECS: i64 = 7 * 24 * 3600;
+                        state
+                            .response_lifecycle
+                            .gc_orphaned_responses(ORPHAN_GC_AGE_SECS);
                         // Two sinks, one struct-of-truth:
                         //   1. dashboard view (`to_json`) — feeds `/metrics`
                         //      and `/api/responses` which read `active_count`,

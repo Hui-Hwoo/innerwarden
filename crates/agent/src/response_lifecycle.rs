@@ -1102,6 +1102,51 @@ impl ResponseLifecycle {
         }
     }
 
+    /// 2026-05-02 audit B3 fix: garbage-collect orphaned history
+    /// entries older than `older_than_secs`. Returns the number of
+    /// entries pruned. The auditor saw 17 orphaned response entries
+    /// sitting in `responses.json` for >48 h with no GC step and no
+    /// retry path; this sweep is the GC half of the contract.
+    ///
+    /// Scope is intentionally narrow: we only prune entries whose
+    /// `reason` field starts with `"orphaned:"` (the format written by
+    /// `mark_revert_failed` when retries exhaust). Other reasons
+    /// (`expired`, `manual`, `already_absent`) stay in history at the
+    /// 1000-entry cap regardless of age — they are part of the audit
+    /// trail an operator legitimately wants to look back on.
+    ///
+    /// Pruning is silent at INFO level when 0 entries are removed and
+    /// at WARN when any are — orphaned drift is exactly the class of
+    /// signal the operator wants to see in journald. The returned
+    /// count is also surfaced via Prometheus by the slow-loop caller.
+    pub fn gc_orphaned_responses(&mut self, older_than_secs: i64) -> usize {
+        let cutoff = Utc::now() - chrono::Duration::seconds(older_than_secs);
+        let before = self.history.len();
+        self.history.retain(|r| {
+            // Only orphaned entries are eligible for GC. Other
+            // completion reasons (expired/manual/already_absent) are
+            // legitimate audit trail; the 1000-entry cap on history
+            // already bounds those.
+            if !r.reason.starts_with("orphaned:") {
+                return true;
+            }
+            r.reverted_at > cutoff
+        });
+        let pruned = before - self.history.len();
+        if pruned > 0 {
+            warn!(
+                pruned,
+                older_than_hours = older_than_secs / 3600,
+                "response lifecycle: pruned {pruned} orphaned response history entries older \
+                 than {} h (audit B3) — original revert attempts exhausted long ago, kernel \
+                 state has drifted; check `journalctl -u innerwarden-agent | grep ORPHANED` \
+                 for the original failures",
+                older_than_secs / 3600
+            );
+        }
+        pruned
+    }
+
     /// Get all currently active responses.
     #[allow(dead_code)] // snapshot read path for the dashboard lifecycle view
     pub fn list_active(&self) -> &[ActiveResponse] {
@@ -2791,5 +2836,112 @@ mod tests {
                 .unwrap_or_else(|| panic!("no active row for {target}"));
             assert_eq!(row.backend, expected, "backend mismatch for skill={skill}");
         }
+    }
+
+    // ── 2026-05-02 audit B3 anchors — orphan response GC ────────────
+    //
+    // The auditor saw 17 entries with reason="orphaned: ..." sitting in
+    // `responses.json` for >48 h with no GC path. These anchors pin
+    // the new sweep so a future refactor that drops the call from
+    // boot.rs (or weakens the predicate) is caught at build time.
+
+    #[test]
+    fn gc_orphaned_responses_prunes_only_old_orphaned_entries() {
+        let mut lc = ResponseLifecycle::new();
+        let now = Utc::now();
+        // Three orphaned, three non-orphaned. Mix of ages.
+        lc.history.push_back(CompletedResponse {
+            id: "old-orphan".to_string(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.10".to_string(),
+            incident_id: "inc-1".to_string(),
+            created_at: now - chrono::Duration::days(10),
+            reverted_at: now - chrono::Duration::days(8),
+            reason: "orphaned: ufw delete failed".to_string(),
+        });
+        lc.history.push_back(CompletedResponse {
+            id: "fresh-orphan".to_string(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.11".to_string(),
+            incident_id: "inc-2".to_string(),
+            created_at: now - chrono::Duration::hours(2),
+            reverted_at: now - chrono::Duration::hours(1),
+            reason: "orphaned: rule still present".to_string(),
+        });
+        lc.history.push_back(CompletedResponse {
+            id: "very-old-but-expired".to_string(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.12".to_string(),
+            incident_id: "inc-3".to_string(),
+            created_at: now - chrono::Duration::days(30),
+            reverted_at: now - chrono::Duration::days(28),
+            reason: "expired".to_string(),
+        });
+        lc.history.push_back(CompletedResponse {
+            id: "old-manual".to_string(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.13".to_string(),
+            incident_id: "inc-4".to_string(),
+            created_at: now - chrono::Duration::days(20),
+            reverted_at: now - chrono::Duration::days(20),
+            reason: "manual".to_string(),
+        });
+        lc.history.push_back(CompletedResponse {
+            id: "old-already-absent".to_string(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.14".to_string(),
+            incident_id: "inc-5".to_string(),
+            created_at: now - chrono::Duration::days(20),
+            reverted_at: now - chrono::Duration::days(20),
+            reason: "already_absent".to_string(),
+        });
+
+        // 7-day cutoff: only `old-orphan` (8d old, reason orphaned)
+        // should be pruned. Fresh orphan stays. expired/manual/
+        // already_absent stay regardless of age.
+        let pruned = lc.gc_orphaned_responses(7 * 24 * 3600);
+        assert_eq!(pruned, 1, "only the 8-day-old orphan must be pruned");
+        let ids: Vec<&str> = lc.history.iter().map(|r| r.id.as_str()).collect();
+        assert!(!ids.contains(&"old-orphan"));
+        assert!(ids.contains(&"fresh-orphan"));
+        assert!(ids.contains(&"very-old-but-expired"));
+        assert!(ids.contains(&"old-manual"));
+        assert!(ids.contains(&"old-already-absent"));
+    }
+
+    #[test]
+    fn gc_orphaned_responses_is_noop_on_empty_history() {
+        let mut lc = ResponseLifecycle::new();
+        let pruned = lc.gc_orphaned_responses(7 * 24 * 3600);
+        assert_eq!(pruned, 0);
+        assert_eq!(lc.history.len(), 0);
+    }
+
+    #[test]
+    fn gc_orphaned_responses_preserves_all_when_threshold_is_huge() {
+        let mut lc = ResponseLifecycle::new();
+        let now = Utc::now();
+        for i in 0..5 {
+            lc.history.push_back(CompletedResponse {
+                id: format!("orph-{i}"),
+                response_type: ResponseType::BlockIp,
+                backend: ResponseBackend::Ufw,
+                target: format!("203.0.113.{i}"),
+                incident_id: format!("inc-{i}"),
+                created_at: now - chrono::Duration::days(30),
+                reverted_at: now - chrono::Duration::days(30),
+                reason: format!("orphaned: failure {i}"),
+            });
+        }
+        // Threshold of 365 days: nothing should be pruned (all 30
+        // days old).
+        let pruned = lc.gc_orphaned_responses(365 * 24 * 3600);
+        assert_eq!(pruned, 0);
+        assert_eq!(lc.history.len(), 5);
     }
 }

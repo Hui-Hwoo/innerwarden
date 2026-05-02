@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::sync::{Arc, RwLock};
 
+use crate::dashboard::types::OverviewSnapshot;
 use crate::knowledge_graph::types::{Node, NodeType, Relation};
 use crate::knowledge_graph::KnowledgeGraph;
 
@@ -16,10 +17,59 @@ pub struct Briefing {
     pub summary: String,
 }
 
+/// Topline counters derived from the canonical `OverviewSnapshot`.
+/// 2026-05-02 audit B1/P1 (Spec 039 Phase 1): briefing must read its
+/// counts from the same snapshot the dashboard tiles read, so the
+/// "0 needing action" / "2 awaiting" contradiction the auditor saw on
+/// the same screen cannot recur. The canonical mapping is:
+///
+/// | briefing | OverviewSnapshot bucket |
+/// |---|---|
+/// | `contained` | blocked + observing + honeypot |
+/// | `ignored`   | dismissed + allowlisted |
+/// | `unresolved` | attention.incidents |
+/// | `unresolved_high_crit` | attention.severities (high+critical) |
+/// | `blocked_ips` count | blocked.unique_attackers |
+///
+/// Narrative detail (top attacker IPs with detector breakdown,
+/// per-detector list, action descriptions, unresolved entity refs)
+/// keeps coming from the KG walk — the snapshot only carries
+/// aggregate counts.
+struct BriefingCounters {
+    contained: usize,
+    ignored: usize,
+    unresolved: usize,
+    unresolved_high_crit: usize,
+    blocked_ips_count: usize,
+}
+
+impl BriefingCounters {
+    fn from_snapshot(snap: &OverviewSnapshot) -> Self {
+        let b = &snap.buckets;
+        let attention_high = b.attention.severities.get("high").copied().unwrap_or(0);
+        let attention_crit = b.attention.severities.get("critical").copied().unwrap_or(0);
+        Self {
+            contained: b.blocked.incidents + b.observing.incidents + b.honeypot.incidents,
+            ignored: b.dismissed.incidents + b.allowlisted.incidents,
+            unresolved: b.attention.incidents,
+            unresolved_high_crit: attention_high + attention_crit,
+            blocked_ips_count: b.blocked.unique_attackers,
+        }
+    }
+}
+
 /// Build the structured context from the knowledge graph for LLM consumption.
 /// Separates contained (resolved) from unresolved, marks internal IPs,
 /// and shows actions already taken.
-pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
+///
+/// 2026-05-02 (Spec 039 P1): pass `Some(snapshot)` to lock topline
+/// counters to the same numbers the dashboard tiles paint. When
+/// `None`, falls back to the legacy KG scan — used by tests and the
+/// boot path before the first overview is computed.
+pub fn build_briefing_context(
+    kg: &Arc<RwLock<KnowledgeGraph>>,
+    snapshot: Option<&OverviewSnapshot>,
+) -> String {
     let graph = kg.read().unwrap();
 
     let incident_nodes = graph.nodes_of_type(NodeType::Incident);
@@ -184,8 +234,12 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
     sorted_detectors.sort_by(|a, b| b.1.cmp(&a.1));
     sorted_detectors.truncate(10);
 
-    // Threat level — based on UNRESOLVED, not total
-    let _threat_level = if unresolved_high_crit > 5 {
+    // Threat level — based on UNRESOLVED, not total. Recomputed
+    // below from the canonical counters once the snapshot is folded in.
+    // This early scan-based value is unused; kept here as documentation
+    // of the legacy threshold map until the threshold helper itself
+    // moves into a function that takes counters as input.
+    let _threat_level_legacy = if unresolved_high_crit > 5 {
         "CRITICAL"
     } else if unresolved_high_crit > 0 {
         "ELEVATED"
@@ -195,7 +249,8 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
         "LOW"
     };
 
-    // Count unique blocked IPs (not decisions — matches dashboard KPI)
+    // Count unique blocked IPs (not decisions — matches dashboard KPI).
+    // Used as the legacy fallback when no snapshot is provided.
     let blocked_ips: std::collections::HashSet<&str> = actions_taken
         .iter()
         .filter_map(|a| {
@@ -207,8 +262,25 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
         })
         .collect();
 
+    // 2026-05-02 (Spec 039 P1): when an OverviewSnapshot is available,
+    // use its bucket counts for the topline numbers. This is the same
+    // source the dashboard tiles read, so the briefing can never paint
+    // a contradictory headline ("0 needing action" while the tile
+    // says "2 awaiting"). Narrative detail still comes from the KG
+    // walk above.
+    let counters = match snapshot {
+        Some(snap) => BriefingCounters::from_snapshot(snap),
+        None => BriefingCounters {
+            contained,
+            ignored,
+            unresolved,
+            unresolved_high_crit,
+            blocked_ips_count: blocked_ips.len(),
+        },
+    };
+
     // Build context
-    let operator_incidents = contained + unresolved; // excludes research_only
+    let operator_incidents = counters.contained + counters.unresolved; // excludes research_only
     let mut ctx = format!(
         "SECURITY INTELLIGENCE CONTEXT — {}\n\n\
          SITUATION STATUS:\n\
@@ -222,15 +294,15 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
          Human attention needed: {}.\n\n",
         Utc::now().format("%Y-%m-%d"),
         operator_incidents,
-        blocked_ips.len(),
-        if blocked_ips.len() == 1 { "" } else { "s" },
-        unresolved,
-        ignored,
-        contained + unresolved, operator_incidents,
-        if unresolved_high_crit == 0 {
+        counters.blocked_ips_count,
+        if counters.blocked_ips_count == 1 { "" } else { "s" },
+        counters.unresolved,
+        counters.ignored,
+        counters.contained + counters.unresolved, operator_incidents,
+        if counters.unresolved_high_crit == 0 {
             "NONE — everything is handled".to_string()
         } else {
-            format!("{} high/critical items to review", unresolved_high_crit)
+            format!("{} high/critical items to review", counters.unresolved_high_crit)
         },
     );
 
@@ -489,7 +561,7 @@ mod tests {
         );
 
         let kg = Arc::new(RwLock::new(graph));
-        let context = build_briefing_context(&kg);
+        let context = build_briefing_context(&kg, None);
 
         assert!(context.contains("SECURITY INTELLIGENCE CONTEXT"));
         assert!(context.contains("ACTIONS ALREADY TAKEN BY AI"));
@@ -505,9 +577,113 @@ mod tests {
     #[test]
     fn build_briefing_context_handles_empty_graph() {
         let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
-        let context = build_briefing_context(&kg);
+        let context = build_briefing_context(&kg, None);
         assert!(context.contains("Operator-relevant incidents today: 0"));
         assert!(context.contains("Human attention needed: NONE"));
         assert!(context.contains("TOP ATTACKERS (external IPs only):"));
+    }
+
+    // 2026-05-02 audit B1/P1 (Spec 039 P1) anchor: when an
+    // OverviewSnapshot is provided, the briefing's topline counters
+    // must come from the snapshot's bucket counts — NOT from a
+    // separate KG scan. This is the auditor's #1 release blocker
+    // (single source of truth across briefing + dashboard tiles).
+    #[test]
+    fn build_briefing_context_reads_topline_counters_from_snapshot() {
+        use crate::dashboard::types::{
+            BucketStats, DetectorCount, OutcomeBuckets, OverviewSnapshot, PendingBreakdown,
+            SystemHealth,
+        };
+        let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
+
+        // Snapshot says: 5 blocked / 3 observing / 1 honeypot / 2
+        // dismissed / 1 allowlisted / 4 attention (2 critical, 1
+        // high). 7 unique blocked attackers. The briefing must paint
+        // those exact numbers — not the empty KG's zeros.
+        let mut attention_severities = std::collections::BTreeMap::new();
+        attention_severities.insert("critical".to_string(), 2);
+        attention_severities.insert("high".to_string(), 1);
+        attention_severities.insert("medium".to_string(), 1);
+        let snap = OverviewSnapshot {
+            date: "2026-05-02".to_string(),
+            generated_at: Utc::now(),
+            health: SystemHealth::OperatingNormally,
+            buckets: OutcomeBuckets {
+                blocked: BucketStats {
+                    incidents: 5,
+                    unique_attackers: 7,
+                    severities: Default::default(),
+                },
+                observing: BucketStats {
+                    incidents: 3,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+                honeypot: BucketStats {
+                    incidents: 1,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+                dismissed: BucketStats {
+                    incidents: 2,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+                allowlisted: BucketStats {
+                    incidents: 1,
+                    unique_attackers: 0,
+                    severities: Default::default(),
+                },
+                attention: BucketStats {
+                    incidents: 4,
+                    unique_attackers: 0,
+                    severities: attention_severities,
+                },
+            },
+            pending: PendingBreakdown::default(),
+            events_today: 1234,
+            top_detectors: vec![DetectorCount {
+                detector: "ssh_bruteforce".to_string(),
+                count: 1,
+            }],
+        };
+
+        let context = build_briefing_context(&kg, Some(&snap));
+
+        // contained = blocked.incidents + observing.incidents + honeypot.incidents = 5+3+1 = 9
+        // ignored   = dismissed.incidents + allowlisted.incidents = 2+1 = 3
+        // unresolved = attention.incidents = 4
+        // unresolved_high_crit = attention.severities[critical]+attention.severities[high] = 2+1 = 3
+        // operator_incidents = contained + unresolved = 9+4 = 13
+        // blocked_ips_count = blocked.unique_attackers = 7
+        assert!(
+            context.contains("Operator-relevant incidents today: 13"),
+            "operator_incidents must use snapshot counters; got: {context}"
+        );
+        assert!(
+            context.contains("BLOCKED: 7 unique IPs"),
+            "blocked_ips count must come from snapshot; got: {context}"
+        );
+        assert!(
+            context.contains("OBSERVING: 4 incidents"),
+            "OBSERVING line emits snapshot.attention.incidents (4); got: {context}"
+        );
+        assert!(
+            context.contains("IGNORED: 3 confirmed"),
+            "IGNORED uses dismissed+allowlisted from snapshot; got: {context}"
+        );
+        assert!(
+            context.contains("3 high/critical items to review"),
+            "high/critical must use snapshot severities; got: {context}"
+        );
+    }
+
+    #[test]
+    fn build_briefing_context_falls_back_to_kg_when_no_snapshot() {
+        // Back-compat: callers that pass `None` still use the KG scan.
+        // This test pins the fallback path for the boot/cold path.
+        let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
+        let context = build_briefing_context(&kg, None);
+        assert!(context.contains("Operator-relevant incidents today: 0"));
     }
 }

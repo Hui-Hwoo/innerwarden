@@ -1231,8 +1231,41 @@ pub(super) async fn api_report(
     Query(query): Query<ReportQuery>,
 ) -> Response {
     let graph = state.knowledge_graph.read().unwrap();
-    let report: TrialReport =
+    let mut report: TrialReport =
         report_mod::compute_for_date_from_graph(&state.data_dir, query.date.as_deref(), &graph);
+    drop(graph);
+
+    // 2026-05-02 audit B1/P1 (Spec 039 P2): when the request is for
+    // today AND the canonical OverviewSnapshot is available, overwrite
+    // the report's incident/block totals with the snapshot's bucket
+    // counts so the markdown report and the dashboard tiles read
+    // identical numbers. Auditor saw "Report 41 / Threats 5 blocked"
+    // contradiction — same source, different scan, different totals.
+    // For historical dates the snapshot is not retained, so the
+    // KG-derived numbers stay (correct for those dates).
+    let today = resolve_date(None);
+    let target_date = query.date.clone().unwrap_or_else(|| today.clone());
+    if target_date == today {
+        if let Some(store) = state.sqlite_store.as_ref() {
+            let now = chrono::Utc::now();
+            let degraded = read_degraded_signals(&state);
+            if let Some(counts) =
+                compute_overview_counts_from_sqlite(store, &today, 0, None, now, &degraded)
+            {
+                if let Some(snap) = counts.snapshot.as_ref() {
+                    let buckets = &snap.buckets;
+                    let total_incidents = buckets.blocked.incidents
+                        + buckets.observing.incidents
+                        + buckets.honeypot.incidents
+                        + buckets.dismissed.incidents
+                        + buckets.allowlisted.incidents
+                        + buckets.attention.incidents;
+                    report.detection_summary.total_incidents = total_incidents as u64;
+                    report.agent_ai_summary.block_ip_count = buckets.blocked.incidents as u64;
+                }
+            }
+        }
+    }
 
     match serde_json::to_string_pretty(&report) {
         Ok(body) => (
@@ -1292,7 +1325,22 @@ pub(super) async fn api_briefing(State(state): State<DashboardState>) -> Json<se
 pub(super) async fn api_briefing_generate(
     State(state): State<DashboardState>,
 ) -> Json<serde_json::Value> {
-    let context = crate::briefing::build_briefing_context(&state.knowledge_graph);
+    // 2026-05-02 audit B1/P1 (Spec 039 P1): hydrate the canonical
+    // OverviewSnapshot for today and pass it into build_briefing_context
+    // so the briefing's topline counters paint the same numbers the
+    // dashboard tiles paint. Pre-fix the briefing scanned the KG and
+    // could read "0 needing action" while the Home tile said "2
+    // awaiting" — the auditor's #1 release blocker (single source of
+    // truth for counters). Snapshot construction mirrors api_overview.
+    let snapshot = state.sqlite_store.as_ref().and_then(|store| {
+        let today = resolve_date(None);
+        let now = chrono::Utc::now();
+        let degraded = read_degraded_signals(&state);
+        compute_overview_counts_from_sqlite(store, &today, 0, None, now, &degraded)
+            .and_then(|counts| counts.snapshot)
+    });
+    let context =
+        crate::briefing::build_briefing_context(&state.knowledge_graph, snapshot.as_ref());
     let prompt = crate::briefing::briefing_prompt(&context);
 
     let threat_level = if context.contains("CRITICAL") {

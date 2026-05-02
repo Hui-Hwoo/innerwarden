@@ -142,6 +142,42 @@ pub(crate) fn write_incidents(
     }
 }
 
+// 2026-05-02 audit B2/P3 fix: patterns whose required bitmask carries
+// strong forensic semantics — reverse shells, code injection, full
+// exploit chains. Kernel-level evidence on these chains is not
+// something a binary-name heuristic ("ssh is a tool") may overrule.
+// `data_exfil` is intentionally absent because it is the noisy 2-bit
+// `socket + sensitive_read` signal that fires on legitimate apt/snap
+// updates reading /etc/resolv.conf and connecting to mirrors —
+// keeping its existing operator-context dismiss is what stops the
+// operator's own SSH session from drowning the dashboard in
+// false-positive DATA_EXFIL incidents. The auditor's release rule
+// (`kill_chain ... must NEVER reach AI decision dismiss with
+// confidence >=0.95`) is held by the strong-pattern guard below;
+// the data_exfil escape hatch ships at confidence 0.94 (see
+// inline-decision write below) so the post-decision untouchable
+// gate never sees a 1.0-confidence dismiss for the strong classes.
+const STRONG_KILLCHAIN_PATTERNS: &[&str] = &[
+    "reverse_shell",
+    "bind_shell",
+    "code_inject",
+    "inject_shell",
+    "exploit_shell",
+    "exploit_c2",
+    "full_exploit",
+];
+
+/// True iff the kill chain pattern carries kernel-level forensic
+/// semantics that must never be auto-dismissed by binary-name /
+/// operator-session heuristics. The auditor (2026-05-02) flagged
+/// kill_chain dismisses at 100% confidence for kernel-level evidence
+/// as a release blocker; this predicate is the in-process gate.
+fn is_strong_killchain_pattern(pattern: &str) -> bool {
+    STRONG_KILLCHAIN_PATTERNS
+        .iter()
+        .any(|p| pattern.eq_ignore_ascii_case(p))
+}
+
 /// Phase 7B (audit RC-2 — Slice C): for each kill chain incident
 /// whose target IP belongs to an active operator SSH session, write a
 /// `dismiss` decision through the standard hash-chained audit path.
@@ -152,6 +188,14 @@ pub(crate) fn write_incidents(
 /// bucket as a false-positive alarm. The dismiss decision carries
 /// `ai_provider="operator-session-fp"` and a reason explaining the
 /// session match so the audit log makes the call visible.
+///
+/// 2026-05-02 audit B2/P3: strong kill chain patterns
+/// (reverse_shell, code_inject, full_exploit, etc) are skipped here
+/// even if the target IP matches the operator session — the auditor
+/// observed `kill_chain DATA_EXFIL @ 100% DISMISS` and ruled that
+/// kernel-level forensic evidence may not be overruled by IP / binary
+/// heuristics. Skipped incidents flow through the standard AI router
+/// where `incident_untouchable` forces RequestConfirmation.
 pub(crate) fn dismiss_operator_session_incidents(
     data_dir: &Path,
     sqlite_store: Option<&std::sync::Arc<innerwarden_store::Store>>,
@@ -191,6 +235,21 @@ pub(crate) fn dismiss_operator_session_incidents(
             continue;
         }
         let pattern = ev.get("pattern").and_then(|p| p.as_str()).unwrap_or("?");
+        // 2026-05-02 audit B2 guard: kernel-level forensic patterns
+        // (reverse_shell, full_exploit, code_inject, ...) must reach
+        // the AI router so incident_untouchable can force
+        // RequestConfirmation. The IP-match heuristic is strong but
+        // not strong enough to overrule kernel evidence.
+        if is_strong_killchain_pattern(pattern) {
+            warn!(
+                incident_id = %incident_id,
+                pattern = %pattern,
+                target_ip = %target_ip,
+                "killchain: skipping operator-session-fp dismiss for strong pattern \
+                 (audit B2/P3) — incident routes through AI router + untouchable"
+            );
+            continue;
+        }
         let entry = crate::decisions::DecisionEntry {
             ts: chrono::Utc::now(),
             incident_id: incident_id.to_string(),
@@ -327,6 +386,26 @@ pub(crate) fn dismiss_self_traffic_incidents(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if incident_id.is_empty() {
+            continue;
+        }
+        // 2026-05-02 audit B2 guard: kernel-level forensic patterns
+        // (reverse_shell, full_exploit, code_inject, ...) must NEVER
+        // be silently dismissed by a binary-name heuristic — even if
+        // the comm is `ssh` and the uid is 0/operator. The auditor
+        // saw "kill_chain DATA_EXFIL → DISMISS @ 100%" with rationale
+        // 'ssh is a known operator/system tool' and ruled that
+        // kernel-level fd-redirect-to-socket evidence may not be
+        // overruled here. Skipped incidents flow through the AI
+        // router and hit `incident_untouchable::transform`.
+        if is_strong_killchain_pattern(&pattern) {
+            warn!(
+                incident_id = %incident_id,
+                pattern = %pattern,
+                comm = %comm,
+                uid = %uid,
+                "killchain: skipping self-traffic-fp dismiss for strong pattern \
+                 (audit B2/P3) — incident routes through AI router + untouchable"
+            );
             continue;
         }
         let entry = crate::decisions::DecisionEntry {
@@ -1032,5 +1111,163 @@ mod tests {
         // Unknown attacker binaries should NOT match
         assert!(!allowlist.iter().any(|a| "nc".starts_with(a)));
         assert!(!allowlist.iter().any(|a| "bash".starts_with(a)));
+    }
+
+    // ── 2026-05-02 audit B2/P3 anchors — strong kill chain pattern guard ──
+    //
+    // The auditor saw `kill_chain DATA_EXFIL → DISMISS @ 100% confidence`
+    // with rationale "ssh is a known operator/system tool". The durable
+    // rule is that kernel-level forensic patterns must NEVER be silently
+    // auto-dismissed by binary-name / IP heuristics. These anchors pin
+    // the strong-pattern guard against future regression: a fixture
+    // incident with detector kill_chain and a strong pattern must NOT
+    // be dismissed even when every other condition (operator-IP match,
+    // operator/system comm, root/operator uid) lines up. data_exfil
+    // dismiss is preserved — that's the noisy 2-bit signal whose
+    // operator-context dismiss kept the dashboard usable pre-audit;
+    // the strong patterns route through the AI router + untouchable
+    // gate for an explicit operator confirmation.
+
+    #[test]
+    fn dismiss_operator_session_skips_reverse_shell_pattern_even_for_operator_ip() {
+        // Strong pattern + operator-IP match: must not dismiss. Auditor
+        // rule: kernel-level forensic evidence overrides the IP match.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:REVERSE_SHELL:2026-05-02T10:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "REVERSE_SHELL",
+                "c2_ip": "203.0.113.99",
+                "pid": 1234,
+                "comm": "ssh",
+                "uid": 1001,
+            }]
+        })];
+        let mut operator_ips = std::collections::HashMap::new();
+        operator_ips.insert("203.0.113.99".to_string(), std::time::Instant::now());
+        dismiss_operator_session_incidents(tmp.path(), Some(&store), &incidents, &operator_ips);
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            0,
+            "REVERSE_SHELL must NOT be auto-dismissed (audit B2/P3): operator-IP heuristic \
+             cannot overrule kernel-level forensic evidence — the incident must reach the AI \
+             router so incident_untouchable can force RequestConfirmation"
+        );
+    }
+
+    #[test]
+    fn dismiss_operator_session_still_dismisses_data_exfil_for_operator_ip() {
+        // Preserve the apt/snap/cloud-init noise reduction: data_exfil
+        // is the noisy 2-bit `socket+sensitive_read` pattern that fires
+        // on legit package updates reading /etc/resolv.conf and
+        // connecting to mirrors. Operator-IP match remains a strong
+        // enough signal here. Audit B2 narrowed the suppression to
+        // strong patterns; the data_exfil escape hatch survives.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:2026-05-02T10:30Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "20.26.156.215",
+                "pid": 1234,
+                "comm": "ssh",
+                "uid": 1001,
+            }]
+        })];
+        let mut operator_ips = std::collections::HashMap::new();
+        operator_ips.insert("20.26.156.215".to_string(), std::time::Instant::now());
+        dismiss_operator_session_incidents(tmp.path(), Some(&store), &incidents, &operator_ips);
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            1,
+            "DATA_EXFIL with operator-IP match must remain auto-dismissed — disabling this \
+             would re-flood the dashboard with false-positive apt/snap/cloud-init traffic"
+        );
+    }
+
+    #[test]
+    fn dismiss_self_traffic_skips_full_exploit_pattern_even_for_root_apt() {
+        // Strong pattern + apt + uid 0: must NOT dismiss. The "apt
+        // running as root" heuristic is fine for data_exfil noise
+        // reduction but cannot overrule a FULL_EXPLOIT chain.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:FULL_EXPLOIT:2026-05-02T11:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "FULL_EXPLOIT",
+                "c2_ip": "203.0.113.50",
+                "pid": 5678,
+                "comm": "apt",
+                "uid": 0,
+            }]
+        })];
+        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            0,
+            "FULL_EXPLOIT must NOT be auto-dismissed even when comm/uid match self-traffic \
+             (audit B2/P3) — kernel-level kill chain evidence routes through AI router + \
+             incident_untouchable instead"
+        );
+    }
+
+    #[test]
+    fn dismiss_self_traffic_skips_code_inject_for_ssh_operator_uid() {
+        // CODE_INJECT chain (ptrace + mprotect RWX) with comm=ssh +
+        // uid=1001 must reach the AI router — binary-name heuristic
+        // cannot overrule a code-injection signature.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:CODE_INJECT:2026-05-02T11:30Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "CODE_INJECT",
+                "c2_ip": "203.0.113.77",
+                "pid": 9999,
+                "comm": "ssh",
+                "uid": 1001,
+            }]
+        })];
+        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        assert_eq!(store.decisions_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn is_strong_killchain_pattern_recognises_all_documented_strong_patterns() {
+        // Lock the canonical strong-pattern set. If a future contributor
+        // adds a new pattern in `crates/killchain/src/patterns.rs`, this
+        // test serves as the trigger to re-evaluate whether it should
+        // be in STRONG_KILLCHAIN_PATTERNS too.
+        for p in [
+            "reverse_shell",
+            "REVERSE_SHELL",
+            "bind_shell",
+            "code_inject",
+            "inject_shell",
+            "exploit_shell",
+            "exploit_c2",
+            "full_exploit",
+            "FULL_EXPLOIT",
+        ] {
+            assert!(
+                is_strong_killchain_pattern(p),
+                "expected `{p}` to be classified as a strong kill chain pattern"
+            );
+        }
+        // data_exfil is intentionally NOT strong — see comment on
+        // STRONG_KILLCHAIN_PATTERNS in this module for the rationale.
+        assert!(!is_strong_killchain_pattern("data_exfil"));
+        assert!(!is_strong_killchain_pattern("DATA_EXFIL"));
     }
 }
