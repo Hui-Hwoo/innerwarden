@@ -16,27 +16,60 @@ pub fn append_to_allowlist(
     key: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
+    use anyhow::{anyhow, Context};
     use fs2::FileExt;
-    use std::io::Write;
-
-    fn toml_escape(value: &str) -> String {
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', " ")
-    }
+    use std::io::{Read, Seek, Write};
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
-        .open(allowlist_path)?;
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(allowlist_path)
+        .with_context(|| format!("open allowlist {}", allowlist_path.display()))?;
     file.lock_exclusive()?;
-    let escaped_key = toml_escape(key);
-    let escaped_reason = toml_escape(reason);
-    writeln!(file, "\n[{section}]")?;
-    writeln!(file, "\"{}\" = \"{}\"", escaped_key, escaped_reason)?;
-    file.flush()?;
-    file.unlock()?;
+
+    let update_result = (|| -> anyhow::Result<()> {
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .with_context(|| format!("read allowlist {}", allowlist_path.display()))?;
+
+        let mut root = if content.trim().is_empty() {
+            toml::Table::new()
+        } else {
+            content
+                .parse::<toml::Table>()
+                .with_context(|| format!("parse allowlist {}", allowlist_path.display()))?
+        };
+
+        let section_value = root
+            .entry(section.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let section_table = section_value
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("allowlist section {section:?} is not a TOML table"))?;
+
+        section_table.insert(
+            key.replace('\n', " "),
+            toml::Value::String(reason.replace('\n', " ")),
+        );
+
+        let output = toml::to_string_pretty(&root)
+            .with_context(|| format!("serialize allowlist {}", allowlist_path.display()))?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .with_context(|| format!("rewind allowlist {}", allowlist_path.display()))?;
+        file.set_len(0)
+            .with_context(|| format!("truncate allowlist {}", allowlist_path.display()))?;
+        file.write_all(output.as_bytes())
+            .with_context(|| format!("write allowlist {}", allowlist_path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush allowlist {}", allowlist_path.display()))?;
+        Ok(())
+    })();
+
+    let unlock_result = file.unlock();
+    update_result?;
+    unlock_result?;
     Ok(())
 }
 
@@ -186,7 +219,10 @@ pub fn remove_from_allowlist(
 
     let mut result_lines: Vec<String> = Vec::new();
     let mut in_target_section = false;
-    let escaped_key = key.replace('\\', "\\\\").replace('"', "\\\"");
+    let normalized_key = key.replace('\n', " ");
+    let escaped_key = normalized_key.replace('\\', "\\\\").replace('"', "\\\"");
+    let quoted_key = format!("\"{escaped_key}\"");
+    let legacy_quoted_key = format!("\"{normalized_key}\"");
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -198,11 +234,16 @@ pub fn remove_from_allowlist(
             continue;
         }
 
-        // If in the target section, skip lines containing the key
-        if in_target_section
-            && (trimmed.contains(&format!("\"{}\"", escaped_key))
-                || trimmed.contains(&format!("\"{}\"", key)))
-        {
+        let key_matches = trimmed
+            .split_once('=')
+            .map(|(lhs, _)| {
+                let lhs = lhs.trim();
+                lhs == normalized_key || lhs == quoted_key || lhs == legacy_quoted_key
+            })
+            .unwrap_or(false);
+
+        // If in the target section, skip the assignment for the requested key.
+        if in_target_section && key_matches {
             continue;
         }
 
@@ -309,6 +350,176 @@ pub fn log_false_positive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_allowlist(path: &std::path::Path) -> toml::Table {
+        let content = std::fs::read_to_string(path).expect("allowlist content");
+        content.parse::<toml::Table>().expect("valid TOML")
+    }
+
+    #[test]
+    fn append_to_allowlist_creates_parseable_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allowlist.toml");
+
+        append_to_allowlist(&path, "ips", "203.0.113.7", "known scanner").unwrap();
+
+        let parsed = parse_allowlist(&path);
+        assert_eq!(parsed["ips"]["203.0.113.7"].as_str(), Some("known scanner"));
+    }
+
+    #[test]
+    fn append_to_allowlist_updates_existing_section_without_duplicate_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allowlist.toml");
+
+        append_to_allowlist(&path, "ips", "203.0.113.7", "first reason").unwrap();
+        append_to_allowlist(&path, "ips", "203.0.113.7", "updated reason").unwrap();
+        append_to_allowlist(&path, "ips", "198.51.100.9", "neighbor").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("[ips]").count(), 1);
+        let parsed = parse_allowlist(&path);
+        assert_eq!(
+            parsed["ips"]["203.0.113.7"].as_str(),
+            Some("updated reason")
+        );
+        assert_eq!(parsed["ips"]["198.51.100.9"].as_str(), Some("neighbor"));
+    }
+
+    #[test]
+    fn append_to_allowlist_handles_toml_sensitive_text_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allowlist.toml");
+
+        append_to_allowlist(
+            &path,
+            "processes",
+            "worker\"\\name\nblue",
+            "quoted \"safe\" path C:\\tmp\napproved",
+        )
+        .unwrap();
+
+        let parsed = parse_allowlist(&path);
+        assert_eq!(
+            parsed["processes"]["worker\"\\name blue"].as_str(),
+            Some("quoted \"safe\" path C:\\tmp approved")
+        );
+    }
+
+    #[test]
+    fn append_to_allowlist_returns_clear_error_for_invalid_existing_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allowlist.toml");
+        std::fs::write(&path, "[ips\nbroken").unwrap();
+
+        let err = append_to_allowlist(&path, "ips", "203.0.113.7", "known scanner")
+            .expect_err("invalid TOML should fail");
+
+        assert!(err.to_string().contains("parse allowlist"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[ips\nbroken");
+    }
+
+    #[test]
+    fn log_allowlist_change_writes_valid_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        log_allowlist_change(dir.path(), "203.0.113.7", "ips", "alice", "add");
+
+        let path = dir.path().join("allowlist-history.jsonl");
+        let content = std::fs::read_to_string(path).expect("history file");
+        let line = content.lines().next().expect("history line");
+        let entry: serde_json::Value = serde_json::from_str(line).expect("valid json");
+        assert!(entry["ts"].as_str().unwrap_or_default().contains('T'));
+        assert_eq!(entry["key"], "203.0.113.7");
+        assert_eq!(entry["section"], "ips");
+        assert_eq!(entry["operator"], "alice");
+        assert_eq!(entry["action"], "add");
+    }
+
+    #[test]
+    fn read_undoable_allowlist_entries_filters_removed_and_honors_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        log_allowlist_change(dir.path(), "203.0.113.1", "ips", "alice", "add");
+        log_allowlist_change(dir.path(), "203.0.113.2", "ips", "alice", "add");
+        log_allowlist_change(dir.path(), "203.0.113.1", "ips", "alice", "remove");
+        log_allowlist_change(dir.path(), "worker", "processes", "bob", "add");
+
+        let entries = read_undoable_allowlist_entries(dir.path(), 2);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "worker");
+        assert_eq!(entries[0].1, "processes");
+        assert_eq!(entries[1].0, "203.0.113.2");
+        assert_eq!(entries[1].1, "ips");
+    }
+
+    #[test]
+    fn remove_from_allowlist_removes_only_requested_section_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allowlist.toml");
+        append_to_allowlist(&path, "ips", "203.0.113.7", "network").unwrap();
+        append_to_allowlist(&path, "processes", "203.0.113.7", "process name").unwrap();
+
+        remove_from_allowlist(&path, "ips", "203.0.113.7").unwrap();
+
+        let parsed = parse_allowlist(&path);
+        assert!(parsed["ips"]
+            .as_table()
+            .unwrap()
+            .get("203.0.113.7")
+            .is_none());
+        assert_eq!(
+            parsed["processes"]["203.0.113.7"].as_str(),
+            Some("process name")
+        );
+    }
+
+    #[test]
+    fn remove_from_allowlist_handles_bare_toml_process_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("allowlist.toml");
+        append_to_allowlist(&path, "processes", "sshd", "trusted process").unwrap();
+        append_to_allowlist(&path, "processes", "sshd-helper", "keep helper").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("\nsshd = "),
+            "serializer should use a bare key for this regression guard: {content}"
+        );
+
+        remove_from_allowlist(&path, "processes", "sshd").unwrap();
+
+        let parsed = parse_allowlist(&path);
+        assert!(parsed["processes"]
+            .as_table()
+            .unwrap()
+            .get("sshd")
+            .is_none());
+        assert_eq!(
+            parsed["processes"]["sshd-helper"].as_str(),
+            Some("keep helper")
+        );
+    }
+
+    #[test]
+    fn log_false_positive_appends_to_existing_daily_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        log_false_positive(dir.path(), "inc-1", "ssh_bruteforce", "alice");
+        log_false_positive(dir.path(), "inc-2", "credential_stuffing", "bob");
+
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        let path = dir.path().join(format!("fp-reports-{today}.jsonl"));
+        let content = std::fs::read_to_string(path).expect("fp report file");
+        let entries = content
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid json"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["incident_id"], "inc-1");
+        assert_eq!(entries[1]["incident_id"], "inc-2");
+        assert_eq!(entries[1]["action"], "reported_fp");
+    }
 
     // Spec 037 I-13 follow-up #2 (smallest slice): append_allowlist_history_or_warn
     //

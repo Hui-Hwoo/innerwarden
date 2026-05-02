@@ -1096,10 +1096,14 @@ mod tests {
         append_to_allowlist(&path, "ips", "1.2.3.4", "known safe").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
+        let parsed = content.parse::<toml::Table>().unwrap();
         assert!(content.contains("[processes]"));
-        assert!(content.contains("\"cargo-build\" = \"from telegram\""));
+        assert_eq!(
+            parsed["processes"]["cargo-build"].as_str(),
+            Some("from telegram")
+        );
         assert!(content.contains("[ips]"));
-        assert!(content.contains("\"1.2.3.4\" = \"known safe\""));
+        assert_eq!(parsed["ips"]["1.2.3.4"].as_str(), Some("known safe"));
     }
 
     #[test]
@@ -1108,8 +1112,11 @@ mod tests {
         let path = dir.path().join("allowlist.toml");
         append_to_allowlist(&path, "processes", "my\"proc", "line1\nline2").unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"my\\\"proc\""));
-        assert!(content.contains("line1 line2"));
+        let parsed = content.parse::<toml::Table>().unwrap();
+        assert_eq!(
+            parsed["processes"]["my\"proc"].as_str(),
+            Some("line1 line2")
+        );
     }
 
     #[test]
