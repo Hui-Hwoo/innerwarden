@@ -1,4 +1,36 @@
 // ── Intelligence tab ──────────────────────────────────────────────
+
+// 2026-05-02 audit B4 (Spec 041 Option B): the Playbooks Intel sub-tab
+// is hidden by default. The playbook engine records intents in the
+// background regardless, but the v1 executor only handles
+// notify/capture_forensics/escalate — every other step type renders
+// as "Triggered (no executor)", which the auditor flagged as
+// misleading in the UI. Default-hide closes that complaint without
+// removing the engine. Operators who flip `[playbook] enabled = true`
+// in agent.toml see the tab re-appear automatically.
+//
+// Probe runs once at boot (boot.js dispatches via DOMContentLoaded).
+// Same pattern as `probeFleetEnabled` for the Fleet tab.
+async function probePlaybooksEnabled() {
+  try {
+    const status = await loadJson('/api/status');
+    const enabled = !!(status && status.playbooks && status.playbooks.executor_enabled);
+    const btn = document.getElementById('intelTabPlaybooks');
+    if (btn) {
+      btn.style.display = enabled ? '' : 'none';
+    }
+    // If the operator deep-linked into Intel with the Playbooks
+    // sub-tab active and the executor is off, fall back to Profiles
+    // so they don't see an empty Playbooks pane with no nav button.
+    if (!enabled && typeof currentIntelTab !== 'undefined' && currentIntelTab === 'playbooks') {
+      if (typeof switchIntelTab === 'function') switchIntelTab('profiles');
+    }
+  } catch (_e) {
+    // Probe failures keep the default-hidden state — safer than
+    // showing a tab whose backend may not exist.
+  }
+}
+
 async function loadIntel() {
   const status = document.getElementById('intelViewStatus');
   const content = document.getElementById('intelContent');
@@ -556,4 +588,7 @@ async function loadMitreCoverage() {
     content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`;
   }
 }
+
+// Boot probe: hide the Playbooks sub-tab unless the executor is on.
+probePlaybooksEnabled();
 

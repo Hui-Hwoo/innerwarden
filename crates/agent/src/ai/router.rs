@@ -28,9 +28,10 @@
 //! ## Back-compat
 //!
 //! If the operator's `agent.toml` contains only the legacy `[ai]`
-//! block (no `[ai.classifier]` / `[ai.llm]` sections), the resulting
+//! block (no `[ai.warden]` / `[ai.llm]` sections), the resulting
 //! router puts the same provider in both slots. Behaviour is
-//! identical to pre-029.
+//! identical to pre-029. The `[ai.classifier]` TOML key is also
+//! still accepted as a serde alias of `[ai.warden]`.
 //!
 //! ## Shadow
 //!
@@ -67,7 +68,7 @@ impl std::fmt::Display for RouterBuildError {
         match self {
             RouterBuildError::EmptyRouter => write!(
                 f,
-                "both ai.classifier and ai.llm are unconfigured - router would serve no capabilities"
+                "both ai.warden and ai.llm are unconfigured - router would serve no capabilities"
             ),
         }
     }

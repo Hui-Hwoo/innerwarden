@@ -223,11 +223,11 @@ pub(crate) async fn process_incidents(
     // Spec 029 PR-C.2: provider resolution migrated to the capability
     // router. This is the Decide path, so we pull from
     // `state.ai_router.provider_for(Capability::Decide)`. When the
-    // operator has configured a dedicated classifier via
-    // `[ai.classifier]`, triage routes through the classifier without
-    // touching the rest of the decision pipeline. Legacy configs
-    // (no `[ai.classifier]` / `[ai.llm]`) populate both slots with the
-    // primary provider, so behaviour is identical.
+    // operator has configured a dedicated Local Warden Model via
+    // `[ai.warden]`, triage routes through it without touching the
+    // rest of the decision pipeline. Legacy configs (no `[ai.warden]`
+    // / `[ai.llm]`) populate both slots with the primary provider,
+    // so behaviour is identical.
     let decide_provider = state.ai_router.provider_for(ai::Capability::Decide);
     let ai_enabled = cfg.ai.enabled && decide_provider.is_some() && !circuit_breaker_open;
     let (all_events, skill_infos, ai_provider, provider_name, already_blocked, mut blocked_set) =

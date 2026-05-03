@@ -1548,7 +1548,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     // Defender brain daily retrain — at 3:30 AM UTC (after autoencoder at 3 AM).
                     // Brain retrain block removed: defender_brain replaced
                     // by SecureBERT classifier provider routed through the
-                    // AI router. Local classifier inference happens in the
+                    // AI router. Local Warden Model inference happens in the
                     // hot path, no nightly retrain needed.
 
                     // Trim in-memory structures to prevent unbounded memory growth

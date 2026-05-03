@@ -145,6 +145,7 @@ pub(super) fn compute_overview_counts_from_sqlite(
     detector_substring: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
     degraded: &DegradedSignals,
+    data_dir: &std::path::Path,
 ) -> Option<OverviewCounts> {
     use super::types::{BucketStats, OutcomeBuckets, OverviewSnapshot, PendingBreakdown};
 
@@ -528,7 +529,18 @@ pub(super) fn compute_overview_counts_from_sqlite(
 
     let health = derive_system_health(&pending, last_decision_secs_ago, degraded);
 
-    let events_today = 0; // backfilled below from telemetry by the caller
+    // 2026-05-02 audit (Spec 039 P3 follow-up): events_today is part
+    // of the canonical snapshot contract. Pre-fix it was hardcoded to
+    // 0 here and backfilled only by api_overview, so every other
+    // surface that read the snapshot (Briefing, Report, Sensors HUD)
+    // showed "Events Today: 0" while the per-source counters showed
+    // millions. The backfill must live inside the SoT helper so all
+    // callers get the same number.
+    let telemetry = crate::telemetry::read_latest_snapshot(data_dir, date);
+    let events_today: usize = telemetry
+        .as_ref()
+        .map(|t| t.events_by_collector.values().copied().sum::<u64>() as usize)
+        .unwrap_or(0);
     counts.snapshot = Some(OverviewSnapshot {
         date: date.to_string(),
         generated_at: now,
@@ -799,6 +811,7 @@ pub(super) async fn api_overview(
             detector_substring_filter.as_deref(),
             now,
             &degraded,
+            &state.data_dir,
         )
     });
     if let Some(c) = sqlite_counts {
@@ -813,15 +826,13 @@ pub(super) async fn api_overview(
             .collect();
         top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
         top_detectors.truncate(6);
-        // Phase 7: events_today on the snapshot reads from telemetry
-        // (sensor counter) when available, falling back to the lossy
-        // KG edge count. Telemetry snapshot is what the operator
-        // actually wants on the "Events Scanned" tile.
-        let events_today = telemetry
-            .as_ref()
-            .map(|t| t.events_by_collector.values().copied().sum::<u64>() as usize)
-            .unwrap_or(metrics.edge_count);
-        let mut snapshot = c.snapshot.clone().unwrap_or_else(|| {
+        // 2026-05-02: events_today is now backfilled inside
+        // compute_overview_counts_from_sqlite (the SoT helper) so every
+        // surface (Briefing, Report, Sensors HUD) gets the same number
+        // without re-implementing the telemetry read. The local
+        // `telemetry` binding above is retained for the legacy
+        // `latest_telemetry` payload field consumed elsewhere.
+        let snapshot = c.snapshot.clone().unwrap_or_else(|| {
             // Defensive default: should never hit because
             // compute_overview_counts_from_sqlite always populates,
             // but if it ever returns None we serve a sensible empty
@@ -836,7 +847,6 @@ pub(super) async fn api_overview(
                 top_detectors: Vec::new(),
             }
         });
-        snapshot.events_today = events_today;
         return Json(OverviewResponse {
             date,
             events_count: metrics.edge_count, // legacy field — kept for backwards-compat
@@ -1249,9 +1259,15 @@ pub(super) async fn api_report(
         if let Some(store) = state.sqlite_store.as_ref() {
             let now = chrono::Utc::now();
             let degraded = read_degraded_signals(&state);
-            if let Some(counts) =
-                compute_overview_counts_from_sqlite(store, &today, 0, None, now, &degraded)
-            {
+            if let Some(counts) = compute_overview_counts_from_sqlite(
+                store,
+                &today,
+                0,
+                None,
+                now,
+                &degraded,
+                &state.data_dir,
+            ) {
                 if let Some(snap) = counts.snapshot.as_ref() {
                     let buckets = &snap.buckets;
                     let total_incidents = buckets.blocked.incidents
@@ -1336,7 +1352,7 @@ pub(super) async fn api_briefing_generate(
         let today = resolve_date(None);
         let now = chrono::Utc::now();
         let degraded = read_degraded_signals(&state);
-        compute_overview_counts_from_sqlite(store, &today, 0, None, now, &degraded)
+        compute_overview_counts_from_sqlite(store, &today, 0, None, now, &degraded, &state.data_dir)
             .and_then(|counts| counts.snapshot)
     });
     let context =
@@ -2272,6 +2288,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts returned");
         assert_eq!(counts.incidents_count, 4, "today only, not yesterday");
@@ -2318,6 +2335,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts returned");
         assert_eq!(
@@ -2356,6 +2374,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts");
         assert_eq!(counts.incidents_count, 1);
@@ -2421,6 +2440,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts");
         let snap = counts.snapshot.expect("snapshot populated");
@@ -2518,6 +2538,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts");
         let snap = counts.snapshot.expect("snap");
@@ -2588,6 +2609,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts");
         let snap = counts.snapshot.expect("snapshot populated");
@@ -2669,6 +2691,7 @@ mod tests {
             None,
             now,
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts");
         let snap = counts.snapshot.expect("snapshot populated");
@@ -2756,6 +2779,7 @@ mod tests {
             None,
             now,
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts");
         let snap = counts.snapshot.expect("snapshot");
@@ -2789,6 +2813,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
+            std::path::Path::new("/nonexistent-test-data-dir"),
         )
         .expect("counts");
         let snap = counts.snapshot.expect("snapshot");
@@ -3172,5 +3197,90 @@ mod tests {
             }
             other => panic!("expected AiNotResponding to take priority, got {other:?}"),
         }
+    }
+
+    // 2026-05-02 audit anchor: events_today is part of the canonical
+    // OverviewSnapshot contract. Pre-fix this field was hardcoded to 0
+    // inside compute_overview_counts_from_sqlite and only api_overview
+    // backfilled it from telemetry — Briefing, Report, and Sensors HUD
+    // all rendered "EVENTS TODAY: 0" while the per-source counters
+    // showed millions. The fix backfills inside the SoT helper so all
+    // callers get the same number. This test pins the contract: when
+    // a telemetry-YYYY-MM-DD.jsonl file is present with a populated
+    // events_by_collector, the snapshot returned by the helper carries
+    // the summed count.
+    #[test]
+    fn compute_overview_counts_backfills_events_today_from_telemetry() {
+        use std::io::Write;
+        let store = make_overview_test_store();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let snap = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "tick": "test_tick",
+            "events_by_collector": {
+                "ebpf": 13_177_172u64,
+                "tcp_stream": 1_123_159u64,
+                "dns_capture": 312_710u64,
+            },
+            "incidents_by_detector": {},
+            "gate_pass_count": 0u64,
+            "gate_suppressed_total": 0u64,
+            "ai_sent_count": 0u64,
+            "telegram_sent_count": 0u64,
+            "ai_decision_count": 0u64,
+            "avg_decision_latency_ms": 0.0,
+            "errors_by_component": {},
+            "decisions_by_action": {},
+            "dry_run_execution_count": 0u64,
+            "real_execution_count": 0u64,
+        });
+        let mut f = std::fs::File::create(dir.path().join(format!("telemetry-{date}.jsonl")))
+            .expect("create telemetry file");
+        writeln!(f, "{}", serde_json::to_string(&snap).unwrap()).unwrap();
+
+        let counts = super::compute_overview_counts_from_sqlite(
+            &store,
+            &date,
+            0,
+            None,
+            chrono::Utc::now(),
+            &super::DegradedSignals::default(),
+            dir.path(),
+        )
+        .expect("counts returned");
+        let snapshot = counts.snapshot.expect("snapshot populated");
+        // 13M + 1.1M + 312k = 14_613_041
+        assert_eq!(
+            snapshot.events_today,
+            13_177_172 + 1_123_159 + 312_710,
+            "events_today must be the sum of telemetry events_by_collector — \
+             if this is 0, the SoT backfill regressed (compute_overview_counts_from_sqlite \
+             stopped reading telemetry inline). See PR #412."
+        );
+    }
+
+    #[test]
+    fn compute_overview_counts_falls_back_to_zero_when_telemetry_missing() {
+        // Boot path / cold start: when no telemetry file exists for
+        // the requested date, the snapshot defaults events_today=0
+        // gracefully instead of erroring. The other surfaces handle
+        // 0 by hiding or showing "—".
+        let store = make_overview_test_store();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let date = "2026-05-02";
+
+        let counts = super::compute_overview_counts_from_sqlite(
+            &store,
+            date,
+            0,
+            None,
+            chrono::Utc::now(),
+            &super::DegradedSignals::default(),
+            dir.path(),
+        )
+        .expect("counts returned");
+        let snapshot = counts.snapshot.expect("snapshot populated");
+        assert_eq!(snapshot.events_today, 0);
     }
 }

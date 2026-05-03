@@ -476,20 +476,25 @@ enum Command {
         command: SuppressCommand,
     },
 
-    /// Install the local SecureBERT classifier model used by the
-    /// agent's local_classifier AI provider.
+    /// Install the Local Warden Model (distilled SecureBERT) used by
+    /// the agent's `local_warden` AI provider.
     ///
     /// Downloads `model.onnx` and `tokenizer.json` from the configured
     /// GitHub release artifact and installs them under
-    /// `/var/lib/innerwarden/models/classifier/`. The classifier
+    /// `/var/lib/innerwarden/models/classifier/`. The Local Warden
     /// provider activates automatically when the agent restarts and
-    /// the operator has set `[ai.classifier].provider = "local_classifier"`
+    /// the operator has set `[ai.warden].provider = "local_warden"`
     /// in `agent.toml` (the `configure` wizard does that for you).
     ///
+    /// 2026-05-03 rename: previously `install-classifier` —
+    /// `install-classifier` is preserved as a visible alias so
+    /// existing automation continues to work.
+    ///
     /// Examples:
-    ///   innerwarden install-classifier
-    ///   innerwarden install-classifier --model minilm-l6 --yes
-    ///   innerwarden install-classifier --url https://github.com/InnerWarden/innerwarden/releases/download/classifier-v1/minilm-l6.tar.gz
+    ///   innerwarden install-warden
+    ///   innerwarden install-warden --model minilm-l6 --yes
+    ///   innerwarden install-warden --url https://github.com/InnerWarden/innerwarden/releases/download/classifier-v1/minilm-l6.tar.gz
+    #[command(name = "install-warden", visible_alias = "install-classifier")]
     InstallClassifier {
         /// Model variant to install. Supported: `minilm-l6` (87 MB,
         /// distilled, default) and `roberta-v1` (478 MB, full
@@ -2767,8 +2772,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_install_classifier_defaults() {
-        let cli = Cli::try_parse_from(["innerwarden", "install-classifier"]).expect("parse cli");
+    fn cli_parses_install_warden_defaults() {
+        let cli = Cli::try_parse_from(["innerwarden", "install-warden"]).expect("parse cli");
         match cli.command {
             Some(Command::InstallClassifier {
                 model,
@@ -2781,15 +2786,29 @@ mod tests {
                 assert!(sha256.is_none());
                 assert!(!yes);
             }
-            _ => panic!("expected install-classifier command"),
+            _ => panic!("expected install-warden command"),
+        }
+    }
+
+    // 2026-05-03 anchor: `install-classifier` must still work as a
+    // visible alias so existing operator automation (cron, ansible,
+    // shell history) is not broken by the rename.
+    #[test]
+    fn cli_accepts_legacy_install_classifier_alias() {
+        let cli = Cli::try_parse_from(["innerwarden", "install-classifier"]).expect("parse cli");
+        match cli.command {
+            Some(Command::InstallClassifier { model, .. }) => {
+                assert_eq!(model, "minilm-l6");
+            }
+            _ => panic!("expected install-classifier alias to dispatch to install-warden"),
         }
     }
 
     #[test]
-    fn cli_parses_install_classifier_overrides() {
+    fn cli_parses_install_warden_overrides() {
         let cli = Cli::try_parse_from([
             "innerwarden",
-            "install-classifier",
+            "install-warden",
             "--model",
             "roberta-v1",
             "--url",
@@ -2814,7 +2833,7 @@ mod tests {
                 assert_eq!(sha256.as_deref(), Some("abc123"));
                 assert!(yes);
             }
-            _ => panic!("expected install-classifier command"),
+            _ => panic!("expected install-warden command"),
         }
     }
 

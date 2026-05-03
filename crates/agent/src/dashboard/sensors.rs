@@ -40,7 +40,13 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
         let now_dt = chrono::Utc::now();
         let degraded = super::data_api::read_degraded_signals(&state);
         super::data_api::compute_overview_counts_from_sqlite(
-            store, &today, 0, None, now_dt, &degraded,
+            store,
+            &today,
+            0,
+            None,
+            now_dt,
+            &degraded,
+            &state.data_dir,
         )
         .and_then(|counts| counts.snapshot)
     });
@@ -171,15 +177,28 @@ fn build_sensors_payload(
         &graph.event_timeline
     };
 
-    // Project bucket keys to bare `HH:MM` for the chart so the x-axis stays
-    // compact. The Sensors tab shows a single day's data at a time, so the
-    // date prefix is redundant for display. The full date is retained in the
-    // in-memory map for windowed queries (`report.rs::compute_recent_window`).
+    // 2026-05-02: filter buckets to TODAY's date prefix before
+    // stripping. Pre-fix the chart folded multi-day data into the same
+    // HH:MM display key (operator: "o grafico fica fixo aparecendo
+    // alto so depois das 20 horas, ta assim a dias"). Cause: bucket
+    // keys are `YYYY-MM-DDTHH:MM`; `strip_date_prefix` drops the
+    // date and `BTreeMap::collect` overwrites duplicates with the
+    // last-iterated entry. With multi-day buckets in the KG, today's
+    // empty pre-spike hours got overwritten by yesterday's same-time
+    // values, producing a static-looking chart that "moved" only
+    // when today's events landed past the agent's restart minute.
+    //
+    // Fix: keep only buckets whose date prefix matches today. The
+    // KG retains multi-day data for windowed queries elsewhere
+    // (report.rs::compute_recent_window); the Sensors HUD chart
+    // explicitly shows TODAY ONLY.
+    let today_prefix = format!("{today}T");
     let event_tl_display: std::collections::BTreeMap<
         String,
         &std::collections::HashMap<String, usize>,
     > = event_tl_source
         .iter()
+        .filter(|(k, _)| k.starts_with(&today_prefix))
         .map(|(k, v)| {
             (
                 crate::knowledge_graph::buckets::strip_date_prefix(k).to_string(),
@@ -187,11 +206,13 @@ fn build_sensors_payload(
             )
         })
         .collect();
+    // Same today-only filter for the detector timeline — same reason.
     let detector_tl_display: std::collections::BTreeMap<
         String,
         &std::collections::HashMap<String, usize>,
     > = detector_timeline
         .iter()
+        .filter(|(k, _)| k.starts_with(&today_prefix))
         .map(|(k, v)| {
             (
                 crate::knowledge_graph::buckets::strip_date_prefix(k).to_string(),
@@ -322,6 +343,16 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
             "dry_run": action_cfg.dry_run,
             "block_backend": action_cfg.block_backend,
             "allowed_skills": action_cfg.allowed_skills
+        },
+        // 2026-05-02 audit B4 (Spec 041 Option B): surface the playbook
+        // executor flag so the frontend can hide the Playbooks Intel
+        // sub-tab when the executor is off. Auditor's complaint:
+        // "Triggered (no executor)" rendered in the UI as if execution
+        // were imminent, masking that no step ever transitions. Default
+        // is `enabled = false`, so the tab is hidden until the operator
+        // explicitly opts in via `[playbook] enabled = true`.
+        "playbooks": {
+            "executor_enabled": action_cfg.playbook_executor_enabled,
         },
         "webhook_format": action_cfg.webhook_format,
         "sudo_protection": action_cfg.sudo_protection_enabled,
@@ -806,5 +837,109 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0]["name"].as_str(), Some("auth_log"));
         assert_eq!(sources[0]["count"].as_u64(), Some(2));
+    }
+
+    // 2026-05-02 audit anchor: the operator reported the Event Timeline
+    // chart was "fixo aparecendo alto so depois das 20 horas" / "ta
+    // assim a dias". Cause: `event_timeline` keys are
+    // `YYYY-MM-DDTHH:MM`; the display projection stripped the date and
+    // the BTreeMap collapsed multi-day buckets onto the same `HH:MM`
+    // display key. With last-iteration-wins semantics, yesterday's
+    // pre-spike hours survived for hours where today hadn't ingested
+    // anything yet — the chart looked like a multi-day average instead
+    // of today's fresh data. The fix filters buckets to today's date
+    // prefix before stripping; this anchor pins that contract.
+    #[test]
+    fn build_sensors_payload_event_timeline_filters_to_today_only() {
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        // Force `total_events_ingested > 0` so the per-source path is
+        // taken (the chart-fold bug only affected dated buckets, not
+        // the per-source counters tested above).
+        g.record_event_telemetry("auth_log", "ssh.login_failed", chrono::Utc::now());
+
+        // Seed the event_timeline with both today's and yesterday's
+        // buckets. Yesterday's value for a slot today hasn't reached
+        // is what would survive the BTreeMap dedup pre-fix.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut yesterday_03_15: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        yesterday_03_15.insert("auth_log".to_string(), 9_999);
+        let mut today_22_00: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        today_22_00.insert("auth_log".to_string(), 7);
+        g.event_timeline
+            .insert(format!("{yesterday}T03:15"), yesterday_03_15);
+        g.event_timeline
+            .insert(format!("{today}T22:00"), today_22_00);
+
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path(), None);
+
+        let timeline = payload["event_timeline"].as_object().expect("timeline");
+        // Yesterday's `03:15` MUST NOT leak into today's chart even
+        // though strip_date_prefix would project it to the same key.
+        assert!(
+            !timeline.contains_key("03:15"),
+            "yesterday's 03:15 bucket must NOT appear on today's chart \
+             (chart-fold regression — see commit message). Got: {timeline:?}"
+        );
+        // Today's bucket is present and untouched.
+        assert!(
+            timeline.contains_key("22:00"),
+            "today's 22:00 bucket must appear on today's chart. Got: {timeline:?}"
+        );
+        let today_bucket = timeline["22:00"].as_object().unwrap();
+        assert_eq!(today_bucket["auth_log"].as_u64(), Some(7));
+    }
+
+    // 2026-05-02 audit anchor: the operator's screenshot showed
+    // "EVENTS TODAY: 0" while per-source counters totalled millions.
+    // Pre-fix the SoT helper hardcoded `events_today: 0` and only
+    // api_overview backfilled it. The Sensors HUD path (PR #409) read
+    // the un-backfilled snapshot directly. This anchor pins that
+    // build_sensors_payload, when handed an OverviewSnapshot with
+    // events_today populated, surfaces that exact value as
+    // `total_events`.
+    #[test]
+    fn build_sensors_payload_uses_snapshot_events_today_field() {
+        use crate::dashboard::types::{
+            BucketStats, OutcomeBuckets, OverviewSnapshot, PendingBreakdown, SystemHealth,
+        };
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let snap = OverviewSnapshot {
+            date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            generated_at: chrono::Utc::now(),
+            health: SystemHealth::OperatingNormally,
+            buckets: OutcomeBuckets {
+                blocked: BucketStats {
+                    incidents: 1,
+                    unique_attackers: 1,
+                    severities: Default::default(),
+                },
+                ..Default::default()
+            },
+            pending: PendingBreakdown::default(),
+            // Distinctive value so a regression that swaps fields would
+            // surface immediately.
+            events_today: 13_177_172,
+            top_detectors: vec![],
+        };
+
+        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap));
+        assert_eq!(
+            payload["total_events"].as_u64(),
+            Some(13_177_172),
+            "total_events MUST come from snapshot.events_today (the \
+             canonical SoT field). If this drops to 0, the SoT \
+             contract regressed — see fix in compute_overview_counts_from_sqlite"
+        );
     }
 }

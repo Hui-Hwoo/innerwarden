@@ -1,4 +1,9 @@
-//! Local ONNX classifier provider (distilled student of a SecureBERT teacher).
+//! Local Warden Model — ONNX classifier (distilled student of a SecureBERT teacher).
+//!
+//! Operator-facing name: **Local Warden Model** (TOML key `[ai.warden]`,
+//! provider id `local_warden`). Internal symbols keep the
+//! `local_classifier` / `LocalClassifier` names for audit-trail
+//! continuity and to keep diffs minimal.
 //!
 //! Runs inference in-process using `tract-onnx` (pure Rust ONNX runtime) and
 //! HuggingFace `tokenizers`. Output: {dismiss, ignore, block_ip, monitor} +
@@ -241,7 +246,7 @@ impl AiProvider for LocalClassifier {
             confidence: conf,
             auto_execute: conf >= self.auto_exec_threshold,
             reason: format!(
-                "Local classifier decided {} with confidence {:.3}. Alternatives: {}.",
+                "Local Warden decided {} with confidence {:.3}. Alternatives: {}.",
                 action_name,
                 conf,
                 alternatives.join(", ")
@@ -252,7 +257,7 @@ impl AiProvider for LocalClassifier {
     }
 
     async fn chat(&self, _system_prompt: &str, _user_message: &str) -> Result<String> {
-        bail!("local_classifier does not support free-form chat (classification only)")
+        bail!("Local Warden does not support free-form chat (classification only)")
     }
 }
 

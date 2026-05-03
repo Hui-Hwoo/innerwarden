@@ -29,7 +29,7 @@ var GLOSSARY = {
   observing:        'Watching the attacker without active blocking. Used when severity is below the action threshold or the operator wants more context first.',
   honeypot:         'Attacker is being redirected to a fake-shell honeypot listener. Activity is recorded as forensic intel.',
   needs_attention:  'AI declined to act and escalated to the operator. The system is waiting for your judgement.',
-  dismissed:        'The system or operator marked this as a false positive. No action recorded; pattern saved as a label for future classifier retraining.',
+  dismissed:        'The system or operator marked this as a false positive. No action recorded; pattern saved as a label for future Local Warden retraining.',
   allowlisted:      'A trusted entity (operator IP, admin user, etc.) — the AI silenced incidents about it because they are operationally expected, not malicious.',
   // Common verbs the dashboard renders.
   attacker:         'A unique IP that produced at least one incident. Counts dedupe by IP, not by event count.',
@@ -209,7 +209,7 @@ function syncModeBadgeFromHealth(overview, modeCfg) {
       'alert-triangle',
       'AI NOT RESPONDING',
       'status-badge-alert',
-      'AI provider/classifier is not answering. See system health.'
+      'AI provider/Local Warden is not answering. See system health.'
     );
     return;
   }

@@ -579,9 +579,10 @@ pub(crate) fn resolve_classifier_variant(name: &str) -> Option<&'static Classifi
     CLASSIFIER_VARIANTS.iter().find(|v| v.name == name)
 }
 
-/// `innerwarden install-classifier` — fetch and install the local
-/// SecureBERT model files used by the agent's `local_classifier`
-/// AI provider. Replaces the deleted defender-brain pipeline.
+/// `innerwarden install-warden` (formerly `install-classifier`) —
+/// fetch and install the Local Warden Model files used by the
+/// agent's `local_warden` AI provider. Replaces the deleted
+/// defender-brain pipeline.
 pub(crate) fn cmd_install_classifier(
     cli: &Cli,
     model: &str,
@@ -622,7 +623,7 @@ fn cmd_install_classifier_with_target(
     let url = url_override.unwrap_or(variant.url);
     let expected_sha = sha256_override.unwrap_or(variant.sha256);
 
-    println!("InnerWarden local classifier install");
+    println!("InnerWarden Local Warden Model install");
     println!();
     println!("  Variant: {} - {}", variant.name, variant.description);
     println!("  URL:     {url}");
@@ -630,9 +631,9 @@ fn cmd_install_classifier_with_target(
     println!("  Target:  {target_dir}");
     println!("  Size:    ~{} MB", variant.approx_size_mb);
     println!();
-    println!("Active classifier replaces the (now removed) AlphaZero defender brain.");
-    println!("The agent's `local_classifier` provider activates automatically when");
-    println!("`agent.toml` has `[ai.classifier].provider = \"local_classifier\"` and");
+    println!("Local Warden Model replaces the (now removed) AlphaZero defender brain.");
+    println!("The agent's `local_warden` provider activates automatically when");
+    println!("`agent.toml` has `[ai.warden].provider = \"local_warden\"` and");
     println!("`base_url = \"{target_dir}\"`. Run `innerwarden configure ai`");
     println!("after install to wire the slot if you have not already.");
     println!();
@@ -642,7 +643,9 @@ fn cmd_install_classifier_with_target(
             "WARNING: pinned SHA-256 not published yet. Pass --sha256 explicitly or wait \
              for the release to be cut. Refusing to install without a real hash."
         );
-        anyhow::bail!("classifier install requires --sha256 until the release artifact is pinned");
+        anyhow::bail!(
+            "Local Warden install requires --sha256 until the release artifact is pinned"
+        );
     }
 
     let stdin = std::io::stdin();

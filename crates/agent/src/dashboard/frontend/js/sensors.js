@@ -319,6 +319,12 @@ function drawThreatGauge(incidents, events) {
     plugins: [{
       id: 'gaugeCenter',
       afterDraw(chart) {
+        // 2026-05-02: section is labelled "UNRESOLVED THREATS" so the
+        // big number must match — show the unresolved count, not the
+        // total. Pre-fix the gauge rendered "409 NOMINAL" while the
+        // tile above said "0 incident being handled by AI": the 409
+        // was total_incidents (mostly blocked), but the heading "Unresolved
+        // Threats" made it look like 409 needed attention.
         const {ctx, chartArea} = chart;
         const cx = (chartArea.left + chartArea.right) / 2;
         const cy = chartArea.bottom - 10;
@@ -328,11 +334,11 @@ function drawThreatGauge(incidents, events) {
         ctx.font = "bold 22px 'JetBrains Mono', monospace";
         ctx.shadowColor = color;
         ctx.shadowBlur = 12;
-        ctx.fillText(incidents.toString(), cx, cy - 8);
+        ctx.fillText(ur.toString(), cx, cy - 8);
         ctx.shadowBlur = 0;
         ctx.fillStyle = '#8b9db8';
         ctx.font = "10px 'Space Grotesk', sans-serif";
-        ctx.fillText('incidents', cx, cy + 8);
+        ctx.fillText('unresolved', cx, cy + 8);
         ctx.restore();
       }
     }]

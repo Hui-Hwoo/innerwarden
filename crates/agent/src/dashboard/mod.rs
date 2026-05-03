@@ -3455,6 +3455,57 @@ mod tests {
     }
 
     #[test]
+    fn playbooks_tab_hidden_behind_feature_flag() {
+        // 2026-05-02 audit B4 (Spec 041 Option B): the Playbooks Intel
+        // sub-tab is hidden by default. The playbook engine still
+        // records intents in the background, but the v1 executor only
+        // handles a few step types and the rest render as "Triggered
+        // (no executor)". The auditor's complaint was that the tab
+        // displayed this misleading state on every install. Default-
+        // hide closes that complaint. Operators who flip
+        // `[playbook] enabled = true` see the tab re-appear.
+
+        // HTML: the tab button starts hidden.
+        let nav_btn_start = INDEX_HTML
+            .find("id=\"intelTabPlaybooks\"")
+            .expect("Playbooks Intel sub-tab button must exist");
+        let nav_btn_slice = &INDEX_HTML[nav_btn_start..nav_btn_start + 400];
+        assert!(
+            nav_btn_slice.contains("display:none"),
+            "intelTabPlaybooks must start hidden — operators opt in via \
+             `[playbook] enabled = true` (audit B4 / Spec 041 Option B)"
+        );
+
+        // intel.js carries the probe + invokes it at boot.
+        assert!(
+            JS_INTEL.contains("function probePlaybooksEnabled"),
+            "intel.js must define probePlaybooksEnabled — mirrors the \
+             probeFleetEnabled pattern for Fleet"
+        );
+        assert!(
+            JS_INTEL.contains("probePlaybooksEnabled();"),
+            "intel.js must invoke probePlaybooksEnabled() at boot so the \
+             tab unhides automatically when the operator opts in"
+        );
+        // Probe reads the flag from /api/status (matches backend
+        // expose path).
+        assert!(
+            JS_INTEL.contains("status.playbooks && status.playbooks.executor_enabled"),
+            "probe must read the executor flag from /api/status. If the \
+             backend renames the field, this test will catch the drift."
+        );
+        // Deep-link safety: if the operator lands on the Playbooks
+        // sub-tab via state and the executor is off, fall back to
+        // Profiles instead of leaving them on a hidden tab.
+        assert!(
+            JS_INTEL.contains("currentIntelTab === 'playbooks'")
+                && JS_INTEL.contains("switchIntelTab('profiles')"),
+            "probe must redirect away from the Playbooks tab when the \
+             executor is off and the operator deep-linked into it"
+        );
+    }
+
+    #[test]
     fn dashboard_audit_2026_05_02_small_fixes_are_wired() {
         // 2026-05-02 audit (P2/P7/P8 + frozen graph): five small wiring
         // fixes bundled in PR #407. This anchor pins them so a future

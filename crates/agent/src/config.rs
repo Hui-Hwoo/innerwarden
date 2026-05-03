@@ -842,9 +842,15 @@ pub struct AiConfig {
     /// the classifier slot of the router — identical to the pre-029
     /// behaviour. When `enabled = true`, the router uses this block
     /// for `Capability::Decide` and `Capability::Classify`. Typical
-    /// production config points this at the local ONNX classifier
-    /// so triage runs without LLM cost.
-    #[serde(default)]
+    /// production config points this at the Local Warden Model
+    /// (ONNX classifier) so triage runs without LLM cost.
+    ///
+    /// 2026-05-03: TOML key was `[ai.classifier]` — operator-facing
+    /// rename to `[ai.warden]` keeps the canonical brand consistent
+    /// with the model name itself (`warden` / `securebert`). The
+    /// `classifier` alias preserves back-compat with existing prod
+    /// configs; new operators write `[ai.warden]`.
+    #[serde(default, alias = "classifier", rename = "warden")]
     pub classifier: RoleProviderConfig,
 
     /// Spec 029 PR-C: dedicated provider for the LLM role
@@ -862,7 +868,8 @@ pub struct AiConfig {
 }
 
 /// Slim per-role provider configuration introduced in spec 029 PR-C.
-/// Shared by `[ai.classifier]` and `[ai.llm]`. Fields are a subset of
+/// Shared by `[ai.warden]` (Local Warden Model — formerly
+/// `[ai.classifier]`) and `[ai.llm]`. Fields are a subset of
 /// `AiConfig` (only what a single provider needs to be constructed);
 /// shared knobs like `confidence_threshold`, `min_severity`, and the
 /// shadow wrapper continue to live on the top-level `[ai]` block.
@@ -874,8 +881,10 @@ pub struct RoleProviderConfig {
     pub enabled: bool,
 
     /// Provider name. Same set of valid values as `[ai].provider`
-    /// (openai, anthropic, ollama, azure_openai, local_classifier,
-    /// stub, or any OpenAI-compatible registered name).
+    /// (openai, anthropic, ollama, azure_openai, local_warden /
+    /// local_classifier, stub, or any OpenAI-compatible registered
+    /// name). `local_warden` is the canonical name for the on-device
+    /// ONNX model; `local_classifier` is accepted as a legacy alias.
     #[serde(default)]
     pub provider: String,
 
@@ -3736,9 +3745,9 @@ detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
         assert!(cfg.api_key.is_empty());
     }
 
-    // Spec 029 PR-C: parses the classifier + llm TOML sections.
+    // Spec 029 PR-C: parses the warden + llm TOML sections.
     #[test]
-    fn load_parses_classifier_and_llm_sections() {
+    fn load_parses_warden_and_llm_sections() {
         let mut tmp = NamedTempFile::new().unwrap();
         writeln!(
             tmp,
@@ -3746,10 +3755,10 @@ detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
 enabled = true
 provider = "stub"
 
-[ai.classifier]
+[ai.warden]
 enabled = true
-provider = "local_classifier"
-base_url = "/var/lib/innerwarden/models/classifier"
+provider = "local_warden"
+base_url = "/var/lib/innerwarden/models/warden"
 
 [ai.llm]
 enabled = true
@@ -3766,16 +3775,43 @@ api_version = "2024-12-01-preview"
         assert_eq!(cfg.ai.provider, "stub");
 
         assert!(cfg.ai.classifier.enabled);
-        assert_eq!(cfg.ai.classifier.provider, "local_classifier");
+        assert_eq!(cfg.ai.classifier.provider, "local_warden");
         assert_eq!(
             cfg.ai.classifier.base_url,
-            "/var/lib/innerwarden/models/classifier"
+            "/var/lib/innerwarden/models/warden"
         );
 
         assert!(cfg.ai.llm.enabled);
         assert_eq!(cfg.ai.llm.provider, "azure_openai");
         assert_eq!(cfg.ai.llm.model, "gpt-5.4-mini");
         assert_eq!(cfg.ai.llm.api_version, "2024-12-01-preview");
+    }
+
+    // 2026-05-03: back-compat anchor — old `[ai.classifier]` TOMLs
+    // must keep parsing. Existing prod configs MUST NOT break on
+    // upgrade.
+    #[test]
+    fn load_accepts_legacy_classifier_alias_for_warden_section() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai]
+enabled = true
+provider = "stub"
+
+[ai.classifier]
+enabled = true
+provider = "local_classifier"
+base_url = "/var/lib/innerwarden/models/classifier"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert!(
+            cfg.ai.classifier.enabled,
+            "legacy [ai.classifier] section must still deserialize"
+        );
+        assert_eq!(cfg.ai.classifier.provider, "local_classifier");
     }
 
     // Spec 029 PR-C: legacy `[ai]` only config is still parsed with

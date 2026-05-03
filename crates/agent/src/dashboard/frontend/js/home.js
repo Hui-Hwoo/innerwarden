@@ -615,7 +615,7 @@ function computeHomeState(payload) {
     reasons.unshift(
       stuckN + ' incident' + (stuckN === 1 ? '' : 's') +
       ' pending >1h with no decision. ' + lastDecisionPart + ' — ' +
-      'AI provider/classifier is likely down.'
+      'AI provider/Local Warden is likely down.'
     );
   }
 

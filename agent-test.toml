@@ -25,17 +25,21 @@ confidence_threshold = 0.8
 incident_poll_secs = 2
 
 # Spec 029: per-role AI providers via the capability router. The
-# `[ai.classifier]` slot, when populated, handles `Decide` / `Classify`
+# `[ai.warden]` slot, when populated, handles `Decide` / `Classify`
 # capabilities locally without touching the cloud LLM. The
-# `local_classifier` provider loads the SecureBERT model installed by
-# `innerwarden install-classifier` (87 MB MiniLM L6 default, 478 MB
+# `local_warden` provider loads the Local Warden Model installed by
+# `innerwarden install-warden` (87 MB MiniLM L6 default, 478 MB
 # RoBERTa V1 alternative). When unset, Decide falls through to the
 # cloud LLM in `[ai]`.
 #
-# [ai.classifier]
-# provider = "local_classifier"
+# Back-compat: `[ai.classifier]` + `provider = "local_classifier"`
+# remain accepted as legacy aliases — existing prod configs upgrade
+# without edits.
+#
+# [ai.warden]
+# provider = "local_warden"
 # base_url = "/var/lib/innerwarden/models/classifier"
-# # auto_exec_threshold: confidence above which the classifier is
+# # auto_exec_threshold: confidence above which the Local Warden is
 # # trusted to fire `auto_execute=true` decisions without a second
 # # opinion. Below the threshold the decision is logged as
 # # advisory-only.

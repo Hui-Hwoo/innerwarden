@@ -489,11 +489,16 @@ fn build_single(
     }
 
     match provider {
+        // 2026-05-03: canonical provider id is `local_warden` (Local
+        // Warden Model). `local_classifier` is accepted as a legacy
+        // alias so existing prod TOMLs upgrade cleanly. Internal
+        // symbols (struct, file, cargo feature) keep the original
+        // name — operator-facing strings only.
         #[cfg(feature = "local-classifier")]
-        "local_classifier" => {
+        "local_warden" | "local_classifier" => {
             if base_url.is_empty() {
                 anyhow::bail!(
-                    "local_classifier requires base_url = <dir with model.onnx + tokenizer.json>"
+                    "local_warden requires base_url = <dir with model.onnx + tokenizer.json>"
                 );
             }
             let dir = std::path::Path::new(base_url);
@@ -507,9 +512,9 @@ fn build_single(
             )?))
         }
         #[cfg(not(feature = "local-classifier"))]
-        "local_classifier" => {
+        "local_warden" | "local_classifier" => {
             anyhow::bail!(
-                "local_classifier provider requires building innerwarden-agent with --features local-classifier"
+                "local_warden provider requires building innerwarden-agent with --features local-classifier"
             )
         }
         "azure_openai" => {
