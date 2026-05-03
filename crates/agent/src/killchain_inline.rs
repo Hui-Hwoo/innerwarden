@@ -302,7 +302,22 @@ pub(crate) fn dismiss_operator_session_incidents(
 /// 2. uid >= 1000 (regular operator) OR uid == 0 (root, system tool)
 ///
 /// Anything else stays for the AI router to decide.
-const SELF_TRAFFIC_COMMS: &[&str] = &[
+///
+/// 2026-05-03: this list is the **single source of truth** for what
+/// the agent considers "operator/system traffic that legitimately
+/// trips kill_chain's `socket + sensitive_read` co-occurrence". Both
+/// `dismiss_self_traffic_incidents` (which writes the dismiss
+/// decision) and `notify_telegram` (which suppresses the Telegram
+/// alert) consume from `self_traffic_comms(cfg)` so they cannot
+/// drift out of sync. Pre-2026-05-03 they had separate constants —
+/// the dismiss list included `apt`/`snap`/`cloud-init`, the
+/// Telegram allowlist did not, so operators saw "Critical Threat"
+/// alerts for apt updates while the AI silently dismissed them.
+///
+/// Operators can extend this list per-deploy via
+/// `[killchain] self_traffic_comms_extra = ["puppet", "chef"]` in
+/// agent.toml. Builtins below cover the common Linux tooling.
+pub(crate) const BUILTIN_SELF_TRAFFIC_COMMS: &[&str] = &[
     // Operator-driven outbound tooling: SSH jumps, file copies, git ops, package managers.
     "ssh",
     "scp",
@@ -329,10 +344,41 @@ const SELF_TRAFFIC_COMMS: &[&str] = &[
     "cloud-init",
 ];
 
+/// Returns the merged self-traffic comm list: builtins + operator
+/// additions from `[killchain].self_traffic_comms_extra`. This is
+/// the function both consumers (dismiss + telegram-suppress) MUST
+/// call; never bypass to read `BUILTIN_SELF_TRAFFIC_COMMS` directly,
+/// or operator-added comms get ignored.
+pub(crate) fn self_traffic_comms(cfg: &crate::config::KillchainConfig) -> Vec<String> {
+    let mut merged: Vec<String> = BUILTIN_SELF_TRAFFIC_COMMS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for extra in &cfg.self_traffic_comms_extra {
+        let trimmed = extra.trim();
+        if !trimmed.is_empty() && !merged.iter().any(|c| c == trimmed) {
+            merged.push(trimmed.to_string());
+        }
+    }
+    merged
+}
+
+/// Match a process `comm` against a self-traffic comm list using the
+/// same prefix-match semantics as the original constant (e.g.
+/// `git-remote-` covers `git-remote-https`).
+pub(crate) fn matches_self_traffic_comm(comm: &str, list: &[String]) -> bool {
+    if comm.is_empty() {
+        return false;
+    }
+    list.iter()
+        .any(|prefix| comm == prefix.as_str() || comm.starts_with(prefix.as_str()))
+}
+
 pub(crate) fn dismiss_self_traffic_incidents(
     data_dir: &Path,
     sqlite_store: Option<&std::sync::Arc<innerwarden_store::Store>>,
     incidents: &[serde_json::Value],
+    self_traffic_list: &[String],
 ) {
     if incidents.is_empty() {
         return;
@@ -370,10 +416,7 @@ pub(crate) fn dismiss_self_traffic_incidents(
         // regular user (operator). Reject service-account uids in
         // the 1-999 range (web servers etc) — those running ssh /
         // curl deserve a real AI decision.
-        let comm_match = SELF_TRAFFIC_COMMS
-            .iter()
-            .any(|prefix| comm == *prefix || comm.starts_with(prefix));
-        if !comm_match {
+        if !matches_self_traffic_comm(comm, self_traffic_list) {
             continue;
         }
         let uid_ok = uid == 0 || uid >= 1000;
@@ -445,35 +488,48 @@ pub(crate) fn dismiss_self_traffic_incidents(
     }
 }
 
+/// Service-process allowlist — distinct from `BUILTIN_SELF_TRAFFIC_COMMS`.
+/// These are long-running services (web gateways, runtimes, databases)
+/// whose `socket + dup` co-occurrence is normal during request
+/// handling. Different semantic from self-traffic (operator/system
+/// tooling). Kept as its own const because they are operationally
+/// different concepts; merging would mis-skip apt-vs-postgres.
+const KILLCHAIN_SERVICE_ALLOWLIST: &[&str] = &[
+    "ruby",
+    "python",
+    "python3",
+    "node",
+    "java",
+    "beam.smp", // runtimes
+    "nginx",
+    "haproxy",
+    "envoy",
+    "caddy", // proxies
+    "postgres",
+    "mysqld",
+    "redis-server", // databases
+    "openclaw",
+    "innerwarden", // our own
+];
+
 /// Notify via Telegram for critical kill chain detections.
 /// Gated through the centralized notification gate.
+///
+/// 2026-05-03 (PR #417): `self_traffic_list` is the SAME list
+/// `dismiss_self_traffic_incidents` uses — keeps the two paths in
+/// lock-step. Without this, the operator received Telegram alerts
+/// for apt/snap/cloud-init updates that the AI then silently
+/// auto-dismissed (the previous version of this function had its
+/// own hardcoded service allowlist that lacked apt/snap/etc).
 pub(crate) fn notify_telegram(
     telegram_client: &Option<std::sync::Arc<crate::telegram::TelegramClient>>,
     incidents: &[serde_json::Value],
     burst_tracker: &crate::notification_gate::BurstTracker,
     deferred: &mut std::collections::HashMap<String, u32>,
     gate_suppressed_counter: &AtomicU64,
+    self_traffic_list: &[String],
 ) {
     let Some(tg) = telegram_client else { return };
-
-    // Known service processes that legitimately do socket+dup (web gateways, proxies).
-    const KILLCHAIN_COMM_ALLOWLIST: &[&str] = &[
-        "ruby",
-        "python",
-        "python3",
-        "node",
-        "java",
-        "beam.smp", // runtimes
-        "nginx",
-        "haproxy",
-        "envoy",
-        "caddy", // proxies
-        "postgres",
-        "mysqld",
-        "redis-server", // databases
-        "openclaw",
-        "innerwarden", // our own
-    ];
 
     for inc in incidents {
         let severity = inc
@@ -484,13 +540,23 @@ pub(crate) fn notify_telegram(
             continue;
         }
 
-        // Skip known service processes (socket+dup is normal for them)
+        // Skip known service processes (socket+dup is normal for them).
         let comm = inc
             .get("evidence")
             .and_then(|e| e.get("comm"))
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        if KILLCHAIN_COMM_ALLOWLIST.iter().any(|a| comm.starts_with(a)) {
+        if KILLCHAIN_SERVICE_ALLOWLIST
+            .iter()
+            .any(|a| comm.starts_with(a))
+        {
+            continue;
+        }
+        // 2026-05-03: also skip self-traffic comms (apt, snap, ssh,
+        // cloud-init, ...). The dismiss path will write a
+        // `self-traffic-fp` decision shortly; suppressing the alert
+        // here means the operator never gets paged for an apt update.
+        if matches_self_traffic_comm(comm, self_traffic_list) {
             continue;
         }
 
@@ -569,6 +635,15 @@ pub(crate) fn stats(tracker: &PidTracker) -> (usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test fixture: builtins-only self-traffic list (no config extras).
+    /// Mirrors what `self_traffic_comms(default_cfg)` returns at runtime.
+    fn test_self_traffic_list() -> Vec<String> {
+        BUILTIN_SELF_TRAFFIC_COMMS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
 
     // ── Phase 7B Slice C anchors ────────────────────────────────────
     //
@@ -700,7 +775,12 @@ mod tests {
                 "uid": 0,
             }]
         })];
-        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
         assert_eq!(store.decisions_count().unwrap(), 1);
         let decisions = store
             .decisions_for_incident("kill_chain:detected:DATA_EXFIL:1234:2026-04-29T10:00Z")
@@ -726,7 +806,12 @@ mod tests {
                 "uid": 1001,
             }]
         })];
-        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
         assert_eq!(store.decisions_count().unwrap(), 1);
     }
 
@@ -748,7 +833,12 @@ mod tests {
                 "uid": 1001,
             }]
         })];
-        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
         assert_eq!(store.decisions_count().unwrap(), 0);
     }
 
@@ -771,7 +861,12 @@ mod tests {
                 "uid": 33,
             }]
         })];
-        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
         assert_eq!(store.decisions_count().unwrap(), 0);
     }
 
@@ -792,7 +887,12 @@ mod tests {
                 // No pid/comm/uid — older schema.
             }]
         })];
-        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
         assert_eq!(store.decisions_count().unwrap(), 0);
     }
 
@@ -1210,7 +1310,12 @@ mod tests {
                 "uid": 0,
             }]
         })];
-        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
         assert_eq!(
             store.decisions_count().unwrap(),
             0,
@@ -1239,7 +1344,12 @@ mod tests {
                 "uid": 1001,
             }]
         })];
-        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents);
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
         assert_eq!(store.decisions_count().unwrap(), 0);
     }
 
@@ -1269,5 +1379,167 @@ mod tests {
         // STRONG_KILLCHAIN_PATTERNS in this module for the rationale.
         assert!(!is_strong_killchain_pattern("data_exfil"));
         assert!(!is_strong_killchain_pattern("DATA_EXFIL"));
+    }
+
+    // ── 2026-05-03 (PR #417) anchors — single source of truth for ──
+    //                     self-traffic comms
+    //
+    // Pre-PR-#417 the dismiss path used SELF_TRAFFIC_COMMS (apt,
+    // snap, ssh, cloud-init, ...) and the Telegram notify path had
+    // its own KILLCHAIN_COMM_ALLOWLIST (nginx, postgres, ruby, ...).
+    // The two lists drifted: dismiss recognised apt as FP and
+    // skipped the AI router; notify did NOT, so the operator got
+    // 11 Telegram alerts for an apt update before AI silently
+    // dismissed them. These anchors pin the SoT contract.
+
+    #[test]
+    fn matches_self_traffic_comm_uses_prefix_semantics() {
+        let list = test_self_traffic_list();
+        // Exact match.
+        assert!(matches_self_traffic_comm("apt", &list));
+        assert!(matches_self_traffic_comm("ssh", &list));
+        assert!(matches_self_traffic_comm("cloud-init", &list));
+        // Prefix match: `git-remote-https` matches `git-remote-`.
+        assert!(matches_self_traffic_comm("git-remote-https", &list));
+        // Empty comm never matches.
+        assert!(!matches_self_traffic_comm("", &list));
+        // Unknown comm.
+        assert!(!matches_self_traffic_comm("evil_tool", &list));
+    }
+
+    #[test]
+    fn self_traffic_comms_returns_builtins_when_config_extras_empty() {
+        let cfg = crate::config::KillchainConfig::default();
+        assert!(cfg.self_traffic_comms_extra.is_empty());
+        let list = self_traffic_comms(&cfg);
+        // Builtins all present.
+        for builtin in BUILTIN_SELF_TRAFFIC_COMMS {
+            assert!(
+                list.iter().any(|c| c == *builtin),
+                "builtin `{builtin}` must be in the merged list when extras is empty"
+            );
+        }
+        assert_eq!(list.len(), BUILTIN_SELF_TRAFFIC_COMMS.len());
+    }
+
+    #[test]
+    fn self_traffic_comms_appends_operator_extras() {
+        // Operator extends via `[killchain] self_traffic_comms_extra`.
+        let cfg = crate::config::KillchainConfig {
+            self_traffic_comms_extra: vec![
+                "puppet".to_string(),
+                "chef-client".to_string(),
+                "salt-minion".to_string(),
+            ],
+            ..Default::default()
+        };
+        let list = self_traffic_comms(&cfg);
+        assert!(list.iter().any(|c| c == "puppet"));
+        assert!(list.iter().any(|c| c == "chef-client"));
+        assert!(list.iter().any(|c| c == "salt-minion"));
+        // Builtins still there.
+        assert!(list.iter().any(|c| c == "apt"));
+    }
+
+    #[test]
+    fn self_traffic_comms_dedupes_extras_against_builtins() {
+        // Operator accidentally lists `apt` (already a builtin).
+        // Merged list must not have it twice.
+        let cfg = crate::config::KillchainConfig {
+            self_traffic_comms_extra: vec!["apt".to_string(), "puppet".to_string()],
+            ..Default::default()
+        };
+        let list = self_traffic_comms(&cfg);
+        let apt_count = list.iter().filter(|c| c.as_str() == "apt").count();
+        assert_eq!(
+            apt_count, 1,
+            "duplicate extras must be deduped against builtins"
+        );
+    }
+
+    #[test]
+    fn self_traffic_comms_trims_and_skips_empty_extras() {
+        let cfg = crate::config::KillchainConfig {
+            self_traffic_comms_extra: vec![
+                "  puppet  ".to_string(),
+                "".to_string(),
+                "   ".to_string(),
+            ],
+            ..Default::default()
+        };
+        let list = self_traffic_comms(&cfg);
+        assert!(list.iter().any(|c| c == "puppet"));
+        assert!(!list.iter().any(|c| c.is_empty() || c.trim().is_empty()));
+    }
+
+    #[test]
+    fn dismiss_self_traffic_skips_when_comm_not_in_extended_list() {
+        // Operator-added comm `puppet` was on the dismiss path now —
+        // dismiss MUST honour it. End-to-end anchor that the merged
+        // list flows through to the dismiss decision.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:1234:2026-05-03T08:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "203.0.113.20",
+                "pid": 1234,
+                "comm": "puppet",
+                "uid": 0,
+            }]
+        })];
+        let cfg = crate::config::KillchainConfig {
+            self_traffic_comms_extra: vec!["puppet".to_string()],
+            ..Default::default()
+        };
+        let extended_list = self_traffic_comms(&cfg);
+        dismiss_self_traffic_incidents(tmp.path(), Some(&store), &incidents, &extended_list);
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            1,
+            "puppet (operator-added) must be dismissed via self-traffic-fp path"
+        );
+    }
+
+    #[test]
+    fn telegram_notify_and_dismiss_consume_same_self_traffic_list() {
+        // The KEY anchor: this test will fail at build-time if anyone
+        // re-introduces a separate hardcoded comm allowlist in
+        // notify_telegram. Both code paths in killchain_inline.rs
+        // must call `matches_self_traffic_comm(comm, list)` against
+        // the SAME list. Pre-PR-#417 they had divergent constants
+        // and the operator received Telegram alerts for apt updates
+        // that were silently auto-dismissed.
+        let src = include_str!("killchain_inline.rs");
+
+        // dismiss path uses matches_self_traffic_comm.
+        assert!(
+            src.contains("matches_self_traffic_comm(comm, self_traffic_list)"),
+            "dismiss_self_traffic_incidents must use matches_self_traffic_comm \
+             against the passed-in list"
+        );
+
+        // notify_telegram path also uses matches_self_traffic_comm.
+        let notify_section_start = src
+            .find("pub(crate) fn notify_telegram(")
+            .expect("notify_telegram fn must exist");
+        let notify_section = &src[notify_section_start..];
+        assert!(
+            notify_section.contains("matches_self_traffic_comm(comm, self_traffic_list)"),
+            "notify_telegram MUST call matches_self_traffic_comm against the SAME \
+             self_traffic_list — anchored on PR #417 to prevent the dismiss/notify \
+             drift that flooded the operator's Telegram with apt-update FPs"
+        );
+
+        // The new architecture: KILLCHAIN_SERVICE_ALLOWLIST (services
+        // that do socket+dup as part of normal request handling)
+        // exists separately from BUILTIN_SELF_TRAFFIC_COMMS (operator
+        // tooling that does socket+sensitive_read on package
+        // updates). Both names must be present and distinct.
+        assert!(src.contains("KILLCHAIN_SERVICE_ALLOWLIST"));
+        assert!(src.contains("BUILTIN_SELF_TRAFFIC_COMMS"));
     }
 }

@@ -902,10 +902,19 @@ pub(crate) async fn process_narrative_tick(
         // get auto-dismissed; an attacker exploiting a service
         // account (uid 1-999) running ssh / curl still goes to the
         // AI router for a real decision.
+        // 2026-05-03 (PR #417): single source of truth for self-
+        // traffic comms. Both dismiss + telegram-suppress consume
+        // the SAME merged list (builtins from
+        // `BUILTIN_SELF_TRAFFIC_COMMS` + operator additions from
+        // `[killchain] self_traffic_comms_extra`). Pre-fix the two
+        // had divergent constants and the operator got Telegram
+        // alerts for apt updates that the AI silently dismissed.
+        let self_traffic_list = killchain_inline::self_traffic_comms(&cfg.killchain);
         crate::killchain_inline::dismiss_self_traffic_incidents(
             data_dir,
             state.sqlite_store.as_ref(),
             &kc_incidents,
+            &self_traffic_list,
         );
         let gate_counter = state.telemetry.gate_suppressed_counter();
         killchain_inline::notify_telegram(
@@ -914,6 +923,7 @@ pub(crate) async fn process_narrative_tick(
             &state.notification_burst_tracker,
             &mut state.telegram_deferred,
             gate_counter.as_ref(),
+            &self_traffic_list,
         );
 
         // Periodic stale PID cleanup (every 60s).

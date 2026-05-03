@@ -361,6 +361,31 @@ pub struct KillchainConfig {
     /// PID session timeout in seconds. Default: 60.
     #[serde(default = "default_killchain_session_timeout")]
     pub session_timeout_secs: i64,
+    /// 2026-05-03: extra `comm` values that count as self-traffic
+    /// (operator/system tooling whose `socket + sensitive_read` is
+    /// legitimate package-management or remote-admin activity, not
+    /// data exfiltration). Builtins are defined in
+    /// `killchain_inline::self_traffic::BUILTIN_SELF_TRAFFIC_COMMS`
+    /// (apt, snap, ssh, scp, curl, wget, cloud-init, etc.). The
+    /// operator can extend that list here without forking the
+    /// binary — useful for shop-specific deployments that have
+    /// custom package agents (puppet, chef, salt) or admin tools.
+    ///
+    /// Example: `[killchain] self_traffic_comms_extra = ["puppet", "chef-client"]`
+    ///
+    /// The merged list is consumed in two places:
+    ///
+    ///   1. `dismiss_self_traffic_incidents` — auto-dismisses the
+    ///      kill_chain incident with `ai_provider="self-traffic-fp"`.
+    ///   2. `notify_telegram` — suppresses the Telegram alert so the
+    ///      operator does not get paged for an apt update they
+    ///      kicked off five seconds ago.
+    ///
+    /// Both consumers MUST read from the same merged list — anchored
+    /// in `telegram_notify_and_dismiss_consume_same_self_traffic_list`
+    /// (killchain_inline.rs).
+    #[serde(default)]
+    pub self_traffic_comms_extra: Vec<String>,
 }
 
 impl Default for KillchainConfig {
@@ -369,6 +394,7 @@ impl Default for KillchainConfig {
             enabled: true,
             pre_chain_threshold: default_killchain_pre_chain_threshold(),
             session_timeout_secs: default_killchain_session_timeout(),
+            self_traffic_comms_extra: Vec::new(),
         }
     }
 }
