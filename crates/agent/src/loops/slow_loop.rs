@@ -588,6 +588,9 @@ fn kg_tick(state: &mut AgentState, data_dir: &Path, events: &[innerwarden_core::
             let calibration_ctx = knowledge_graph::detectors::CalibrationContext {
                 is_cloud: state.environment_profile.is_cloud(),
                 human_uids: state.environment_profile.human_uids.clone(),
+                human_user_names: state.environment_profile.human_user_names.clone(),
+                service_uids: state.environment_profile.service_uids.clone(),
+                service_user_names: state.environment_profile.service_user_names.clone(),
             };
             let incidents = knowledge_graph::detectors::run_all_with_calibration(
                 &graph,

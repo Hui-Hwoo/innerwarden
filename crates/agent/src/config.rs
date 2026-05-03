@@ -2815,6 +2815,31 @@ pub struct EnvironmentConfig {
     /// Applied automatically when `platform` is detected as cloud VPS.
     #[serde(default = "default_cloud_timing_multiplier")]
     pub cloud_timing_multiplier: u32,
+
+    /// 2026-05-03: extra service account names that should be
+    /// classified as `Service` for graph-detector threshold
+    /// purposes. Auto-detection (uid >= 1000 + nologin shell)
+    /// covers the OS-shipped accounts (snap_daemon, _apt,
+    /// systemd-resolve, messagebus, etc.). This list is for
+    /// shop-specific accounts that the auto-detect can't reach —
+    /// e.g. config-management agents (`puppet`, `chef-client`,
+    /// `salt-minion`) installed in `/usr/local/bin` with a real
+    /// login shell.
+    ///
+    /// Example:
+    /// ```toml
+    /// [environment]
+    /// service_users_extra = ["puppet", "chef-client", "ansible-runner"]
+    /// service_uids_extra = [991, 992]
+    /// ```
+    #[serde(default)]
+    pub service_users_extra: Vec<String>,
+
+    /// 2026-05-03: same as `service_users_extra` but by uid.
+    /// Useful when the operator knows the uid but not a stable
+    /// name (containerized service accounts, etc.).
+    #[serde(default)]
+    pub service_uids_extra: Vec<u32>,
 }
 
 impl Default for EnvironmentConfig {
@@ -2823,6 +2848,8 @@ impl Default for EnvironmentConfig {
             auto_profile: true,
             census_interval_hours: default_census_interval_hours(),
             cloud_timing_multiplier: default_cloud_timing_multiplier(),
+            service_users_extra: Vec::new(),
+            service_uids_extra: Vec::new(),
         }
     }
 }

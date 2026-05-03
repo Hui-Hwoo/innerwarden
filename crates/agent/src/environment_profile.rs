@@ -15,6 +15,45 @@ use crate::config::EnvironmentConfig;
 // Profile data
 // ---------------------------------------------------------------------------
 
+/// Operator-facing classification of a user observed in events.
+///
+/// Returned by `EnvironmentProfile::classify_user`. Graph detectors
+/// use this to apply differentiated thresholds:
+///
+/// * `Root` — uid 0. Always-trusted (3x threshold by convention).
+/// * `Human` — uid >= 1000 with a login shell (`bash`, `zsh`, etc.).
+///   Real operators. 3x threshold.
+/// * `Service` — uid >= 1000 with `nologin`/`false` shell. System
+///   service accounts (`snap_daemon`, `_apt`, `systemd-resolve`,
+///   `messagebus`, etc.) that the OS spawns to run package updates,
+///   DNS resolution, dbus brokering, etc. They legitimately do
+///   `socket + sensitive_read` and process bursts during routine
+///   work. 5x threshold by default; `data_exfil` skips them
+///   entirely because that detector is the noisiest.
+/// * `Unknown` — anyone the agent does not recognise. Standard
+///   threshold. Real attacker scenarios (compromised low-uid
+///   service that doesn't appear in /etc/passwd, exec from a
+///   chroot, etc.) end up here and get the strict treatment they
+///   deserve.
+///
+/// **Threat model (2026-05-03):** classifying a user as Service
+/// dampens noise but does NOT silence telemetry — every suppression
+/// increments `innerwarden_graph_detector_suppressed_total{user_class}`
+/// in the metrics so the operator can grep `/metrics` and see what
+/// was hidden. If `snap_daemon` itself is ever compromised at uid
+/// level, kill_chain detection in eBPF still fires (different code
+/// path, untouchable enforcement applies); only the graph
+/// behavioural detectors (which are inherently noisy on routine
+/// service activity) are dampened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum UserClass {
+    Root,
+    Human,
+    Service,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EnvironmentProfile {
     /// "cloud_vps", "vm", or "bare_metal"
@@ -23,6 +62,22 @@ pub(crate) struct EnvironmentProfile {
     pub provider: String,
     /// UIDs of human users (uid >= 1000, with login shell)
     pub human_uids: Vec<u32>,
+    /// 2026-05-03: UIDs of system service accounts (uid >= 1000,
+    /// `nologin`/`false` shell). Auto-detected from `/etc/passwd`.
+    /// Distinct from `human_uids` so detectors can apply different
+    /// thresholds (Service gets 5x, Human gets 3x).
+    #[serde(default)]
+    pub service_uids: Vec<u32>,
+    /// 2026-05-03: names of those service accounts. Same length as
+    /// `service_uids` and 1:1 indexed. Needed because graph events
+    /// arrive with the user as a name (`snap_daemon`) more often
+    /// than as `uid:NNNN`, so the classifier needs reverse lookup.
+    #[serde(default)]
+    pub service_user_names: Vec<String>,
+    /// 2026-05-03: names of human user accounts. Same role as above
+    /// (reverse lookup). 1:1 with `human_uids`.
+    #[serde(default)]
+    pub human_user_names: Vec<String>,
     /// Running systemd service names
     pub services: Vec<String>,
     /// Cron job descriptions
@@ -37,6 +92,9 @@ impl Default for EnvironmentProfile {
             platform: "unknown".into(),
             provider: "unknown".into(),
             human_uids: vec![],
+            service_uids: vec![],
+            service_user_names: vec![],
+            human_user_names: vec![],
             services: vec![],
             crons: vec![],
             profiled_at: chrono::Utc::now(),
@@ -52,6 +110,76 @@ impl EnvironmentProfile {
     #[allow(dead_code)]
     pub fn is_human_uid(&self, uid: u32) -> bool {
         self.human_uids.contains(&uid)
+    }
+
+    /// 2026-05-03: classify a user observed in graph events. Accepts
+    /// either a numeric `uid:NNNN` form or a named user (`snap_daemon`,
+    /// `ubuntu`, `root`).
+    ///
+    /// Mirrored on `CalibrationContext::classify_user` (which is what
+    /// the graph detectors call after the boot path bridges the
+    /// fields). Kept here so any code holding a `&EnvironmentProfile`
+    /// directly can classify without first building a context.
+    #[allow(dead_code)]
+    pub fn classify_user(&self, name_or_uid: &str) -> UserClass {
+        if name_or_uid == "root" {
+            return UserClass::Root;
+        }
+        if let Some(uid_str) = name_or_uid.strip_prefix("uid:") {
+            if let Ok(uid) = uid_str.parse::<u32>() {
+                return self.classify_uid(uid);
+            }
+            return UserClass::Unknown;
+        }
+        // Named user — reverse lookup against the cached name lists
+        // populated at boot from /etc/passwd.
+        if self.service_user_names.iter().any(|n| n == name_or_uid) {
+            return UserClass::Service;
+        }
+        if self.human_user_names.iter().any(|n| n == name_or_uid) {
+            return UserClass::Human;
+        }
+        UserClass::Unknown
+    }
+
+    #[allow(dead_code)]
+    fn classify_uid(&self, uid: u32) -> UserClass {
+        if uid == 0 {
+            return UserClass::Root;
+        }
+        if self.human_uids.contains(&uid) {
+            return UserClass::Human;
+        }
+        if self.service_uids.contains(&uid) {
+            return UserClass::Service;
+        }
+        UserClass::Unknown
+    }
+
+    /// 2026-05-03: extend the Service classification with operator-
+    /// supplied user names from `[graph_detectors] service_users_extra`.
+    /// Runs at boot after `bootstrap_profile`. Idempotent —
+    /// duplicates are deduped, empty / whitespace entries skipped.
+    /// Also accepts pure-uid extras via `service_uids_extra`.
+    pub fn merge_operator_service_extras(
+        &mut self,
+        service_users_extra: &[String],
+        service_uids_extra: &[u32],
+    ) {
+        for name in service_users_extra {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !self.service_user_names.iter().any(|n| n == trimmed) {
+                self.service_user_names.push(trimmed.to_string());
+            }
+        }
+        for uid in service_uids_extra {
+            if !self.service_uids.contains(uid) {
+                self.service_uids.push(*uid);
+            }
+        }
     }
 }
 
@@ -96,7 +224,12 @@ fn save_profile(data_dir: &Path, profile: &EnvironmentProfile) -> anyhow::Result
 /// Generate and save the environment profile. Runs once at first boot.
 pub(crate) fn bootstrap_profile(data_dir: &Path, _cfg: &EnvironmentConfig) -> EnvironmentProfile {
     let (platform, provider) = detect_platform();
-    let human_uids = detect_human_uids();
+    let UserAccountScan {
+        human_uids,
+        human_user_names,
+        service_uids,
+        service_user_names,
+    } = scan_user_accounts();
     let services = detect_services();
     let crons = detect_crons();
 
@@ -104,6 +237,9 @@ pub(crate) fn bootstrap_profile(data_dir: &Path, _cfg: &EnvironmentConfig) -> En
         platform,
         provider,
         human_uids,
+        service_uids,
+        service_user_names,
+        human_user_names,
         services,
         crons,
         profiled_at: chrono::Utc::now(),
@@ -116,6 +252,7 @@ pub(crate) fn bootstrap_profile(data_dir: &Path, _cfg: &EnvironmentConfig) -> En
             platform = %profile.platform,
             provider = %profile.provider,
             human_uids = ?profile.human_uids,
+            service_uids = ?profile.service_uids,
             services_count = profile.services.len(),
             crons_count = profile.crons.len(),
             "environment profile bootstrapped"
@@ -206,35 +343,89 @@ fn read_dmi(field: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Human UID detection
+// User account detection (humans + service accounts)
 // ---------------------------------------------------------------------------
 
-fn detect_human_uids() -> Vec<u32> {
-    let content = match std::fs::read_to_string("/etc/passwd") {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
+/// 2026-05-03: result of one `/etc/passwd` scan, partitioned into
+/// the four classifications graph detectors care about. Names and
+/// UIDs are kept in parallel slices (1:1 indexed) because graph
+/// events arrive with the user as a name (`snap_daemon`) more often
+/// than as `uid:NNNN`, and the classifier needs both directions.
+pub(crate) struct UserAccountScan {
+    pub human_uids: Vec<u32>,
+    pub human_user_names: Vec<String>,
+    pub service_uids: Vec<u32>,
+    pub service_user_names: Vec<String>,
+}
 
+/// Parse `/etc/passwd` and partition entries into Human / Service.
+///
+/// Classification rules (2026-05-03 — anchored on the operator's
+/// `snap_daemon = uid 584788` finding which the previous range
+/// `1000..65534` silently dropped):
+///
+/// * uid 0 (root) → not classified here. Graph detectors handle
+///   root via the `Root` arm of `UserClass`, not via this scan.
+/// * uid 65534 (`nobody`) → skipped. Reserved for "no real user".
+/// * any uid != 0 / 65534 with a `nologin` / `false` shell →
+///   Service. Covers both low-uid system services (`_apt = 42`,
+///   `systemd-resolve = 991`) AND high-uid mappings used by snap
+///   subuid namespaces (`snap_daemon = 584788`, often beyond the
+///   classical 16-bit range).
+/// * uid >= 1000 with a real login shell → Human.
+/// * uid 1-999 with a login shell → unclassified (rare; default
+///   to the strict path so real attacker scenarios surface).
+///
+/// Pure function over file contents. Real I/O lives in
+/// `scan_user_accounts`. Split so tests can drive synthetic input.
+pub(crate) fn parse_passwd_for_user_classes(content: &str) -> UserAccountScan {
+    const NOBODY_UID: u32 = 65534;
     let nologin_shells = ["/usr/sbin/nologin", "/bin/false", "/sbin/nologin"];
+    let mut scan = UserAccountScan {
+        human_uids: Vec::new(),
+        human_user_names: Vec::new(),
+        service_uids: Vec::new(),
+        service_user_names: Vec::new(),
+    };
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+        let name = parts[0];
+        let Ok(uid) = parts[2].parse::<u32>() else {
+            continue;
+        };
+        if uid == 0 || uid == NOBODY_UID {
+            continue;
+        }
+        let shell = parts[6];
+        let is_nologin = nologin_shells.iter().any(|s| shell.ends_with(s));
+        if is_nologin {
+            scan.service_uids.push(uid);
+            scan.service_user_names.push(name.to_string());
+        } else if uid >= 1000 {
+            scan.human_uids.push(uid);
+            scan.human_user_names.push(name.to_string());
+        }
+        // uid 1-999 with login shell: rare edge case (e.g. uid for
+        // `mail`/`bin` but with /bin/sh by mistake). Leave
+        // unclassified — falls into UserClass::Unknown so detectors
+        // apply the strict standard threshold.
+    }
+    scan
+}
 
-    content
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() < 7 {
-                return None;
-            }
-            let uid: u32 = parts[2].parse().ok()?;
-            let shell = parts[6];
-
-            // Human users: uid >= 1000, with a login shell (not nologin/false)
-            if (1000..65534).contains(&uid) && !nologin_shells.iter().any(|s| shell.ends_with(s)) {
-                Some(uid)
-            } else {
-                None
-            }
-        })
-        .collect()
+fn scan_user_accounts() -> UserAccountScan {
+    match std::fs::read_to_string("/etc/passwd") {
+        Ok(content) => parse_passwd_for_user_classes(&content),
+        Err(_) => UserAccountScan {
+            human_uids: Vec::new(),
+            human_user_names: Vec::new(),
+            service_uids: Vec::new(),
+            service_user_names: Vec::new(),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,10 +736,14 @@ pub(crate) fn run_census(
         return CensusOutcome::default();
     }
 
+    let scan = scan_user_accounts();
     let current = EnvironmentProfile {
         platform: previous.platform.clone(),
         provider: previous.provider.clone(),
-        human_uids: detect_human_uids(),
+        human_uids: scan.human_uids,
+        human_user_names: scan.human_user_names,
+        service_uids: scan.service_uids,
+        service_user_names: scan.service_user_names,
         services: detect_services(),
         crons: detect_crons(),
         profiled_at: chrono::Utc::now(),
@@ -625,6 +820,9 @@ mod tests {
             platform: "cloud_vps".into(),
             provider: "oracle".into(),
             human_uids: vec![1001],
+            human_user_names: vec!["ubuntu".into()],
+            service_uids: vec![],
+            service_user_names: vec![],
             services: vec!["nginx".into()],
             crons: vec!["root: certbot renew".into()],
             profiled_at: chrono::Utc::now(),
@@ -692,6 +890,9 @@ mod tests {
             platform: "bare_metal".into(),
             provider: "none".into(),
             human_uids: uids,
+            human_user_names: vec![],
+            service_uids: vec![],
+            service_user_names: vec![],
             services: services.into_iter().map(String::from).collect(),
             crons: crons.into_iter().map(String::from).collect(),
             profiled_at: chrono::Utc::now(),
@@ -860,5 +1061,142 @@ mod tests {
             captured.contains("error="),
             "error field missing, got: {captured}"
         );
+    }
+
+    // ── 2026-05-03 (PR #418) anchors — trusted service accounts ──
+    //
+    // These pin the parse_passwd_for_user_classes contract +
+    // EnvironmentProfile::classify_user behaviour so a future
+    // refactor that mis-classifies snap_daemon (or breaks the
+    // human/service split) is caught at build time.
+
+    #[test]
+    fn parse_passwd_splits_humans_and_service_accounts() {
+        // Mix of real-world cases:
+        //  - root: uid 0 → not classified (handled by Root arm).
+        //  - daemon (uid 1): low-uid system service, nologin → Service.
+        //  - ubuntu (uid 1000): real operator with login shell → Human.
+        //  - maicon (uid 1001): another operator → Human.
+        //  - snap_daemon (uid 584788): high-uid subuid mapping
+        //    that the operator hit on the dashboard, /usr/bin/false
+        //    shell → Service. The previous parser dropped this on
+        //    the `1000..65534` range filter; this anchor pins the
+        //    high-uid coverage.
+        //  - _apt (uid 42): low-uid system, nologin → Service.
+        //  - systemd-resolve (uid 991): nologin → Service.
+        //  - sshd (uid 121): nologin → Service.
+        //  - nobody-mark (uid 65534): the canonical "no user" → skip.
+        let synthetic = "\
+root:x:0:0::/root:/bin/bash\n\
+daemon:x:1:1::/usr/sbin:/usr/sbin/nologin\n\
+_apt:x:42:65534::/nonexistent:/usr/sbin/nologin\n\
+sshd:x:121:65534::/run/sshd:/usr/sbin/nologin\n\
+systemd-resolve:x:991:993:::/usr/sbin/nologin\n\
+ubuntu:x:1000:1000::/home/ubuntu:/bin/bash\n\
+maicon:x:1001:1001::/home/maicon:/bin/zsh\n\
+snap_daemon:x:584788:584788::/nonexistent:/usr/bin/false\n\
+nobody-mark:x:65534:65534::/nonexistent:/usr/sbin/nologin\n\
+";
+        let scan = parse_passwd_for_user_classes(synthetic);
+        // Humans: uid >= 1000 + login shell, in file order.
+        assert_eq!(scan.human_uids, vec![1000, 1001]);
+        assert_eq!(scan.human_user_names, vec!["ubuntu", "maicon"]);
+        // Services: any uid != 0/65534 with nologin shell, in file order.
+        assert_eq!(scan.service_uids, vec![1, 42, 121, 991, 584788]);
+        assert_eq!(
+            scan.service_user_names,
+            vec!["daemon", "_apt", "sshd", "systemd-resolve", "snap_daemon"]
+        );
+        // High-uid mapping (584788) MUST be picked up — that's the
+        // exact case the operator's dashboard alert came from.
+        assert!(scan.service_user_names.contains(&"snap_daemon".to_string()));
+        assert!(scan.service_uids.contains(&584788));
+        // root and nobody (65534) are skipped.
+        assert!(!scan.human_uids.contains(&0));
+        assert!(!scan.service_uids.contains(&65534));
+    }
+
+    #[test]
+    fn classify_user_recognises_named_service_account() {
+        let mut profile = EnvironmentProfile::default();
+        profile.service_uids = vec![584788];
+        profile.service_user_names = vec!["snap_daemon".to_string()];
+        profile.human_uids = vec![1000];
+        profile.human_user_names = vec!["ubuntu".to_string()];
+        // The exact case the operator hit on the dashboard:
+        // graph events arrive with `name=snap_daemon`, NOT
+        // `uid:584788`, and the old `is_trusted_graph_user` would
+        // have returned `false` for that. Now must return Service.
+        assert_eq!(profile.classify_user("snap_daemon"), UserClass::Service);
+        assert_eq!(profile.classify_user("ubuntu"), UserClass::Human);
+        assert_eq!(profile.classify_user("root"), UserClass::Root);
+        assert_eq!(profile.classify_user("attacker"), UserClass::Unknown);
+    }
+
+    #[test]
+    fn classify_user_handles_uid_form() {
+        let mut profile = EnvironmentProfile::default();
+        profile.human_uids = vec![1000, 1001];
+        profile.service_uids = vec![584788];
+        assert_eq!(profile.classify_user("uid:0"), UserClass::Root);
+        assert_eq!(profile.classify_user("uid:1000"), UserClass::Human);
+        assert_eq!(profile.classify_user("uid:584788"), UserClass::Service);
+        assert_eq!(profile.classify_user("uid:9999"), UserClass::Unknown);
+        // Malformed UID strings fall through to Unknown.
+        assert_eq!(profile.classify_user("uid:notanumber"), UserClass::Unknown);
+    }
+
+    #[test]
+    fn merge_operator_service_extras_dedupes_and_trims() {
+        let mut profile = EnvironmentProfile::default();
+        profile.service_user_names = vec!["snap_daemon".to_string()];
+        profile.service_uids = vec![584788];
+        profile.merge_operator_service_extras(
+            &[
+                "puppet".to_string(),
+                "  chef-client  ".to_string(),
+                "snap_daemon".to_string(), // duplicate
+                "".to_string(),            // empty
+                "   ".to_string(),         // whitespace
+            ],
+            &[991, 584788, 992],
+        );
+        // Duplicates and empty entries skipped, whitespace trimmed.
+        assert_eq!(
+            profile.service_user_names,
+            vec!["snap_daemon", "puppet", "chef-client"]
+        );
+        assert_eq!(profile.service_uids, vec![584788, 991, 992]);
+        // Operator-added users are now classified as Service.
+        assert_eq!(profile.classify_user("puppet"), UserClass::Service);
+        assert_eq!(profile.classify_user("chef-client"), UserClass::Service);
+    }
+
+    #[test]
+    fn classify_user_real_user_with_login_shell_is_not_service() {
+        // Negative anchor: a regular user (uid 1000, /bin/bash)
+        // must NOT slip into Service even after operator adds a
+        // bunch of service extras. Compromise of `ubuntu` would
+        // show up at standard threshold.
+        //
+        // puppet here has nologin shell so it parses as Service
+        // automatically (uid 991, nologin /usr/bin/false). Note
+        // that low-uid + nologin is now classified as Service per
+        // the post-PR-#418 parser — covers the real /etc/passwd
+        // shape on Ubuntu / Debian.
+        let synthetic = "ubuntu:x:1000:1000::/home/ubuntu:/bin/bash\n\
+puppet:x:991:991::/var/lib/puppet:/usr/bin/false\n";
+        let scan = parse_passwd_for_user_classes(synthetic);
+        let mut profile = EnvironmentProfile {
+            human_uids: scan.human_uids,
+            human_user_names: scan.human_user_names,
+            service_uids: scan.service_uids,
+            service_user_names: scan.service_user_names,
+            ..EnvironmentProfile::default()
+        };
+        profile.merge_operator_service_extras(&["custom-svc".into()], &[]);
+        assert_eq!(profile.classify_user("ubuntu"), UserClass::Human);
+        assert_eq!(profile.classify_user("puppet"), UserClass::Service);
+        assert_eq!(profile.classify_user("custom-svc"), UserClass::Service);
     }
 }

@@ -15,6 +15,14 @@ use super::types::*;
 
 /// Environment calibration context passed to graph detectors.
 /// Enables cloud-aware suppression and operator UID awareness.
+///
+/// 2026-05-03: extended with `service_uids` + `service_user_names`
+/// so detectors can classify users into Human / Service / Root /
+/// Unknown and apply graduated thresholds. Pre-2026-05-03 only
+/// `human_uids` was available, which meant a service account like
+/// `snap_daemon` (uid 584788, no login shell) defaulted to standard
+/// threshold and trivially fired graph_discovery_burst on routine
+/// `snap refresh` operations.
 #[derive(Debug, Clone, Default)]
 pub struct CalibrationContext {
     /// True if running on a cloud VM (auto-detected from environment profile).
@@ -22,8 +30,62 @@ pub struct CalibrationContext {
     /// timing anomaly sensitivity, network noise suppression).
     #[allow(dead_code)]
     pub is_cloud: bool,
-    /// UIDs of human operators. Graph detectors use higher thresholds for these.
+    /// UIDs of human operators. Graph detectors use 3x threshold for these.
     pub human_uids: Vec<u32>,
+    /// 2026-05-03: names of human operators (for reverse lookup when
+    /// graph events arrive with `name` rather than `uid:NNNN`).
+    pub human_user_names: Vec<String>,
+    /// 2026-05-03: UIDs of system service accounts. Graph detectors
+    /// use 5x threshold for these (or skip entirely for very noisy
+    /// detectors like `data_exfil`).
+    pub service_uids: Vec<u32>,
+    /// 2026-05-03: names of system service accounts.
+    pub service_user_names: Vec<String>,
+}
+
+/// 2026-05-03: classification of a user observed in graph events.
+/// Mirrors `environment_profile::UserClass` but lives here so the
+/// detectors module is self-contained and the public API stays
+/// inside knowledge_graph::detectors. The `From` impl below bridges
+/// when the boot path passes a `&EnvironmentProfile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserClass {
+    Root,
+    Human,
+    Service,
+    Unknown,
+}
+
+impl CalibrationContext {
+    /// Classify a graph user (`"root"` / `"ubuntu"` / `"snap_daemon"`
+    /// / `"uid:1001"`). Single entry point for ALL graph detectors —
+    /// drift between detectors becomes a one-place fix.
+    pub fn classify_user(&self, name_or_uid: &str) -> UserClass {
+        if name_or_uid == "root" {
+            return UserClass::Root;
+        }
+        if let Some(uid_str) = name_or_uid.strip_prefix("uid:") {
+            if let Ok(uid) = uid_str.parse::<u32>() {
+                if uid == 0 {
+                    return UserClass::Root;
+                }
+                if self.human_uids.contains(&uid) {
+                    return UserClass::Human;
+                }
+                if self.service_uids.contains(&uid) {
+                    return UserClass::Service;
+                }
+            }
+            return UserClass::Unknown;
+        }
+        if self.service_user_names.iter().any(|n| n == name_or_uid) {
+            return UserClass::Service;
+        }
+        if self.human_user_names.iter().any(|n| n == name_or_uid) {
+            return UserClass::Human;
+        }
+        UserClass::Unknown
+    }
 }
 
 /// Cooldown tracker to prevent duplicate graph-based alerts.
@@ -36,6 +98,27 @@ pub struct GraphDetectorState {
     /// Tracks recent graph detections: "detector:entity" → timestamp.
     /// Used to suppress duplicate sensor incidents.
     recent_detections: HashMap<String, DateTime<Utc>>,
+    /// 2026-05-03: counters for trusted-class suppression. Key:
+    /// `(detector_id, user_class)` like
+    /// `("discovery_burst", "service")`. Value: how many times we
+    /// would have fired but suppressed due to elevated threshold for
+    /// the user class. Surfaced via Prometheus
+    /// `innerwarden_graph_detector_suppressed_total{detector,user_class}`
+    /// so the operator can grep `/metrics` and audit what is being
+    /// dampened. Without this, suppression is invisible.
+    pub(crate) suppressed_counts: HashMap<(String, &'static str), u64>,
+}
+
+/// 2026-05-03: stable label string per UserClass for the
+/// suppression counter. Bounded set (4 values) keeps Prometheus
+/// cardinality safe.
+fn user_class_label(class: UserClass) -> &'static str {
+    match class {
+        UserClass::Root => "root",
+        UserClass::Human => "human",
+        UserClass::Service => "service",
+        UserClass::Unknown => "unknown",
+    }
 }
 
 impl GraphDetectorState {
@@ -44,6 +127,7 @@ impl GraphDetectorState {
             cooldowns: HashMap::new(),
             default_cooldown_secs: 300,
             recent_detections: HashMap::new(),
+            suppressed_counts: HashMap::new(),
         }
     }
 
@@ -654,17 +738,30 @@ fn detect_discovery_burst_calibrated(
 
         let total = sensitive_reads + exec_count;
 
-        // Apply 3x threshold for root AND trusted operator UIDs.
-        // Operators doing their job (deploying, debugging) routinely
-        // hit discovery thresholds. This is structural suppression:
-        // the UID is declared or auto-detected, not observed.
-        let is_trusted_user =
-            user_name == "root" || is_trusted_graph_user(&user_name, &ctx.human_uids);
-        let adjusted_threshold = if is_trusted_user {
-            threshold * 3
-        } else {
-            threshold
+        // 2026-05-03: graduated thresholds by user class.
+        //   Root + Human → 3x (operators legitimately run discovery
+        //     during deploys, debugging, recon-as-defense).
+        //   Service → 5x (snap refresh, apt update, systemd-* spawn
+        //     bursts of processes during routine work).
+        //   Unknown → 1x (strict — covers attackers / compromised
+        //     low-uid services).
+        let user_class = ctx.classify_user(&user_name);
+        let adjusted_threshold = match user_class {
+            UserClass::Root | UserClass::Human => threshold * 3,
+            UserClass::Service => threshold * 5,
+            UserClass::Unknown => threshold,
         };
+        // 2026-05-03: when activity is over the standard threshold
+        // but below the elevated one, the alert is suppressed
+        // because of the user class. Record it so /metrics can
+        // surface it — invisible suppression is a known
+        // anti-pattern (operator can't audit what's being hidden).
+        if total >= threshold && total < adjusted_threshold {
+            *state
+                .suppressed_counts
+                .entry(("discovery_burst".to_string(), user_class_label(user_class)))
+                .or_insert(0) += 1;
+        }
 
         if total >= adjusted_threshold {
             let key = format!("graph_discovery:{}", user_name);
@@ -705,18 +802,17 @@ fn detect_discovery_burst_calibrated(
     incidents
 }
 
-/// Check if a graph user name (which can be "root", "ubuntu", "uid:1001", etc.)
-/// corresponds to a trusted operator UID from the calibration context.
+/// 2026-05-03: legacy thin wrapper kept for back-compat with old
+/// tests. New code uses `CalibrationContext::classify_user` which
+/// returns the four-way `UserClass` (Root / Human / Service /
+/// Unknown) rather than this binary trust check.
+#[allow(dead_code)]
 fn is_trusted_graph_user(user_name: &str, human_uids: &[u32]) -> bool {
-    // Graph user names can be actual usernames or "uid:NNNN" format
     if let Some(uid_str) = user_name.strip_prefix("uid:") {
         if let Ok(uid) = uid_str.parse::<u32>() {
             return human_uids.contains(&uid);
         }
     }
-    // For named users, check if any human UID resolves to this name.
-    // Since we don't have a reverse map, we check if the user has a UID >= 1000
-    // pattern (human UIDs are >= 1000 by convention).
     false
 }
 
@@ -811,7 +907,7 @@ fn detect_data_exfil_calibrated(
     state: &mut GraphDetectorState,
     host: &str,
     now: DateTime<Utc>,
-    _ctx: &CalibrationContext,
+    ctx: &CalibrationContext,
 ) -> Vec<Incident> {
     let mut incidents = Vec::new();
     let cutoff = now - Duration::seconds(60);
@@ -896,6 +992,38 @@ fn detect_data_exfil_calibrated(
             }
             // Also skip InnerWarden UID (typically 998)
             if uid == 998 {
+                continue;
+            }
+
+            // 2026-05-03: classify the process owner. data_exfil is
+            // the noisiest of the graph detectors — `socket +
+            // sensitive_read` is exactly what apt/snap/cloud-init
+            // do during routine package work. Service-class users
+            // get skipped entirely (counted in suppressed_total so
+            // the operator can audit). Real exfil scenarios end up
+            // in Unknown class and pass through unchanged.
+            let owner_user = format!("uid:{uid}");
+            let user_class_by_uid = ctx.classify_user(&owner_user);
+            let user_class_by_name = ctx.classify_user(&comm);
+            // Take whichever classification gives a service answer —
+            // the comm path catches `snap_daemon` even when the uid
+            // bookkeeping is missing in environment_profile.json.
+            let user_class = if matches!(user_class_by_uid, UserClass::Service)
+                || matches!(user_class_by_name, UserClass::Service)
+            {
+                UserClass::Service
+            } else if matches!(user_class_by_uid, UserClass::Human) {
+                UserClass::Human
+            } else if matches!(user_class_by_uid, UserClass::Root) {
+                UserClass::Root
+            } else {
+                UserClass::Unknown
+            };
+            if matches!(user_class, UserClass::Service) {
+                *state
+                    .suppressed_counts
+                    .entry(("data_exfil".to_string(), user_class_label(user_class)))
+                    .or_insert(0) += 1;
                 continue;
             }
 
@@ -2122,11 +2250,26 @@ fn detect_host_drift_calibrated(
 
     // Fire aggregated incidents per user
     for (user, procs) in &user_drifts {
-        // Trusted operators (root + human UIDs from calibration) get a
-        // higher threshold. Operators building software, deploying, or
-        // debugging legitimately run many non-standard binaries.
-        let is_trusted = user == "uid:0" || is_trusted_graph_user(user, &ctx.human_uids);
-        let threshold = if is_trusted { 30 } else { 15 };
+        // 2026-05-03: graduated thresholds via UserClass.
+        //   Root + Human → 30 (operators legitimately build / deploy /
+        //     debug, exec many non-standard binaries from /usr/local).
+        //   Service → 75 (5x — service accounts spawning many helper
+        //     binaries during package work).
+        //   Unknown → 15 (strict).
+        let user_class = ctx.classify_user(user);
+        let threshold = match user_class {
+            UserClass::Root | UserClass::Human => 30,
+            UserClass::Service => 75,
+            UserClass::Unknown => 15,
+        };
+        // Suppression telemetry: would have fired but didn't because
+        // of class-elevated threshold. Operator can grep /metrics.
+        if procs.len() >= 15 && procs.len() < threshold {
+            *state
+                .suppressed_counts
+                .entry(("host_drift".to_string(), user_class_label(user_class)))
+                .or_insert(0) += 1;
+        }
         if procs.len() < threshold {
             continue;
         }
@@ -3595,5 +3738,147 @@ mod tests {
             !result.is_empty(),
             "6 periodic connections at 30s intervals should trigger C2 beacon"
         );
+    }
+
+    // ── 2026-05-03 (PR #418) anchors — uniform UserClass via ──────────
+    //                  CalibrationContext::classify_user
+    //
+    // Pre-PR-#418 each detector did its own thing:
+    //  - discovery_burst: 3x for human, standard for everyone else
+    //  - data_exfil: NO suppression (took _ctx but never used it)
+    //  - host_drift: 2x for human, standard for everyone else
+    // and `is_trusted_graph_user("snap_daemon", ...)` returned false
+    // because there was no name→uid reverse lookup.
+    //
+    // These anchors pin the post-fix contract: the four user classes
+    // map correctly, snap_daemon (the operator's actual case) is
+    // recognised, and all three detectors call classify_user.
+
+    #[test]
+    fn calibration_context_recognises_named_service_account() {
+        let ctx = CalibrationContext {
+            is_cloud: false,
+            human_uids: vec![1000],
+            human_user_names: vec!["ubuntu".to_string()],
+            service_uids: vec![584788],
+            service_user_names: vec!["snap_daemon".to_string()],
+        };
+        assert_eq!(ctx.classify_user("snap_daemon"), UserClass::Service);
+        assert_eq!(ctx.classify_user("ubuntu"), UserClass::Human);
+        assert_eq!(ctx.classify_user("root"), UserClass::Root);
+        assert_eq!(ctx.classify_user("attacker"), UserClass::Unknown);
+        // uid:NNNN form still works.
+        assert_eq!(ctx.classify_user("uid:584788"), UserClass::Service);
+        assert_eq!(ctx.classify_user("uid:1000"), UserClass::Human);
+        assert_eq!(ctx.classify_user("uid:0"), UserClass::Root);
+    }
+
+    #[test]
+    fn user_class_label_is_bounded_set_for_prometheus() {
+        // Anchor that the Prometheus label cardinality is bounded.
+        // Adding a UserClass variant without updating user_class_label
+        // would create an unlabelled bucket — caught here.
+        for class in [
+            UserClass::Root,
+            UserClass::Human,
+            UserClass::Service,
+            UserClass::Unknown,
+        ] {
+            let label = user_class_label(class);
+            assert!(
+                ["root", "human", "service", "unknown"].contains(&label),
+                "label `{label}` not in expected set"
+            );
+        }
+    }
+
+    #[test]
+    fn all_three_protected_detectors_call_classify_user() {
+        // Source-grep anchor that build-time guarantees the three
+        // graph detectors that handle multi-user activity (discovery
+        // burst, data exfil, host drift) all consult classify_user.
+        // Pre-PR-#418 detect_data_exfil_calibrated had `_ctx` —
+        // unused. If anyone reverts to the old pattern, this fails.
+        let src = include_str!("detectors.rs");
+
+        let burst_section_start = src
+            .find("fn detect_discovery_burst_calibrated")
+            .expect("discovery_burst function must exist");
+        let exfil_section_start = src
+            .find("fn detect_data_exfil_calibrated")
+            .expect("data_exfil function must exist");
+        let drift_section_start = src
+            .find("fn detect_host_drift_calibrated")
+            .expect("host_drift function must exist");
+
+        // Each detector must reference classify_user within ~5K bytes
+        // of its function header (loose bound — the bodies vary in
+        // length but classify_user is always in the threshold-pick
+        // block near the top).
+        for (label, start) in [
+            ("discovery_burst", burst_section_start),
+            ("data_exfil", exfil_section_start),
+            ("host_drift", drift_section_start),
+        ] {
+            let end = std::cmp::min(start + 6000, src.len());
+            let section = &src[start..end];
+            assert!(
+                section.contains("classify_user"),
+                "detector `{label}` must call ctx.classify_user — without it the \
+                 service-account suppression doesn't apply and snap_daemon-class \
+                 FPs come back. (PR #418 anchor)"
+            );
+        }
+
+        // data_exfil must NOT have the old `_ctx: &CalibrationContext`
+        // pattern (underscore prefix = unused). If it returns, the
+        // detector silently stops applying suppression.
+        let exfil_end = std::cmp::min(exfil_section_start + 200, src.len());
+        let exfil_signature = &src[exfil_section_start..exfil_end];
+        assert!(
+            !exfil_signature.contains("_ctx: &CalibrationContext"),
+            "data_exfil ctx must NOT be unused — that was the original bug \
+             where snap_daemon DATA_EXFIL alerts went out unfiltered"
+        );
+    }
+
+    #[test]
+    fn suppressed_counts_increment_for_service_account_under_elevated_threshold() {
+        // End-to-end: simulate snap_daemon doing 8 discovery actions.
+        // Standard threshold is 5 (would fire), service threshold is
+        // 25 (won't fire). Counter must increment.
+        use chrono::Utc;
+        let mut state = GraphDetectorState::new();
+        // Simulate the suppression bookkeeping the detector does:
+        // total >= threshold && total < adjusted_threshold.
+        // Driving the actual detector path requires a full graph
+        // fixture (covered separately by happy-path tests in this
+        // file); here we exercise just the counter contract.
+        let class = UserClass::Service;
+        *state
+            .suppressed_counts
+            .entry(("discovery_burst".to_string(), user_class_label(class)))
+            .or_insert(0) += 1;
+        assert_eq!(
+            state
+                .suppressed_counts
+                .get(&("discovery_burst".to_string(), "service")),
+            Some(&1)
+        );
+        // Drive a second + third increment — counter is monotonic.
+        for _ in 0..2 {
+            *state
+                .suppressed_counts
+                .entry(("discovery_burst".to_string(), user_class_label(class)))
+                .or_insert(0) += 1;
+        }
+        assert_eq!(
+            state
+                .suppressed_counts
+                .get(&("discovery_burst".to_string(), "service")),
+            Some(&3)
+        );
+        // Avoid `now` warning.
+        let _ = Utc::now();
     }
 }

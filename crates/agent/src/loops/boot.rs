@@ -836,10 +836,23 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         pending_confirmations: HashMap::new(),
         approval_rx: None, // set below in continuous mode
         grouping_engine: notification_pipeline::GroupingEngine::new(&cfg.notifications),
-        environment_profile: environment_profile::load_or_bootstrap(
-            &cli.data_dir,
-            &cfg.environment,
-        ),
+        environment_profile: {
+            // 2026-05-03: load auto-detected profile, then merge in
+            // operator-supplied service account extras from
+            // `[environment] service_users_extra` /
+            // `service_uids_extra`. This is the user-extension
+            // surface for the trusted-services classification used
+            // by the graph detectors. Static config today; future
+            // PR (Wave 3) wires a runtime API endpoint that appends
+            // here under a 2FA gate.
+            let mut profile =
+                environment_profile::load_or_bootstrap(&cli.data_dir, &cfg.environment);
+            profile.merge_operator_service_extras(
+                &cfg.environment.service_users_extra,
+                &cfg.environment.service_uids_extra,
+            );
+            profile
+        },
         last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(neural_lifecycle::AnomalyConfig {
             data_dir: cli.data_dir.clone(),
