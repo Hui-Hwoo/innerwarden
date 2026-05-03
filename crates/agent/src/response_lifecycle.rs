@@ -1158,7 +1158,197 @@ impl ResponseLifecycle {
     pub fn list_history(&self) -> &VecDeque<CompletedResponse> {
         &self.history
     }
+}
 
+/// Per-orphan diagnostic emitted by the dashboard's `/api/responses/orphans`
+/// endpoint. Each field maps directly to a card row the operator sees.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanDiagnostic {
+    pub id: String,
+    pub target: String,
+    pub backend: ResponseBackend,
+    pub incident_id: String,
+    pub created_at: DateTime<Utc>,
+    pub reverted_at: DateTime<Utc>,
+    /// Stderr from the last revert attempt (parsed out of
+    /// `CompletedResponse::reason` which has shape `"orphaned: <error>"`).
+    pub last_error: String,
+    /// Operator-facing classification of the failure mode. Cluster
+    /// header on the dashboard groups orphans by this value so a
+    /// single fix (`enable IPv6 in /etc/default/ufw`) can resolve
+    /// many at once.
+    pub cluster: OrphanErrorCluster,
+    /// Human-readable string describing what command the agent tried
+    /// to run during revert. NOT executed at diagnostic time —
+    /// purely informational. The actual revert path lives in
+    /// `execute_revert` and is unchanged.
+    pub revert_command: String,
+}
+
+/// Operator-facing classification of orphan revert failure patterns.
+/// Mapping is heuristic but covers the common modes documented in
+/// the explore agent's pre-PR-#419 audit:
+///   - IPv6 rule format mismatch
+///   - nftables handle missing
+///   - rule already absent (false orphan, kernel state actually clean)
+///   - permission / sudo timeout
+///   - external mutation (rule renumbered or removed by fail2ban etc)
+///   - unknown / catch-all
+///
+/// The dashboard groups orphans by this enum and shows the suggested
+/// fix per cluster (Wave 4 telemetry pass extends with counters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrphanErrorCluster {
+    Ipv6Mismatch,
+    NftablesHandleMissing,
+    RuleAlreadyAbsent,
+    PermissionDenied,
+    ExternalMutation,
+    Unknown,
+}
+
+/// Pure classifier — keeps the matching logic testable without
+/// touching the lifecycle state.
+pub fn classify_orphan_error(stderr: &str) -> OrphanErrorCluster {
+    let s = stderr.to_lowercase();
+    // IPv6: agent created an IPv6 rule but the codepath used IPv4
+    // commands (iptables only handles v4 — uses `ip6tables` for v6).
+    if s.contains("ipv6")
+        || s.contains("inet6")
+        || s.contains("address family")
+        || s.contains("does not match")
+    {
+        return OrphanErrorCluster::Ipv6Mismatch;
+    }
+    // nftables-specific: handle stored at create time was None.
+    if s.contains("no nftables handle") || s.contains("handle missing") {
+        return OrphanErrorCluster::NftablesHandleMissing;
+    }
+    // The rule was already absent — false orphan.
+    if s.contains("non-existent")
+        || s.contains("does not exist")
+        || s.contains("not found")
+        || s.contains("no such")
+        || s.contains("matching rule exist")
+    {
+        return OrphanErrorCluster::RuleAlreadyAbsent;
+    }
+    // Permission / sudo issues.
+    if s.contains("permission denied")
+        || s.contains("operation not permitted")
+        || s.contains("must be run as root")
+        || s.contains("sudo: a password is required")
+    {
+        return OrphanErrorCluster::PermissionDenied;
+    }
+    // External mutation — fail2ban or manual edits renumbered or
+    // rewrote the rule between create and delete.
+    if s.contains("rule renumber") || s.contains("file modified") {
+        return OrphanErrorCluster::ExternalMutation;
+    }
+    OrphanErrorCluster::Unknown
+}
+
+/// Describe the revert command shape per backend. Operator-facing
+/// hint shown on the diagnostic card. Mirrors the actual commands
+/// run in `execute_revert` so the operator sees what the agent
+/// tried, even when the lifecycle bookkeeping records only the
+/// stderr.
+pub fn describe_revert_command(backend: &ResponseBackend, target: &str) -> String {
+    match backend {
+        ResponseBackend::Ufw => format!("sudo ufw delete deny from {target}"),
+        ResponseBackend::Iptables => {
+            format!("sudo iptables -D INPUT -s {target} -j DROP")
+        }
+        ResponseBackend::Nftables => {
+            format!("sudo nft delete rule inet filter input <handle> (target {target})")
+        }
+        ResponseBackend::Pf => format!("(pf manual revert: target {target})"),
+        ResponseBackend::Xdp => {
+            format!("sudo bpftool map delete pinned /sys/fs/bpf/innerwarden/blocklist key {target}")
+        }
+        ResponseBackend::Cloudflare => format!("(cloudflare api revert: target {target})"),
+        ResponseBackend::Nginx => format!("(nginx config revert: target {target})"),
+        ResponseBackend::Container => format!("(container unpause: target {target})"),
+        ResponseBackend::Sudo => {
+            format!("(sudo restore: gpasswd -d {target} suspended-ops; cleanup .iw-suspended)")
+        }
+    }
+}
+
+/// 2026-05-03 (PR #419 Wave 2): parse the persisted `responses.json`
+/// (or SQLite blob) and enumerate orphan entries with diagnostic
+/// classification. The dashboard endpoint reads from disk rather
+/// than the in-memory lifecycle (matches the existing `/api/responses`
+/// pattern), so this helper takes the raw JSON shape and walks
+/// the `history` array.
+pub fn enumerate_orphans_from_responses_json(raw: &str) -> Vec<OrphanDiagnostic> {
+    let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    let history = match value.get("history").and_then(|h| h.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    history
+        .iter()
+        .filter_map(|entry| {
+            let reason = entry.get("reason").and_then(|r| r.as_str())?;
+            if !reason.starts_with("orphaned:") {
+                return None;
+            }
+            let last_error = reason
+                .strip_prefix("orphaned:")
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let cluster = classify_orphan_error(&last_error);
+            let backend = parse_backend(entry.get("backend").and_then(|b| b.as_str()));
+            let target = entry
+                .get("target")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let revert_command = describe_revert_command(&backend, &target);
+            let id = entry
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string();
+            let incident_id = entry
+                .get("incident_id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string();
+            let created_at = entry
+                .get("created_at")
+                .and_then(|s| s.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+            let reverted_at = entry
+                .get("reverted_at")
+                .and_then(|s| s.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+            Some(OrphanDiagnostic {
+                id,
+                target,
+                backend,
+                incident_id,
+                created_at,
+                reverted_at,
+                last_error,
+                cluster,
+                revert_command,
+            })
+        })
+        .collect()
+}
+
+impl ResponseLifecycle {
     /// Check if an IP is already tracked (to avoid duplicates).
     pub fn is_tracked(&self, target: &str, backend: &ResponseBackend) -> bool {
         self.active
@@ -2943,5 +3133,134 @@ mod tests {
         let pruned = lc.gc_orphaned_responses(365 * 24 * 3600);
         assert_eq!(pruned, 0);
         assert_eq!(lc.history.len(), 5);
+    }
+
+    // ─── PR #419 Wave 2 — orphan diagnostic anchor tests ────────────
+    //
+    // These pin the heuristic classifier and the JSON enumerator to
+    // their expected behaviour so the dashboard's `/api/responses/orphans`
+    // surface stays stable. Stderr fixtures come from real revert
+    // failures observed in prod (responses.json on the Oracle host).
+
+    #[test]
+    fn classify_orphan_error_ipv6_mismatch() {
+        // Real iptables output when v6 rule is fed to the v4 binary.
+        let s = "iptables v1.8.7: host/network `2001:db8::1' not found: \
+                 Address family for hostname not supported by AF_INET";
+        assert_eq!(classify_orphan_error(s), OrphanErrorCluster::Ipv6Mismatch);
+    }
+
+    #[test]
+    fn classify_orphan_error_nftables_handle_missing() {
+        let s = "no nftables handle stored at create time";
+        assert_eq!(
+            classify_orphan_error(s),
+            OrphanErrorCluster::NftablesHandleMissing
+        );
+    }
+
+    #[test]
+    fn classify_orphan_error_rule_already_absent() {
+        // ufw renumbered the rule between create and revert.
+        let s = "ERROR: Could not delete non-existent rule";
+        assert_eq!(
+            classify_orphan_error(s),
+            OrphanErrorCluster::RuleAlreadyAbsent
+        );
+    }
+
+    #[test]
+    fn classify_orphan_error_permission_denied() {
+        let s = "sudo: a password is required";
+        assert_eq!(
+            classify_orphan_error(s),
+            OrphanErrorCluster::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn classify_orphan_error_external_mutation() {
+        let s = "fail2ban rule renumber detected";
+        assert_eq!(
+            classify_orphan_error(s),
+            OrphanErrorCluster::ExternalMutation
+        );
+    }
+
+    #[test]
+    fn classify_orphan_error_unknown_falls_through() {
+        let s = "completely unfamiliar failure";
+        assert_eq!(classify_orphan_error(s), OrphanErrorCluster::Unknown);
+    }
+
+    #[test]
+    fn describe_revert_command_per_backend() {
+        // Operator-facing strings — pinned so the dashboard card
+        // always reflects what the agent actually attempted.
+        assert_eq!(
+            describe_revert_command(&ResponseBackend::Ufw, "1.2.3.4"),
+            "sudo ufw delete deny from 1.2.3.4"
+        );
+        assert_eq!(
+            describe_revert_command(&ResponseBackend::Iptables, "5.6.7.8"),
+            "sudo iptables -D INPUT -s 5.6.7.8 -j DROP"
+        );
+        let nft = describe_revert_command(&ResponseBackend::Nftables, "9.9.9.9");
+        assert!(nft.contains("nft delete rule"));
+        assert!(nft.contains("9.9.9.9"));
+    }
+
+    #[test]
+    fn enumerate_orphans_from_responses_json_happy_path() {
+        let raw = serde_json::json!({
+            "active": [],
+            "history": [
+                {
+                    "id": "r-1",
+                    "response_type": "block_ip",
+                    "backend": "ufw",
+                    "target": "203.0.113.7",
+                    "incident_id": "inc-7",
+                    "created_at": "2026-04-30T10:00:00Z",
+                    "reverted_at": "2026-04-30T11:00:00Z",
+                    "reason": "orphaned: ERROR: Could not delete non-existent rule"
+                },
+                {
+                    "id": "r-2",
+                    "response_type": "block_ip",
+                    "backend": "iptables",
+                    "target": "203.0.113.8",
+                    "incident_id": "inc-8",
+                    "created_at": "2026-04-30T10:05:00Z",
+                    "reverted_at": "2026-04-30T11:05:00Z",
+                    "reason": "expired_ttl"
+                }
+            ]
+        })
+        .to_string();
+
+        let out = enumerate_orphans_from_responses_json(&raw);
+        // Only the orphaned entry is returned, even though both are in history.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "r-1");
+        assert_eq!(out[0].target, "203.0.113.7");
+        assert_eq!(out[0].backend, ResponseBackend::Ufw);
+        assert_eq!(out[0].cluster, OrphanErrorCluster::RuleAlreadyAbsent);
+        assert!(out[0].last_error.contains("non-existent"));
+        assert!(out[0].revert_command.contains("ufw delete deny"));
+    }
+
+    #[test]
+    fn enumerate_orphans_from_responses_json_malformed_input() {
+        // Garbage in -> empty out, never panic.
+        assert!(enumerate_orphans_from_responses_json("").is_empty());
+        assert!(enumerate_orphans_from_responses_json("not json").is_empty());
+        assert!(enumerate_orphans_from_responses_json("{}").is_empty());
+        // history present but not an array.
+        let bad = r#"{"history": "oops"}"#;
+        assert!(enumerate_orphans_from_responses_json(bad).is_empty());
+        // history with a non-orphan entry only.
+        let none = r#"{"history": [{"reason": "expired_ttl"}]}"#;
+        assert!(enumerate_orphans_from_responses_json(none).is_empty());
     }
 }

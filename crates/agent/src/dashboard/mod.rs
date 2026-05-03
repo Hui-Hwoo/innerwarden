@@ -609,6 +609,8 @@ pub async fn serve(
         .route("/api/graph/timeline", get(api_graph_timeline))
         .route("/api/graph/threats", get(api_graph_threats))
         .route("/api/responses", get(api_responses))
+        // PR #419 Wave 2: read-only orphan diagnostic.
+        .route("/api/responses/orphans", get(api_responses_orphans))
         // Spec 005 T017: active incident groups snapshot (noise-reduction view).
         .route("/api/incident-groups", get(api_incident_groups))
         .route("/api/mitre/navigator", get(api_mitre_navigator))
@@ -3496,8 +3498,11 @@ mod tests {
             "intel.js must define baselineHeroCard — the operator's \
              1-line answer to 'is everything normal?'"
         );
-        assert!(JS_INTEL.contains("Aprendendo o normal deste servidor"));
-        assert!(JS_INTEL.contains("Algo diferente"));
+        // PR #419 Wave 2: translated to English. The earlier PT-BR
+        // copy ("Aprendendo o normal deste servidor" / "Algo diferente")
+        // was replaced because the rest of the dashboard is English.
+        assert!(JS_INTEL.contains("Learning what's normal on this server"));
+        assert!(JS_INTEL.contains("Something changed"));
         assert!(JS_INTEL.contains("baseline-hero-normal"));
         assert!(JS_INTEL.contains("baseline-hero-deviation"));
         assert!(JS_INTEL.contains("baseline-hero-learning"));
@@ -4010,5 +4015,61 @@ mod tests {
         // Hard-fail label must be present so the operator sees a
         // distinct "no data" verb instead of just "reconnecting".
         assert!(JS_SSE.contains("NO DATA"));
+    }
+
+    // ─── PR #419 Wave 2 — orphan diagnostic UI is wired ─────────
+    #[test]
+    fn js_responses_contains_orphan_diagnostic_panel() {
+        // The dashboard's Responses tab must include the lazy-load
+        // orphan diagnostic panel, the cluster summary, and the per-
+        // orphan card renderer. These names are checked here so a
+        // future rename of any of them must update the tests too.
+        assert!(JS_RESPONSES.contains("loadOrphanDiagnostics"));
+        assert!(JS_RESPONSES.contains("renderOrphanDiagnosticPanel"));
+        assert!(JS_RESPONSES.contains("renderOrphanCard"));
+        assert!(JS_RESPONSES.contains("ORPHAN_CLUSTER_LABELS"));
+        assert!(JS_RESPONSES.contains("ORPHAN_KERNEL_STATE_BADGE"));
+        // The endpoint path must match the route registered in this file.
+        assert!(JS_RESPONSES.contains("/api/responses/orphans"));
+    }
+
+    // ─── PR #419 Wave 2 — Baseline tab is in English ────────────
+    #[test]
+    fn js_intel_baseline_tab_is_english_not_pt_br() {
+        // Operator-facing strings in the Baseline section must be
+        // English to match the rest of the dashboard. Anchor on a few
+        // known-translated phrases (positive) and on common PT-BR
+        // signature words (negative) so a regression that re-imports
+        // PT-BR copy is caught by tests.
+
+        // Positive: known EN strings landed.
+        assert!(JS_INTEL.contains("Learning what's normal on this server"));
+        assert!(JS_INTEL.contains("Something changed"));
+        assert!(JS_INTEL.contains("What changed in the last 24 hours"));
+        assert!(JS_INTEL.contains("What I consider normal here"));
+        assert!(JS_INTEL.contains("Learned process lineages"));
+        assert!(JS_INTEL.contains("Failed to load Baseline"));
+
+        // Negative: PT-BR copy must not return.
+        let banned = [
+            "Carregando…",
+            "Aprendendo (",
+            "Algo diferente",
+            "nas últimas 24",
+            "Falha ao carregar",
+            "O que considero normal",
+            "Cadeias de processo aprendidas",
+            "Processos que falam para fora",
+            "dias de aprendizado",
+            "fontes somadas",
+            "toLocaleString('pt-BR')",
+        ];
+        for needle in banned {
+            assert!(
+                !JS_INTEL.contains(needle),
+                "Baseline regressed to PT-BR — found {:?} in intel.js",
+                needle
+            );
+        }
     }
 }

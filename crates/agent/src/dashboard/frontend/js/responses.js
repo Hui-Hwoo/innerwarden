@@ -142,6 +142,14 @@ async function loadResponses() {
       html += '</tbody></table>';
     }
 
+    // 2026-05-03 (PR #419 Wave 2): if orphans exist, append a
+    // collapsible "Diagnose orphans" panel that lazy-loads the
+    // /api/responses/orphans endpoint. Read-only; Wave 3 will add
+    // remediation buttons behind 2FA.
+    if (orphaned > 0) {
+      html += renderOrphanDiagnosticPanel();
+    }
+
     content.innerHTML = html;
     if (status) {
       const parts = [`${r.active_count||0} active`];
@@ -153,5 +161,132 @@ async function loadResponses() {
     content.innerHTML = `<p style="color:#e74c3c">Failed to load responses: ${e.message}</p>`;
     if (status) status.textContent = 'Error';
   }
+}
+
+// ── 2026-05-03 (PR #419 Wave 2) — orphan diagnostic ────────────────
+//
+// Read-only panel surfaced when there are >0 orphaned responses.
+// Fetches /api/responses/orphans which returns:
+//   - orphans: array of per-orphan diagnostic (last_error, cluster,
+//     revert_command, kernel_state, etc.)
+//   - clusters: array of {cluster, count, suggested_fix}
+//   - probe_available: bool — whether ufw/iptables probe ran
+// Renders a cluster summary at the top + per-orphan card below.
+// Wave 3 adds the remediation buttons; for now the operator sees
+// the diagnostic and acts via SSH if needed.
+
+const ORPHAN_CLUSTER_LABELS = {
+  ipv6_mismatch: { icon: '🌐', label: 'IPv6 / IPv4 mismatch' },
+  nftables_handle_missing: { icon: '🔧', label: 'nftables handle missing' },
+  rule_already_absent: { icon: '✅', label: 'Rule already gone (false orphan)' },
+  permission_denied: { icon: '🔒', label: 'Permission / sudo' },
+  external_mutation: { icon: '🌀', label: 'External mutation' },
+  unknown: { icon: '❓', label: 'Unclassified' },
+};
+
+const ORPHAN_KERNEL_STATE_BADGE = {
+  still_blocked: { color: '#f39c12', label: 'Rule still active in kernel' },
+  already_gone: { color: '#27ae60', label: 'Rule already removed' },
+  probe_failed: { color: 'var(--dim)', label: 'Could not probe kernel state' },
+};
+
+function renderOrphanDiagnosticPanel() {
+  return `
+    <details id="orphanDiagnosticPanel" class="orphan-diag-panel" style="margin-top:18px;border:1px solid var(--border);border-radius:8px;background:rgba(231,76,60,0.04);">
+      <summary onclick="loadOrphanDiagnostics()" style="padding:12px 14px;cursor:pointer;font-weight:600;font-size:0.9rem;color:var(--text);list-style:none;">
+        ▸ Diagnose orphaned responses
+        <span style="font-weight:400;font-size:0.78rem;color:var(--dim);margin-left:8px;">(read-only — Wave 3 adds cleanup buttons with 2FA)</span>
+      </summary>
+      <div id="orphanDiagBody" style="padding:14px;border-top:1px solid var(--border);">
+        <p style="color:var(--dim);font-size:0.82rem;">Loading diagnostic…</p>
+      </div>
+    </details>`;
+}
+
+let _orphanDiagLoaded = false;
+async function loadOrphanDiagnostics() {
+  if (_orphanDiagLoaded) return;
+  _orphanDiagLoaded = true;
+  const body = document.getElementById('orphanDiagBody');
+  if (!body) return;
+  try {
+    const data = await loadJson('/api/responses/orphans');
+    const orphans = Array.isArray(data.orphans) ? data.orphans : [];
+    const clusters = Array.isArray(data.clusters) ? data.clusters : [];
+    if (orphans.length === 0) {
+      body.innerHTML = '<p style="color:var(--dim);font-size:0.82rem;">No orphans to diagnose right now.</p>';
+      return;
+    }
+    let html = '';
+    // Cluster summary header.
+    if (clusters.length > 0) {
+      html += '<div style="margin-bottom:14px;">';
+      html += '<div style="font-size:0.78rem;font-weight:700;color:var(--accent);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:8px;">Root cause clusters</div>';
+      // Sort: highest count first.
+      const sorted = clusters.slice().sort((a, b) => b.count - a.count);
+      sorted.forEach((c) => {
+        const meta = ORPHAN_CLUSTER_LABELS[c.cluster] || { icon: '❓', label: c.cluster };
+        html += `
+          <div class="orphan-cluster-card" style="padding:10px 12px;border-radius:6px;background:var(--card-bg);margin-bottom:6px;border-left:3px solid var(--accent);">
+            <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;">
+              <span style="font-size:1.1rem;line-height:1;">${meta.icon}</span>
+              <strong style="font-size:0.88rem;">${esc(meta.label)}</strong>
+              <span style="font-size:0.72rem;color:var(--dim);">${c.count} ${c.count === 1 ? 'orphan' : 'orphans'}</span>
+            </div>
+            <div style="font-size:0.78rem;color:var(--dim);line-height:1.5;">${esc(c.suggested_fix)}</div>
+          </div>`;
+      });
+      html += '</div>';
+    }
+
+    // Probe-availability hint.
+    if (!data.probe_available) {
+      html += `
+        <div style="padding:8px 12px;margin-bottom:12px;background:rgba(243,156,18,0.08);border:1px solid rgba(243,156,18,0.2);border-radius:4px;font-size:0.78rem;color:var(--dim);">
+          ${lucideIcon('alert-triangle',{size:13})}
+          Could not probe live ufw/iptables state — agent likely lacks sudo for status commands. Rule-state column will show "—".
+        </div>`;
+    }
+
+    // Per-orphan cards.
+    html += '<div style="font-size:0.78rem;font-weight:700;color:var(--accent);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:8px;">Per-orphan diagnostic</div>';
+    orphans.forEach((o) => { html += renderOrphanCard(o); });
+
+    body.innerHTML = html;
+  } catch (e) {
+    body.innerHTML = `<p style="color:#e74c3c;font-size:0.82rem;">Failed to load diagnostic: ${esc(e.message)}</p>`;
+    _orphanDiagLoaded = false;  // allow retry on next open
+  }
+}
+
+function renderOrphanCard(o) {
+  const cluster = ORPHAN_CLUSTER_LABELS[o.cluster] || { icon: '❓', label: o.cluster };
+  const state = ORPHAN_KERNEL_STATE_BADGE[o.kernel_state] || { color: 'var(--dim)', label: o.kernel_state };
+  const ageMin = Math.max(0, Math.floor((Date.now() - new Date(o.reverted_at).getTime()) / 60000));
+  const ageStr = ageMin < 60
+    ? `${ageMin}m ago`
+    : ageMin < 1440
+      ? `${Math.floor(ageMin / 60)}h ago`
+      : `${Math.floor(ageMin / 1440)}d ago`;
+  return `
+    <div class="orphan-card" style="padding:12px 14px;border-radius:6px;background:var(--card-bg);margin-bottom:8px;border:1px solid var(--border);">
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+        <code style="font-family:monospace;font-size:0.82rem;font-weight:600;color:var(--text);">${esc(o.target)}</code>
+        <span style="font-size:0.72rem;padding:1px 6px;border-radius:3px;background:rgba(127,231,255,0.08);color:var(--accent);text-transform:uppercase;">${esc(o.backend)}</span>
+        <span style="font-size:0.72rem;color:${state.color};">${state.label}</span>
+        <span style="font-size:0.72rem;color:var(--dim);">${ageStr}</span>
+      </div>
+      <div style="font-size:0.78rem;color:var(--text);margin-bottom:6px;line-height:1.5;">
+        <span style="font-weight:600;">${cluster.icon} ${esc(cluster.label)}</span>
+      </div>
+      <div style="font-size:0.74rem;color:var(--dim);font-family:monospace;background:rgba(0,0,0,0.15);padding:6px 8px;border-radius:3px;margin-bottom:6px;word-break:break-all;">
+        ${esc(o.revert_command)}
+      </div>
+      <details>
+        <summary style="font-size:0.74rem;color:var(--dim);cursor:pointer;">stderr from last attempt</summary>
+        <pre style="font-size:0.72rem;color:var(--dim);background:rgba(0,0,0,0.15);padding:6px 8px;border-radius:3px;margin-top:4px;overflow-x:auto;white-space:pre-wrap;">${esc(o.last_error || '(empty)')}</pre>
+      </details>
+      ${o.incident_id ? `<div style="font-size:0.7rem;color:var(--dim);margin-top:4px;">incident: <code>${esc(o.incident_id)}</code></div>` : ''}
+    </div>`;
 }
 

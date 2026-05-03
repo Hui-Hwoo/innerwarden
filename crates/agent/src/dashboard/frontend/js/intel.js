@@ -360,7 +360,7 @@ async function loadChains() {
 // operator bounced off it. The redesign answers three questions in
 // order:
 //
-//   1. Is everything normal right now?  → Hero (1 line, sempre visivel)
+//   1. Is everything normal right now?  → Hero (1 line, always visible)
 //   2. If not, what changed?              → Deviation cards (top 5)
 //   3. What does the agent consider normal here? → "Show learned baseline" (collapsed)
 //
@@ -373,36 +373,39 @@ async function loadChains() {
 // Friendly headlines + emoji + suggested action text per anomaly type.
 // Server returns the raw `anomaly_type` enum value; this map turns it
 // into a card the operator can read in 2 seconds.
+// 2026-05-03 (PR #419 Wave 2): translated PT-BR → EN to align with
+// the rest of the dashboard. Original strings were Portuguese-only,
+// inconsistent with all other tabs. Operator request.
 const BASELINE_ANOMALY_LABELS = {
   event_rate_drop: {
     icon: '📉',
-    headline: (a) => `${prettySource(a)} ficou silencioso`,
-    explainer: (a) => `Esperado nesta hora: cerca de ${a.expected}. Visto: ${a.observed}.`,
-    why: 'Pode significar que ninguém usou o serviço ou que algo desativou os logs. Vale conferir.',
+    headline: (a) => `${prettySource(a)} went silent`,
+    explainer: (a) => `Expected this hour: about ${a.expected}. Seen: ${a.observed}.`,
+    why: 'Could mean nobody used the service or something disabled the logs. Worth checking.',
   },
   event_rate_spike: {
     icon: '📈',
-    headline: (a) => `${prettySource(a)} disparou acima do normal`,
-    explainer: (a) => `Esperado: cerca de ${a.expected}. Visto: ${a.observed}.`,
-    why: 'Pico súbito de atividade. Pode ser deploy, scan externo ou ataque em andamento.',
+    headline: (a) => `${prettySource(a)} spiked above normal`,
+    explainer: (a) => `Expected: about ${a.expected}. Seen: ${a.observed}.`,
+    why: 'Sudden activity peak. Could be a deploy, an external scan, or an attack in progress.',
   },
   process_lineage: {
     icon: '🌿',
-    headline: (a) => 'Cadeia de processos nunca vista antes',
+    headline: (a) => 'Process lineage never seen before',
     explainer: (a) => a.description,
-    why: 'O agente nunca observou esse pai → filho neste host. Costuma indicar shell saindo de serviço web.',
+    why: 'The agent has never observed this parent → child on this host. Often indicates a shell spawning out of a web service.',
   },
   user_login_time: {
     icon: '🌙',
-    headline: (a) => `${a.subject || 'Usuário'} logou fora do horário`,
-    explainer: (a) => `Horário típico: ${a.expected}. Login agora: ${a.observed}.`,
-    why: 'Acesso fora do padrão histórico. Confirma se foi você ou alguém autorizado.',
+    headline: (a) => `${a.subject || 'User'} logged in outside typical hours`,
+    explainer: (a) => `Typical hours: ${a.expected}. Login now: ${a.observed}.`,
+    why: 'Access outside the historical pattern. Confirm whether it was you or an authorised user.',
   },
   new_destination: {
     icon: '🔀',
-    headline: (a) => `${a.subject || 'Processo'} conectou em destino novo`,
-    explainer: (a) => `Destinos típicos: ${a.expected}. Agora: ${a.observed}.`,
-    why: 'Processo conhecido falando com endpoint inédito. Muda o perfil de risco.',
+    headline: (a) => `${a.subject || 'Process'} connected to a new destination`,
+    explainer: (a) => `Typical destinations: ${a.expected}. Now: ${a.observed}.`,
+    why: 'A known process talking to an unfamiliar endpoint. Risk profile changes.',
   },
 };
 
@@ -410,28 +413,28 @@ function prettySource(a) {
   // Pull a friendly source name from the description if present, or
   // fall back to a generic phrase. Server passes details inline.
   const m = (a.description || '').match(/source ['"]?([a-z_]+)['"]?/i);
-  return m ? m[1] : 'Coleta de eventos';
+  return m ? m[1] : 'Event collection';
 }
 
 function baselineCardForAnomaly(a) {
   const meta = BASELINE_ANOMALY_LABELS[a.anomaly_type] || {
     icon: '⚠️',
-    headline: () => 'Padrão fora do normal',
+    headline: () => 'Pattern outside normal',
     explainer: (x) => x.description || '',
     why: '',
   };
   const ageMin = Math.max(0, Math.floor((Date.now() - new Date(a.ts).getTime()) / 60000));
   const ageStr = ageMin < 60
-    ? `${ageMin} min atrás`
+    ? `${ageMin}m ago`
     : ageMin < 1440
-      ? `${Math.floor(ageMin / 60)}h atrás`
-      : `${Math.floor(ageMin / 1440)}d atrás`;
+      ? `${Math.floor(ageMin / 60)}h ago`
+      : `${Math.floor(ageMin / 1440)}d ago`;
   const sevColor = a.severity === 'critical' ? '#e74c3c'
     : a.severity === 'high' ? '#f39c12'
     : a.severity === 'medium' ? '#f59e0b'
     : 'var(--dim)';
   const subjectLink = a.subject
-    ? `<button type="button" onclick="homeBannerOpenPivot('${a.anomaly_type === 'user_login_time' ? 'user' : 'ip'}', '${esc(a.subject)}')" style="margin-top:6px;padding:4px 10px;border-radius:4px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;font-size:0.75rem;">Investigar ${esc(a.subject)} →</button>`
+    ? `<button type="button" onclick="homeBannerOpenPivot('${a.anomaly_type === 'user_login_time' ? 'user' : 'ip'}', '${esc(a.subject)}')" style="margin-top:6px;padding:4px 10px;border-radius:4px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;font-size:0.75rem;">Investigate ${esc(a.subject)} →</button>`
     : '';
   return `
     <div class="baseline-deviation-card">
@@ -459,8 +462,8 @@ function baselineHeroCard(b, deviations24h) {
       <div class="baseline-hero baseline-hero-learning">
         <div class="baseline-hero-icon">🔵</div>
         <div class="baseline-hero-body">
-          <div class="baseline-hero-title">Aprendendo o normal deste servidor</div>
-          <div class="baseline-hero-sub">${days} de 7 dias coletados. A detecção de anomalias começa em ${remaining} ${remaining === 1 ? 'dia' : 'dias'}.</div>
+          <div class="baseline-hero-title">Learning what's normal on this server</div>
+          <div class="baseline-hero-sub">${days} of 7 days collected. Anomaly detection starts in ${remaining} ${remaining === 1 ? 'day' : 'days'}.</div>
         </div>
       </div>`;
   }
@@ -470,7 +473,7 @@ function baselineHeroCard(b, deviations24h) {
         <div class="baseline-hero-icon">🟢</div>
         <div class="baseline-hero-body">
           <div class="baseline-hero-title">Normal</div>
-          <div class="baseline-hero-sub">O servidor está se comportando como nos últimos dias. Nenhum padrão fora do normal nas últimas 24 horas.</div>
+          <div class="baseline-hero-sub">The server is behaving the same as on recent days. No patterns outside normal in the last 24 hours.</div>
         </div>
       </div>`;
   }
@@ -478,8 +481,8 @@ function baselineHeroCard(b, deviations24h) {
     <div class="baseline-hero baseline-hero-deviation">
       <div class="baseline-hero-icon">🟡</div>
       <div class="baseline-hero-body">
-        <div class="baseline-hero-title">Algo diferente</div>
-        <div class="baseline-hero-sub">${deviations24h} ${deviations24h === 1 ? 'padrão fora do normal' : 'padrões fora do normal'} nas últimas 24 horas. Veja abaixo o que mudou.</div>
+        <div class="baseline-hero-title">Something changed</div>
+        <div class="baseline-hero-sub">${deviations24h} ${deviations24h === 1 ? 'pattern' : 'patterns'} outside normal in the last 24 hours. See what changed below.</div>
       </div>
     </div>`;
 }
@@ -493,7 +496,7 @@ function loginHeatmap(logins) {
     const cells = hours.map((v, i) => {
       const active = v > 0;
       const cls = active ? 'login-cell login-cell-active' : 'login-cell';
-      return `<div class="${cls}" title="${esc(user)} — ${i}:00 ${active ? '✓ logou nesta hora' : '(sem registro)'}"></div>`;
+      return `<div class="${cls}" title="${esc(user)} - ${i}:00 ${active ? '✓ logged in at this hour' : '(no record)'}"></div>`;
     }).join('');
     return `
       <div class="login-heatmap-row">
@@ -520,12 +523,12 @@ function eventRateAggregateSparkline(rates) {
   const max = Math.max(...aggregate, 1);
   const bars = aggregate.map((v, i) => {
     const h = Math.max(2, (v / max) * 36);
-    const tooltip = `${i}:00 — ~${v.toFixed(0)} events típicos`;
+    const tooltip = `${i}:00 - ~${v.toFixed(0)} typical events`;
     return `<div class="sparkline-bar" style="height:${h}px;" title="${tooltip}"></div>`;
   }).join('');
   return `
     <div class="baseline-sparkline">
-      <div class="baseline-sparkline-label">Atividade típica por hora (todas as ${sourceCount} fontes somadas)</div>
+      <div class="baseline-sparkline-label">Typical activity per hour (all ${sourceCount} sources combined)</div>
       <div class="baseline-sparkline-bars">${bars}</div>
       <div class="baseline-sparkline-axis"><span>0h</span><span>6h</span><span>12h</span><span>18h</span><span>23h</span></div>
     </div>`;
@@ -537,11 +540,11 @@ function topProcessDestinations(dests, limit) {
     .filter((x) => x.count > 0)
     .sort((a, b) => b.count - a.count)
     .slice(0, limit);
-  if (entries.length === 0) return '<p style="color:var(--dim);font-size:0.8rem;">Nenhum destino observado ainda.</p>';
+  if (entries.length === 0) return '<p style="color:var(--dim);font-size:0.8rem;">No destinations observed yet.</p>';
   return `
     <ul class="baseline-dest-list">
       ${entries.map((x) => `
-        <li><code>${esc(x.proc)}</code> conecta em <strong>${x.count}</strong> ${x.count === 1 ? 'destino conhecido' : 'destinos conhecidos'}</li>
+        <li><code>${esc(x.proc)}</code> connects to <strong>${x.count}</strong> ${x.count === 1 ? 'known destination' : 'known destinations'}</li>
       `).join('')}
     </ul>`;
 }
@@ -555,7 +558,7 @@ function topProcessLineages(lineages, limit) {
   if (list.length === 0) return '';
   return `
     <p style="font-size:0.8rem;margin:6px 0;color:var(--dim);">
-      ${list.length} cadeias pai→filho consideradas normais. Exemplos:
+      ${list.length} parent→child chains considered normal. Examples:
       ${list.slice(0, limit).map((l) => `<code>${esc(l)}</code>`).join(' · ')}
     </p>`;
 }
@@ -563,7 +566,7 @@ function topProcessLineages(lineages, limit) {
 async function loadBaseline() {
   const content = document.getElementById('intelContent');
   const statusEl = document.getElementById('intelViewStatus');
-  if (statusEl) statusEl.textContent = 'Carregando…';
+  if (statusEl) statusEl.textContent = 'Loading…';
   const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
     const b = await loadJson('/api/baseline-status', { signal });
@@ -583,15 +586,15 @@ async function loadBaseline() {
 
     // ── Level 2: deviation cards (top 5) ─────────────────────
     if (recent.length > 0) {
-      html += '<h3 class="baseline-section-title">O que mudou nas últimas 24 horas</h3>';
+      html += '<h3 class="baseline-section-title">What changed in the last 24 hours</h3>';
       html += '<div class="baseline-deviations">';
       html += recent.slice(0, 5).map(baselineCardForAnomaly).join('');
       html += '</div>';
       if (recent.length > 5) {
-        html += `<p style="font-size:0.78rem;color:var(--dim);margin-top:8px;">+${recent.length - 5} outros padrões. <a href="#threats" style="color:var(--accent);">Ver na investigação →</a></p>`;
+        html += `<p style="font-size:0.78rem;color:var(--dim);margin-top:8px;">+${recent.length - 5} other patterns. <a href="#threats" style="color:var(--accent);">See in investigation →</a></p>`;
       }
     } else if (b.mature) {
-      html += '<div class="baseline-empty-deviations">Nenhum desvio detectado nas últimas 24 horas.</div>';
+      html += '<div class="baseline-empty-deviations">No deviations detected in the last 24 hours.</div>';
     }
 
     // ── Level 3: collapsed "learned baseline" ────────────────
@@ -600,29 +603,29 @@ async function loadBaseline() {
       ? lineages.length
       : (lineages && typeof lineages === 'object' ? Object.keys(lineages).length : 0);
     const learnedSummary = `
-      ${(b.training_days || 0) >= 7 ? '✓ 7+ dias de aprendizado' : `${b.training_days || 0}/7 dias de aprendizado`}
-      · ${(b.total_observations || 0).toLocaleString('pt-BR')} eventos observados
-      · ${lineageCount} cadeias de processo conhecidas
+      ${(b.training_days || 0) >= 7 ? '✓ 7+ days of learning' : `${b.training_days || 0}/7 days of learning`}
+      · ${(b.total_observations || 0).toLocaleString('en-US')} events observed
+      · ${lineageCount} known process lineages
     `;
     html += `
       <details class="baseline-learned" id="baselineLearnedSection">
         <summary class="baseline-learned-summary">
-          <span>O que considero normal aqui</span>
+          <span>What I consider normal here</span>
           <span class="baseline-learned-meta">${learnedSummary.replace(/\s+/g, ' ').trim()}</span>
         </summary>
         <div class="baseline-learned-body">
           ${eventRateAggregateSparkline(b.event_rate_by_hour || {})}
           ${Object.keys(b.user_login_hours || {}).length > 0 ? `
-            <h4 class="baseline-subtitle">Quem loga, quando</h4>
-            <p style="font-size:0.8rem;color:var(--dim);margin:0 0 8px;">Cada linha é um usuário; cada quadrado é uma hora do dia em que esse usuário foi visto logando alguma vez.</p>
+            <h4 class="baseline-subtitle">Who logs in, when</h4>
+            <p style="font-size:0.8rem;color:var(--dim);margin:0 0 8px;">Each row is a user; each square is an hour of the day this user was seen logging in at some point.</p>
             ${loginHeatmap(b.user_login_hours)}
           ` : ''}
           ${Object.keys(b.process_destinations || {}).length > 0 ? `
-            <h4 class="baseline-subtitle">Processos que falam para fora</h4>
+            <h4 class="baseline-subtitle">Processes that talk to the outside</h4>
             ${topProcessDestinations(b.process_destinations, 6)}
           ` : ''}
           ${lineageCount > 0 ? `
-            <h4 class="baseline-subtitle">Cadeias de processo aprendidas</h4>
+            <h4 class="baseline-subtitle">Learned process lineages</h4>
             ${topProcessLineages(lineages, 6)}
           ` : ''}
         </div>
@@ -631,14 +634,14 @@ async function loadBaseline() {
     content.innerHTML = html;
     if (statusEl) {
       statusEl.textContent = !b.mature
-        ? `Aprendendo (${b.training_days || 0}/7 dias)`
+        ? `Learning (${b.training_days || 0}/7 days)`
         : recent.length === 0
-          ? 'Tudo normal'
-          : `${recent.length} ${recent.length === 1 ? 'desvio' : 'desvios'} nas últimas 24h`;
+          ? 'All normal'
+          : `${recent.length} ${recent.length === 1 ? 'deviation' : 'deviations'} in the last 24h`;
     }
   } catch(e) {
     if (e && (e.name === 'AbortError' || e.code === 20)) return;
-    content.innerHTML = `<p style="color:#e74c3c">Falha ao carregar Baseline: ${e.message}</p>`;
+    content.innerHTML = `<p style="color:#e74c3c">Failed to load Baseline: ${e.message}</p>`;
   }
 }
 

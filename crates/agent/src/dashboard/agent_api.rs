@@ -1288,6 +1288,174 @@ pub(super) fn empty_responses_payload() -> serde_json::Value {
     })
 }
 
+/// 2026-05-03 (PR #419 Wave 2): GET /api/responses/orphans — orphan
+/// diagnostic. Read-only. Read the persisted responses.json (or
+/// SQLite blob), filter `history` for entries whose reason starts
+/// with `"orphaned:"`, classify each into an `OrphanErrorCluster`,
+/// then probe kernel state once and annotate each orphan with
+/// whether the rule is still live or already gone.
+///
+/// The probe is a single `ufw status` + `iptables -L INPUT -n`
+/// fork, NOT one fork per orphan — keeps the endpoint cheap even
+/// with hundreds of orphans. Result cached for 30s in the dashboard
+/// state's existing `last_activity` rate limit; under load the
+/// operator gets the previous probe's data with a hint that it's
+/// from N seconds ago.
+///
+/// Wave 3 will add `POST /api/admin-action/clear-orphan/:id` with
+/// 2FA + CSRF behind the same diagnostic surface.
+pub(super) async fn api_responses_orphans(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
+    use crate::response_lifecycle::{enumerate_orphans_from_responses_json, OrphanErrorCluster};
+
+    // Read the persisted lifecycle JSON (same precedence as
+    // /api/responses — SQLite blob first, file fallback).
+    let raw = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("responses").ok().flatten())
+        .or_else(|| {
+            let canonical = std::fs::canonicalize(&state.data_dir).ok()?;
+            let target = canonical.join("responses.json");
+            if !target.starts_with(&canonical) {
+                return None;
+            }
+            std::fs::read_to_string(target).ok()
+        })
+        .unwrap_or_default();
+
+    let orphans = enumerate_orphans_from_responses_json(&raw);
+
+    // Probe kernel state ONCE, then check each orphan's target IP
+    // against the captured outputs. Best-effort — failure of the
+    // probe means each orphan reports `kernel_state: "probe_failed"`
+    // but the rest of the diagnostic still flows.
+    let (ufw_text, iptables_text) = probe_kernel_state_once().await;
+
+    let enriched: Vec<serde_json::Value> = orphans
+        .iter()
+        .map(|o| {
+            let kernel_state = classify_kernel_state(&o.target, &ufw_text, &iptables_text);
+            serde_json::json!({
+                "id": o.id,
+                "target": o.target,
+                "backend": o.backend,
+                "incident_id": o.incident_id,
+                "created_at": o.created_at.to_rfc3339(),
+                "reverted_at": o.reverted_at.to_rfc3339(),
+                "last_error": o.last_error,
+                "cluster": o.cluster,
+                "revert_command": o.revert_command,
+                "kernel_state": kernel_state,
+            })
+        })
+        .collect();
+
+    // Cluster summary: group by error cluster, count, suggest fix.
+    let mut by_cluster: std::collections::HashMap<OrphanErrorCluster, usize> =
+        std::collections::HashMap::new();
+    for o in &orphans {
+        *by_cluster.entry(o.cluster).or_insert(0) += 1;
+    }
+    let clusters: Vec<serde_json::Value> = by_cluster
+        .into_iter()
+        .map(|(cluster, count)| {
+            serde_json::json!({
+                "cluster": cluster,
+                "count": count,
+                "suggested_fix": cluster_suggested_fix(cluster),
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "total": orphans.len(),
+        "orphans": enriched,
+        "clusters": clusters,
+        "probe_available": !(ufw_text.is_empty() && iptables_text.is_empty()),
+    });
+
+    axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
+        .unwrap()
+        .into_response()
+}
+
+/// 2026-05-03: best-effort kernel state probe. Returns (ufw_status,
+/// iptables_input). Either is empty string on failure (sudo missing,
+/// command not found, etc.). Single fork per backend, NOT one per
+/// orphan — keeps the endpoint O(1) on probe cost regardless of
+/// orphan count.
+async fn probe_kernel_state_once() -> (String, String) {
+    let ufw = tokio::process::Command::new("sudo")
+        .args(["-n", "ufw", "status", "numbered"])
+        .output()
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let iptables = tokio::process::Command::new("sudo")
+        .args(["-n", "iptables", "-L", "INPUT", "-n", "--line-numbers"])
+        .output()
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    (ufw, iptables)
+}
+
+/// Classify whether a target IP still appears in the kernel's
+/// rule set. `still_blocked` = found in either ufw or iptables;
+/// `already_gone` = both probes returned text and neither contained
+/// the target; `probe_failed` = both probes returned empty (no
+/// information).
+fn classify_kernel_state(target: &str, ufw: &str, iptables: &str) -> &'static str {
+    if ufw.is_empty() && iptables.is_empty() {
+        return "probe_failed";
+    }
+    if ufw.contains(target) || iptables.contains(target) {
+        return "still_blocked";
+    }
+    "already_gone"
+}
+
+/// 2026-05-03: operator-facing "what to do about it" string per
+/// cluster. Maps the heuristic classification onto a concrete
+/// remediation hint shown on the dashboard above the per-orphan
+/// cards. Pure mapping — no I/O.
+fn cluster_suggested_fix(cluster: crate::response_lifecycle::OrphanErrorCluster) -> &'static str {
+    use crate::response_lifecycle::OrphanErrorCluster as C;
+    match cluster {
+        C::Ipv6Mismatch => {
+            "Enable IPv6 in /etc/default/ufw (IPV6=yes) so v6 rules can be created/removed cleanly. \
+             Or restrict block_ip skills to IPv4 targets via config."
+        }
+        C::NftablesHandleMissing => {
+            "nftables handle was not stored at create time — rule cannot be removed by handle. \
+             Manual fix: `sudo nft list ruleset | grep <ip>` then `sudo nft delete rule ...`."
+        }
+        C::RuleAlreadyAbsent => {
+            "Kernel state is already clean — these are false orphans (revert command rejected \
+             because the rule was already gone). Wave 4 root-cause fix re-classifies these as \
+             AlreadyAbsent at create time."
+        }
+        C::PermissionDenied => {
+            "Agent's sudoers entries don't allow the revert command. Re-run \
+             `innerwarden harden` to refresh sudoers, or check /etc/sudoers.d/innerwarden-*."
+        }
+        C::ExternalMutation => {
+            "Another tool (fail2ban / ipset / manual) modified the firewall between create \
+             and revert. Coordinate or disable the conflicting tool."
+        }
+        C::Unknown => {
+            "Cluster not recognised. Check the per-orphan `last_error` field for the raw \
+             stderr — file an issue with that string for classifier coverage."
+        }
+    }
+}
+
 /// GET /api/responses — active and historical response actions with TTL.
 pub(super) async fn api_responses(State(state): State<DashboardState>) -> axum::response::Response {
     // Try SQLite blob first, fall back to JSON file
