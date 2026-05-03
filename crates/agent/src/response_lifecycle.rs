@@ -832,6 +832,27 @@ impl ResponseLifecycle {
         ttl_secs: i64,
         revert_handle: Option<String>,
     ) -> String {
+        // PR #426 Wave 4e: invariant — caller must dedupe via
+        // `is_tracked()` before calling register. A duplicate (target,
+        // backend) entry is a real bug shape: the kernel rule already
+        // exists, the agent thinks it doesn't, both entries race on
+        // revert. This loud failure in tests catches the contract
+        // violation; release builds skip the check.
+        debug_assert!(
+            !self
+                .active
+                .iter()
+                .any(|r| r.target == target && r.backend == backend),
+            "register invariant: caller must check is_tracked() first — \
+             duplicate (target={target}, backend={backend:?}) would race on revert"
+        );
+
+        // Note: ttl_secs = 0 is a legitimate API use (immediate expiry,
+        // exercised by the lifecycle's revert-after-expiry tests).
+        // Negative TTL is also tolerated — `stage_pending_reverts`
+        // handles "already expired" entries deterministically. No
+        // invariant assert here.
+
         let id = format!("resp-{}", self.next_id);
         self.next_id += 1;
 

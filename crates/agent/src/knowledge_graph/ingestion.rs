@@ -227,6 +227,21 @@ impl KnowledgeGraph {
 
     /// Ingest a sensor event into the graph, creating/updating nodes and edges.
     pub fn ingest(&mut self, event: &Event) {
+        // PR #426 Wave 4e: invariant — `_current_event_*` must be None
+        // when ingest enters. If it isn't, the previous ingest cycle
+        // exited without clearing (or some other path set them outside
+        // an ingest), which is the exact mechanism behind the prod
+        // 2026-05-03 cross-attribution bug. Loud failure in tests
+        // catches regressions immediately. Cheap in release (no-op).
+        debug_assert!(
+            self._current_event_source.is_none(),
+            "ingest invariant: _current_event_source must be None on entry — \
+             previous cycle did not clean up. Prior bug surface: PR #423 Wave 4c."
+        );
+        debug_assert!(self._current_event_kind.is_none());
+        debug_assert!(self._current_event_summary.is_none());
+        debug_assert!(self._current_event_severity.is_none());
+
         // Record telemetry for sensors tab
         self.record_event_telemetry(&event.source, &event.kind, event.ts);
 

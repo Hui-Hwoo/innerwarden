@@ -1,0 +1,23 @@
+name: Anchor Tests
+
+# Asserts every named test in ANCHOR_TESTS.md still exists in the
+# source tree. Fails the PR if a regression-anchor test is renamed
+# or deleted without updating the manifest. The manifest itself
+# is part of the bug-discipline contract: see ADR/0002 + the
+# `.claude-local/RECURRING_BUGS.md` companion (private to operator).
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - development
+
+jobs:
+  verify-anchors:
+    name: Verify anchor tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run verify-anchor-tests.sh
+        run: ./scripts/verify-anchor-tests.sh
