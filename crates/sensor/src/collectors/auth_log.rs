@@ -280,4 +280,17 @@ mod tests {
         let line = "Mar 12 06:00:01 host sudo[999]: user : TTY=pts/0";
         assert!(parse_sshd_line(line, "host").is_none());
     }
+
+    #[test]
+    fn skip_sshd_noise() {
+        let line = "Mar 12 06:00:01 host sshd[123]: Server listening on 0.0.0.0 port 22.";
+        assert!(parse_sshd_line(line, "host").is_none());
+    }
+
+    #[test]
+    fn parse_incomplete_line() {
+        // e.g., missing the "from" or "port"
+        let line = "Mar 12 06:00:01 host sshd[123]: Failed password for invalid user";
+        assert!(parse_sshd_line(line, "host").is_none());
+    }
 }

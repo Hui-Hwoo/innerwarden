@@ -321,4 +321,199 @@ mod tests {
         assert!(parse_request(b"not http at all").is_none());
         assert!(parse_request(b"INVALID / HTTP/1.1\r\n\r\n").is_none());
     }
+
+    #[test]
+    fn test_parse_request_other_methods() {
+        let methods = [
+            "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE",
+        ];
+        for method in methods {
+            let raw = format!("{method} / HTTP/1.1\r\n\r\n").into_bytes();
+            let req = parse_request(&raw).unwrap();
+            assert_eq!(req.method, method);
+        }
+    }
+
+    #[test]
+    fn test_parse_request_missing_crlfcrlf() {
+        assert!(parse_request(b"GET / HTTP/1.1\r\nHost: example.com").is_none());
+    }
+
+    #[test]
+    fn test_parse_request_no_body() {
+        let raw = b"GET / HTTP/1.1\r\n\r\n";
+        let req = parse_request(raw).unwrap();
+        assert!(req.body.is_empty());
+    }
+
+    #[test]
+    fn test_parse_response_non_http() {
+        assert!(parse_response(b"FTP/1.1 200 OK\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn test_parse_response_no_body() {
+        let raw = b"HTTP/1.1 200 OK\r\n\r\n";
+        let resp = parse_response(raw).unwrap();
+        assert!(resp.body.is_empty());
+    }
+
+    #[test]
+    fn test_parse_response_with_content_disposition() {
+        let raw =
+            b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"test.txt\"\r\n\r\n";
+        let resp = parse_response(raw).unwrap();
+        assert_eq!(
+            resp.content_disposition.unwrap(),
+            "attachment; filename=\"test.txt\""
+        );
+    }
+
+    #[test]
+    fn test_extract_signals_sql_injection() {
+        let req = HttpRequest {
+            method: "GET".into(),
+            uri: "/?id=1 union select password".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            host: "target.com".into(),
+            user_agent: "curl/7.0".into(),
+            content_type: String::new(),
+            content_length: None,
+        };
+        let signals = extract_signals(&req, None);
+        assert!(signals.contains(&"sql_injection_attempt".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signals_xss() {
+        let req = HttpRequest {
+            method: "GET".into(),
+            uri: "/?q=<script>alert(1)</script>".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            host: "target.com".into(),
+            user_agent: "curl/7.0".into(),
+            content_type: String::new(),
+            content_length: None,
+        };
+        let signals = extract_signals(&req, None);
+        assert!(signals.contains(&"xss_attempt".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signals_command_injection() {
+        let req = HttpRequest {
+            method: "GET".into(),
+            uri: "/?cmd=ls".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            host: "target.com".into(),
+            user_agent: "curl/7.0".into(),
+            content_type: String::new(),
+            content_length: None,
+        };
+        let signals = extract_signals(&req, None);
+        assert!(signals.contains(&"command_injection_attempt".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signals_webshell_upload() {
+        let req = HttpRequest {
+            method: "POST".into(),
+            uri: "/upload.php".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: b"<?php system('id'); ?>".to_vec(),
+            host: "target.com".into(),
+            user_agent: "curl/7.0".into(),
+            content_type: String::new(),
+            content_length: None,
+        };
+        let signals = extract_signals(&req, None);
+        assert!(signals.contains(&"webshell_upload".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signals_code_injection_body() {
+        let req = HttpRequest {
+            method: "POST".into(),
+            uri: "/api".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: b"eval(base64_decode('...'))".to_vec(),
+            host: "target.com".into(),
+            user_agent: "curl/7.0".into(),
+            content_type: String::new(),
+            content_length: None,
+        };
+        let signals = extract_signals(&req, None);
+        assert!(signals.contains(&"code_injection_body".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signals_empty_user_agent() {
+        let req = HttpRequest {
+            method: "GET".into(),
+            uri: "/".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            host: "target.com".into(),
+            user_agent: "".into(),
+            content_type: String::new(),
+            content_length: None,
+        };
+        let signals = extract_signals(&req, None);
+        assert!(signals.contains(&"empty_user_agent".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signals_suspicious_short_user_agent() {
+        let req = HttpRequest {
+            method: "GET".into(),
+            uri: "/".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            host: "target.com".into(),
+            user_agent: "python".into(),
+            content_type: String::new(),
+            content_length: None,
+        };
+        let signals = extract_signals(&req, None);
+        assert!(signals.contains(&"suspicious_user_agent".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signals_response_analysis() {
+        let req = HttpRequest {
+            method: "GET".into(),
+            uri: "/download".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            host: "target.com".into(),
+            user_agent: "curl/7.0".into(),
+            content_type: String::new(),
+            content_length: None,
+        };
+        let resp = HttpResponse {
+            status_code: 200,
+            reason: "OK".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+            content_type: "application/octet-stream".into(),
+            content_length: Some(2_000_000),
+            content_disposition: Some("attachment".into()),
+        };
+        let signals = extract_signals(&req, Some(&resp));
+        assert!(signals.contains(&"file_download".to_string()));
+        assert!(signals.contains(&"large_response:2MB".to_string()));
+        assert!(signals.contains(&"binary_download".to_string()));
+    }
 }

@@ -195,6 +195,46 @@ mod tests {
     }
 
     #[test]
+    fn line_with_sshd_accepted_is_recognized() {
+        let line = "Jan 15 15:00:01.123 mymac sshd[1234]: Accepted publickey for ubuntu from 10.0.0.1 port 54321 ssh2: RSA SHA256:abc";
+        let ev = parse_macos_log_line(line, "mymac").expect("should parse SSH event");
+        assert_eq!(ev.kind, "ssh.login_success");
+        assert_eq!(ev.details["user"], "ubuntu");
+        assert_eq!(ev.details["method"], "publickey");
+    }
+
+    #[test]
+    fn line_with_sshd_missing_separator() {
+        let line = "Jan 15 15:00:01.123 mymac sshd[1234] some other format";
+        assert!(parse_macos_log_line(line, "mymac").is_none());
+    }
+
+    #[test]
+    fn sudo_line_missing_user_returns_none() {
+        let line = "Jan 15 15:00:01.123 mymac sudo[5678]: deploy : TTY=ttys001 ; PWD=/home/deploy ; COMMAND=/usr/bin/id";
+        assert!(parse_macos_log_line(line, "mymac").is_none());
+    }
+
+    #[test]
+    fn sudo_line_missing_colon_separator() {
+        let line = "Jan 15 15:00:01.123 mymac sudo[5678]: USER=root ; COMMAND=/usr/bin/id";
+        let ev = parse_macos_log_line(line, "mymac").unwrap();
+        // Without colon, the whole message prefix is treated as the user.
+        assert!(ev.details["user"]
+            .as_str()
+            .unwrap()
+            .starts_with("USER=root"));
+    }
+
+    #[test]
+    fn test_field_after() {
+        assert_eq!(field_after("A=1 ; B=2", "A="), Some("1"));
+        assert_eq!(field_after("A=1 ; B=2", "B="), Some("2"));
+        assert_eq!(field_after("A=1 ; B=2 ; C=3", "B="), Some("2"));
+        assert_eq!(field_after("A=1", "C="), None);
+    }
+
+    #[test]
     fn sudo_line_is_recognized() {
         let line = "Jan 15 15:00:01.123 mymac sudo[5678]: deploy : TTY=ttys001 ; PWD=/home/deploy ; USER=root ; COMMAND=/usr/bin/id";
         let ev = parse_macos_log_line(line, "mymac").expect("should parse sudo event");

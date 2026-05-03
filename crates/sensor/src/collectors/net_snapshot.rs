@@ -279,4 +279,41 @@ mod tests {
         assert_eq!(tcp_state("06"), "TIME_WAIT");
         assert_eq!(tcp_state("FF"), "UNKNOWN");
     }
+
+    #[test]
+    fn parse_proc_net_tcp_skips_short_lines() {
+        let content = "header\nshort line";
+        assert!(parse_proc_net_tcp(content).is_empty());
+    }
+
+    #[test]
+    fn parse_proc_net_tcp_handles_missing_inode() {
+        // Line with 10 fields but invalid inode
+        let content = "header\n0: 0100007F:0050 00000000:0000 0A 0 0 0 0 0 invalid_inode 0";
+        let entries = parse_proc_net_tcp(content);
+        assert_eq!(entries[0].inode, 0);
+    }
+
+    #[test]
+    fn test_parse_hex_addr_invalid_format() {
+        // No colon
+        let (addr, port) = parse_hex_addr("0100007F0050");
+        assert_eq!(addr, "0.0.0.0");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn test_parse_hex_addr_invalid_hex() {
+        // Invalid hex in IP
+        let (addr, port) = parse_hex_addr("XX00007F:0050");
+        assert_eq!(addr, "0.0.0.0");
+        assert_eq!(port, 80); // port parses ok
+    }
+
+    #[test]
+    fn test_parse_hex_addr_ipv6() {
+        let (addr, port) = parse_hex_addr("00000000000000000000000000000001:0050");
+        assert_eq!(addr, "ipv6:00000000000000000000000000000001");
+        assert_eq!(port, 80);
+    }
 }

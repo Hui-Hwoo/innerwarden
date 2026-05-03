@@ -429,4 +429,36 @@ mod tests {
         // Verifies non-critical taint additions retain high severity instead of being over-promoted.
         assert!(matches!(classify_kernel_taint_severity(1), Severity::High));
     }
+
+    #[test]
+    fn should_hash_esp_entry_rejects_no_extension() {
+        assert!(!should_hash_esp_entry(Path::new(
+            "/boot/efi/EFI/BOOT/README"
+        )));
+    }
+
+    #[test]
+    fn kernel_taint_reasons_empty() {
+        let reasons = kernel_taint_reasons(0);
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn make_event_creates_expected_structure() {
+        let ev = make_event(
+            "test-host",
+            Severity::High,
+            "summary text",
+            "test.kind",
+            &[("key", "value")],
+            &["tag1"],
+        );
+        assert_eq!(ev.host, "test-host");
+        assert_eq!(ev.severity, Severity::High);
+        assert_eq!(ev.summary, "summary text");
+        assert_eq!(ev.kind, "test.kind");
+        assert_eq!(ev.details["key"].as_str().unwrap(), "value");
+        assert_eq!(ev.tags.len(), 1);
+        assert_eq!(ev.tags[0], "tag1");
+    }
 }

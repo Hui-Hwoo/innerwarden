@@ -229,15 +229,19 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
 
 /// Read key syscall addresses from /proc/kallsyms.
 fn read_kallsyms() -> HashMap<String, String> {
-    let mut syscalls = HashMap::new();
     let content = match std::fs::read_to_string("/proc/kallsyms") {
         Ok(c) => c,
         Err(e) => {
             warn!("kernel_integrity: cannot read /proc/kallsyms: {e}");
-            return syscalls;
+            return HashMap::new();
         }
     };
 
+    parse_kallsyms(&content)
+}
+
+fn parse_kallsyms(content: &str) -> HashMap<String, String> {
+    let mut syscalls = HashMap::new();
     for line in content.lines() {
         // Format: address type name
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
@@ -297,12 +301,16 @@ fn read_bpf_program_info(id: u32) -> Option<String> {
 
 /// Read loaded kernel modules from /proc/modules.
 fn read_kernel_modules() -> HashSet<String> {
-    let mut modules = HashSet::new();
     let content = match std::fs::read_to_string("/proc/modules") {
         Ok(c) => c,
-        Err(_) => return modules,
+        Err(_) => return HashSet::new(),
     };
 
+    parse_modules(&content)
+}
+
+fn parse_modules(content: &str) -> HashSet<String> {
+    let mut modules = HashSet::new();
     for line in content.lines() {
         if let Some(name) = line.split_whitespace().next() {
             modules.insert(name.to_string());
@@ -398,5 +406,28 @@ mod tests {
         if let Some(name) = info {
             assert!(!name.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn test_parse_kallsyms() {
+        let content = "ffffffff81000000 T _stext
+ffffffff81000000 t startup_64
+ffffffff81123456 t __x64_sys_execve
+ffffffff81123456 t __x64_sys_execve\t[module]
+ffffffff81abcdef T __x64_sys_openat";
+        let parsed = parse_kallsyms(content);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get("__x64_sys_execve").unwrap(), "ffffffff81123456");
+        assert_eq!(parsed.get("__x64_sys_openat").unwrap(), "ffffffff81abcdef");
+    }
+
+    #[test]
+    fn test_parse_modules() {
+        let content = "veth 36864 0 - Live 0xffffffffc0000000\n\
+                       intel_rapl_msr 20480 0 - Live 0xffffffffc0010000";
+        let parsed = parse_modules(content);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains("veth"));
+        assert!(parsed.contains("intel_rapl_msr"));
     }
 }

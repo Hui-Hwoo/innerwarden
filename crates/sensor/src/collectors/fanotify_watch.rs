@@ -381,4 +381,11 @@ mod tests {
         assert!(DEFAULT_WATCH_PATHS.contains(&"/etc/sudoers"));
         assert!(DEFAULT_WATCH_PATHS.contains(&"/boot/grub/grub.cfg"));
     }
+
+    #[test]
+    fn compute_file_state_returns_none_for_missing_file() {
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let path = dir.path().join("missing.txt");
+        assert!(compute_file_state(&path).is_none());
+    }
 }

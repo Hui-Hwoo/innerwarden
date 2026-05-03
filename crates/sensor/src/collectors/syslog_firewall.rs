@@ -278,4 +278,22 @@ mod tests {
         // Value is last token - no trailing space
         assert_eq!(extract_field("SRC=1.2.3.4", "SRC="), Some("1.2.3.4"));
     }
+
+    #[test]
+    fn ignores_kernel_lines_with_invalid_ip() {
+        let line = "Jan 15 12:00:00 host kernel: SRC=not-an-ip DST=10.0.0.1 PROTO=TCP DPT=80";
+        assert!(parse_firewall_line(line).is_none());
+    }
+
+    #[test]
+    fn ignores_kernel_lines_with_invalid_dpt() {
+        let line = "Jan 15 12:00:00 host kernel: SRC=1.2.3.4 DST=10.0.0.1 PROTO=TCP DPT=abc";
+        assert!(parse_firewall_line(line).is_none());
+    }
+
+    #[test]
+    fn extract_field_empty_value() {
+        let line = "SRC= ";
+        assert!(extract_field(line, "SRC=").is_none());
+    }
 }

@@ -477,4 +477,45 @@ mod tests {
         assert_eq!(entry.path, "/api/search?q=test");
         assert_eq!(entry.status, 404);
     }
+
+    #[test]
+    fn is_known_good_bot_detects_bots() {
+        assert!(is_known_good_bot(
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+        ));
+        assert!(is_known_good_bot(
+            "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"
+        ));
+        assert!(is_known_good_bot("duckduckbot/1.0"));
+        assert!(!is_known_good_bot("Mozilla/5.0 Firefox/124.0"));
+    }
+
+    #[test]
+    fn verify_bot_rdns_not_in_list_returns_true() {
+        // "anthropic-ai" is in KNOWN_GOOD_BOTS but not in BOT_RDNS_PATTERNS
+        // It should get benefit of the doubt
+        assert!(verify_bot_rdns("anthropic-ai", "127.0.0.1"));
+    }
+
+    #[test]
+    fn verify_bot_rdns_invalid_ip_returns_false() {
+        assert!(!verify_bot_rdns("googlebot", "not-an-ip"));
+    }
+
+    #[test]
+    fn test_http_severity_edge_cases() {
+        assert_eq!(http_severity(100), Severity::Debug); // _ arm
+        assert_eq!(http_severity(599), Severity::Medium);
+        assert_eq!(http_severity(0), Severity::Debug); // _ arm
+    }
+
+    #[test]
+    fn test_extract_last_quoted_no_quotes() {
+        assert_eq!(extract_last_quoted("hello world"), None);
+    }
+
+    #[test]
+    fn test_extract_last_quoted_single_quote() {
+        assert_eq!(extract_last_quoted("hello \"world"), None);
+    }
 }

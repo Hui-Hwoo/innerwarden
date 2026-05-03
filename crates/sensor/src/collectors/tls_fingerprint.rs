@@ -877,6 +877,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_packet_not_tcp() {
+        let mut data = vec![0u8; 40];
+        data[12] = 0x08;
+        data[13] = 0x00; // IPv4
+        data[14] = 0x45; // Version 4, IHL 5
+        data[23] = 17; // Protocol UDP
+        assert!(parse_packet(&data).is_none());
+    }
+
+    #[test]
+    fn parse_packet_not_tls() {
+        let mut data = vec![0u8; 80];
+        data[12] = 0x08;
+        data[13] = 0x00; // IPv4
+        data[14] = 0x45; // Version 4, IHL 5
+        data[23] = 6; // Protocol TCP
+        data[46] = 0x50; // Data offset 5
+                         // TLS content type is byte 34 + 20 = 54
+        data[54] = 0x17; // Application Data (not Handshake)
+        assert!(parse_packet(&data).is_none());
+    }
+
+    #[test]
+    fn parse_packet_not_client_hello() {
+        let mut data = vec![0u8; 80];
+        data[12] = 0x08;
+        data[13] = 0x00; // IPv4
+        data[14] = 0x45; // Version 4, IHL 5
+        data[23] = 6; // Protocol TCP
+        data[46] = 0x50; // Data offset 5
+        data[54] = 0x16; // Handshake
+                         // Handshake type is byte 59
+        data[59] = 0x02; // ServerHello
+        assert!(parse_packet(&data).is_none());
+    }
+
+    #[test]
     fn join_functions() {
         assert_eq!(join_u16(&[1, 2, 3]), "1-2-3");
         assert_eq!(join_u16(&[]), "");

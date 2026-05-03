@@ -285,4 +285,51 @@ mod tests {
             Some("GET /path HTTP/1.1")
         );
     }
+
+    #[test]
+    fn test_extract_field_missing_prefix() {
+        let body = "client: 1.2.3.4";
+        assert_eq!(extract_field(body, "server: "), None);
+    }
+
+    #[test]
+    fn test_extract_field_bare_value_at_end() {
+        let body = "client: 1.2.3.4";
+        assert_eq!(extract_field(body, "client: ").as_deref(), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn test_extract_field_empty_value() {
+        let body = "client: , server: foo";
+        assert_eq!(extract_field(body, "client: "), None);
+    }
+
+    #[test]
+    fn test_error_severity_cases() {
+        assert_eq!(error_severity("warning"), Severity::Low);
+        assert_eq!(error_severity("alert"), Severity::High);
+        assert_eq!(error_severity("unknown"), Severity::Low);
+    }
+
+    #[test]
+    fn skips_info_level() {
+        let line = r#"2024/01/15 12:00:00 [info] 100#100: *1 some info, client: 1.2.3.4"#;
+        assert!(parse_line(line).is_none());
+    }
+
+    #[test]
+    fn parses_body_without_asterisk() {
+        let line = r#"2024/01/15 12:34:56 [error] 1234#1234: open() "/etc/passwd" failed, client: 1.2.3.4"#;
+        let entry = parse_line(line).unwrap();
+        assert_eq!(entry.client_ip.as_deref(), Some("1.2.3.4"));
+        assert_eq!(entry.message, r#"open() "/etc/passwd" failed"#);
+    }
+
+    #[test]
+    fn truncates_long_messages() {
+        let long_msg = "A".repeat(300);
+        let line = format!(r#"2024/01/15 12:34:56 [emerg] 1234#1234: {long_msg}"#);
+        let entry = parse_line(&line).unwrap();
+        assert_eq!(entry.message.len(), 200);
+    }
 }

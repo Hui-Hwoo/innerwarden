@@ -225,7 +225,10 @@ fn parse_maps(pid: u32, comm: &str) -> Vec<SuspiciousRegion> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
+    parse_maps_content(&content, pid, comm)
+}
 
+fn parse_maps_content(content: &str, pid: u32, comm: &str) -> Vec<SuspiciousRegion> {
     let mut findings = Vec::new();
 
     for line in content.lines() {
@@ -475,5 +478,58 @@ mod tests {
         assert!(is_known_rwx("custom-runtime", "/opt/lib/libv8_snapshot.so"));
         assert!(is_known_rwx("custom-runtime", "/usr/lib/jvm/libjvm.so"));
         assert!(!is_known_rwx("custom-runtime", "/tmp/unknown_payload.bin"));
+    }
+
+    #[test]
+    fn parse_maps_content_rwx() {
+        let content = "7f1234000000-7f1234001000 rwxp 00000000 00:00 0  /tmp/malware";
+        let findings = parse_maps_content(content, 123, "bash");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].region_type.label(), "rwx_memory");
+    }
+
+    #[test]
+    fn parse_maps_content_anon_executable() {
+        let content = "7f1234000000-7f1234001000 r-xp 00000000 00:00 0  ";
+        let findings = parse_maps_content(content, 123, "bash");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].region_type.label(), "anon_executable");
+    }
+
+    #[test]
+    fn parse_maps_content_deleted_file() {
+        let content = "7f1234000000-7f1234001000 r-xp 00000000 00:00 0  /tmp/malware (deleted)";
+        let findings = parse_maps_content(content, 123, "bash");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].region_type.label(), "deleted_file_mapping");
+    }
+
+    #[test]
+    fn parse_maps_content_executable_stack() {
+        let content = "7f1234000000-7f1234001000 rwxp 00000000 00:00 0  [stack]";
+        let findings = parse_maps_content(content, 123, "bash");
+        // It matches both RWX and ExecutableStack
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .any(|f| matches!(f.region_type, RegionType::ExecutableStack)));
+    }
+
+    #[test]
+    fn parse_maps_content_executable_heap() {
+        let content = "7f1234000000-7f1234001000 rwxp 00000000 00:00 0  [heap]";
+        let findings = parse_maps_content(content, 123, "bash");
+        // It matches both RWX and ExecutableHeap
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .any(|f| matches!(f.region_type, RegionType::ExecutableHeap)));
+    }
+
+    #[test]
+    fn parse_maps_content_invalid_lines() {
+        let content = "invalid line\n7f1234000000-invalid r-xp 00000000 00:00 0";
+        let findings = parse_maps_content(content, 123, "bash");
+        assert_eq!(findings.len(), 0);
     }
 }

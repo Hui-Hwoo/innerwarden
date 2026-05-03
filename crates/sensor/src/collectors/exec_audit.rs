@@ -354,4 +354,47 @@ mod tests {
         assert_eq!(ev.details["tty"], "pts0");
         assert_eq!(ev.details["decoded_preview"], "ls -la\\r");
     }
+
+    #[test]
+    fn parse_other_record_type_returns_none() {
+        let line = "type=USER_AUTH msg=audit(1711800000.123:4242): user=root";
+        assert!(parse_audit_line(line, "host-a", true).is_none());
+    }
+
+    #[test]
+    fn parse_execve_no_args_returns_none() {
+        let line = "type=EXECVE msg=audit(1711800000.123:4242): argc=0";
+        assert!(parse_audit_line(line, "host-a", false).is_none());
+    }
+
+    #[test]
+    fn parse_tty_line_empty_msg_returns_none() {
+        let line = "type=TTY msg=audit(1711800100.456:5001): tty=pts0 uid=1000 auid=1000 msg=''";
+        assert!(parse_audit_line(line, "host-a", true).is_none());
+    }
+
+    #[test]
+    fn test_truncate() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn test_decode_hex_preview() {
+        assert_eq!(decode_hex_preview("6c73", 10), "ls");
+        // invalid hex
+        assert_eq!(decode_hex_preview("6c7z", 10), "l");
+        // non-printable
+        assert_eq!(decode_hex_preview("000102", 10), "<non-printable>");
+        // truncation
+        assert_eq!(decode_hex_preview("6c73", 1), "l");
+    }
+
+    #[test]
+    fn test_parse_audit_metadata_invalid() {
+        // missing audit id
+        assert!(parse_audit_metadata("msg=audit(1711800000.123):").is_none());
+        // missing start
+        assert!(parse_audit_metadata("type=EXECVE").is_none());
+    }
 }

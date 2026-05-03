@@ -109,4 +109,80 @@ mod tests {
         assert!(session.has_tunnel_request);
         assert!(session.signals.contains(&"ssh_tunnel_detected".to_string()));
     }
+
+    #[test]
+    fn test_detect_tunnel_forwarded() {
+        let mut client = b"SSH-2.0-OpenSSH_8.9\r\n".to_vec();
+        client.extend_from_slice(b"forwarded-tcpip");
+        let server = b"SSH-2.0-OpenSSH_9.6\r\n";
+        let session = parse_session(&client, server).unwrap();
+        assert!(session.has_tunnel_request);
+        assert!(session.signals.contains(&"ssh_tunnel_detected".to_string()));
+    }
+
+    #[test]
+    fn test_detect_libssh() {
+        let client = b"SSH-2.0-libssh_0.9.6\r\n";
+        let session = parse_session(client, b"").unwrap();
+        assert!(session.signals.contains(&"libssh_client".to_string()));
+    }
+
+    #[test]
+    fn test_detect_putty() {
+        let client = b"SSH-2.0-PuTTY_Release_0.76\r\n";
+        let session = parse_session(client, b"").unwrap();
+        assert!(session.signals.contains(&"putty_client".to_string()));
+    }
+
+    #[test]
+    fn test_detect_go_client() {
+        let client = b"SSH-2.0-Go\r\n";
+        let session = parse_session(client, b"").unwrap();
+        assert!(session.signals.contains(&"go_ssh_client".to_string()));
+    }
+
+    #[test]
+    fn test_detect_bruteforce_tools() {
+        for tool in ["ncrack", "hydra", "medusa"] {
+            let client = format!("SSH-2.0-{}\r\n", tool).into_bytes();
+            let session = parse_session(&client, b"").unwrap();
+            assert!(session.signals.contains(&"bruteforce_tool".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_malformed_version() {
+        let client = b"SSH-3.0-Unknown\r\n";
+        let session = parse_session(client, b"").unwrap();
+        assert!(session.signals.contains(&"malformed_version".to_string()));
+    }
+
+    #[test]
+    fn test_oversized_version_string() {
+        let mut client = b"SSH-2.0-".to_vec();
+        client.extend_from_slice(&[b'A'; 250]);
+        client.extend_from_slice(b"\r\n");
+        let session = parse_session(&client, b"").unwrap();
+        assert!(session
+            .signals
+            .contains(&"oversized_version_string".to_string()));
+    }
+
+    #[test]
+    fn test_no_valid_ssh_version() {
+        let client = b"HTTP/1.1 200 OK\r\n";
+        assert!(parse_session(client, b"").is_none());
+    }
+
+    #[test]
+    fn test_extract_version_truncation() {
+        let mut data = vec![b'A'; 400];
+        assert!(extract_version(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_version_no_prefix() {
+        let data = b"Some random text\r\n";
+        assert!(extract_version(data).is_none());
+    }
 }

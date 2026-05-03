@@ -274,4 +274,75 @@ mod tests {
 
         assert!(parse_session(&data).is_none());
     }
+
+    #[test]
+    fn test_smb1_commands() {
+        let open_file = parse_session(&smb1_message(0x2D)).unwrap();
+        assert!(open_file.signals.contains(&"open_file".to_string()));
+
+        let transaction = parse_session(&smb1_message(0x32)).unwrap();
+        assert!(transaction.signals.contains(&"transaction".to_string()));
+
+        let nt_create = parse_session(&smb1_message(0xA2)).unwrap();
+        assert!(nt_create.signals.contains(&"nt_create".to_string()));
+    }
+
+    #[test]
+    fn test_smb2_commands() {
+        let create_file = parse_session(&smb2_message(0x0005)).unwrap();
+        assert!(create_file.signals.contains(&"create_file".to_string()));
+
+        let read_file = parse_session(&smb2_message(0x0008)).unwrap();
+        assert!(read_file.signals.contains(&"read_file".to_string()));
+
+        let write_file = parse_session(&smb2_message(0x0009)).unwrap();
+        assert!(write_file.signals.contains(&"write_file".to_string()));
+
+        let ioctl = parse_session(&smb2_message(0x000B)).unwrap();
+        assert!(ioctl.signals.contains(&"ioctl".to_string()));
+    }
+
+    #[test]
+    fn test_credential_enumeration_samr() {
+        let mut data = smb2_message(0x0005);
+        data.extend_from_slice(b"samr\x00");
+        let session = parse_session(&data).unwrap();
+        assert!(session.signals.contains(&"sam_enumeration".to_string()));
+        assert!(session
+            .signals
+            .contains(&"CREDENTIAL_ENUMERATION".to_string()));
+    }
+
+    #[test]
+    fn test_credential_enumeration_lsarpc() {
+        let mut data = smb2_message(0x0005);
+        data.extend_from_slice(b"lsarpc\x00");
+        let session = parse_session(&data).unwrap();
+        assert!(session.signals.contains(&"lsa_enumeration".to_string()));
+        assert!(session
+            .signals
+            .contains(&"CREDENTIAL_ENUMERATION".to_string()));
+    }
+
+    #[test]
+    fn test_admin_share() {
+        let mut data = smb2_message(0x0005);
+        data.extend_from_slice(b"\\ADMIN$\x00");
+        let session = parse_session(&data).unwrap();
+        assert!(session.signals.contains(&"admin_share".to_string()));
+    }
+
+    #[test]
+    fn test_c_share() {
+        let mut data = smb2_message(0x0005);
+        data.extend_from_slice(b"\\C$\x00");
+        let session = parse_session(&data).unwrap();
+        assert!(session.signals.contains(&"c_share".to_string()));
+    }
+
+    #[test]
+    fn test_zero_length_netbios() {
+        let data = vec![0x00, 0x00, 0x00, 0x00, 0xFF, b'S', b'M', b'B'];
+        assert!(parse_session(&data).is_none());
+    }
 }

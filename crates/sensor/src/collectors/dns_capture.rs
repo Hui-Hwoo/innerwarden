@@ -378,10 +378,129 @@ mod tests {
     }
 
     #[test]
+    fn parse_dns_name_compression_pointer() {
+        let data = b"\x03www\xC0\x04";
+        let (name, len) = parse_dns_name(data, 0).unwrap();
+        assert_eq!(name, "www");
+        assert_eq!(len, 6);
+    }
+
+    #[test]
+    fn parse_dns_name_out_of_bounds_label() {
+        let data = b"\x05test";
+        assert!(parse_dns_name(data, 0).is_none());
+    }
+
+    #[test]
+    fn parse_dns_name_invalid_utf8() {
+        let data = b"\x04te\xFFt\x00";
+        assert!(parse_dns_name(data, 0).is_none());
+    }
+
+    #[test]
+    fn parse_dns_query_qdcount_zero() {
+        let pkt = [
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(parse_dns_query(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_dns_query_missing_qtype() {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&[
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        pkt.extend_from_slice(b"\x07example\x03com\x00");
+        // Missing the 4 bytes of QTYPE and QCLASS
+        assert!(parse_dns_query(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_packet_not_ipv4() {
+        let mut data = vec![0u8; 60];
+        data[12] = 0x86;
+        data[13] = 0xDD; // IPv6
+        assert!(parse_packet(&data).is_none());
+    }
+
+    #[test]
+    fn parse_packet_not_udp() {
+        let mut data = vec![0u8; 60];
+        data[12] = 0x08;
+        data[13] = 0x00; // IPv4
+        data[14] = 0x45; // Version 4, IHL 5
+        data[23] = 6; // TCP
+        assert!(parse_packet(&data).is_none());
+    }
+
+    #[test]
+    fn parse_packet_short_udp_header() {
+        let mut data = vec![0u8; 36];
+        data[12] = 0x08;
+        data[13] = 0x00; // IPv4
+        data[14] = 0x45; // Version 4, IHL 5
+        data[23] = 17; // UDP
+                       // Total len is 36, ip_offset=14, ihl=20. udp_offset=34. 36 < 34+8
+        assert!(parse_packet(&data).is_none());
+    }
+
+    #[test]
+    fn parse_packet_wrong_port() {
+        let mut data = vec![0u8; 60];
+        data[12] = 0x08;
+        data[13] = 0x00; // IPv4
+        data[14] = 0x45; // Version 4, IHL 5
+        data[23] = 17; // UDP
+        let udp_offset = 34;
+        data[udp_offset..udp_offset + 2].copy_from_slice(&12345u16.to_be_bytes()); // src
+        data[udp_offset + 2..udp_offset + 4].copy_from_slice(&80u16.to_be_bytes()); // dst not 53
+        assert!(parse_packet(&data).is_none());
+    }
+
+    #[test]
+    fn parse_packet_valid_dns() {
+        let mut data = vec![0u8; 60];
+        data[12] = 0x08;
+        data[13] = 0x00; // IPv4
+        data[14] = 0x45; // Version 4, IHL 5
+        data[23] = 17; // UDP
+        let ip_offset = 14;
+        data[ip_offset + 12..ip_offset + 16].copy_from_slice(&[192, 168, 1, 1]); // src IP
+        data[ip_offset + 16..ip_offset + 20].copy_from_slice(&[10, 0, 0, 1]); // dst IP
+        let udp_offset = 34;
+        data[udp_offset..udp_offset + 2].copy_from_slice(&12345u16.to_be_bytes()); // src
+        data[udp_offset + 2..udp_offset + 4].copy_from_slice(&53u16.to_be_bytes()); // dst = 53
+
+        let res = parse_packet(&data);
+        assert!(res.is_some());
+    }
+
+    #[test]
+    fn parse_packet_vlan_tagged() {
+        let mut data = vec![0u8; 64];
+        data[12] = 0x81;
+        data[13] = 0x00; // VLAN
+        let ip_offset = 18;
+        data[ip_offset] = 0x45; // Version 4, IHL 5
+        data[ip_offset + 9] = 17; // UDP
+        let udp_offset = ip_offset + 20;
+        data[udp_offset + 2..udp_offset + 4].copy_from_slice(&53u16.to_be_bytes()); // dst = 53
+
+        assert!(parse_packet(&data).is_some());
+    }
+
+    #[test]
     fn qtype_names() {
         assert_eq!(qtype_name(1), "A");
-        assert_eq!(qtype_name(28), "AAAA");
+        assert_eq!(qtype_name(2), "NS");
+        assert_eq!(qtype_name(5), "CNAME");
+        assert_eq!(qtype_name(6), "SOA");
+        assert_eq!(qtype_name(12), "PTR");
+        assert_eq!(qtype_name(15), "MX");
         assert_eq!(qtype_name(16), "TXT");
+        assert_eq!(qtype_name(28), "AAAA");
+        assert_eq!(qtype_name(33), "SRV");
         assert_eq!(qtype_name(255), "ANY");
         assert_eq!(qtype_name(999), "OTHER");
     }

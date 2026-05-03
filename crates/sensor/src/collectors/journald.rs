@@ -364,4 +364,114 @@ mod tests {
         let (_, ev) = parse_journal_line(&line, "host").unwrap();
         assert!(ev.is_none());
     }
+
+    #[test]
+    fn parse_journal_line_missing_cursor() {
+        let line = serde_json::json!({
+            "SYSLOG_IDENTIFIER": "nginx",
+            "MESSAGE": "GET /health 200",
+        })
+        .to_string();
+        assert!(parse_journal_line(&line, "host").is_none());
+    }
+
+    #[test]
+    fn parse_journal_line_missing_identifier() {
+        // Defaults to ""
+        let line = serde_json::json!({
+            "__CURSOR": "test-cursor-abc",
+            "MESSAGE": "GET /health 200",
+        })
+        .to_string();
+        let (cursor, ev) = parse_journal_line(&line, "host").unwrap();
+        assert_eq!(cursor, "test-cursor-abc");
+        assert!(ev.is_none());
+    }
+
+    #[test]
+    fn test_field_after() {
+        assert_eq!(field_after("A=1 ; B=2", "A="), Some("1"));
+        assert_eq!(field_after("A=1 ; B=2", "B="), Some("2"));
+        assert_eq!(field_after("A=1 ; B=2 ; C=3", "B="), Some("2"));
+        assert_eq!(field_after("A=1", "C="), None);
+    }
+
+    #[test]
+    fn test_kv_after() {
+        assert_eq!(kv_after("A=1 B=2", "A="), Some("1"));
+        assert_eq!(kv_after("A=1 B=2", "B="), Some("2"));
+        assert_eq!(kv_after("A=1 B=2 C=3", "B="), Some("2"));
+        assert_eq!(kv_after("A=1", "C="), None);
+        // test with newline / carriage return
+        assert_eq!(kv_after("A=1\nB=2", "A="), Some("1"));
+    }
+
+    #[test]
+    fn parse_sudo_missing_user() {
+        // Missing USER=
+        let line = journal_line(
+            "sudo",
+            "deploy : TTY=pts/0 ; PWD=/home/deploy ; COMMAND=/bin/sh",
+        );
+        let (_, ev) = parse_journal_line(&line, "host").unwrap();
+        assert!(ev.is_none());
+    }
+
+    #[test]
+    fn parse_sudo_missing_command() {
+        // Missing COMMAND=
+        let line = journal_line(
+            "sudo",
+            "deploy : TTY=pts/0 ; PWD=/home/deploy ; USER=root ; ",
+        );
+        let (_, ev) = parse_journal_line(&line, "host").unwrap();
+        assert!(ev.is_none());
+    }
+
+    #[test]
+    fn parse_kernel_firewall_only_src_dst_dpt() {
+        // Only SRC, DST, DPT (no UFW prefix)
+        let line = journal_line("kernel", "SRC=1.1.1.1 DST=2.2.2.2 DPT=80 PROTO=TCP");
+        let (_, ev) = parse_journal_line(&line, "host").unwrap();
+        let ev = ev.expect("should have event");
+        assert_eq!(ev.details["src_ip"], "1.1.1.1");
+        assert_eq!(ev.details["dst_ip"], "2.2.2.2");
+        assert_eq!(ev.details["dst_port"], 80);
+    }
+
+    #[test]
+    fn parse_kernel_firewall_missing_src() {
+        let line = journal_line("kernel", "[UFW BLOCK] DST=2.2.2.2 DPT=80 PROTO=TCP");
+        let (_, ev) = parse_journal_line(&line, "host").unwrap();
+        assert!(ev.is_none()); // requires SRC
+    }
+
+    #[test]
+    fn parse_kernel_firewall_missing_dpt() {
+        let line = journal_line("kernel", "[UFW BLOCK] SRC=1.1.1.1 DST=2.2.2.2 PROTO=TCP");
+        let (_, ev) = parse_journal_line(&line, "host").unwrap();
+        assert!(ev.is_none()); // requires DPT
+    }
+
+    #[test]
+    fn parse_kernel_firewall_invalid_dpt() {
+        let line = journal_line(
+            "kernel",
+            "[UFW BLOCK] SRC=1.1.1.1 DST=2.2.2.2 DPT=abc PROTO=TCP",
+        );
+        let (_, ev) = parse_journal_line(&line, "host").unwrap();
+        assert!(ev.is_none()); // requires valid numeric DPT
+    }
+
+    #[test]
+    fn parse_kernel_firewall_same_src_dst() {
+        // Entity deduplication check
+        let line = journal_line(
+            "kernel",
+            "[UFW BLOCK] SRC=1.1.1.1 DST=1.1.1.1 DPT=80 PROTO=TCP",
+        );
+        let (_, ev) = parse_journal_line(&line, "host").unwrap();
+        let ev = ev.unwrap();
+        assert_eq!(ev.entities.len(), 1); // should only have one entity since SRC == DST
+    }
 }

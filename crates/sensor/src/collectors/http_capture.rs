@@ -402,4 +402,120 @@ mod tests {
         assert!(HTTP_PORTS.contains(&8787));
         assert!(!HTTP_PORTS.contains(&22)); // SSH not monitored
     }
+
+    #[test]
+    fn parse_other_methods() {
+        let methods = ["PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"];
+        for method in methods {
+            let raw = format!("{method} / HTTP/1.1\r\n\r\n");
+            let req = parse_http_request(raw.as_bytes()).unwrap();
+            assert_eq!(req.method, method);
+        }
+    }
+
+    #[test]
+    fn parse_missing_version() {
+        let raw = b"GET /\r\n\r\n";
+        let req = parse_http_request(raw).unwrap();
+        assert_eq!(req.version, "HTTP/1.1"); // defaults to HTTP/1.1
+    }
+
+    #[test]
+    fn parse_content_length_failure() {
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: invalid\r\n\r\n";
+        let req = parse_http_request(raw).unwrap();
+        assert_eq!(req.content_length, 0);
+    }
+
+    #[test]
+    fn test_truncate_str() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    fn eth_ip_tcp_frame(ethertype: u16, proto: u8, dst_port: u16) -> Vec<u8> {
+        let mut frame = vec![0; 14 + 20 + 20 + 10]; // eth + ip + tcp + payload
+        frame[12..14].copy_from_slice(&ethertype.to_be_bytes()); // Ethertype
+
+        // IP Header
+        let ip_offset = 14;
+        frame[ip_offset] = 0x45; // Version 4, IHL 5
+        frame[ip_offset + 9] = proto; // Protocol
+
+        // Src IP, Dst IP
+        frame[ip_offset + 12..ip_offset + 16].copy_from_slice(&[192, 168, 1, 1]);
+        frame[ip_offset + 16..ip_offset + 20].copy_from_slice(&[10, 0, 0, 1]);
+
+        let tcp_offset = ip_offset + 20;
+        frame[tcp_offset..tcp_offset + 2].copy_from_slice(&12345u16.to_be_bytes()); // src_port
+        frame[tcp_offset + 2..tcp_offset + 4].copy_from_slice(&dst_port.to_be_bytes()); // dst_port
+        frame[tcp_offset + 12] = 0x50; // Data offset 5
+
+        let payload_offset = tcp_offset + 20;
+        frame[payload_offset..payload_offset + 3].copy_from_slice(b"GET");
+        frame
+    }
+
+    #[test]
+    fn parse_tcp_packet_short() {
+        assert!(parse_tcp_packet(&[0; 10]).is_none());
+        assert!(parse_tcp_packet(&[0; 30]).is_none());
+        assert!(parse_tcp_packet(&[0; 40]).is_none());
+    }
+
+    #[test]
+    fn parse_tcp_packet_wrong_ethertype() {
+        let frame = eth_ip_tcp_frame(0x0806, 6, 80); // ARP
+        assert!(parse_tcp_packet(&frame).is_none());
+    }
+
+    #[test]
+    fn parse_tcp_packet_non_tcp() {
+        let frame = eth_ip_tcp_frame(0x0800, 17, 80); // UDP
+        assert!(parse_tcp_packet(&frame).is_none());
+    }
+
+    #[test]
+    fn parse_tcp_packet_vlan_tagged() {
+        let mut frame = vec![0; 18 + 20 + 20 + 10]; // eth + vlan + ip + tcp + payload
+        frame[12..14].copy_from_slice(&0x8100u16.to_be_bytes()); // Ethertype
+
+        // IP Header
+        let ip_offset = 18;
+        frame[ip_offset] = 0x45; // Version 4, IHL 5
+        frame[ip_offset + 9] = 6; // Protocol
+
+        // Src IP, Dst IP
+        frame[ip_offset + 12..ip_offset + 16].copy_from_slice(&[192, 168, 1, 1]);
+        frame[ip_offset + 16..ip_offset + 20].copy_from_slice(&[10, 0, 0, 1]);
+
+        let tcp_offset = ip_offset + 20;
+        frame[tcp_offset..tcp_offset + 2].copy_from_slice(&12345u16.to_be_bytes()); // src_port
+        frame[tcp_offset + 2..tcp_offset + 4].copy_from_slice(&80u16.to_be_bytes()); // dst_port
+        frame[tcp_offset + 12] = 0x50; // Data offset 5
+
+        let payload_offset = tcp_offset + 20;
+        frame[payload_offset..payload_offset + 3].copy_from_slice(b"GET");
+
+        let result = parse_tcp_packet(&frame);
+        assert!(result.is_some());
+        let (src, sport, dst, dport, payload) = result.unwrap();
+        assert_eq!(src, "192.168.1.1");
+        assert_eq!(dst, "10.0.0.1");
+        assert_eq!(sport, 12345);
+        assert_eq!(dport, 80);
+        assert!(payload.starts_with(b"GET"));
+    }
+
+    #[test]
+    fn parse_tcp_packet_non_http_port() {
+        let frame = eth_ip_tcp_frame(0x0800, 6, 22); // SSH
+        assert!(parse_tcp_packet(&frame).is_none());
+    }
+
+    #[test]
+    fn parse_tcp_packet_valid() {
+        let frame = eth_ip_tcp_frame(0x0800, 6, 80);
+        assert!(parse_tcp_packet(&frame).is_some());
+    }
 }
