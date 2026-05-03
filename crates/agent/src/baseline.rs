@@ -265,12 +265,31 @@ impl BaselineStore {
             }
         }
 
-        // Track user login hours — only SUCCESSFUL logins.
-        // Failed logins (brute-force) must NOT pollute the baseline,
-        // otherwise attacker usernames appear as "normal" login patterns.
-        if event.kind == "ssh.login_success" || event.kind.contains("accepted") {
+        // Track user login hours — only SUCCESSFUL logins from real
+        // sources, with valid usernames.
+        //
+        // Three filters applied (Wave 5b 2026-05-03 — operator hit a
+        // baseline.json full of `Admin`, `AdminGPON`, `123456789`,
+        // `!`, `"`, etc., none of which are real Linux accounts):
+        //
+        //   1. Skip honeypot sources. The agent's honeypot binds 0.0.0.0:2222
+        //      and accepts any credential to fool attackers; if the session
+        //      log ever flows back through the event pipeline (now or via a
+        //      future wiring) it must NOT contaminate baseline.
+        //   2. Skip events tagged `honeypot`. Same rationale — defence in
+        //      depth against any path that bypasses the source check.
+        //   3. Skip entity values that don't look like Linux usernames.
+        //      POSIX/util-linux constraints: must start with `[a-z_]`, then
+        //      `[a-z0-9_-]`, optional trailing `$`. Anything outside is
+        //      either spoofed (Accepted password for "AdminGPON" emitted by
+        //      a third-party sshd-honeypot) or a bug in the auth_log parser
+        //      misreading e.g. quoted shell tokens. Either way, the
+        //      operator-facing heatmap should not show it.
+        let is_honeypot =
+            event.source.starts_with("honeypot") || event.tags.iter().any(|t| t == "honeypot");
+        if !is_honeypot && (event.kind == "ssh.login_success" || event.kind.contains("accepted")) {
             for entity in &event.entities {
-                if entity.r#type == EntityType::User {
+                if entity.r#type == EntityType::User && is_valid_unix_username(&entity.value) {
                     let profile = self
                         .user_login_hours
                         .entry(entity.value.clone())
@@ -481,6 +500,20 @@ impl BaselineStore {
         }
     }
 
+    /// 2026-05-03 (Wave 5b): one-shot cleanup of pre-Wave-5b pollution.
+    /// Removes any `user_login_hours` entries whose key does not look
+    /// like a valid Linux username. Run at boot after `load`. Safe to
+    /// call repeatedly — idempotent and cheap (linear in user count).
+    ///
+    /// Returns the number of entries removed so the caller can log
+    /// the operator-visible delta.
+    pub fn prune_invalid_users(&mut self) -> usize {
+        let before = self.user_login_hours.len();
+        self.user_login_hours
+            .retain(|user, _| is_valid_unix_username(user));
+        before - self.user_login_hours.len()
+    }
+
     // ── Internal ───────────────────────────────────────────────────
 
     /// Flush current hour counts into the running average.
@@ -508,6 +541,43 @@ impl Default for BaselineStore {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// 2026-05-03 (Wave 5b): does `name` look like a valid Linux username?
+///
+/// Rule from POSIX 3.437 + util-linux `useradd(8)` `NAME_REGEX`:
+/// must start with `[a-z_]`, then `[a-z0-9_-]`, optionally end with `$`
+/// (Samba-style machine accounts). Length 1..=32. Operator-extension
+/// note: this is NOT meant to be exhaustive — anyone running a host
+/// with `NAME_REGEX` overridden in `/etc/login.defs` to allow `[A-Z]`
+/// will see those names rejected here. The trade-off is intentional:
+/// the operator's complaint was that `Admin`, `AdminGPON`, `1234`,
+/// `123456789`, `!`, `"`, `(`, `)`, `*` were appearing as "users who
+/// log in" — every one of those fails this check, while every real
+/// account on the prod hosts (`ubuntu`, `_apt`, `systemd-resolve`,
+/// `snap_daemon`) passes.
+///
+/// Pure function. No I/O. Tested below.
+fn is_valid_unix_username(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let len = bytes.len();
+    if !(1..=32).contains(&len) {
+        return false;
+    }
+    // First char: [a-z_]
+    let first = bytes[0];
+    if !(first.is_ascii_lowercase() || first == b'_') {
+        return false;
+    }
+    // Middle chars: [a-z0-9_-]
+    let middle_end = if bytes[len - 1] == b'$' { len - 1 } else { len };
+    for &b in &bytes[1..middle_end] {
+        let ok = b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-';
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
 
 fn format_active_hours(profile: &[u8; 24]) -> String {
     let active: Vec<String> = profile
@@ -602,6 +672,149 @@ mod tests {
         let store = BaselineStore::new();
         assert!(!store.is_mature());
         assert_eq!(store.training_days(), 0);
+    }
+
+    // ── Wave 5b 2026-05-03 — username sanity + honeypot filter ────
+    //
+    // Operator hit a baseline.json with `Admin`, `AdminGPON`,
+    // `123456789`, `!`, `(`, `*` etc. recorded as if they had real
+    // login hours. None of those are valid Linux usernames; all are
+    // brute-force attempts that somehow reached the success branch
+    // (third-party sshd-honeypot, log spoofing, or auth_log parser
+    // edge case). The filter has three layers, each pinned by a
+    // test below so a refactor that drops any layer ships red.
+
+    #[test]
+    fn is_valid_unix_username_accepts_real_accounts() {
+        // Every account on the prod hosts the operator runs.
+        // Note: Samba machine accounts like `DOMAIN$` (uppercase + $)
+        // are intentionally NOT supported — InnerWarden's target
+        // deployment is Linux servers and the cost of allowing
+        // `[A-Z]` would be re-admitting `Admin`, `AdminGPON`,
+        // `Administrator` (the actual operator complaint). If a
+        // future Samba deployment surfaces, lift the lowercase
+        // restriction here AND document via an operator-configurable
+        // override; do not silently broaden.
+        for ok in &[
+            "ubuntu",
+            "root",
+            "snap_daemon",
+            "_apt",
+            "systemd-resolve",
+            "messagebus",
+            "syslog",
+            "u", // single-char minimum
+        ] {
+            assert!(
+                is_valid_unix_username(ok),
+                "real username `{ok}` was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn is_valid_unix_username_rejects_brute_force_and_garbage() {
+        // Exact strings observed in the operator's polluted baseline
+        // on 2026-05-03. Every one of these MUST fail the check.
+        for bad in &[
+            "Admin",         // capital A — Linux usernames are lowercase
+            "AdminGPON",     // capital + GPON router brute-force list
+            "Administrator", // Windows-style
+            "1234",          // starts with digit
+            "123456789",     // starts with digit
+            "2k18",          // starts with digit
+            "!",
+            "\"",
+            "(",
+            ")",
+            "*",
+            ".",
+            "",                                       // empty
+            "abcdefghijklmnopqrstuvwxyz0123456789ab", // 38 chars (>32)
+            "user with space",
+            "user@host",
+            "../../etc/passwd",
+        ] {
+            assert!(
+                !is_valid_unix_username(bad),
+                "garbage username `{bad}` was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn observe_event_skips_honeypot_source_logins() {
+        // ANCHOR: the honeypot accepts every credential to fool
+        // attackers. If its session log is ever wired back into the
+        // event pipeline, baseline must NOT record those usernames.
+        let mut store = BaselineStore::new();
+        let mut ev = make_login_event("ubuntu");
+        ev.source = "honeypot_ssh".into();
+        store.observe_event(&ev);
+        assert!(
+            store.user_login_hours.is_empty(),
+            "honeypot_ssh source must not write to user_login_hours"
+        );
+    }
+
+    #[test]
+    fn observe_event_skips_honeypot_tagged_logins() {
+        // ANCHOR: defence-in-depth — even if a future code path
+        // emits the honeypot session as source="auth_log" but tags
+        // it with "honeypot", the tag must also gate the write.
+        let mut store = BaselineStore::new();
+        let mut ev = make_login_event("ubuntu");
+        ev.tags = vec!["honeypot".into()];
+        store.observe_event(&ev);
+        assert!(
+            store.user_login_hours.is_empty(),
+            "honeypot-tagged event must not write to user_login_hours"
+        );
+    }
+
+    #[test]
+    fn observe_event_skips_invalid_usernames() {
+        // ANCHOR: even from a non-honeypot source, a username that
+        // fails `is_valid_unix_username` must not be recorded. This
+        // is the actual operator-hit case: real auth_log emitted
+        // `ssh.login_success` with entities=["AdminGPON"] (likely
+        // a PAM module misconfig or third-party sshd) and baseline
+        // recorded it.
+        let mut store = BaselineStore::new();
+        for bad in &["AdminGPON", "1234", "!", "Administrator"] {
+            store.observe_event(&make_login_event(bad));
+        }
+        assert!(
+            store.user_login_hours.is_empty(),
+            "invalid usernames must not write to user_login_hours"
+        );
+        // And good usernames must still pass.
+        store.observe_event(&make_login_event("ubuntu"));
+        assert!(
+            store.user_login_hours.contains_key("ubuntu"),
+            "real username must still be recorded"
+        );
+    }
+
+    #[test]
+    fn prune_invalid_users_cleans_pre_wave5b_pollution() {
+        // ANCHOR: existing baseline.json files on prod hosts will
+        // still carry pollution from before Wave 5b. The boot path
+        // calls `prune_invalid_users` once at load time. This test
+        // pins the cleanup so a future refactor that drops the
+        // call leaves the operator looking at garbage.
+        let mut store = BaselineStore::new();
+        store.user_login_hours.insert("ubuntu".into(), [1; 24]);
+        store.user_login_hours.insert("snap_daemon".into(), [0; 24]);
+        store.user_login_hours.insert("AdminGPON".into(), [3; 24]);
+        store.user_login_hours.insert("123456789".into(), [5; 24]);
+        store.user_login_hours.insert("(".into(), [7; 24]);
+        let removed = store.prune_invalid_users();
+        assert_eq!(removed, 3, "expected 3 invalid entries pruned");
+        assert!(store.user_login_hours.contains_key("ubuntu"));
+        assert!(store.user_login_hours.contains_key("snap_daemon"));
+        assert!(!store.user_login_hours.contains_key("AdminGPON"));
+        assert!(!store.user_login_hours.contains_key("("));
     }
 
     #[test]

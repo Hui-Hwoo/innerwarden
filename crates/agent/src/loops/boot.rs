@@ -993,7 +993,22 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         narrative_incidents_offset: 0,
         forensics: forensics::ForensicsCapture::new(&cli.data_dir),
         store,
-        baseline: baseline::BaselineStore::load(&cli.data_dir, sqlite_store.as_deref()),
+        baseline: {
+            let mut b = baseline::BaselineStore::load(&cli.data_dir, sqlite_store.as_deref());
+            // 2026-05-03 (Wave 5b): one-shot prune of pollution from
+            // pre-Wave-5b baselines that recorded brute-force usernames
+            // (`Admin`, `AdminGPON`, `1234`, special chars) as if they
+            // were real logins. Idempotent — pure-Linux usernames
+            // (ubuntu, snap_daemon, _apt, ...) pass through unchanged.
+            let removed = b.prune_invalid_users();
+            if removed > 0 {
+                info!(
+                    removed,
+                    "baseline: pruned {removed} invalid user_login_hours entries (Wave 5b cleanup)"
+                );
+            }
+            b
+        },
         sqlite_store: sqlite_store.clone(),
         sqlite_store_path: cli.data_dir.clone(),
         sqlite_reopen_last_attempt: None,
