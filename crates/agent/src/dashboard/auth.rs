@@ -195,11 +195,14 @@ pub(super) async fn require_auth(
         Arc<RwLock<HashMap<String, Session>>>,
         u64,
     )>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // No credentials configured → open access
+    // No credentials configured → open access. Inject a sentinel so
+    // handlers don't have to handle the missing-extension case.
     let Some(auth) = auth else {
+        req.extensions_mut()
+            .insert(AuthenticatedUser("anonymous".to_string()));
         return next.run(req).await;
     };
 
@@ -207,21 +210,26 @@ pub(super) async fn require_auth(
 
     // 1. Try Bearer token first (session-based auth)
     if let Some(token) = extract_bearer_token(&req) {
-        let valid = {
+        let session_user = {
             let map = sessions.read().unwrap_or_else(|e| e.into_inner());
             if let Some(session) = map.get(token) {
                 if !session.is_expired(session_timeout_minutes) {
                     session.touch();
-                    true
+                    Some(session.username.clone())
                 } else {
-                    false
+                    None
                 }
             } else {
                 // Token not found - fall through to return error
                 return (StatusCode::UNAUTHORIZED, "session expired or invalid").into_response();
             }
         };
-        if valid {
+        if let Some(user) = session_user {
+            // PR #422 Wave 4a: thread the authenticated username into
+            // request extensions so handlers (orphan resolution etc.)
+            // can stamp audit rows with the real operator instead of
+            // a hardcoded "dashboard" placeholder.
+            req.extensions_mut().insert(AuthenticatedUser(user));
             return next.run(req).await;
         }
         // Expired - remove session
@@ -267,7 +275,22 @@ pub(super) async fn require_auth(
 
     // Successful auth - clear any prior failed attempts for this IP
     clear_rate_limit(&client_ip);
+    req.extensions_mut().insert(AuthenticatedUser(user));
     next.run(req).await
+}
+
+/// PR #422 Wave 4a: handler-side accessor for the authenticated
+/// username injected by `require_auth`. Newtype around `String` so
+/// `axum::Extension<AuthenticatedUser>` is unambiguous in handler
+/// signatures and won't clash with any other extension's String.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthenticatedUser(pub String);
+
+impl AuthenticatedUser {
+    /// Default fallback when no auth layer ran — used by tests and
+    /// by no-auth (loopback) deployments. Keeps audit rows non-empty
+    /// without lying about provenance.
+    pub const ANONYMOUS: &'static str = "anonymous";
 }
 
 /// Extract a Bearer token from the Authorization header.

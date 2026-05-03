@@ -965,6 +965,46 @@ pub(super) fn append_spec024_metrics(
         // quiet host — exporting no rows would hide the silent-source alert.
         out.push_str("innerwarden_event_rate_per_hour{source=\"none\"} 0\n");
     }
+
+    // ── 11. innerwarden_orphan_resolutions_total{kind} (PR #422 W4a) ──
+    // Operator-recorded resolutions for orphaned responses. Reads from
+    // the sidecar JSONL maintained by the dashboard. Two labels in use
+    // ("cleared", "already_gone") matching `OrphanResolution::KIND_*`.
+    // A non-zero rate paired with a flat orphaned counter signals
+    // "operator is keeping up with maintenance debt" (good).
+    out.push_str(
+        "# HELP innerwarden_orphan_resolutions_total Operator-recorded \
+         orphan resolutions, by kind. Latest value is last-write-wins per id.\n",
+    );
+    out.push_str("# TYPE innerwarden_orphan_resolutions_total counter\n");
+    let by_kind = count_orphan_resolutions_by_kind(&state.data_dir);
+    // Always emit both rows so alert queries see a present series.
+    for kind in ["cleared", "already_gone"] {
+        let n = by_kind.get(kind).copied().unwrap_or(0);
+        out.push_str(&format!(
+            "innerwarden_orphan_resolutions_total{{kind=\"{kind}\"}} {n}\n"
+        ));
+    }
+}
+
+/// PR #422 Wave 4a: count orphan resolutions per kind. Reads the
+/// sidecar JSONL and folds last-wins per orphan id (an operator who
+/// resolves the same id twice with different kinds counts only the
+/// latest decision). Empty map if the file is missing — Prometheus
+/// rows are still emitted as zeros.
+fn count_orphan_resolutions_by_kind(
+    data_dir: &std::path::Path,
+) -> std::collections::HashMap<&'static str, u64> {
+    let mut out: std::collections::HashMap<&'static str, u64> = std::collections::HashMap::new();
+    for r in crate::response_lifecycle::read_orphan_resolutions(data_dir).values() {
+        let key = match r.kind.as_str() {
+            "cleared" => "cleared",
+            "already_gone" => "already_gone",
+            _ => continue,
+        };
+        *out.entry(key).or_insert(0) += 1;
+    }
+    out
 }
 
 fn count_incidents_last_hour_by_severity(
@@ -1534,6 +1574,7 @@ fn verify_dashboard_totp(state: &DashboardState, supplied: &str) -> Result<(), &
 /// the kind here keeps the route handlers as one-line dispatchers.
 async fn record_orphan_resolution(
     state: DashboardState,
+    operator: String,
     orphan_id: String,
     kind: &'static str,
     body: OrphanResolutionRequest,
@@ -1561,13 +1602,7 @@ async fn record_orphan_resolution(
         orphan_id: orphan_id.clone(),
         kind: kind.to_string(),
         reason: reason.clone(),
-        // The auth layer attaches the authenticated username via a
-        // request extension, but the simplest reliable read here is
-        // the session table — which the handler does not have direct
-        // access to. Use a placeholder; the audit row carries the
-        // real username because `append_admin_action` reads its own
-        // operator field from the entry we build below.
-        operator: "dashboard".to_string(),
+        operator: operator.clone(),
         resolved_at: chrono::Utc::now(),
     };
 
@@ -1582,7 +1617,7 @@ async fn record_orphan_resolution(
 
     let mut audit = AdminActionEntry {
         ts: chrono::Utc::now(),
-        operator: "dashboard".to_string(),
+        operator,
         source: "dashboard".to_string(),
         action: if kind == OrphanResolution::KIND_CLEARED {
             "orphan_clear".to_string()
@@ -1617,6 +1652,7 @@ async fn record_orphan_resolution(
                 "ok": true,
                 "id": orphan_id,
                 "kind": kind,
+                "operator": resolution.operator,
                 "resolved_at": resolution.resolved_at.to_rfc3339(),
             }))
             .unwrap_or_default(),
@@ -1625,16 +1661,29 @@ async fn record_orphan_resolution(
         .into_response()
 }
 
+/// PR #422 Wave 4a: extract the authenticated username from the
+/// request extension injected by `require_auth`. Falls back to the
+/// `AuthenticatedUser::ANONYMOUS` sentinel when no auth layer ran
+/// (loopback bind without credentials, test harness).
+fn operator_from_extension(
+    user: Option<axum::Extension<crate::dashboard::auth::AuthenticatedUser>>,
+) -> String {
+    user.map(|axum::Extension(u)| u.0)
+        .unwrap_or_else(|| crate::dashboard::auth::AuthenticatedUser::ANONYMOUS.to_string())
+}
+
 /// POST /api/responses/orphans/:id/clear — operator confirms the
 /// orphan entry should be cleared from the diagnostic surface (e.g.
 /// stale entry, no longer relevant). Audit-trail entry written.
 pub(super) async fn api_orphan_clear(
     State(state): State<DashboardState>,
+    user: Option<axum::Extension<crate::dashboard::auth::AuthenticatedUser>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::Json(body): axum::Json<OrphanResolutionRequest>,
 ) -> axum::response::Response {
     use crate::response_lifecycle::OrphanResolution;
-    record_orphan_resolution(state, id, OrphanResolution::KIND_CLEARED, body).await
+    let operator = operator_from_extension(user);
+    record_orphan_resolution(state, operator, id, OrphanResolution::KIND_CLEARED, body).await
 }
 
 /// POST /api/responses/orphans/:id/mark-already-gone — operator
@@ -1642,11 +1691,20 @@ pub(super) async fn api_orphan_clear(
 /// the dashboard hides it from the unresolved cluster summary.
 pub(super) async fn api_orphan_mark_already_gone(
     State(state): State<DashboardState>,
+    user: Option<axum::Extension<crate::dashboard::auth::AuthenticatedUser>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::Json(body): axum::Json<OrphanResolutionRequest>,
 ) -> axum::response::Response {
     use crate::response_lifecycle::OrphanResolution;
-    record_orphan_resolution(state, id, OrphanResolution::KIND_ALREADY_GONE, body).await
+    let operator = operator_from_extension(user);
+    record_orphan_resolution(
+        state,
+        operator,
+        id,
+        OrphanResolution::KIND_ALREADY_GONE,
+        body,
+    )
+    .await
 }
 
 /// GET /api/responses — active and historical response actions with TTL.
@@ -2793,7 +2851,14 @@ enabled = false
             reason: "   ".to_string(), // whitespace-only
             totp: "".to_string(),
         };
-        let resp = record_orphan_resolution(state, "orph-1".to_string(), "cleared", body).await;
+        let resp = record_orphan_resolution(
+            state,
+            "alice".to_string(),
+            "orph-1".to_string(),
+            "cleared",
+            body,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -2805,7 +2870,14 @@ enabled = false
             reason: "x".repeat(2048),
             totp: "".to_string(),
         };
-        let resp = record_orphan_resolution(state, "orph-1".to_string(), "cleared", body).await;
+        let resp = record_orphan_resolution(
+            state,
+            "alice".to_string(),
+            "orph-1".to_string(),
+            "cleared",
+            body,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -2818,7 +2890,14 @@ enabled = false
             reason: "ok".to_string(),
             totp: "".to_string(),
         };
-        let resp = record_orphan_resolution(state.clone(), "".to_string(), "cleared", body).await;
+        let resp = record_orphan_resolution(
+            state.clone(),
+            "alice".to_string(),
+            "".to_string(),
+            "cleared",
+            body,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
 
         // Excessively long id (>128 chars).
@@ -2826,7 +2905,9 @@ enabled = false
             reason: "ok".to_string(),
             totp: "".to_string(),
         };
-        let resp = record_orphan_resolution(state, "x".repeat(200), "cleared", body).await;
+        let resp =
+            record_orphan_resolution(state, "alice".to_string(), "x".repeat(200), "cleared", body)
+                .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -2838,7 +2919,14 @@ enabled = false
             reason: "stale entry".to_string(),
             totp: "".to_string(), // 2FA enforced + no code
         };
-        let resp = record_orphan_resolution(state, "orph-1".to_string(), "cleared", body).await;
+        let resp = record_orphan_resolution(
+            state,
+            "alice".to_string(),
+            "orph-1".to_string(),
+            "cleared",
+            body,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
@@ -2850,7 +2938,14 @@ enabled = false
             reason: "operator confirms IP no longer relevant".to_string(),
             totp: "".to_string(),
         };
-        let resp = record_orphan_resolution(state, "orph-happy".to_string(), "cleared", body).await;
+        let resp = record_orphan_resolution(
+            state,
+            "alice".to_string(),
+            "orph-happy".to_string(),
+            "cleared",
+            body,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         // Sidecar JSONL must exist with one entry.
@@ -2868,8 +2963,14 @@ enabled = false
             reason: "audit row test".to_string(),
             totp: "".to_string(),
         };
-        let resp =
-            record_orphan_resolution(state, "orph-audit".to_string(), "already_gone", body).await;
+        let resp = record_orphan_resolution(
+            state,
+            "alice".to_string(),
+            "orph-audit".to_string(),
+            "already_gone",
+            body,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         // admin-actions-YYYY-MM-DD.jsonl exists with the right action.
@@ -2882,5 +2983,120 @@ enabled = false
         assert!(raw.contains("orphan_mark_already_gone"), "got: {raw}");
         assert!(raw.contains("\"target\":\"orph-audit\""), "got: {raw}");
         assert!(raw.contains("\"audit row test\""), "reason in audit: {raw}");
+    }
+
+    // ─── PR #422 Wave 4a — operator field + telemetry ──────────
+
+    #[tokio::test]
+    async fn orphan_resolution_uses_authenticated_username() {
+        // The handler stamps the audit row + sidecar JSONL with the
+        // username pulled from the auth-layer extension, NOT the
+        // hardcoded "dashboard" placeholder Wave 3 used.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_two_factor(dir.path(), "none", "");
+        let body = OrphanResolutionRequest {
+            reason: "test".to_string(),
+            totp: "".to_string(),
+        };
+        let resp = record_orphan_resolution(
+            state,
+            "alice".to_string(), // simulates auth layer's AuthenticatedUser
+            "orph-user".to_string(),
+            "cleared",
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Sidecar JSONL carries the operator.
+        let resolutions = crate::response_lifecycle::read_orphan_resolutions(dir.path());
+        let got = resolutions.get("orph-user").unwrap();
+        assert_eq!(got.operator, "alice");
+
+        // Audit row also carries the operator (no longer "dashboard").
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let audit_path = dir.path().join(format!("admin-actions-{today}.jsonl"));
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(raw.contains("\"operator\":\"alice\""), "got: {raw}");
+    }
+
+    #[test]
+    fn count_orphan_resolutions_by_kind_folds_last_wins() {
+        // Operator resolves orph-A as cleared, then revises to
+        // already_gone. Counter should attribute the latest decision
+        // (already_gone), not both.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        for r in [
+            crate::response_lifecycle::OrphanResolution {
+                orphan_id: "orph-A".to_string(),
+                kind: "cleared".to_string(),
+                reason: "first".to_string(),
+                operator: "alice".to_string(),
+                resolved_at: now,
+            },
+            crate::response_lifecycle::OrphanResolution {
+                orphan_id: "orph-A".to_string(),
+                kind: "already_gone".to_string(),
+                reason: "revised".to_string(),
+                operator: "alice".to_string(),
+                resolved_at: now + chrono::Duration::seconds(1),
+            },
+            crate::response_lifecycle::OrphanResolution {
+                orphan_id: "orph-B".to_string(),
+                kind: "cleared".to_string(),
+                reason: "ok".to_string(),
+                operator: "alice".to_string(),
+                resolved_at: now,
+            },
+        ] {
+            crate::response_lifecycle::append_orphan_resolution(dir.path(), &r).unwrap();
+        }
+        let counts = count_orphan_resolutions_by_kind(dir.path());
+        assert_eq!(counts.get("cleared").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("already_gone").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn prometheus_emits_orphan_resolutions_metric_even_when_empty() {
+        // Floor-zero: even on a fresh deploy with no orphans yet,
+        // both label rows must be present so alert rules see a series.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dashboard_state_for_metrics(dir.path(), None);
+        let now = chrono::Utc::now();
+        let text = build_prometheus_metrics_text(&state, now);
+        assert!(
+            text.contains("innerwarden_orphan_resolutions_total{kind=\"cleared\"} 0"),
+            "missing cleared row: {text}"
+        );
+        assert!(
+            text.contains("innerwarden_orphan_resolutions_total{kind=\"already_gone\"} 0"),
+            "missing already_gone row: {text}"
+        );
+    }
+
+    #[test]
+    fn prometheus_orphan_resolutions_metric_increments() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        for i in 0..3 {
+            let r = crate::response_lifecycle::OrphanResolution {
+                orphan_id: format!("orph-{i}"),
+                kind: "cleared".to_string(),
+                reason: "ok".to_string(),
+                operator: "alice".to_string(),
+                resolved_at: now,
+            };
+            crate::response_lifecycle::append_orphan_resolution(dir.path(), &r).unwrap();
+        }
+        let state = dashboard_state_for_metrics(dir.path(), None);
+        let text = build_prometheus_metrics_text(&state, now);
+        assert!(
+            text.contains("innerwarden_orphan_resolutions_total{kind=\"cleared\"} 3"),
+            "expected count=3: {text}"
+        );
     }
 }
