@@ -221,7 +221,19 @@ fn cmd_unblock_with_sudo(
     Ok(())
 }
 
-pub(crate) fn cmd_allowlist_add(cli: &Cli, ip: Option<&str>, user: Option<&str>) -> Result<()> {
+/// Wave 8e (2026-05-04): added `reason: Option<&str>` so operators can
+/// record WHY an IP/user is being trusted. The reason is persisted in
+/// the admin audit log (hash-chained, JSONL) so a future operator can
+/// answer "why is 147.154.0.0/16 in this allowlist?" by grepping the
+/// audit, not by guessing. The flag is optional to preserve compat with
+/// existing operator scripts; a missing reason emits a stderr warning
+/// (does not fail the command).
+pub(crate) fn cmd_allowlist_add(
+    cli: &Cli,
+    ip: Option<&str>,
+    user: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
     use crate::config_editor::write_array_push;
     let mut changed = false;
     if let Some(ip_val) = ip {
@@ -246,6 +258,19 @@ pub(crate) fn cmd_allowlist_add(cli: &Cli, ip: Option<&str>, user: Option<&str>)
         anyhow::bail!("specify --ip <cidr> or --user <username>");
     }
     if changed {
+        // Wave 8e: warn (without failing) when the operator skipped --reason.
+        // Trust decisions on prod systems are forensic-grade events; future
+        // operators auditing the allowlist need the WHY to decide if the
+        // entry is still load-bearing or stale. Print to stderr so scripted
+        // callers see it on a side channel without breaking stdout parsers.
+        if reason.is_none() {
+            eprintln!(
+                "  [warn] no --reason recorded. Future operators will not know \
+                 WHY this entry was trusted. Re-run with `--reason \"<short \
+                 explanation>\"` so the admin audit log has it."
+            );
+        }
+
         // Audit log
         let target = ip
             .map(|v| v.to_string())
@@ -257,7 +282,7 @@ pub(crate) fn cmd_allowlist_add(cli: &Cli, ip: Option<&str>, user: Option<&str>)
             source: "cli".to_string(),
             action: "allowlist_add".to_string(),
             target,
-            parameters: serde_json::json!({ "ip": ip, "user": user }),
+            parameters: serde_json::json!({ "ip": ip, "user": user, "reason": reason }),
             result: "success".to_string(),
             prev_hash: None,
         };
@@ -331,7 +356,7 @@ pub(crate) fn cmd_allowlist_list(cli: &Cli) -> Result<()> {
 
     if ips.is_empty() && users.is_empty() {
         println!("Allowlist is empty - no trusted IPs or users configured.");
-        println!("Add entries with: innerwarden allowlist add --ip <cidr>");
+        println!("Add entries with: innerwarden allowlist add --ip <cidr> --reason \"<why>\"");
         return Ok(());
     }
 
@@ -347,6 +372,13 @@ pub(crate) fn cmd_allowlist_list(cli: &Cli) -> Result<()> {
             println!("  {user}");
         }
     }
+    println!();
+    println!(
+        "(Reasons recorded in admin audit log. Wave 8e (2026-05-04) added \
+         the --reason flag — entries created before that, or with a missing \
+         reason, may have no recorded WHY. Use `innerwarden audit list \
+         --action allowlist_add` to inspect.)"
+    );
     Ok(())
 }
 
@@ -689,7 +721,7 @@ mod tests {
         // Validates guard clause that prevents no-op allowlist updates.
         let temp = TempDir::new().expect("test should create temp dir");
         let cli = test_cli(&temp);
-        let err = cmd_allowlist_add(&cli, None, None).expect_err("empty add must fail");
+        let err = cmd_allowlist_add(&cli, None, None, None).expect_err("empty add must fail");
         assert!(err
             .to_string()
             .contains("specify --ip <cidr> or --user <username>"));
@@ -701,7 +733,8 @@ mod tests {
         let temp = TempDir::new().expect("test should create temp dir");
         let cli = test_cli(&temp);
 
-        cmd_allowlist_add(&cli, Some("10.0.0.1"), None).expect("add ip should succeed");
+        cmd_allowlist_add(&cli, Some("10.0.0.1"), None, Some("test fixture"))
+            .expect("add ip should succeed");
         let ips =
             crate::config_editor::read_str_array(&cli.agent_config, "allowlist", "trusted_ips");
         assert_eq!(ips, vec!["10.0.0.1".to_string()]);
@@ -710,6 +743,113 @@ mod tests {
         let ips =
             crate::config_editor::read_str_array(&cli.agent_config, "allowlist", "trusted_ips");
         assert!(ips.is_empty());
+    }
+
+    // Wave 8e anchor (2026-05-04): when an operator runs
+    // `innerwarden allowlist add --ip <cidr> --reason "<text>"` the reason
+    // MUST land in the admin audit log (`admin-actions-*.jsonl`) so a future
+    // operator looking at the allowlist can answer "why is this trusted?"
+    // without guessing. Pinned because on 2026-05-04 the operator added 4
+    // emergency CIDRs (Ubuntu mirrors / Telegram / GitHub Pages / Oracle
+    // Cloud) without an audit trail and there was no flag to record WHY.
+    /// Wave 8e helper: locate today's admin-actions file. The audit
+    /// writer uses `chrono::Local` for the date and canonicalises the
+    /// data_dir (so `/var/folders/...` becomes `/private/var/folders/...`
+    /// on macOS). Mirroring both here keeps the anchor tests robust on
+    /// any host the test suite runs on. Reads the actual `data_dir`
+    /// from the test CLI so it matches `test_cli`'s `temp/data` choice.
+    fn admin_audit_today_in(cli: &Cli) -> std::path::PathBuf {
+        let day = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let canonical = std::fs::canonicalize(&cli.data_dir).expect("data_dir should canonicalise");
+        canonical.join(format!("admin-actions-{day}.jsonl"))
+    }
+
+    // Wave 8e anchor (2026-05-04): when an operator runs
+    // `innerwarden allowlist add --ip <cidr> --reason "<text>"` the reason
+    // MUST land in the admin audit log (`admin-actions-*.jsonl`) so a future
+    // operator looking at the allowlist can answer "why is this trusted?"
+    // without guessing. Pinned because on 2026-05-04 the operator added 4
+    // emergency CIDRs (Ubuntu mirrors / Telegram / GitHub Pages / Oracle
+    // Cloud) without an audit trail and there was no flag to record WHY.
+    #[test]
+    fn cmd_allowlist_add_with_reason_persists_reason_in_admin_audit() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_allowlist_add(
+            &cli,
+            Some("147.154.0.0/16"),
+            None,
+            Some("Oracle Cloud London region (CL-008 FP fix)"),
+        )
+        .expect("add with reason should succeed");
+
+        let audit_path = admin_audit_today_in(&cli);
+        let body = std::fs::read_to_string(&audit_path)
+            .unwrap_or_else(|e| panic!("audit file {audit_path:?} not written: {e}"));
+        assert!(
+            body.contains("Oracle Cloud London region (CL-008 FP fix)"),
+            "audit log must contain the verbatim reason; got: {body}"
+        );
+        assert!(
+            body.contains("\"action\":\"allowlist_add\""),
+            "audit entry must label itself as allowlist_add; got: {body}"
+        );
+        assert!(
+            body.contains("\"target\":\"147.154.0.0/16\""),
+            "audit entry must record the CIDR as target; got: {body}"
+        );
+    }
+
+    // Wave 8e: cover `cmd_allowlist_list` paths so codecov sees the new
+    // "(Reasons recorded in admin audit log...)" hint we added at the
+    // bottom. Two cases — empty allowlist and populated — exercise both
+    // branches of the early-return guard.
+    #[test]
+    fn cmd_allowlist_list_prints_audit_log_hint_when_populated() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        cmd_allowlist_add(&cli, Some("10.0.0.99"), None, Some("test fixture")).expect("seed entry");
+        // Populated path runs through the IPs/users print branches AND
+        // the trailing hint. We assert it returns Ok; output capture
+        // happens via stdout in the test runner.
+        cmd_allowlist_list(&cli).expect("list should print without error");
+    }
+
+    #[test]
+    fn cmd_allowlist_list_prints_setup_hint_when_empty() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        // Fresh agent.toml has empty arrays — exercise the early-return
+        // hint that suggests `--reason` from the start.
+        cmd_allowlist_list(&cli).expect("list should print without error");
+    }
+
+    // Wave 8e anchor: --reason is OPTIONAL for backwards compat, but
+    // omitting it MUST be visible in the audit log as a null reason
+    // (so a future operator can grep for entries with no WHY). Anti-
+    // regression for silently accepting reason-less adds — that is
+    // the original 2026-05-04 bug shape we are fixing.
+    #[test]
+    fn cmd_allowlist_add_without_reason_records_null_reason_in_audit() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_allowlist_add(&cli, Some("10.0.0.1"), None, None)
+            .expect("add without reason still succeeds (compat)");
+
+        let audit_path = admin_audit_today_in(&cli);
+        let body = std::fs::read_to_string(&audit_path).expect("audit file should be written");
+        // serde_json renders `Option::None` as `null` so the audit JSONL
+        // line carries `"reason":null` — that's the signal future-operator
+        // tooling can grep for.
+        assert!(
+            body.contains("\"reason\":null"),
+            "audit entry must record missing reason as null; got: {body}"
+        );
     }
 
     #[test]

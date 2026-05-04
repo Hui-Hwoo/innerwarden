@@ -838,9 +838,9 @@ enum AllowlistCommand {
     /// Add a trusted IP, CIDR, or user to the allowlist.
     ///
     /// Examples:
-    ///   innerwarden allowlist add --ip 10.0.0.1
-    ///   innerwarden allowlist add --ip 192.168.0.0/24
-    ///   innerwarden allowlist add --user deploy
+    ///   innerwarden allowlist add --ip 10.0.0.1 --reason "office NAT"
+    ///   innerwarden allowlist add --ip 192.168.0.0/24 --reason "internal LAN"
+    ///   innerwarden allowlist add --user deploy --reason "CI/CD service account"
     Add {
         /// IP address or CIDR range to trust (e.g. 10.0.0.1 or 192.168.0.0/24)
         #[arg(long)]
@@ -849,6 +849,14 @@ enum AllowlistCommand {
         /// Username to trust
         #[arg(long)]
         user: Option<String>,
+
+        /// Why this entry is being trusted. Recorded in the admin audit
+        /// log so a future operator can answer "why is 147.154.0.0/16
+        /// here?" without guessing. Optional today (Wave 8e, 2026-05-04)
+        /// to preserve backwards compat with existing scripts; a missing
+        /// reason emits a warning suggesting the operator add one.
+        #[arg(long)]
+        reason: Option<String>,
     },
 
     /// Remove an IP, CIDR, or user from the allowlist.
@@ -1298,8 +1306,8 @@ enum TrustCommand {
     /// Add a trusted IP, CIDR, or user to the allowlist.
     ///
     /// Examples:
-    ///   innerwarden trust add --ip 10.0.0.1
-    ///   innerwarden trust add --user deploy
+    ///   innerwarden trust add --ip 10.0.0.1 --reason "office NAT"
+    ///   innerwarden trust add --user deploy --reason "CI/CD service account"
     Add {
         /// IP address or CIDR range to trust
         #[arg(long)]
@@ -1308,6 +1316,11 @@ enum TrustCommand {
         /// Username to trust
         #[arg(long)]
         user: Option<String>,
+
+        /// Why this entry is being trusted. Recorded in the admin audit
+        /// log for future-operator forensics. See `allowlist add` docs.
+        #[arg(long)]
+        reason: Option<String>,
     },
 
     /// Remove an IP, CIDR, or user from the allowlist.
@@ -2164,9 +2177,16 @@ fn main() -> Result<()> {
         Command::Trust {
             command: Some(ref command),
         } => match command {
-            TrustCommand::Add { ref ip, ref user } => {
-                commands::response::cmd_allowlist_add(&cli, ip.as_deref(), user.as_deref())
-            }
+            TrustCommand::Add {
+                ref ip,
+                ref user,
+                ref reason,
+            } => commands::response::cmd_allowlist_add(
+                &cli,
+                ip.as_deref(),
+                user.as_deref(),
+                reason.as_deref(),
+            ),
             TrustCommand::Remove { ref ip, ref user } => {
                 commands::response::cmd_allowlist_remove(&cli, ip.as_deref(), user.as_deref())
             }
@@ -2520,9 +2540,16 @@ fn main() -> Result<()> {
             commands::history::cmd_entity(&cli, target, days, &cli.data_dir.clone())
         }
         Command::Allowlist { ref command } => match command {
-            AllowlistCommand::Add { ref ip, ref user } => {
-                commands::response::cmd_allowlist_add(&cli, ip.as_deref(), user.as_deref())
-            }
+            AllowlistCommand::Add {
+                ref ip,
+                ref user,
+                ref reason,
+            } => commands::response::cmd_allowlist_add(
+                &cli,
+                ip.as_deref(),
+                user.as_deref(),
+                reason.as_deref(),
+            ),
             AllowlistCommand::Remove { ref ip, ref user } => {
                 commands::response::cmd_allowlist_remove(&cli, ip.as_deref(), user.as_deref())
             }
@@ -2870,6 +2897,77 @@ mod tests {
             !msg.contains("module install"),
             "non-modules must not get the module-install hint, got: {msg}"
         );
+    }
+
+    // Wave 8e: clap exposes the new `--reason` flag on both
+    // `allowlist add` and `trust add` (alias). Cover the parse path so
+    // codecov sees the new struct fields and the dispatch arms in
+    // main.rs's match. These are pure parse tests; the persistence
+    // behaviour is covered by anchor tests in commands::response.
+    #[test]
+    fn cli_parses_allowlist_add_with_reason() {
+        let cli = Cli::try_parse_from([
+            "innerwarden",
+            "allowlist",
+            "add",
+            "--ip",
+            "147.154.0.0/16",
+            "--reason",
+            "Oracle Cloud London",
+        ])
+        .expect("parse cli");
+        match cli.command {
+            Some(Command::Allowlist {
+                command: AllowlistCommand::Add { ip, user, reason },
+            }) => {
+                assert_eq!(ip.as_deref(), Some("147.154.0.0/16"));
+                assert!(user.is_none());
+                assert_eq!(reason.as_deref(), Some("Oracle Cloud London"));
+            }
+            _ => panic!("expected allowlist add command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_allowlist_add_without_reason_keeps_compat() {
+        // Wave 8e: --reason is optional; existing scripts must keep
+        // working without it. Reason parses as None.
+        let cli = Cli::try_parse_from(["innerwarden", "allowlist", "add", "--ip", "10.0.0.1"])
+            .expect("parse cli");
+        match cli.command {
+            Some(Command::Allowlist {
+                command: AllowlistCommand::Add { reason, .. },
+            }) => {
+                assert!(reason.is_none(), "missing --reason must parse as None");
+            }
+            _ => panic!("expected allowlist add command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_trust_add_with_reason_alias() {
+        // Wave 8e: `innerwarden trust add` is the visible alias of
+        // `allowlist add`; same --reason support.
+        let cli = Cli::try_parse_from([
+            "innerwarden",
+            "trust",
+            "add",
+            "--user",
+            "deploy",
+            "--reason",
+            "CI/CD service account",
+        ])
+        .expect("parse cli");
+        match cli.command {
+            Some(Command::Trust {
+                command: Some(TrustCommand::Add { ip, user, reason }),
+            }) => {
+                assert!(ip.is_none());
+                assert_eq!(user.as_deref(), Some("deploy"));
+                assert_eq!(reason.as_deref(), Some("CI/CD service account"));
+            }
+            _ => panic!("expected trust add command"),
+        }
     }
 
     #[test]
