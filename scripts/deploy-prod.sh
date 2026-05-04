@@ -23,6 +23,59 @@ esac
 
 echo "=== Deploy $component to production ==="
 
+# Step -1: Source-state guard (Wave 9d, 2026-05-04).
+#
+# Guards against the failure mode that produced the 2026-05-04 prod
+# incident: a fix had been merged to main for hours but the binary on
+# prod was built from a stale checkout (HEAD on a feature branch from 2
+# days earlier). cargo build succeeded, the agent restarted "clean",
+# and the operator believed the fix was live - 1000+ false-positive
+# correlation chains continued firing for two days.
+#
+# Refuses to proceed when:
+#   - remote /home/ubuntu/innerwarden HEAD is not on the `main` branch
+#   - HEAD is behind origin/main (would silently miss merged commits)
+#   - working tree has uncommitted changes (cargo build would pick them
+#     up but the resulting binary would not match any commit)
+#
+# Operator can still ship a feature-branch experiment by skipping the
+# guard explicitly: DEPLOY_SKIP_SOURCE_GUARD=1 ./scripts/deploy-prod.sh
+# (use sparingly; the guard exists for a reason).
+echo "[-1/4] Source-state guard..."
+if [ "${DEPLOY_SKIP_SOURCE_GUARD:-0}" = "1" ]; then
+  echo "  WARN: DEPLOY_SKIP_SOURCE_GUARD=1 set - skipping branch/sync check."
+else
+  branch=$($SSH "cd $REMOTE_DIR && git rev-parse --abbrev-ref HEAD" 2>/dev/null || echo "?")
+  if [ "$branch" != "main" ]; then
+    die "remote $REMOTE_DIR is on branch '$branch', not 'main'. Either:
+  - SSH in and \`git checkout main\` first, or
+  - Re-run with DEPLOY_SKIP_SOURCE_GUARD=1 to deploy this branch anyway."
+  fi
+  $SSH "cd $REMOTE_DIR && git fetch origin main --quiet" || die "git fetch failed"
+  ahead_behind=$($SSH "cd $REMOTE_DIR && git rev-list --left-right --count HEAD...origin/main" 2>/dev/null || echo "? ?")
+  ahead=$(echo "$ahead_behind" | awk '{print $1}')
+  behind=$(echo "$ahead_behind" | awk '{print $2}')
+  if [ "$behind" != "0" ]; then
+    head=$($SSH "cd $REMOTE_DIR && git rev-parse --short=12 HEAD")
+    main=$($SSH "cd $REMOTE_DIR && git rev-parse --short=12 origin/main")
+    die "remote $REMOTE_DIR HEAD is $behind commit(s) behind origin/main:
+  HEAD:        $head
+  origin/main: $main
+The build would silently miss those commits. Step [1/4] will pull, but
+this guard fires first so the operator sees the gap."
+  fi
+  if [ "$ahead" != "0" ]; then
+    head=$($SSH "cd $REMOTE_DIR && git rev-parse --short=12 HEAD")
+    echo "  WARN: HEAD is $ahead commit(s) AHEAD of origin/main ($head). Local-only commits will be in the binary."
+  fi
+  dirty=$($SSH "cd $REMOTE_DIR && git status --porcelain | head -1")
+  if [ -n "$dirty" ]; then
+    die "remote $REMOTE_DIR has uncommitted changes (sample: '$dirty'). Stash or revert before deploying so the build matches a real commit."
+  fi
+  echo "  OK: on main, in sync with origin, clean working tree."
+fi
+
+
 # Step 0: Pre-deploy cleanup (free disk before pulling/building).
 #
 # Production deploys have hit "Out of diskspace" during git pull when

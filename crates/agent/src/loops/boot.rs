@@ -565,6 +565,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         honeypot_redirect = cfg.honeypot.redirect.enabled,
         responder = cfg.responder.enabled,
         dry_run = cfg.responder.dry_run,
+        // Build provenance baked in by `crates/agent/build.rs`. Surfaced
+        // here so an operator who suspects a stale binary (e.g. a fix
+        // looks shipped on github but not in prod behaviour) can verify
+        // the running build's source by grepping `journalctl -u
+        // innerwarden-agent | grep build_commit` against `git rev-parse
+        // HEAD`. See Wave 9d (2026-05-04 prod incident) for the failure
+        // mode this anchors against.
+        build_commit = env!("INNERWARDEN_BUILD_COMMIT"),
+        build_dirty = env!("INNERWARDEN_BUILD_DIRTY"),
         "innerwarden-agent v{} starting",
         env!("CARGO_PKG_VERSION")
     );
@@ -3020,6 +3029,62 @@ url = "http://127.0.0.1:9/hooks"
             timed_out: 2,
         });
         // If we reach here without panic, both branches are safe.
+    }
+
+    // ── Wave 9d (2026-05-04) anchors — build provenance ──────────────────
+    //
+    // Wave 9d root cause: a fix merged to `main` for hours was not in the
+    // binary running on prod because `cargo build --release` ran from a
+    // stale source tree. The agent restarted "clean" and the operator
+    // believed the fix was live. 1000+ false-positive correlation chains
+    // continued firing for two days before anyone noticed.
+    //
+    // The anchor is two-sided:
+    //   - `crates/agent/build.rs` bakes `INNERWARDEN_BUILD_COMMIT` +
+    //     `INNERWARDEN_BUILD_DIRTY` into the binary so the running source
+    //     can be verified post-deploy.
+    //   - `scripts/deploy-prod.sh` refuses to deploy when the remote
+    //     checkout is behind `origin/main`.
+    //
+    // These tests pin the env-var contract at compile time so a future
+    // contributor cannot remove `build.rs` (or rename the env vars)
+    // without the boot-log macro failing to compile.
+
+    #[test]
+    fn build_commit_env_is_set_and_well_formed() {
+        // env! is evaluated at compile time. If `crates/agent/build.rs`
+        // does not emit `cargo:rustc-env=INNERWARDEN_BUILD_COMMIT=...`
+        // this test does not even build, which is the strongest possible
+        // anchor against accidental removal.
+        let sha = env!("INNERWARDEN_BUILD_COMMIT");
+        assert!(
+            !sha.is_empty(),
+            "INNERWARDEN_BUILD_COMMIT must not be empty"
+        );
+        // Either a hex SHA prefix (real git checkout) or the explicit
+        // `unknown` fallback that build.rs emits when git is unavailable
+        // (vendored sources, source tarball, CI image without `.git`).
+        // Reject anything else - the boot log surfaces this verbatim and
+        // an arbitrary string would mislead the operator at incident time.
+        let valid =
+            sha == "unknown" || (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            valid,
+            "INNERWARDEN_BUILD_COMMIT={sha:?} must be a hex SHA prefix or the literal \"unknown\""
+        );
+    }
+
+    #[test]
+    fn build_dirty_env_is_a_canonical_bool_string() {
+        // `INNERWARDEN_BUILD_DIRTY` is consumed by the boot log as a
+        // tracing field, so the value must be a stable canonical form -
+        // the operator greps for `build_dirty=true` to find binaries
+        // built from a dirty working tree.
+        let dirty = env!("INNERWARDEN_BUILD_DIRTY");
+        assert!(
+            dirty == "true" || dirty == "false",
+            "INNERWARDEN_BUILD_DIRTY={dirty:?} must be exactly \"true\" or \"false\""
+        );
     }
 }
 
