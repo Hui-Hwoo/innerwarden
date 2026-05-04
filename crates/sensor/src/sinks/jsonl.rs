@@ -196,4 +196,76 @@ mod tests {
         assert_eq!(writer.data_dir(), data_dir.as_path());
         assert!(data_dir.exists());
     }
+
+    #[test]
+    fn test_jsonl_writer_skips_events_when_disabled() {
+        let dir = unique_test_dir();
+        let mut writer = JsonlWriter::new(&dir, false).unwrap();
+        
+        let event = Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "test".to_string(),
+            kind: "test.event".to_string(),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: "Test".to_string(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+        
+        writer.write_event(&event).unwrap();
+        writer.flush().unwrap();
+        
+        let today = chrono::Local::now().date_naive();
+        let event_path = events_file_path(&dir, today);
+        assert!(!event_path.exists());
+    }
+
+    #[test]
+    fn test_jsonl_writer_writes_events_and_incidents() {
+        let dir = unique_test_dir();
+        let mut writer = JsonlWriter::new(&dir, true).unwrap();
+        
+        let event = Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "test".to_string(),
+            kind: "ssh.login_success".to_string(),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: "Login".to_string(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+        
+        writer.write_event(&event).unwrap();
+        
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            incident_id: "inc-1".to_string(),
+            severity: innerwarden_core::event::Severity::High,
+            title: "Test".to_string(),
+            summary: "Summary".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        };
+
+        writer.write_incident(&incident).unwrap();
+        writer.flush().unwrap();
+        
+        let today = chrono::Local::now().date_naive();
+        let event_path = events_file_path(&dir, today);
+        assert!(event_path.exists());
+        let event_content = std::fs::read_to_string(&event_path).unwrap();
+        assert!(event_content.contains("ssh.login_success"));
+        
+        let incident_path = incidents_file_path(&dir, today);
+        assert!(incident_path.exists());
+        let incident_content = std::fs::read_to_string(&incident_path).unwrap();
+        assert!(incident_content.contains("inc-1"));
+    }
 }

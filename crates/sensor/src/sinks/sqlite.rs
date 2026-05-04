@@ -77,3 +77,139 @@ fn is_high_volume_event(kind: &str) -> bool {
             | "network.snapshot_listening"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_high_volume_event() {
+        assert!(is_high_volume_event("tcp_stream.flow"));
+        assert!(is_high_volume_event("tcp_stream.http"));
+        assert!(is_high_volume_event("process.exit"));
+        assert!(is_high_volume_event("process.clone"));
+        assert!(is_high_volume_event("process.fd_redirect"));
+        assert!(is_high_volume_event("network.snapshot_connected"));
+        assert!(is_high_volume_event("network.snapshot_listening"));
+
+        assert!(!is_high_volume_event("ssh.login_success"));
+        assert!(!is_high_volume_event("sudo.command"));
+        assert!(!is_high_volume_event("system.new_suid"));
+        assert!(!is_high_volume_event("firmware.esp_modified"));
+    }
+
+    #[test]
+    fn test_sqlite_writer_skips_events_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SqliteWriter::new(dir.path(), false).unwrap();
+
+        let event = Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "test".to_string(),
+            kind: "test.event".to_string(),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: "Test".to_string(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+
+        writer.write_event(&event);
+
+        // Count events in the DB
+        let store = innerwarden_store::Store::open(dir.path()).unwrap();
+        let count = store
+            .conn()
+            .unwrap()
+            .query_row("SELECT count(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_sqlite_writer_skips_high_volume_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SqliteWriter::new(dir.path(), true).unwrap();
+
+        let event = Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "test".to_string(),
+            kind: "tcp_stream.flow".to_string(),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: "Flow".to_string(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+
+        writer.write_event(&event);
+
+        let store = innerwarden_store::Store::open(dir.path()).unwrap();
+        let count = store
+            .conn()
+            .unwrap()
+            .query_row("SELECT count(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_sqlite_writer_writes_normal_events_and_incidents() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SqliteWriter::new(dir.path(), true).unwrap();
+
+        let event = Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "test".to_string(),
+            kind: "ssh.login_success".to_string(),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: "Login".to_string(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+
+        writer.write_event(&event);
+
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            incident_id: "inc-1".to_string(),
+            severity: innerwarden_core::event::Severity::High,
+            title: "Test".to_string(),
+            summary: "Summary".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        };
+
+        writer.write_incident(&incident);
+
+        let store = innerwarden_store::Store::open(dir.path()).unwrap();
+        let event_count = store
+            .conn()
+            .unwrap()
+            .query_row("SELECT count(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        let incident_count = store
+            .conn()
+            .unwrap()
+            .query_row("SELECT count(*) FROM incidents", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(incident_count, 1);
+    }
+}

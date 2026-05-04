@@ -95,3 +95,24 @@ pub fn format_daily_digest(
 pub fn explain_detector(detector: &str) -> String {
     templates::explain_detector(detector)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_guardian_mode_labels() {
+        assert_eq!(GuardianMode::Guard.label(), "🟢 GUARD");
+        assert_eq!(GuardianMode::DryRun.label(), "🟡 DRY-RUN");
+        assert_eq!(GuardianMode::Watch.label(), "🔵 WATCH");
+    }
+
+    #[test]
+    fn test_guardian_mode_descriptions() {
+        assert!(GuardianMode::Guard
+            .description()
+            .contains("blocked automatically"));
+        assert!(GuardianMode::DryRun.description().contains("Test mode"));
+        assert!(GuardianMode::Watch.description().contains("Monitor only"));
+    }
+}

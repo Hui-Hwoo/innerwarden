@@ -194,4 +194,76 @@ mod tests {
         assert!(body.contains("\"overview\""));
         assert!(body.contains("\"health_kind\":\"operating_normally\""));
     }
+
+    #[tokio::test]
+    async fn api_fleet_hosts_returns_404_when_disabled() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+
+        let response = api_fleet_hosts(State(state)).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_fleet_overview_returns_404_when_disabled() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+
+        let response = api_fleet_overview(State(state)).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_fleet_hosts_returns_json_when_enabled() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+
+        let cfg = vec![host("prod-eu", "https://eu.example.com:8787")];
+        state.fleet_state = Some(FleetState::from_config(&cfg));
+
+        let response = api_fleet_hosts(State(state)).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert!(json.get("hosts").is_some());
+        let hosts = json["hosts"].as_array().unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0]["id"], "prod-eu");
+    }
+
+    #[tokio::test]
+    async fn api_fleet_overview_returns_json_when_enabled() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+
+        let cfg = vec![host("prod-eu", "https://eu.example.com:8787")];
+        state.fleet_state = Some(FleetState::from_config(&cfg));
+
+        let response = api_fleet_overview(State(state)).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert!(json.get("fleet").is_some());
+        assert!(json.get("by_host").is_some());
+    }
 }

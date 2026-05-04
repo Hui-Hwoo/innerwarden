@@ -45,3 +45,42 @@ impl Default for Metrics {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_initializes_all_counters_to_zero() {
+        let m = Metrics::new();
+        assert_eq!(m.events_processed.load(Ordering::Relaxed), 0);
+        assert_eq!(m.chains_detected.load(Ordering::Relaxed), 0);
+        assert_eq!(m.pre_chains_emitted.load(Ordering::Relaxed), 0);
+        assert_eq!(m.lsm_blocked_processed.load(Ordering::Relaxed), 0);
+        assert_eq!(m.incidents_published.load(Ordering::Relaxed), 0);
+        assert_eq!(m.c2_ips_extracted.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn default_delegates_to_new() {
+        let m = Metrics::default();
+        assert_eq!(m.events_processed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn log_summary_does_not_panic() {
+        let m = Metrics::new();
+        m.events_processed.store(42, Ordering::Relaxed);
+        m.chains_detected.store(3, Ordering::Relaxed);
+        m.log_summary(); // should not panic
+    }
+
+    #[test]
+    fn counters_increment_correctly() {
+        let m = Metrics::new();
+        m.events_processed.fetch_add(10, Ordering::Relaxed);
+        m.incidents_published.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(m.events_processed.load(Ordering::Relaxed), 10);
+        assert_eq!(m.incidents_published.load(Ordering::Relaxed), 1);
+    }
+}

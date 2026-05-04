@@ -526,22 +526,45 @@ fn matches_stage(
     true
 }
 
-/// Wave 8a (2026-05-04): does `event.details.comm` match the per-rule
-/// suppression list? Used to keep correlation chains from misclassifying
-/// legitimate package-manager activity (apt/dpkg/dnf/zypper/etc reading
-/// /etc/* and connecting to mirrors) as data exfiltration.
+/// Does `event.details.comm` match a suppression list, either the
+/// per-rule package-manager list (Wave 8a) or the rule-agnostic
+/// InnerWarden self-traffic list (PR ε, 2026-05-04)?
 ///
-/// Returns false when no suppression list applies, when the event has
-/// no comm field, or when the comm does not match.
+/// Two distinct policies share this gate:
+///
+/// 1. **Self-traffic** (always applies, every rule): the originating
+///    process is the agent / sensor / watchdog / one of their
+///    tokio-rt-worker threads. The chain is the agent's own outbound
+///    traffic (Telegram polling, AbuseIPDB API, threat-feed downloads,
+///    GeoIP refresh, watchdog health probes, ...) and must never be
+///    classified as attacker activity. Same intent as the inline
+///    killchain `self-traffic-fp` dismiss path - lifted to the
+///    correlation-engine layer so cross-layer chains (CL-008 et al.)
+///    get the same gate.
+///
+/// 2. **Package manager** (per-rule, currently only CL-008): the
+///    originating process is apt / dnf / pacman / brew / etc.
+///    reading /etc/passwd-style sensitive files and connecting to
+///    distribution mirrors. Wave 8a. Distinct from self-traffic
+///    because operators may legitimately want package-manager
+///    suppressed for some chains and not others.
+///
+/// Returns false when the event has no `comm` field or when the
+/// `comm` does not match either list.
 pub(crate) fn event_comm_is_suppressed(rule_id: &str, event: &CorrelationEvent) -> bool {
-    let suppressions = rule_comm_suppressions(rule_id);
-    if suppressions.is_empty() {
-        return false;
-    }
     let Some(comm) = event.details.get("comm").and_then(|v| v.as_str()) else {
         return false;
     };
-    suppressions.contains(&comm)
+    // PR ε: self-traffic suppression is rule-agnostic. Whatever chain
+    // a self-comm event is participating in, the chain is not real
+    // attacker activity. We check this BEFORE the per-rule list so
+    // self-traffic short-circuits even when the rule's per-rule list
+    // is empty.
+    if INNERWARDEN_SELF_COMMS.contains(&comm) {
+        return true;
+    }
+    // Wave 8a: per-rule package-manager suppression.
+    rule_comm_suppressions(rule_id).contains(&comm)
 }
 
 /// Wave 8a (2026-05-04): per-rule list of `comm` values whose events
@@ -629,6 +652,47 @@ const PACKAGE_MANAGER_COMMS: &[&str] = &[
     // Cross-distro service-style package backends
     "PackageKit",
     "packagekitd",
+];
+
+/// PR ε (2026-05-04): comm names of InnerWarden's own processes.
+/// Correlation chains whose originating event has one of these comms
+/// are agent self-traffic (Telegram polling, AbuseIPDB API calls,
+/// threat-feed downloads, watchdog health probes, GeoIP refresh,
+/// etc.) and must NOT be classified as attacker activity regardless
+/// of the rule that wants to claim them.
+///
+/// Linux truncates `comm` to 15 characters (TASK_COMM_LEN - 1), so
+/// `innerwarden-agent` (17 chars) appears as `innerwarden-age` in
+/// `/proc/<pid>/comm` and in eBPF events. We pre-truncate here so
+/// the exact-match comparison works against what the kernel actually
+/// produces - the full untruncated names would never match.
+///
+/// Distinct from the existing graph-level
+/// `is_self_traffic_incident` filter (which catches incidents AFTER
+/// they have been ingested into the knowledge graph and tags them
+/// `research_only`): this list short-circuits the chain at correlation
+/// time so the chain is never CREATED to begin with. The two layers
+/// are complementary - the graph filter still catches single-stage
+/// noise, this one stops cross-layer chain false positives upstream.
+///
+/// AUDIT-CL008-SELF (2026-05-04 prod): pre-fix CL-008 fired 72x in
+/// 30 min on prod, blocking outbound to 208.95.112.1 (an external
+/// dependency the agent reaches), to Telegram (149.154.166.110 -
+/// would have been blocked but for the operator's allowlist), and
+/// to the host's own cloud provider (147.154.x = Oracle Cloud). All
+/// of these had `comm = tokio-rt-worker` from the agent's outbound
+/// connect path; without this list, every such call became a
+/// 24-hour UFW block.
+const INNERWARDEN_SELF_COMMS: &[&str] = &[
+    // Main binaries - kernel truncates to 15 chars (TASK_COMM_LEN-1).
+    "innerwarden-age",  // innerwarden-agent (17 chars truncated)
+    "innerwarden-sen",  // innerwarden-sensor (18 chars truncated)
+    "innerwarden-ctl",  // 15 chars - exact
+    "innerwarden-watc", // innerwarden-watchdog (20 chars truncated)
+    // Tokio runtime worker thread name - all outbound HTTP / Redis /
+    // DNS calls from the agent execute on these threads, so the
+    // eBPF connect() events carry this as comm. 15 chars exactly.
+    "tokio-rt-worker",
 ];
 
 fn entity_type_str(et: &EntityType) -> &'static str {

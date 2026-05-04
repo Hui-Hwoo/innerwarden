@@ -21,16 +21,23 @@ pub(super) fn risky_open_services(ss_output: &str) -> Vec<&'static str> {
         (":27017", "MongoDB"),
         (":11211", "Memcached"),
     ];
-    risky_ports
-        .into_iter()
-        .filter_map(|(pattern, name)| {
-            if ss_output.contains(pattern) && ss_output.contains("0.0.0.0:") {
-                Some(name)
-            } else {
-                None
+    let mut results = Vec::new();
+    for line in ss_output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let local_addr = fields[3];
+        if !local_addr.starts_with("0.0.0.0:") {
+            continue;
+        }
+        for (pattern, name) in &risky_ports {
+            if line.contains(pattern) && !results.contains(name) {
+                results.push(*name);
             }
-        })
-        .collect()
+        }
+    }
+    results
 }
 
 pub(super) fn check_firewall(env: &impl HardenEnv) -> CheckResult {
@@ -140,5 +147,50 @@ pub(super) fn check_firewall(env: &impl HardenEnv) -> CheckResult {
         category: cat,
         passed,
         findings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_firewalld_zone_is_recommended() {
+        assert!(firewalld_zone_is_recommended("drop"));
+        assert!(firewalld_zone_is_recommended("block"));
+        assert!(firewalld_zone_is_recommended("public"));
+        assert!(!firewalld_zone_is_recommended("trusted"));
+        assert!(!firewalld_zone_is_recommended("home"));
+    }
+
+    #[test]
+    fn test_ufw_is_active() {
+        assert!(ufw_is_active("Status: active\nLogging: on"));
+        assert!(!ufw_is_active("Status: inactive"));
+    }
+
+    #[test]
+    fn test_ufw_default_is_deny_incoming() {
+        assert!(ufw_default_is_deny_incoming(
+            "Status: active\nDefault: deny (incoming), allow (outgoing)"
+        ));
+        assert!(!ufw_default_is_deny_incoming(
+            "Status: active\nDefault: allow (incoming), allow (outgoing)"
+        ));
+    }
+
+    #[test]
+    fn test_risky_open_services() {
+        let ss_output = "\
+State    Recv-Q   Send-Q   Local Address:Port   Peer Address:Port   Process
+LISTEN   0        128      0.0.0.0:3306         0.0.0.0:*           users:((\"mysqld\",pid=1000,fd=10))
+LISTEN   0        128      127.0.0.1:5432       0.0.0.0:*           users:((\"postgres\",pid=2000,fd=10))
+LISTEN   0        128      0.0.0.0:6379         0.0.0.0:*           users:((\"redis-server\",pid=3000,fd=10))
+";
+        let risky = risky_open_services(ss_output);
+        assert_eq!(risky.len(), 2);
+        assert!(risky.contains(&"MySQL"));
+        assert!(risky.contains(&"Redis"));
+        assert!(!risky.contains(&"PostgreSQL")); // bound to localhost
     }
 }

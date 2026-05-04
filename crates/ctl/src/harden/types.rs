@@ -53,3 +53,32 @@ pub(super) struct CheckResult {
     pub(super) passed: Vec<String>,
     pub(super) findings: Vec<Finding>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_severity_labels() {
+        assert_eq!(Severity::Info.label(), "info");
+        assert_eq!(Severity::Low.label(), "low");
+        assert_eq!(Severity::Medium.label(), "medium");
+        assert_eq!(Severity::High.label(), "high");
+        assert_eq!(Severity::Critical.label(), "critical");
+    }
+
+    #[test]
+    fn test_severity_score_penalty() {
+        assert_eq!(Severity::Info.score_penalty(), 0);
+        assert_eq!(Severity::Low.score_penalty(), 2);
+        assert_eq!(Severity::Medium.score_penalty(), 5);
+        assert_eq!(Severity::High.score_penalty(), 10);
+        assert_eq!(Severity::Critical.score_penalty(), 20);
+    }
+
+    #[test]
+    fn test_severity_icons_exist() {
+        assert!(!Severity::Info.icon().is_empty());
+        assert!(!Severity::High.icon().is_empty());
+    }
+}

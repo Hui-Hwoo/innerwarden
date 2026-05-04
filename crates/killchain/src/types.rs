@@ -63,3 +63,52 @@ impl PidChainState {
         elapsed.num_seconds() > timeout_secs
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn test_pid_chain_state_new() {
+        let ts = Utc::now();
+        let state = PidChainState::new(1234, 1000, "bash".to_string(), "host1".to_string(), ts);
+
+        assert_eq!(state.pid, 1234);
+        assert_eq!(state.uid, 1000);
+        assert_eq!(state.comm, "bash");
+        assert_eq!(state.host, "host1");
+        assert_eq!(state.flags, 0);
+        assert!(state.events.is_empty());
+        assert_eq!(state.first_seen, ts);
+        assert_eq!(state.last_seen, ts);
+    }
+
+    #[test]
+    fn test_add_flag_updates_state() {
+        let ts1 = Utc::now();
+        let mut state = PidChainState::new(1, 0, "test".to_string(), "host".to_string(), ts1);
+
+        let ts2 = ts1 + Duration::seconds(10);
+        let event = ChainEvent {
+            ts: ts2,
+            syscall: "execve".to_string(),
+            details: serde_json::json!({}),
+            flag_set: 0x1,
+        };
+
+        state.add_flag(0x1, event);
+        assert_eq!(state.flags, 0x1);
+        assert_eq!(state.last_seen, ts2);
+        assert_eq!(state.events.len(), 1);
+    }
+
+    #[test]
+    fn test_is_stale() {
+        let ts = Utc::now();
+        let state = PidChainState::new(1, 0, "test".to_string(), "host".to_string(), ts);
+
+        assert!(!state.is_stale(ts + Duration::seconds(5), 10));
+        assert!(state.is_stale(ts + Duration::seconds(15), 10));
+    }
+}

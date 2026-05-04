@@ -362,4 +362,134 @@ mod tests {
         assert_eq!(loaded.pid, 42);
         assert_eq!(loaded.incident_id, "test:disk:1");
     }
+
+    #[test]
+    fn read_cmdline_parses_nul_separated_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_dir = tmp.path();
+        fs::write(
+            proc_dir.join("cmdline"),
+            b"/usr/bin/python3\0-c\0print(1)\0",
+        )
+        .unwrap();
+        let result = read_cmdline(proc_dir);
+        assert_eq!(result, Some("/usr/bin/python3 -c print(1)".to_string()));
+    }
+
+    #[test]
+    fn read_cmdline_empty_file_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("cmdline"), b"").unwrap();
+        assert!(read_cmdline(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn read_cmdline_missing_file_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_cmdline(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn read_file_string_reads_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("status"), "Name:\tpython3\nPid:\t1234\n").unwrap();
+        let result = read_file_string(tmp.path(), "status");
+        assert!(result.unwrap().contains("python3"));
+    }
+
+    #[test]
+    fn read_file_string_missing_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_file_string(tmp.path(), "missing").is_none());
+    }
+
+    #[test]
+    fn read_environ_redacted_with_synthetic_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Simulate /proc/PID/environ format: NUL-separated KEY=VALUE pairs
+        let environ = b"HOME=/root\0API_KEY=supersecret\0PATH=/usr/bin\0DB_PASSWORD=hunter2\0";
+        fs::write(tmp.path().join("environ"), environ).unwrap();
+        let result = read_environ_redacted(tmp.path());
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&"HOME=/root".to_string()));
+        assert!(result.contains(&"API_KEY=<REDACTED>".to_string()));
+        assert!(result.contains(&"PATH=/usr/bin".to_string()));
+        assert!(result.contains(&"DB_PASSWORD=<REDACTED>".to_string()));
+    }
+
+    #[test]
+    fn read_environ_redacted_missing_file_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_environ_redacted(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn read_fds_empty_dir_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("fd")).unwrap();
+        let result = read_fds(tmp.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn read_fds_missing_dir_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = read_fds(tmp.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn read_maps_missing_file_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_maps(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn read_maps_with_synthetic_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let maps_content = (0..60)
+            .map(|i| {
+                format!(
+                    "{:08x}-{:08x} r-xp 00000000 08:01 {} /lib/entry{}",
+                    i * 0x1000,
+                    (i + 1) * 0x1000,
+                    i,
+                    i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(tmp.path().join("maps"), maps_content).unwrap();
+        let result = read_maps(tmp.path());
+        assert!(result.len() <= MAX_MAP_LINES + 1); // +1 for truncation message
+        assert!(result.last().unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn read_network_missing_dir_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_network(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn cooldown_prunes_stale_entries() {
+        let mut capture = ForensicsCapture::new(Path::new("/tmp"));
+        let old = Utc::now() - chrono::Duration::seconds(CAPTURE_COOLDOWN_SECS * 3);
+        capture.cooldown.insert(1000, old);
+        capture.cooldown.insert(1001, Utc::now());
+
+        let cutoff = Utc::now() - chrono::Duration::seconds(CAPTURE_COOLDOWN_SECS * 2);
+        capture.cooldown.retain(|_, ts| *ts > cutoff);
+        assert_eq!(capture.cooldown.len(), 1);
+        assert!(capture.cooldown.contains_key(&1001));
+    }
+
+    #[test]
+    fn redact_patterns_cover_expected_secrets() {
+        assert!(REDACT_PATTERNS.contains(&"KEY"));
+        assert!(REDACT_PATTERNS.contains(&"SECRET"));
+        assert!(REDACT_PATTERNS.contains(&"TOKEN"));
+        assert!(REDACT_PATTERNS.contains(&"PASSWORD"));
+        assert!(REDACT_PATTERNS.contains(&"PASS"));
+    }
 }

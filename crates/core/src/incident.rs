@@ -27,3 +27,27 @@ pub struct Incident {
     #[serde(default)]
     pub entities: Vec<EntityRef>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incident_serialization() {
+        let incident = Incident {
+            ts: Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: "test-id".to_string(),
+            severity: Severity::High,
+            title: "Test Incident".to_string(),
+            summary: "This is a test".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        };
+        let serialized = serde_json::to_string(&incident).unwrap();
+        assert!(serialized.contains("test-host"));
+        assert!(serialized.contains("test-id"));
+    }
+}

@@ -45,3 +45,40 @@ pub struct Event {
     #[serde(default)]
     pub entities: Vec<EntityRef>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_severity() {
+        assert_eq!(default_severity(), Severity::Info);
+    }
+
+    #[test]
+    fn test_severity_serialization() {
+        let s = Severity::High;
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, "\"high\"");
+    }
+
+    #[test]
+    fn test_event_serialization() {
+        let e = Event {
+            ts: Utc::now(),
+            host: "testhost".to_string(),
+            source: "testsrc".to_string(),
+            kind: "testkind".to_string(),
+            severity: Severity::Medium,
+            summary: "summary".to_string(),
+            details: serde_json::json!({"key": "value"}),
+            tags: vec![],
+            entities: vec![],
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("testhost"));
+        assert!(json.contains("testsrc"));
+        assert!(json.contains("testkind"));
+        assert!(json.contains("medium"));
+    }
+}

@@ -3099,4 +3099,45 @@ enabled = false
             "expected count=3: {text}"
         );
     }
+
+    #[test]
+    fn parse_disabled_detectors_returns_empty_on_empty_content() {
+        let disabled = parse_disabled_detectors("");
+        assert!(disabled.is_empty());
+    }
+
+    #[test]
+    fn parse_disabled_detectors_returns_empty_on_invalid_toml() {
+        let disabled = parse_disabled_detectors("[detectors\ninvalid = toml");
+        assert!(disabled.is_empty());
+    }
+
+    #[test]
+    fn parse_disabled_detectors_identifies_disabled_ones() {
+        let toml = r#"
+        [detectors.ssh_bruteforce]
+        enabled = false
+
+        [detectors.port_scan]
+        enabled = true
+
+        [detectors.docker_anomaly]
+        enabled = false
+        "#;
+        let disabled = parse_disabled_detectors(toml);
+        assert_eq!(disabled.len(), 2);
+        assert!(disabled.contains("ssh_bruteforce"));
+        assert!(disabled.contains("docker_anomaly"));
+        assert!(!disabled.contains("port_scan"));
+    }
+
+    #[test]
+    fn parse_disabled_detectors_ignores_missing_enabled_flag() {
+        let toml = r#"
+        [detectors.reverse_shell]
+        threshold = 5
+        "#;
+        let disabled = parse_disabled_detectors(toml);
+        assert!(disabled.is_empty());
+    }
 }

@@ -402,4 +402,89 @@ mod tests {
         let path2 = store_file(dir.path(), hash, data, "test.bin");
         assert_eq!(path1, path2);
     }
+
+    #[test]
+    fn test_to_event() {
+        let ef = ExtractedFile {
+            sha256: "deadbeef".to_string(),
+            filename: "malware.elf".to_string(),
+            content_type: "application/x-executable".to_string(),
+            size: 9000,
+            src_ip: "10.0.0.1".to_string(),
+            dst_ip: "10.0.0.2".to_string(),
+            src_port: 8080,
+            dst_port: 54321,
+            uri: "/download/malware.elf".to_string(),
+            stored_path: Some(PathBuf::from("/tmp/deadbeef.bin")),
+            timestamp: Utc::now(),
+            signals: vec!["elf_binary_download".to_string()],
+        };
+
+        let ev = to_event(&ef, "host-123");
+        assert_eq!(ev.severity, innerwarden_core::event::Severity::High);
+        assert_eq!(ev.kind, "file.extracted_from_network");
+        assert_eq!(ev.details["sha256"], "deadbeef");
+        assert_eq!(ev.details["filename"], "malware.elf");
+    }
+
+    #[test]
+    fn test_extract_from_http_not_binary_or_exec() {
+        let req = "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 104\r\n\r\n<html><body><h1>Hello, World! This is a perfectly normal and safe text document. Nothing to see here.</h1></body></html>";
+
+        let key = crate::collectors::tcp_stream::FlowKey {
+            src_ip: 0x0A000001,
+            dst_ip: 0x0A000002,
+            src_port: 80,
+            dst_port: 54321,
+            proto: 6,
+        };
+        let fe = FlowEvent {
+            key,
+            app_proto: AppProtocol::Http,
+            client_data: req.as_bytes().to_vec(),
+            server_data: resp.as_bytes().to_vec(),
+            started: Utc::now(),
+            duration_ms: 100,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let extracted = extract_from_flow(&fe, dir.path());
+        assert!(extracted.is_none()); // Text file is ignored
+    }
+
+    #[test]
+    fn test_extract_from_http_elf_binary() {
+        let req = "GET /payload HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut body = b"\x7fELF  some more data so length is at least 100 bytes ".to_vec();
+        body.extend_from_slice(&[0u8; 100]); // Pad body
+
+        let mut resp =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+        resp.extend_from_slice(&body);
+
+        let key = crate::collectors::tcp_stream::FlowKey {
+            src_ip: 0x0A000001,
+            dst_ip: 0x0A000002,
+            src_port: 80,
+            dst_port: 54321,
+            proto: 6,
+        };
+        let fe = FlowEvent {
+            key,
+            app_proto: AppProtocol::Http,
+            client_data: req.as_bytes().to_vec(),
+            server_data: resp,
+            started: Utc::now(),
+            duration_ms: 100,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let extracted = extract_from_flow(&fe, dir.path()).expect("Should extract ELF binary");
+
+        assert_eq!(extracted.filename, "payload");
+        assert!(extracted
+            .signals
+            .contains(&"elf_binary_download".to_string()));
+    }
 }

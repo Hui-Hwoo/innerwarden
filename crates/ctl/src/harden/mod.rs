@@ -437,17 +437,25 @@ mod tests {
     }
 
     #[test]
-    fn ssh_config_value_prefers_last_directive_and_ignores_comments() {
-        // Covers ssh directive resolution order where the last active value should win.
+    fn ssh_config_value_returns_first_directive_and_ignores_comments() {
+        // OpenSSH `sshd_config(5)`: "the first obtained value will be
+        // used". Anti-regression for assuming shell-style "last wins"
+        // semantics - that would silently neutralise a hardened
+        // drop-in fragment whose value sits LATER in the concatenated
+        // config, while a stale insecure value at the top wins. The
+        // commented line must be skipped; the lowercase variant must
+        // still match (case-insensitive directive names).
         let config = r#"
             # PasswordAuthentication yes
-            PasswordAuthentication yes
             passwordauthentication no
+            PasswordAuthentication yes
         "#;
         assert_eq!(
             ssh_config_value(config, "PasswordAuthentication")
                 .expect("directive should be present"),
-            "no"
+            "no",
+            "OpenSSH first-value-wins: the lowercase 'no' line precedes \
+             the 'yes' line, so it must win"
         );
     }
 

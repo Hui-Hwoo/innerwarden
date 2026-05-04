@@ -172,4 +172,75 @@ mod tests {
         assert!(store.is_known("hash1"));
         assert!(store.is_known("hash2"));
     }
+
+    #[test]
+    fn is_known_returns_false_for_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DnaStore::load(dir.path()).unwrap();
+        assert!(!store.is_known("nonexistent"));
+    }
+
+    #[test]
+    fn find_similar_matches_fuzzy_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DnaStore::load(dir.path()).unwrap();
+        store.insert(make_dna("a1"));
+        store.insert(make_dna("a2"));
+        // Both have fuzzy_hash = "fuzzy123"
+        let similar = store.find_similar("fuzzy123");
+        assert_eq!(similar.len(), 2);
+    }
+
+    #[test]
+    fn find_similar_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DnaStore::load(dir.path()).unwrap();
+        store.insert(make_dna("a1"));
+        let similar = store.find_similar("no_match");
+        assert!(similar.is_empty());
+    }
+
+    #[test]
+    fn top_threats_sorted_by_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DnaStore::load(dir.path()).unwrap();
+        store.insert(make_dna("low"));
+
+        let mut hot = make_dna("hot");
+        store.insert(hot.clone());
+        // Insert duplicate to bump seen_count
+        hot.exact_hash = "hot".to_string();
+        store.insert(hot);
+        store.insert(make_dna("hot")); // seen_count now 3
+
+        let top = store.top_threats(1);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].exact_hash, "hot");
+    }
+
+    #[test]
+    fn insert_duplicate_updates_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DnaStore::load(dir.path()).unwrap();
+        store.insert(make_dna("c1"));
+        assert!(store.get("c1").unwrap().classification.is_none());
+
+        let mut updated = make_dna("c1");
+        updated.classification = Some(crate::fingerprint::ThreatClass::BruteForceAndExploit);
+        store.insert(updated);
+        assert_eq!(
+            store.get("c1").unwrap().classification,
+            Some(crate::fingerprint::ThreatClass::BruteForceAndExploit)
+        );
+    }
+
+    #[test]
+    fn all_returns_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DnaStore::load(dir.path()).unwrap();
+        store.insert(make_dna("x1"));
+        store.insert(make_dna("x2"));
+        store.insert(make_dna("x3"));
+        assert_eq!(store.all().len(), 3);
+    }
 }

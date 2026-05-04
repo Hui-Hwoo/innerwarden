@@ -147,6 +147,109 @@ pub(super) fn check_auditd(env: &impl HardenEnv) -> CheckResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main command
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harden::env::{DirEntry, HardenEnv};
+
+    struct MockEnv {
+        auditd_installed: bool,
+        auditd_active: bool,
+        rules_content: String,
+    }
+
+    impl HardenEnv for MockEnv {
+        fn read_to_string(&self, path: &str) -> Option<String> {
+            if path == "/etc/audit/audit.rules" {
+                Some(self.rules_content.clone())
+            } else {
+                None
+            }
+        }
+        fn read_bytes(&self, _path: &str) -> Option<Vec<u8>> {
+            None
+        }
+        fn read_dir(&self, _path: &str) -> Vec<DirEntry> {
+            vec![]
+        }
+        fn metadata_mode(&self, _path: &str) -> Option<u32> {
+            None
+        }
+        fn path_exists(&self, path: &str) -> bool {
+            if path.contains("auditd") {
+                self.auditd_installed
+            } else {
+                false
+            }
+        }
+        fn command_stdout(&self, _program: &str, _args: &[&str]) -> Option<String> {
+            if self.auditd_active {
+                Some("active\n".to_string())
+            } else {
+                Some("inactive\n".to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_auditd_not_installed() {
+        let env = MockEnv {
+            auditd_installed: false,
+            auditd_active: false,
+            rules_content: "".to_string(),
+        };
+        let res = check_auditd(&env);
+        assert!(res
+            .findings
+            .iter()
+            .any(|f| f.title.contains("not installed")));
+    }
+
+    #[test]
+    fn test_check_auditd_installed_not_active() {
+        let env = MockEnv {
+            auditd_installed: true,
+            auditd_active: false,
+            rules_content: "".to_string(),
+        };
+        let res = check_auditd(&env);
+        assert!(res.findings.iter().any(|f| f.title.contains("not running")));
+    }
+
+    #[test]
+    fn test_check_auditd_missing_rules() {
+        let env = MockEnv {
+            auditd_installed: true,
+            auditd_active: true,
+            rules_content: "-w /etc/passwd\n".to_string(),
+        };
+        let res = check_auditd(&env);
+        assert!(res.findings.iter().any(|f| f.title.contains("missing")));
+    }
+
+    #[test]
+    fn test_check_auditd_all_rules_present() {
+        let env = MockEnv {
+            auditd_installed: true,
+            auditd_active: true,
+            rules_content: "\
+-S execve
+-w /etc/passwd
+-w /etc/shadow
+-w /etc/sudoers
+-w /etc/cron
+-w /etc/ssh
+-S connect
+-S ptrace
+-w /tmp -p x
+-S init_module
+"
+            .to_string(),
+        };
+        let res = check_auditd(&env);
+        assert!(res
+            .passed
+            .iter()
+            .any(|p| p.contains("All critical audit rules configured")));
+    }
+}

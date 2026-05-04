@@ -272,4 +272,43 @@ network.service loaded active running Network Manager
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].name, "network.service");
     }
+
+    #[test]
+    fn test_build_event() {
+        let unit = SystemdUnit {
+            name: "malicious.service".to_string(),
+            load_state: "loaded".to_string(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+            fragment_path: "/tmp/malicious.service".to_string(),
+        };
+
+        let event = build_event(
+            &unit,
+            "suspicious_existing_unit",
+            Severity::Critical,
+            "host123",
+            "Found malicious service",
+        );
+
+        assert_eq!(event.host, "host123");
+        assert_eq!(event.source, "systemd_inventory");
+        assert_eq!(event.kind, "system.suspicious_existing_unit");
+        assert_eq!(event.severity, Severity::Critical);
+        assert_eq!(event.summary, "Found malicious service");
+        assert_eq!(event.tags, vec!["systemd", "inventory", "persistence"]);
+
+        let entities = event.entities;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].value, "malicious.service");
+
+        let details = event.details;
+        assert_eq!(details["action"], "suspicious_existing_unit");
+        assert_eq!(details["unit_name"], "malicious.service");
+        assert_eq!(details["load_state"], "loaded");
+        assert_eq!(details["active_state"], "active");
+        assert_eq!(details["sub_state"], "running");
+        assert_eq!(details["fragment_path"], "/tmp/malicious.service");
+        assert_eq!(details["suspicious_path"], true);
+    }
 }

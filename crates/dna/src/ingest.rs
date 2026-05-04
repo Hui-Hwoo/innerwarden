@@ -391,4 +391,242 @@ mod tests {
         let closed = builder.close_stale(Utc::now());
         assert_eq!(closed.len(), 0);
     }
+
+    #[test]
+    fn parse_event_login_success() {
+        let line = r#"{"kind":"auth.login_success","ts":"2026-03-22T10:00:00Z","details":{"src_ip":"5.5.5.5"}}"#;
+        let (ip, atom, _, _) = parse_event(line).unwrap();
+        assert_eq!(ip, "5.5.5.5");
+        assert!(matches!(atom, Atom::Login { success: true }));
+    }
+
+    #[test]
+    fn parse_event_login_failure() {
+        let line = r#"{"kind":"auth.login_failure","ts":"2026-03-22T10:00:00Z","details":{"src_ip":"6.6.6.6"}}"#;
+        let (_, atom, _, _) = parse_event(line).unwrap();
+        assert!(matches!(atom, Atom::Login { success: false }));
+    }
+
+    #[test]
+    fn parse_event_privesc() {
+        let line = r#"{"kind":"privilege.escalation","ts":"2026-03-22T10:00:00Z","details":{"src_ip":"7.7.7.7"}}"#;
+        let (_, atom, _, _) = parse_event(line).unwrap();
+        assert!(matches!(atom, Atom::PrivEsc));
+    }
+
+    #[test]
+    fn parse_event_file_access_sensitive() {
+        let line = r#"{"kind":"file.read_access","ts":"2026-03-22T10:00:00Z","details":{"path":"/etc/shadow","src_ip":"8.8.8.8"}}"#;
+        let result = parse_event(line);
+        assert!(result.is_some());
+        let (_, atom, _, _) = result.unwrap();
+        assert!(matches!(atom, Atom::FileAccess { .. }));
+    }
+
+    #[test]
+    fn parse_event_file_access_normal_is_skipped() {
+        let line = r#"{"kind":"file.read_access","ts":"2026-03-22T10:00:00Z","details":{"path":"/var/log/syslog","src_ip":"9.9.9.9"}}"#;
+        let result = parse_event(line);
+        assert!(result.is_none()); // Normal files are skipped
+    }
+
+    #[test]
+    fn parse_event_no_ip_returns_none() {
+        let line = r#"{"kind":"shell.command_exec","ts":"2026-03-22T10:00:00Z","details":{"comm":"whoami"}}"#;
+        assert!(parse_event(line).is_none());
+    }
+
+    #[test]
+    fn parse_event_unknown_kind_returns_none() {
+        let line = r#"{"kind":"unknown.event","ts":"2026-03-22T10:00:00Z","details":{"src_ip":"1.1.1.1"}}"#;
+        assert!(parse_event(line).is_none());
+    }
+
+    #[test]
+    fn parse_event_invalid_json_returns_none() {
+        assert!(parse_event("not json").is_none());
+    }
+
+    #[test]
+    fn parse_incident_kill_chain() {
+        let line = r#"{"title":"Kill Chain detected","ts":"2026-03-22T10:00:00Z","entities":[{"type":"ip","value":"1.2.3.4"}],"evidence":[{"pattern":"REVERSE_SHELL"}]}"#;
+        let (ip, atom, _) = parse_incident(line).unwrap();
+        assert_eq!(ip, "1.2.3.4");
+        assert!(matches!(
+            atom,
+            Atom::KillChain {
+                pattern: KillChainPattern::ReverseShell
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_incident_brute_force() {
+        let line = r#"{"title":"Brute force attack","ts":"2026-03-22T10:00:00Z","entities":[{"type":"ip","value":"2.2.2.2"}]}"#;
+        let (_, atom, _) = parse_incident(line).unwrap();
+        assert!(matches!(atom, Atom::Login { success: false }));
+    }
+
+    #[test]
+    fn parse_incident_no_ip_returns_none() {
+        let line = r#"{"title":"something","ts":"2026-03-22T10:00:00Z","entities":[]}"#;
+        assert!(parse_incident(line).is_none());
+    }
+
+    #[test]
+    fn classify_kill_chain_pattern_all_variants() {
+        assert_eq!(
+            classify_kill_chain_pattern("reverse_shell"),
+            KillChainPattern::ReverseShell
+        );
+        assert_eq!(
+            classify_kill_chain_pattern("BIND_SHELL"),
+            KillChainPattern::BindShell
+        );
+        assert_eq!(
+            classify_kill_chain_pattern("code_inject"),
+            KillChainPattern::CodeInject
+        );
+        assert_eq!(
+            classify_kill_chain_pattern("EXPLOIT_SHELL"),
+            KillChainPattern::ExploitShell
+        );
+        assert_eq!(
+            classify_kill_chain_pattern("INJECT_SHELL"),
+            KillChainPattern::InjectShell
+        );
+        assert_eq!(
+            classify_kill_chain_pattern("EXPLOIT_C2"),
+            KillChainPattern::ExploitC2
+        );
+        assert_eq!(
+            classify_kill_chain_pattern("FULL_EXPLOIT"),
+            KillChainPattern::FullExploit
+        );
+        assert_eq!(
+            classify_kill_chain_pattern("DATA_EXFIL"),
+            KillChainPattern::DataExfil
+        );
+        assert_eq!(
+            classify_kill_chain_pattern("garbage"),
+            KillChainPattern::Unknown
+        );
+    }
+
+    #[test]
+    fn session_builder_deduplicates_pids() {
+        let mut builder = SessionBuilder::new();
+        let now = Utc::now();
+        builder.add_event("1.2.3.4", Atom::PrivEsc, now, Some(42));
+        builder.add_event("1.2.3.4", Atom::PrivEsc, now, Some(42));
+        let closed = builder.close_stale(now + Duration::seconds(600));
+        assert_eq!(closed[0].pids, vec![42]);
+    }
+
+    #[test]
+    fn parse_event_extracts_ip_from_entities_fallback() {
+        let line = r#"{"kind":"shell.command_exec","ts":"2026-03-22T10:00:00Z","details":{"comm":"whoami"},"entities":[{"type":"ip","value":"10.0.0.1"}]}"#;
+        let (ip, _, _, _) = parse_event(line).unwrap();
+        assert_eq!(ip, "10.0.0.1");
+    }
+
+    #[test]
+    fn test_read_new_lines_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        std::fs::File::create(&path).unwrap();
+
+        let mut lines_read = 0;
+        let offset = read_new_lines(&path, 0, |_| {
+            lines_read += 1;
+        });
+
+        assert_eq!(lines_read, 0);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_read_new_lines_incremental() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        writeln!(file, "{{\"event\": 1}}").unwrap();
+
+        let mut lines_read = 0;
+        let offset1 = read_new_lines(&path, 0, |_| {
+            lines_read += 1;
+        });
+
+        assert_eq!(lines_read, 1);
+        assert!(offset1 > 0);
+
+        // Write another line
+        writeln!(file, "{{\"event\": 2}}").unwrap();
+
+        // Read from previous offset
+        let mut lines_read_second = 0;
+        let offset2 = read_new_lines(&path, offset1, |_| {
+            lines_read_second += 1;
+        });
+
+        assert_eq!(lines_read_second, 1);
+        assert!(offset2 > offset1);
+
+        // Re-read should give 0
+        let mut lines_read_third = 0;
+        let offset3 = read_new_lines(&path, offset2, |_| {
+            lines_read_third += 1;
+        });
+
+        assert_eq!(lines_read_third, 0);
+        assert_eq!(offset3, offset2);
+    }
+
+    #[test]
+    fn test_read_new_lines_file_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        // Pretend file was 100 bytes long, but it's now smaller
+        std::fs::write(&path, "{\"short\": true}\n").unwrap();
+
+        let mut lines_read = 0;
+        let offset = read_new_lines(&path, 100, |_| {
+            lines_read += 1;
+        });
+
+        // It should reset offset to 0 and not read the line in the same call (returns 0 offset and caller tries again)
+        assert_eq!(lines_read, 0);
+        assert_eq!(offset, 0);
+
+        // Next read will pick it up
+        let mut lines_read2 = 0;
+        let offset2 = read_new_lines(&path, offset, |_| {
+            lines_read2 += 1;
+        });
+
+        assert_eq!(lines_read2, 1);
+        assert!(offset2 > 0);
+    }
+
+    #[test]
+    fn test_read_new_lines_skips_non_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        std::fs::write(&path, "not json\n{\"is_json\": true}\n").unwrap();
+
+        let mut lines_read = 0;
+        let offset = read_new_lines(&path, 0, |line| {
+            assert!(line.starts_with('{'));
+            lines_read += 1;
+        });
+
+        // Should only read the JSON line
+        assert_eq!(lines_read, 1);
+        assert!(offset > 0);
+    }
 }

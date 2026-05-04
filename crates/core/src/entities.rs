@@ -48,3 +48,40 @@ impl EntityRef {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_entity_ref_constructors() {
+        let ip = EntityRef::ip("1.2.3.4");
+        assert_eq!(ip.r#type, EntityType::Ip);
+        assert_eq!(ip.value, "1.2.3.4");
+
+        let user = EntityRef::user("root");
+        assert_eq!(user.r#type, EntityType::User);
+        assert_eq!(user.value, "root");
+
+        let container = EntityRef::container("abcdef123456");
+        assert_eq!(container.r#type, EntityType::Container);
+        assert_eq!(container.value, "abcdef123456");
+
+        let path = EntityRef::path("/etc/passwd");
+        assert_eq!(path.r#type, EntityType::Path);
+        assert_eq!(path.value, "/etc/passwd");
+
+        let service = EntityRef::service("sshd");
+        assert_eq!(service.r#type, EntityType::Service);
+        assert_eq!(service.value, "sshd");
+    }
+
+    #[test]
+    fn test_entity_type_serialization() {
+        assert_eq!(serde_json::to_string(&EntityType::Ip).unwrap(), "\"ip\"");
+        assert_eq!(
+            serde_json::to_string(&EntityType::Container).unwrap(),
+            "\"container\""
+        );
+    }
+}

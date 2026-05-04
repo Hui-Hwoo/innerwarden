@@ -142,4 +142,46 @@ mod tests {
         assert!(!web_push_enabled("   "));
         assert!(web_push_enabled("BElongPublicKey"));
     }
+
+    #[tokio::test]
+    async fn test_api_push_vapid_key() {
+        use axum::extract::State;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = crate::dashboard::state::test_dashboard_state(tmp.path());
+        state.web_push_vapid_public_key = "test_key".to_string();
+
+        let response = api_push_vapid_key(State(state)).await;
+        let body = axum::response::IntoResponse::into_response(response).into_body();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(json["publicKey"], "test_key");
+        assert_eq!(json["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn test_api_push_subscribe_disabled() {
+        use axum::extract::State;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(tmp.path());
+
+        let body = PushSubscribeBody {
+            endpoint: "test".to_string(),
+            keys: PushSubscribeKeys {
+                p256dh: "k".to_string(),
+                auth: "a".to_string(),
+            },
+        };
+
+        let response = api_push_subscribe(State(state), axum::Json(body)).await;
+        let body = axum::response::IntoResponse::into_response(response).into_body();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(json["success"], false);
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains("web push is not configured"));
+    }
 }

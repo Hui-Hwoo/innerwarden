@@ -798,6 +798,47 @@ mod tests {
         assert_eq!(filtered.len(), 0);
     }
 
+    #[tokio::test]
+    async fn test_api_attacker_profiles_empty() {
+        use axum::extract::{Query, State};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(tmp.path());
+
+        let query = AttackerProfilesQuery {
+            limit: None,
+            offset: None,
+            sort: None,
+            min_risk: None,
+        };
+        let response = api_attacker_profiles(State(state), Query(query)).await;
+
+        assert_eq!(response.0["total"].as_u64().unwrap(), 0);
+        assert!(response.0["profiles"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_api_baseline_status_empty() {
+        use axum::extract::State;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(tmp.path());
+
+        let response = api_baseline_status(State(state)).await;
+
+        assert_eq!(response.0["mature"].as_bool().unwrap(), false);
+        assert_eq!(response.0["training_days"].as_u64().unwrap(), 0);
+        assert!(response.0["user_classes"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_api_deep_security() {
+        use axum::extract::State;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(tmp.path());
+
+        let response = api_deep_security(State(state)).await;
+        assert_eq!(response.0["killchain_pids_tracked"].as_u64().unwrap(), 0);
+    }
+
     #[test]
     fn test_min_risk_100_filters_everything() {
         // min_risk=100 should filter all profiles below 100.
