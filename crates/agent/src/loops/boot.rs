@@ -171,7 +171,7 @@ pub(crate) fn backfill_015_research_only_backup_path(snapshot_path: &Path, stamp
 
 /// Build the primary AI provider used for the spec-029 capability
 /// router. Three branches:
-/// - `enabled = false` → `None` (Falco mode)
+/// - `enabled = false` → `None` (rules-only mode)
 /// - `enabled = true`, build succeeds → `Some(Arc<dyn AiProvider>)`
 /// - `enabled = true`, build fails → log warning, `None`
 ///

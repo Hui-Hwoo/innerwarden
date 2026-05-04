@@ -188,7 +188,7 @@ pub(crate) struct DashboardState {
     /// single `ai_provider` field. Briefing / explain endpoints
     /// resolve by capability (Generate / Explain) so the dashboard
     /// works whether the operator runs a full LLM, a classifier-
-    /// only deployment, or Falco-mode with no AI at all.
+    /// only deployment, or rules-only mode with no AI at all.
     pub(super) ai_router: crate::ai::AiRouter,
     /// Latest AI intelligence briefing.
     pub(super) latest_briefing: Arc<tokio::sync::Mutex<Option<crate::briefing::Briefing>>>,

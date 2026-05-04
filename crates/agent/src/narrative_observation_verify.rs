@@ -1818,9 +1818,9 @@ mod tests {
     // Spec 029 PR-C.2: ai_verify_ambiguous now resolves the provider
     // via `state.ai_router.provider_for(Classify)` instead of reading
     // the legacy `state.ai_provider` field. When the router has no
-    // Classify-capable provider (Falco-mode or classifier-only with
-    // the classifier declining Classify), the function must return
-    // early without panicking.
+    // Classify-capable provider (rules-only mode or classifier-only
+    // with the classifier declining Classify), the function must
+    // return early without panicking.
     #[tokio::test]
     async fn ai_verify_ambiguous_noop_when_router_has_no_classify_provider() {
         use crate::config::AgentConfig;

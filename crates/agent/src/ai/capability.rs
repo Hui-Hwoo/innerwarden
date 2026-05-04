@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 /// Each call site in the agent requests a capability (not a specific
 /// provider). The router resolves the request to a concrete provider
 /// or returns `None` when the role is unavailable (operator chose a
-/// Falco-like deployment with no LLM, for example).
+/// rules-only deployment with no LLM, for example).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Capability {
     /// Incident triage: take a `DecisionContext` and return an

@@ -91,10 +91,11 @@ impl AiRouter {
         Ok(Self { classifier, llm })
     }
 
-    /// Falco-mode factory: a router that serves no capabilities. Used
-    /// by the agent when `[ai] enabled = false` so code paths that
-    /// hold a router handle still compile but every `provider_for`
-    /// call returns `None`.
+    /// Rules-only mode factory: a router that serves no capabilities.
+    /// Used by the agent when `[ai] enabled = false` so code paths
+    /// that hold a router handle still compile but every
+    /// `provider_for` call returns `None`. See git history (Wave 8f
+    /// 2026-05-04) for the rename rationale.
     ///
     /// Prefer `new` when at least one slot is populated — this
     /// constructor is a deliberate "AI is off" declaration.
@@ -191,7 +192,7 @@ impl AiRouter {
         bits
     }
 
-    /// Is the router effectively "Falco mode" (no capabilities)?
+    /// Is the router effectively in rules-only mode (no capabilities)?
     /// Used by test helpers (`dashboard::state::test_dashboard_state`)
     /// and router unit tests to assert on construction results.
     #[allow(dead_code)]
@@ -220,7 +221,7 @@ impl AiRouter {
 /// Spec 029 PR-C.1: build an `AiRouter` from the primary provider
 /// plus optional per-role config sections. Extracted from
 /// `loops/boot.rs` so the branch logic (per-role build failure
-/// fallback, legacy-only back-compat path, Falco-mode empty config)
+/// fallback, legacy-only back-compat path, rules-only empty config)
 /// is unit-testable without spinning up the whole agent.
 ///
 /// Contract:
@@ -232,7 +233,7 @@ impl AiRouter {
 /// - Same logic for both classifier and llm roles.
 /// - If both resulting slots are empty, return `AiRouter::disabled()`
 ///   instead of the `EmptyRouter` error so the agent can run in
-///   Falco-mode (rules-only detection, no LLM cost).
+///   rules-only mode (sigma + correlation detection, no LLM cost).
 ///
 /// Side-effect callbacks keep tracing concerns in the caller; this
 /// helper stays pure enough to unit-test without mocking a logger.
@@ -885,10 +886,11 @@ mod tests {
     }
 
     // Spec 029 PR-C.1: no primary provider + both per-role blocks
-    // disabled. Router goes into Falco-mode (disabled) instead of
+    // disabled. Router goes into rules-only mode (disabled) instead of
     // erroring. The agent is explicitly allowed to run without AI.
+    // (Wave 8f 2026-05-04: see git history for the test rename.)
     #[test]
-    fn build_from_config_no_primary_and_no_per_role_is_falco_mode() {
+    fn build_from_config_no_primary_and_no_per_role_is_rules_only_mode() {
         let (configured, fallbacks) = record_callbacks();
         let cfg_configured = configured.clone();
         let cfg_fallbacks = fallbacks.clone();
