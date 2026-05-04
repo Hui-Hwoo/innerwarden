@@ -18,7 +18,9 @@ use innerwarden_core::{
     event::{Event, Severity},
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, info, warn};
+
+use super::log_state::{classify_open, log_instruction_for, LogInstruction, OpenLogState};
 
 pub struct NginxErrorCollector {
     path: String,
@@ -40,11 +42,35 @@ impl NginxErrorCollector {
         let host = self.host.clone();
         let mut offset = self.start_offset;
 
+        // Wave 9f (AUDIT-010 anchor): same per-retry log-spam suppression
+        // as nginx_access. See `super::log_state` for the contract.
+        let mut open_log_state = OpenLogState::new();
+
         loop {
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
+            let open_result = std::fs::File::open(&path);
+            let action = classify_open(
+                &mut open_log_state,
+                open_result.as_ref().err().map(|e| format!("{e:#}")),
+            );
+            let instruction = log_instruction_for(&action);
+            let file = match open_result {
+                Ok(f) => {
+                    if instruction == LogInstruction::InfoRecovered {
+                        info!(path = %path, "nginx_error: open recovered");
+                    }
+                    f
+                }
                 Err(e) => {
-                    warn!("nginx_error: cannot open {path}: {e:#}");
+                    let err_str = format!("{e:#}");
+                    match instruction {
+                        LogInstruction::WarnCannotOpen => {
+                            warn!(path = %path, error = %err_str, "nginx_error: cannot open");
+                        }
+                        LogInstruction::DebugSuppressed => {
+                            debug!(path = %path, error = %err_str, "nginx_error: still cannot open (suppressed)");
+                        }
+                        _ => debug_assert!(false, "unexpected instruction on Err: {instruction:?}"),
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -331,5 +357,73 @@ mod tests {
         let line = format!(r#"2024/01/15 12:34:56 [emerg] 1234#1234: {long_msg}"#);
         let entry = parse_line(&line).unwrap();
         assert_eq!(entry.message.len(), 200);
+    }
+
+    // ── Wave 9f integration anchors (AUDIT-010) ────────────────────────
+    //
+    // Same pattern as `nginx_access::tests`: exercise the Ok and Err arms
+    // of the `match open_result` so the per-verdict log-instruction
+    // branches get tarpaulin coverage. The pure verdict→level mapping is
+    // pinned in `log_state::tests`; these add the collector wiring.
+
+    use std::io::Write;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn run_emits_event_for_existing_error_line() {
+        // Ok arm: tempfile with one valid `[error]` line that has a
+        // client IP. The collector must open the file, parse the line,
+        // and emit an `http.error` event.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("error.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"2026/01/15 12:34:56 [error] 1234#1234: *7 open() "/etc/passwd" failed (2: No such file or directory), client: 198.51.100.7, server: example.com, request: "GET /etc/passwd HTTP/1.1", host: "example.com""#
+        )
+        .unwrap();
+        drop(f);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let shared_offset = Arc::new(AtomicU64::new(0));
+        let collector =
+            NginxErrorCollector::new(path.to_str().unwrap(), "test-host".to_string(), 0);
+        let handle = tokio::spawn(collector.run(tx, shared_offset));
+
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("should not time out")
+            .expect("event channel must produce one event");
+
+        assert_eq!(event.source, "nginx_error");
+        assert_eq!(event.kind, "http.error");
+        assert!(event.summary.contains("198.51.100.7"));
+
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_retries_quietly_on_persistent_missing_file() {
+        // Err arm: the path does not exist. The collector hits Err on
+        // every iteration and must not panic. First iteration: WARN.
+        // Subsequent iterations within the same failure episode: DEBUG
+        // (suppressed). We trust `log_instruction_for` unit tests for the
+        // verdict→level mapping; this test simply exercises the wiring.
+        let (tx, _rx) = mpsc::channel::<Event>(16);
+        let shared_offset = Arc::new(AtomicU64::new(0));
+        let collector = NginxErrorCollector::new(
+            "/var/empty/_nonexistent_innerwarden_test_path/error.log".to_string(),
+            "test-host".to_string(),
+            0,
+        );
+        let handle = tokio::spawn(collector.run(tx, shared_offset));
+
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+        }
+
+        handle.abort();
+        let _ = handle.await;
     }
 }

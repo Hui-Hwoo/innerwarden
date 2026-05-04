@@ -22,7 +22,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 toml = "1.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # Structural command analysis (AST) for execution-guard detector
 tree-sitter = "0.26"
 tree-sitter-bash = "0.25"
@@ -44,3 +44,18 @@ tempfile = "3"
 proptest = "1"
 serde_yaml = "0.9"
 glob = "0.3"
+# `test-util` enables `#[tokio::test(start_paused = true)]` and
+# `tokio::time::advance` used by the nginx_access / nginx_error
+# integration tests in Wave 9f. Without this feature the macro expands
+# to a Builder method that is gated out, breaking compilation.
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# Wave 9f (AUDIT-009 root): journald sink wired in main.rs when the
+# binary runs under systemd (detected via `JOURNAL_STREAM` env var).
+# Without this, tracing-subscriber writes plain text to stdout which
+# journald captures with no `PRIORITY=` field, so `journalctl -p
+# warning` silently drops every WARN this crate emits. tracing-journald
+# sets PRIORITY based on the tracing level via sd_journal_send so
+# operator severity filters work as documented.
+[target.'cfg(target_os = "linux")'.dependencies]
+tracing-journald = "0.3"

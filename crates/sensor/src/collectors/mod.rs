@@ -11,6 +11,7 @@ pub mod http_capture;
 pub mod integrity;
 pub mod journald;
 pub mod kernel_integrity;
+pub mod log_state;
 pub mod macos_log;
 pub mod net_snapshot;
 pub mod nginx_access;

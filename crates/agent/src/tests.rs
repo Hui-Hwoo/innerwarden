@@ -1702,3 +1702,59 @@ fn narrative_accumulator_resets_on_date_change() {
     assert!(acc.events_by_kind.is_empty());
     assert_eq!(acc.date, "2026-01-02");
 }
+
+// ── Wave 9f anchors (2026-05-04) — journald-detection contract ─────────
+//
+// AUDIT-009 root: tracing-subscriber writes plain text to stdout which
+// journald captures with no `PRIORITY=` field. `journalctl -p warning`
+// then silently drops every WARN this crate emits. The fix routes
+// tracing through `tracing-journald` when the binary runs under systemd
+// (detected via JOURNAL_STREAM env var). These anchors pin the detection
+// logic so a future refactor that breaks the env-var contract is caught
+// at test time rather than by the operator one morning when their
+// `journalctl -p warning` query goes silent.
+
+#[test]
+fn use_journald_layer_returns_true_when_journal_stream_is_set() {
+    // The JOURNAL_STREAM=<dev>:<inode> shape that systemd documents.
+    assert!(crate::use_journald_layer(Some("8:42")));
+}
+
+#[test]
+fn use_journald_layer_returns_false_when_env_is_unset() {
+    // Off-systemd dev shell + macOS dev: env var simply absent. We must
+    // NOT try to write to a non-existent journal socket because that
+    // fails the binary at startup on macOS where there is no /run/systemd
+    // at all.
+    assert!(!crate::use_journald_layer(None));
+}
+
+#[test]
+fn use_journald_layer_returns_false_when_env_is_empty_string() {
+    // Defensive: env vars set to empty string are common operator
+    // mistakes (e.g. `JOURNAL_STREAM= cargo run`). Treat empty as unset.
+    assert!(!crate::use_journald_layer(Some("")));
+}
+
+#[test]
+fn build_tracing_env_filter_includes_innerwarden_directives() {
+    // Anchor: the env filter MUST enable both the `innerwarden_agent`
+    // namespace (the actual code) and `telegram_audit` + `innerwarden_store`
+    // (sub-namespaces previous PRs explicitly opted into - PRs #357 and
+    // the audit-ui spec). Dropping any of these silently turns off
+    // operator-visible logs for the affected subsystem.
+    let f = crate::build_tracing_env_filter().expect("env filter must build");
+    let s = format!("{}", f);
+    assert!(
+        s.contains("innerwarden_agent"),
+        "env filter must enable innerwarden_agent; got: {s}"
+    );
+    assert!(
+        s.contains("telegram_audit"),
+        "env filter must enable telegram_audit; got: {s}"
+    );
+    assert!(
+        s.contains("innerwarden_store"),
+        "env filter must enable innerwarden_store; got: {s}"
+    );
+}

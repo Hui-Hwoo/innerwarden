@@ -153,6 +153,56 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/config.rs::tests::every_top_level_section_is_documented_with_an_inner_struct` — locks the canonical set of top-level sections. Adding a new section is fine; renaming or removing one fails this test, forcing the contributor to either pair the rename with a `serde(alias)` (back-compat for existing prod agent.toml files) or document the breaking change.
 
+### Sensor log discipline (Wave 9f — AUDIT-010 anchor)
+
+- `crates/sensor/src/collectors/log_state.rs::tests::first_failure_warns_subsequent_identical_failures_are_quiet` — `OpenLogState` emits exactly one `WarnNewFailure` for the first failure in a state and `Quiet` on every subsequent retry with the same error. Pinned the 2026-05-04 prod log spam where `nginx_access` and `nginx_error` collectors emitted **728 WARN entries in 30 minutes** while retrying a missing log file every 5 s — one WARN per attempt instead of one WARN per failure episode. Pre-fix the same scenario produced ~720 WARN/h; post-fix it produces 1.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::recovery_after_failure_emits_info_and_resets` — when an open succeeds after a failure, `observe_open` returns `InfoRecovered` (logged at INFO by the collector). Pairs with the WARN the operator saw earlier; closes the loop on the failure episode.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::different_error_after_first_failure_warns_again` — ENOENT followed by EACCES re-WARNs because the failure shape changed. Anti-regression for a "remember every error we ever saw and never WARN again" simplification that would silence the second failure class.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::flapping_failure_recovery_failure_re_warns_each_failure_episode` — drop-in / drop-out / drop-in cycles produce one WARN per failure episode + one INFO per recovery. Anti-regression for cumulative-state designs that would silence the second episode.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::long_run_steady_failure_emits_one_warn_total` — end-to-end count: 720 retries against a persistent failure produces exactly 1 WARN (vs 720 pre-fix). The headline anchor for the AUDIT-010 reproduction case.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::classify_open_repeat_failure_returns_retry_quiet` — `classify_open` returns `Retry { verdict: Quiet }` for repeated identical failures, so the collector's match arm leads to a debug log, never a WARN. Anti-regression for accidentally re-emitting WARN on every retry through the high-level helper.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::classify_open_recovery_returns_proceed_info_recovered` — the success-after-failure path produces `Proceed { verdict: Some(InfoRecovered) }`, so the collector knows to log the recovery INFO line and resume the read loop.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::log_instruction_retry_quiet_is_debug_suppressed` - `log_instruction_for(Retry { Quiet })` returns `DebugSuppressed`. Anti-regression for collapsing the suppressed-retry branch back to `WarnCannotOpen`, which would resurrect the AUDIT-010 prod log flood (~720 WARN/h on a missing nginx log).
+
+- `crates/sensor/src/collectors/log_state.rs::tests::log_instruction_retry_first_failure_is_warn` - `log_instruction_for(Retry { WarnNewFailure })` returns `WarnCannotOpen`. Pins that the FIRST observation of a failure stays at WARN (operator visibility) regardless of how the per-verdict mapping is rewritten.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::log_instruction_end_to_end_through_classify_open` - exercises the full `state -> classify_open -> log_instruction_for` chain across 100 retries: 1 WARN, 100 DEBUGs, 1 INFO recovery. End-to-end shape that documents the contract three layers care about.
+
+- `crates/sensor/src/collectors/log_state.rs::tests::log_instruction_retry_recovered_falls_back_to_debug_in_release` - defensive: if a future verdict variant ever ends up on a `Retry { InfoRecovered }` path (contract drift), the helper returns the QUIETEST level, not WARN. `debug_assert!` still fires in debug builds; release builds degrade to `DebugSuppressed`.
+
+- `crates/sensor/src/collectors/nginx_access.rs::tests::run_emits_event_for_existing_log_line` - exercises the `Ok` arm of `match open_result` end-to-end: tempfile with one valid combined-log-format line, the collector parses it and emits an `http.request` event. Anchors that the Wave 9f refactor (extracting `log_instruction_for`) did not break the happy path.
+
+- `crates/sensor/src/collectors/nginx_access.rs::tests::run_retries_quietly_on_persistent_missing_file` - exercises the `Err` arm under paused tokio time so the 5-second retry sleep is virtual. Anchors that the collector survives a missing file across multiple iterations without panicking. Pairs with the unit tests on `log_instruction_for` for the verdict-to-level mapping.
+
+- `crates/sensor/src/collectors/nginx_error.rs::tests::run_emits_event_for_existing_error_line` - same `Ok`-arm anchor as nginx_access, on the error log collector. Tempfile with a `[error]` line carrying a client IP must produce one `http.error` event.
+
+- `crates/sensor/src/collectors/nginx_error.rs::tests::run_retries_quietly_on_persistent_missing_file` - same `Err`-arm anchor as nginx_access, on the error log collector.
+
+### Tracing journald priority (Wave 9f - AUDIT-009 root)
+
+- `crates/agent/src/tests::use_journald_layer_returns_true_when_journal_stream_is_set` - `use_journald_layer` returns true iff the binary is being captured by systemd's journal stream (detected via the `JOURNAL_STREAM=<dev>:<inode>` env var). Pinned the 2026-05-04 audit AUDIT-009: pre-fix `journalctl -p warning` silently dropped every WARN this crate emitted because `tracing-subscriber`'s fmt layer wrote plain text to stdout with no `PRIORITY=` field. Wave 9f routes tracing through `tracing-journald` when this returns true, which sets PRIORITY based on the tracing level via `sd_journal_send`.
+
+- `crates/agent/src/tests::use_journald_layer_returns_false_when_env_is_unset` — off-systemd dev shell + macOS dev: env var absent, `use_journald_layer` returns false so the binary does NOT try to write to a non-existent journal socket (would fail at startup on macOS where there is no `/run/systemd`).
+
+- `crates/agent/src/tests::use_journald_layer_returns_false_when_env_is_empty_string` — defensive: `JOURNAL_STREAM=` (empty) is treated as unset. Anti-regression for an operator's foreground run silently attempting a journald write that fails.
+
+- `crates/agent/src/tests::build_tracing_env_filter_includes_innerwarden_directives` — the env filter MUST enable both `innerwarden_agent` (the actual code) and `telegram_audit` + `innerwarden_store` (sub-namespaces previous PRs explicitly opted into — PR #357 and the audit-ui spec). Dropping any of these silently turns off operator-visible logs for the affected subsystem.
+
+- `crates/sensor/src/main.rs::tests::use_journald_layer_returns_true_when_journal_stream_is_set` — same contract on the sensor side.
+
+- `crates/sensor/src/main.rs::tests::use_journald_layer_returns_false_when_env_is_unset` — same defensive case for sensor.
+
+- `crates/sensor/src/main.rs::tests::use_journald_layer_returns_false_when_env_is_empty_string` — same empty-env defensive case for sensor.
+
+- `crates/sensor/src/main.rs::tests::build_tracing_env_filter_includes_innerwarden_sensor_directive` — the sensor's env filter MUST enable the `innerwarden_sensor` namespace; dropping it silently turns off most logs.
+
 ### Cloudflare CIDR validation (Wave 9g — AUDIT-017 anchor)
 
 - `crates/agent/src/cloudflare.rs::tests::cloudflare_target_is_valid_accepts_bare_ipv4` — bare IPv4 / IPv6 addresses (no prefix) pass the validator. Cloudflare's IP Access Rules API treats them as host-targeted blocks; the validator must not require a prefix.

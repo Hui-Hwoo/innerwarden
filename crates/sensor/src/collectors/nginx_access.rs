@@ -12,7 +12,9 @@ use innerwarden_core::{
     event::{Event, Severity},
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, info, warn};
+
+use super::log_state::{classify_open, log_instruction_for, LogInstruction, OpenLogState};
 
 pub struct NginxAccessCollector {
     path: String,
@@ -34,12 +36,41 @@ impl NginxAccessCollector {
         let host = self.host.clone();
         let mut offset = self.start_offset;
 
+        // Wave 9f (AUDIT-010 anchor): suppress per-retry log spam. The
+        // collector retries to open `path` every 5s when the file is
+        // unreadable; pre-fix that emitted ~720 WARN entries per hour. The
+        // state machine emits exactly one WARN per failure episode + one
+        // INFO on recovery. See `super::log_state` for the contract.
+        let mut open_log_state = OpenLogState::new();
+
         loop {
-            // Open file and seek to last known offset
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
+            // Open file and seek to last known offset.
+            let open_result = std::fs::File::open(&path);
+            let action = classify_open(
+                &mut open_log_state,
+                open_result.as_ref().err().map(|e| format!("{e:#}")),
+            );
+            let instruction = log_instruction_for(&action);
+            let file = match open_result {
+                Ok(f) => {
+                    if instruction == LogInstruction::InfoRecovered {
+                        info!(path = %path, "nginx_access: open recovered");
+                    }
+                    f
+                }
                 Err(e) => {
-                    warn!("nginx_access: cannot open {path}: {e:#}");
+                    let err_str = format!("{e:#}");
+                    match instruction {
+                        LogInstruction::WarnCannotOpen => {
+                            warn!(path = %path, error = %err_str, "nginx_access: cannot open");
+                        }
+                        LogInstruction::DebugSuppressed => {
+                            debug!(path = %path, error = %err_str, "nginx_access: still cannot open (suppressed)");
+                        }
+                        // None / InfoRecovered are unreachable on the Err
+                        // arm per classify_open's contract.
+                        _ => debug_assert!(false, "unexpected instruction on Err: {instruction:?}"),
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -517,5 +548,91 @@ mod tests {
     #[test]
     fn test_extract_last_quoted_single_quote() {
         assert_eq!(extract_last_quoted("hello \"world"), None);
+    }
+
+    // ── Wave 9f integration anchors (AUDIT-010) ────────────────────────
+    //
+    // These exercise the actual `run` loop so the per-verdict log-level
+    // branches (warn for first failure, debug for repeated failures, info
+    // for recovery, plus the Ok-arm of the `match open_result`) get
+    // covered by tarpaulin. Pure unit tests on `log_instruction_for`
+    // already pin the verdict→level mapping; these add the collector
+    // wiring on top.
+    //
+    // Time is mocked via `start_paused = true` so the 5-second retry
+    // sleep is virtual; tests run in milliseconds while still exercising
+    // multiple iterations of the retry loop.
+
+    use std::io::Write;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn run_emits_event_for_existing_log_line() {
+        // Ok arm of the match open_result. Pre-seed a tempfile with one
+        // valid nginx access log line, run the collector against it, and
+        // assert that the event lands on the channel. Anchors that the
+        // refactor to `log_instruction_for` did not break the happy path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"203.0.113.10 - - [01/Jan/2026:00:00:00 +0000] "GET /healthz HTTP/1.1" 200 5 "-" "curl/8.0""#
+        )
+        .unwrap();
+        drop(f);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let shared_offset = Arc::new(AtomicU64::new(0));
+        let collector =
+            NginxAccessCollector::new(path.to_str().unwrap(), "test-host".to_string(), 0);
+        let handle = tokio::spawn(collector.run(tx, shared_offset));
+
+        // Receive the parsed event. With paused time the inter-iteration
+        // 500ms sleep is also virtual, but the collector emits the event
+        // before the first such sleep.
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("should not time out")
+            .expect("event channel must produce one event");
+
+        assert_eq!(event.source, "nginx_access");
+        assert_eq!(event.kind, "http.request");
+        assert!(event.summary.contains("203.0.113.10"));
+
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_retries_quietly_on_persistent_missing_file() {
+        // Err arm of the match open_result. Path that does not exist:
+        // the collector hits Err, calls log_instruction_for (which on
+        // first hit returns WarnCannotOpen), sleeps 5s, retries. Subsequent
+        // iterations get DebugSuppressed. The test does not assert on log
+        // output (we trust log_instruction_for's unit tests for that) but
+        // it DOES exercise the Err arm + the sleep + the continue path,
+        // which is the bulk of the changed lines under codecov.
+        let (tx, _rx) = mpsc::channel::<Event>(16);
+        let shared_offset = Arc::new(AtomicU64::new(0));
+        let collector = NginxAccessCollector::new(
+            "/var/empty/_nonexistent_innerwarden_test_path/access.log".to_string(),
+            "test-host".to_string(),
+            0,
+        );
+        let handle = tokio::spawn(collector.run(tx, shared_offset));
+
+        // Advance virtual time past several retry cadences. Each
+        // tokio::time::advance hop wakes any sleeping task whose deadline
+        // it passes, so the collector iterates the loop multiple times.
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Cancel the collector. Aborting from inside the test runtime is
+        // safe: the task does not hold any externally-visible resource
+        // that needs draining.
+        handle.abort();
+        let _ = handle.await; // resolve the JoinHandle (ignores AbortedError)
     }
 }

@@ -719,24 +719,7 @@ async fn main() -> Result<()> {
     // The persistent audit lives in `data_dir/telegram-sent.jsonl`
     // (see `telegram::client::write_audit_jsonl`) so journald log
     // rotation does not lose the trail.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("innerwarden_agent=info".parse()?)
-                .add_directive("telegram_audit=info".parse()?)
-                // 2026-05-01 (audit-ui spec): the maintenance scheduler
-                // emits `info!` log lines from `innerwarden_store::maintenance`
-                // for the steady-state path ("hash chain intact (documented
-                // breaks tolerated)", "kv expired cleanup", etc.). Without
-                // this directive those drop at the default WARN level,
-                // which means a successful hourly tick is invisible
-                // (operator only sees output when something is broken —
-                // an asymmetry that hid the prod chain-fix verification
-                // for ~1h2026-05-01 03:38 UTC. Same family as the
-                // `telegram_audit` gap PR #357 closed.
-                .add_directive("innerwarden_store=info".parse()?),
-        )
-        .init();
+    init_tracing()?;
 
     let cli = Cli::parse();
 
@@ -801,6 +784,84 @@ fn run_validate_config_only(cli: Cli) -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// Build the tracing env-filter shared by every tracing init path. Pure
+/// so the unit test below can compare directives without reaching into
+/// process-global state.
+fn build_tracing_env_filter() -> Result<tracing_subscriber::EnvFilter> {
+    Ok(tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("innerwarden_agent=info".parse()?)
+        .add_directive("telegram_audit=info".parse()?)
+        // 2026-05-01 (audit-ui spec): the maintenance scheduler emits
+        // `info!` log lines from `innerwarden_store::maintenance` for the
+        // steady-state path ("hash chain intact (documented breaks
+        // tolerated)", "kv expired cleanup", etc.). Without this directive
+        // those drop at the default WARN level, which means a successful
+        // hourly tick is invisible (operator only sees output when
+        // something is broken). Same family as the telegram_audit gap
+        // PR #357 closed.
+        .add_directive("innerwarden_store=info".parse()?))
+}
+
+/// Wave 9f (AUDIT-009 root): true iff the process is being captured by
+/// systemd's journal stream. Pure helper so tests do not have to mutate
+/// process-global env vars - we pass the env value in as an argument.
+///
+/// systemd sets `JOURNAL_STREAM=<dev>:<inode>` on services launched via a
+/// unit file, so the binary's stdout/stderr go into the journal. Reading
+/// that env var is the documented way to detect the case (man:systemd.exec
+/// "Environment Variables Set or Propagated by the Manager"). When the
+/// variable is set we route tracing through `tracing-journald` so each
+/// record gets a real `PRIORITY=` field, instead of letting journald
+/// guess the priority off the captured plain stdout text.
+///
+/// `#[allow(dead_code)]` outside Linux: the only non-test caller is the
+/// Linux-cfg branch in `init_tracing`. macOS / dev-shell builds never
+/// reach the call site, but the unit tests below DO build and exercise
+/// the function on every platform - hence the `cfg_attr(not(test), ...)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn use_journald_layer(journal_stream: Option<&str>) -> bool {
+    journal_stream.is_some_and(|v| !v.is_empty())
+}
+
+/// Set up tracing for the agent binary. Routes through `tracing-journald`
+/// when running under systemd, plain stdout fmt subscriber otherwise. See
+/// [`use_journald_layer`] for the systemd-detection contract.
+fn init_tracing() -> Result<()> {
+    let env_filter = build_tracing_env_filter()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let journal_stream = std::env::var("JOURNAL_STREAM").ok();
+        if use_journald_layer(journal_stream.as_deref()) {
+            // Systemd-managed run: emit structured journal records. WARN /
+            // ERROR get PRIORITY=4/3 so `journalctl -p warning` filters
+            // work. Record fields land as JOURNAL_FIELD entries which
+            // operators can `grep` with `journalctl _JOURNAL_FIELD=...`.
+            // If the journald socket is unreachable for any reason fall
+            // back to fmt so the agent still boots.
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            match tracing_journald::layer() {
+                Ok(layer) => {
+                    tracing_subscriber::registry()
+                        .with(env_filter)
+                        .with(layer)
+                        .init();
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "tracing-journald layer unavailable ({e}); falling back to stdout fmt subscriber"
+                    );
+                }
+            }
+        }
+    }
+    // Off-systemd, dev shell, macOS: stdout fmt with the existing env-filter.
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    Ok(())
 }
 
 #[cfg(test)]
