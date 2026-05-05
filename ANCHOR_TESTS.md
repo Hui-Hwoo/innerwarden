@@ -300,6 +300,24 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent-guard/src/threats.rs::tests::does_not_detect_downloader_without_subsequent_executor` - `curl evil.com | tee out.txt` (download + non-executor) must NOT trip this specific detector.
 - `crates/agent-guard/src/threats.rs::tests::does_not_detect_double_pipe_with_only_downloader` - downloader followed by non-executor pipes (`grep | wc`) must not trigger.
 
+### AbuseIPDB burst cap bypass (Wave 3 - AUDIT-WAVE3-BURST-CAP anchor)
+
+- `crates/agent/src/abuseipdb_report_budget.rs::tests::plan_burst_within_cap_bypasses_pre_fix_but_now_caps_correctly` - the headline anchor: counter at 750, cap 800, batch of 100 ready items. Pre-fix planned 100 sends (all read counter=750 < 800), post-fix plans 50 sends + 50 skips with `DailyCapReached`. The in-batch counter `planned_sends_this_batch` short-circuits the cap before the batch dispatches.
+- `crates/agent/src/abuseipdb_report_budget.rs::tests::plan_keeps_normal_within_cap_passing_when_no_burst` - 5 items at counter 0 cap 800 must all Send. Anti-regression for the in-batch counter accidentally double-counting.
+- `crates/agent/src/abuseipdb_report_budget.rs::tests::plan_burst_exactly_at_remaining_cap_lands_no_skips` - boundary: counter 798, cap 800, batch of 2. Both Send.
+- `crates/agent/src/abuseipdb_report_budget.rs::tests::plan_burst_one_over_remaining_cap_skips_the_overflow` - same boundary + 1: batch of 3 produces 2 sends + 1 skip.
+- `crates/agent/src/abuseipdb_report_budget.rs::tests::plan_burst_with_cloud_safelist_does_not_consume_cap` - cloud-safelist hits go to `SkipCloud`, NOT `Send`, so they MUST NOT consume `planned_sends_this_batch` slots. Anti-regression for accidentally bumping the in-batch counter before the safelist short-circuit.
+
+### Sync I/O in async cleanup_expired_* (Wave 3 - AUDIT-WAVE3-SYNC-IO anchor)
+
+- `crates/agent/src/skills/builtin/suspend_user_sudo.rs::tests::enumerate_expired_suspensions_returns_only_expired_entries` - the pure-sync helper `enumerate_expired_suspensions_sync` filters expired entries, removes corrupt JSON inline, ignores non-`.json` files, and retains fresh entries. Pinned the 2026-05-04 ultrareview class where 3 async cleanup_expired_* fns blocked the tokio runtime via `std::fs::read_dir` + per-file `std::fs::read_to_string`. The fix offloads enumeration to `spawn_blocking` and routes per-entry deletes through `tokio::fs::remove_file`.
+- `crates/agent/src/skills/builtin/suspend_user_sudo.rs::tests::enumerate_expired_suspensions_empty_dir_returns_empty_vec` - empty dir does not error, returns empty vec.
+- `crates/agent/src/skills/builtin/suspend_user_sudo.rs::tests::enumerate_expired_suspensions_missing_dir_errors_with_context` - missing dir errors with the `read_dir <path>` context the caller can log usefully.
+- `crates/agent/src/skills/builtin/rate_limit_nginx.rs::tests::enumerate_expired_nginx_blocks_returns_only_expired_entries` - same contract for the nginx variant.
+- `crates/agent/src/skills/builtin/rate_limit_nginx.rs::tests::enumerate_expired_nginx_blocks_empty_dir` - empty dir non-error path.
+- `crates/agent/src/skills/builtin/block_container.rs::tests::enumerate_expired_container_blocks_returns_only_expired_entries` - same contract for the container variant.
+- `crates/agent/src/skills/builtin/block_container.rs::tests::enumerate_expired_container_blocks_includes_non_pause_actions` - the helper returns non-pause expired entries too (the async caller branches on `action` after enumeration). Anti-regression for filtering them at the helper layer.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

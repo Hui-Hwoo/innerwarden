@@ -195,6 +195,18 @@ where
     F: Fn(&str) -> Option<&'static str>,
 {
     let mut out = Vec::with_capacity(ready.len());
+    // Wave 3 (AUDIT-WAVE3-BURST-CAP, 2026-05-04 ultrareview): in-batch
+    // counter so a single flush cannot bypass the daily cap. Pre-fix
+    // every entry called `check_report_budget` independently and the
+    // KV counter was only persisted by `commit.apply()` AFTER the
+    // network call. A flush of 100 items with the counter at 750 and
+    // a 800 cap would therefore plan 100 `Send` outcomes (each call
+    // saw 750 < 800), then dispatch would push the persisted counter
+    // to 850 - 50 over cap. The fix tracks the in-flight planned
+    // increment locally so the (count + planned) >= cap check fires
+    // mid-batch and the remaining items get skipped with the same
+    // `DailyCapReached` reason the autonomous-block path uses.
+    let mut planned_sends_this_batch: u32 = 0;
     for (ip, comment, categories, _) in ready {
         if let Some(provider) = identify_provider(ip) {
             out.push(FlushOutcome::SkipCloud {
@@ -205,19 +217,28 @@ where
         }
 
         let commit = match store {
-            Some(sq) => match check_report_budget(sq, ip, today, daily_cap) {
-                ReportBudgetDecision::Allow(c) => Some(c),
-                ReportBudgetDecision::Reject(reason) => {
-                    out.push(FlushOutcome::Skip {
-                        ip: ip.clone(),
-                        reason,
-                    });
-                    continue;
+            Some(sq) => {
+                // Adjusted cap: subtract the in-batch planned sends so
+                // the next planning call sees the budget that WOULD
+                // exist after this batch's dispatch. Saturating sub
+                // floors at zero so a burst much larger than `daily_cap`
+                // still gets rejected uniformly.
+                let effective_cap = daily_cap.saturating_sub(planned_sends_this_batch);
+                match check_report_budget(sq, ip, today, effective_cap) {
+                    ReportBudgetDecision::Allow(c) => Some(c),
+                    ReportBudgetDecision::Reject(reason) => {
+                        out.push(FlushOutcome::Skip {
+                            ip: ip.clone(),
+                            reason,
+                        });
+                        continue;
+                    }
                 }
-            },
+            }
             None => None,
         };
 
+        planned_sends_this_batch = planned_sends_this_batch.saturating_add(1);
         out.push(FlushOutcome::Send {
             ip: ip.clone(),
             categories: categories.clone(),
@@ -725,5 +746,182 @@ mod tests {
             .expect("seed garbage");
         let ok = allow_or_panic(check_report_budget(&store, "1.2.3.4", "2026-04-18", 800));
         assert_eq!(ok.new_count(), 1);
+    }
+
+    // ── Wave 3 anchors (AUDIT-WAVE3-BURST-CAP) ────────────────────────
+    //
+    // Pre-fix `plan_queue_flush` called `check_report_budget` per-item,
+    // and that check read the persisted KV counter. Since the counter
+    // only updates AFTER a successful report (via `commit.apply()`),
+    // every item in a single batch saw the SAME starting counter and
+    // got `Allow`. A flush of N items with counter at C and cap K
+    // would plan N sends if C < K, regardless of whether C+N exceeded
+    // K. The fix tracks the in-batch planned increment locally so the
+    // (count + planned) comparison fires mid-batch.
+
+    #[test]
+    fn plan_burst_within_cap_bypasses_pre_fix_but_now_caps_correctly() {
+        // The exact prod failure shape: counter at 750, cap at 800,
+        // batch of 100 ready items. Pre-fix: 100 Send outcomes
+        // (effective post-dispatch counter 850 = 50 over cap).
+        // Post-fix: 50 Send + 50 Skip(DailyCapReached).
+        let store = mem_store();
+        store
+            .kv_set(LIMITS_NS, "abuseipdb_report_daily_2026-04-18", b"750")
+            .expect("seed counter");
+        let ready: Vec<_> = (0..100)
+            .map(|i| queue_entry(&format!("203.0.113.{i}")))
+            .collect();
+        let outcomes = plan_queue_flush(&ready, Some(&store), no_cloud, "2026-04-18", 800);
+        let send_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, FlushOutcome::Send { .. }))
+            .count();
+        let skip_cap_count = outcomes
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    FlushOutcome::Skip {
+                        reason: RejectReason::DailyCapReached,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            send_count, 50,
+            "exactly cap-counter (800-750) sends planned in one batch"
+        );
+        assert_eq!(
+            skip_cap_count, 50,
+            "remaining 50 items must skip with DailyCapReached"
+        );
+    }
+
+    #[test]
+    fn plan_keeps_normal_within_cap_passing_when_no_burst() {
+        // Anti-regression for the in-batch counter accidentally
+        // double-counting: 5 items at counter 0 cap 800 must all
+        // plan as Send. Pre-fix this passed; the fix MUST NOT
+        // regress it (e.g. by reading planned_sends before any
+        // Send outcome accumulates).
+        let store = mem_store();
+        let ready: Vec<_> = (0..5)
+            .map(|i| queue_entry(&format!("203.0.113.{i}")))
+            .collect();
+        let outcomes = plan_queue_flush(&ready, Some(&store), no_cloud, "2026-04-18", 800);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, FlushOutcome::Send { .. }))
+                .count(),
+            5,
+            "5 items at counter 0 cap 800 must all Send"
+        );
+    }
+
+    #[test]
+    fn plan_burst_exactly_at_remaining_cap_lands_no_skips() {
+        // Boundary: counter 798, cap 800, batch of exactly 2. Both
+        // Send. Pre-fix: also both Send. Post-fix MUST not regress:
+        // first Send drops effective_cap to 1 and budget check sees
+        // 798 < 1+798=799 = NO wait. The math is: effective_cap =
+        // daily_cap.saturating_sub(planned_sends). Item 1: 800-0=800,
+        // counter 798 < 800, Allow, planned=1. Item 2: 800-1=799,
+        // counter 798 < 799, Allow, planned=2. Both Send. Correct.
+        let store = mem_store();
+        store
+            .kv_set(LIMITS_NS, "abuseipdb_report_daily_2026-04-18", b"798")
+            .expect("seed counter");
+        let ready: Vec<_> = (0..2)
+            .map(|i| queue_entry(&format!("203.0.113.{i}")))
+            .collect();
+        let outcomes = plan_queue_flush(&ready, Some(&store), no_cloud, "2026-04-18", 800);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, FlushOutcome::Send { .. }))
+                .count(),
+            2,
+            "exactly 2 sends at the boundary"
+        );
+    }
+
+    #[test]
+    fn plan_burst_one_over_remaining_cap_skips_the_overflow() {
+        // Same boundary as above but batch of 3. Item 3 must skip.
+        let store = mem_store();
+        store
+            .kv_set(LIMITS_NS, "abuseipdb_report_daily_2026-04-18", b"798")
+            .expect("seed counter");
+        let ready: Vec<_> = (0..3)
+            .map(|i| queue_entry(&format!("203.0.113.{i}")))
+            .collect();
+        let outcomes = plan_queue_flush(&ready, Some(&store), no_cloud, "2026-04-18", 800);
+        let sends = outcomes
+            .iter()
+            .filter(|o| matches!(o, FlushOutcome::Send { .. }))
+            .count();
+        let skips = outcomes
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    FlushOutcome::Skip {
+                        reason: RejectReason::DailyCapReached,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(sends, 2, "first 2 fit the budget");
+        assert_eq!(skips, 1, "third item skips at the cap");
+    }
+
+    #[test]
+    fn plan_burst_with_cloud_safelist_does_not_consume_cap() {
+        // Cloud safelist hits do NOT count toward the in-batch
+        // planned counter (they go to SkipCloud, not Send). Anti-
+        // regression for accidentally bumping `planned_sends_this_batch`
+        // before the cloud-safelist short-circuit.
+        let store = mem_store();
+        store
+            .kv_set(LIMITS_NS, "abuseipdb_report_daily_2026-04-18", b"799")
+            .expect("seed counter");
+        // First 5 items are all Cloudflare. The 6th is a real attacker.
+        // Without the cap-only-on-Send fix, the cloud safelist hits
+        // would consume planned slots and the legit item would skip.
+        fn cloud_for_first_five(ip: &str) -> Option<&'static str> {
+            if ip.starts_with("104.16.0.") {
+                Some("Cloudflare")
+            } else {
+                None
+            }
+        }
+        let mut ready: Vec<_> = (0..5)
+            .map(|i| queue_entry(&format!("104.16.0.{i}")))
+            .collect();
+        ready.push(queue_entry("203.0.113.99"));
+        let outcomes = plan_queue_flush(
+            &ready,
+            Some(&store),
+            cloud_for_first_five,
+            "2026-04-18",
+            800,
+        );
+        let sends = outcomes
+            .iter()
+            .filter(|o| matches!(o, FlushOutcome::Send { .. }))
+            .count();
+        let skip_cloud = outcomes
+            .iter()
+            .filter(|o| matches!(o, FlushOutcome::SkipCloud { .. }))
+            .count();
+        assert_eq!(
+            sends, 1,
+            "real attacker must still Send (cap not eaten by safelist)"
+        );
+        assert_eq!(skip_cloud, 5);
     }
 }

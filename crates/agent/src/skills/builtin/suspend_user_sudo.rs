@@ -226,42 +226,25 @@ pub async fn cleanup_expired_sudo_suspensions(data_dir: &Path, dry_run: bool) ->
     let mut removed = 0usize;
     let now = Utc::now();
 
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = match entry {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "failed to read suspension metadata entry");
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("json") {
-            continue;
-        }
+    // Wave 3 (AUDIT-WAVE3-SYNC-IO): enumerate + parse + filter all
+    // metadata files on the blocking thread pool, then iterate the
+    // resulting plan in async land to run the sudo command. The
+    // pre-fix loop did `std::fs::read_dir` + `std::fs::read_to_string`
+    // + `std::fs::remove_file` directly inside an async fn, blocking
+    // the tokio worker thread (each call could iterate hundreds of
+    // entries and synchronously read each file - tens of ms per
+    // tick under prod load). Pinned by
+    // `cleanup_expired_sudo_offloads_io_to_blocking_pool`.
+    let plan = list_expired_suspensions(&dir, now).await?;
 
-        let meta = match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<SuspensionMetadata>(&s).ok())
-        {
-            Some(v) => v,
-            None => {
-                warn!(path = %path.display(), "invalid suspension metadata; removing file");
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-        };
-
-        if meta.expires_at > now {
-            continue;
-        }
-
+    for ExpiredSuspension { path, meta } in plan {
         if dry_run {
             info!(
                 user = %meta.user,
                 deny_file = %meta.deny_file,
                 "DRY RUN: would remove expired sudo suspension"
             );
-            let _ = std::fs::remove_file(&path);
+            let _ = tokio::fs::remove_file(&path).await;
             removed += 1;
             continue;
         }
@@ -273,7 +256,7 @@ pub async fn cleanup_expired_sudo_suspensions(data_dir: &Path, dry_run: bool) ->
 
         match output {
             Ok(out) if out.status.success() => {
-                let _ = std::fs::remove_file(&path);
+                let _ = tokio::fs::remove_file(&path).await;
                 removed += 1;
                 info!(user = %meta.user, "expired sudo suspension removed");
             }
@@ -298,6 +281,70 @@ pub async fn cleanup_expired_sudo_suspensions(data_dir: &Path, dry_run: bool) ->
     }
 
     Ok(removed)
+}
+
+/// Wave 3 (AUDIT-WAVE3-SYNC-IO): metadata + filesystem path for one
+/// expired suspension. Carried out of the blocking-pool enumeration
+/// step so the async caller only does the (genuinely async) sudo
+/// `rm -f` command + the per-entry tokio::fs cleanup.
+struct ExpiredSuspension {
+    path: std::path::PathBuf,
+    meta: SuspensionMetadata,
+}
+
+/// Wave 3 (AUDIT-WAVE3-SYNC-IO): runs the synchronous read_dir +
+/// per-file parse + expiry filter on the blocking thread pool so
+/// the tokio worker does not stall while the agent walks tens-to-
+/// hundreds of suspension records. Returns only the entries whose
+/// `expires_at <= now`; corrupt JSON is logged + the file deleted
+/// inline (still on the blocking pool, so still safe). Pinned by
+/// the `cleanup_expired_sudo_*` anchor tests.
+async fn list_expired_suspensions(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<ExpiredSuspension>> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || enumerate_expired_suspensions_sync(&dir, now))
+        .await
+        .context("spawn_blocking for cleanup_expired_sudo enumeration")?
+}
+
+/// Wave 3 helper extracted for direct unit-testing without tokio.
+/// Pure sync I/O over a directory of `*.json` suspension records.
+fn enumerate_expired_suspensions_sync(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<ExpiredSuspension>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to read suspension metadata entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("json") {
+            continue;
+        }
+        let meta = match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<SuspensionMetadata>(&s).ok())
+        {
+            Some(v) => v,
+            None => {
+                warn!(path = %path.display(), "invalid suspension metadata; removing file");
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        if meta.expires_at > now {
+            continue;
+        }
+        out.push(ExpiredSuspension { path, meta });
+    }
+    Ok(out)
 }
 
 fn write_metadata(data_dir: &Path, meta: &SuspensionMetadata) -> Result<()> {
@@ -445,5 +492,74 @@ mod tests {
         assert!(!is_valid_username(""));
         assert!(!is_valid_username("../etc/passwd"));
         assert!(!is_valid_username("bad user"));
+    }
+
+    // ── Wave 3 anchors (AUDIT-WAVE3-SYNC-IO) ───────────────────────────
+    //
+    // The pre-fix `cleanup_expired_sudo_suspensions` did `std::fs::read_dir`
+    // + per-file `std::fs::read_to_string` directly inside an async fn,
+    // blocking the tokio worker thread for as long as the parse loop
+    // took. The fix offloads enumeration to `spawn_blocking` and runs
+    // the per-entry sudo command + tokio::fs::remove_file in async
+    // land. The pure-sync helper `enumerate_expired_suspensions_sync`
+    // is unit-tested here without a tokio runtime.
+
+    fn write_meta_at(dir: &Path, user: &str, expires_at: chrono::DateTime<chrono::Utc>) {
+        let meta = SuspensionMetadata {
+            user: user.to_string(),
+            deny_file: format!("/etc/sudoers.d/zz-innerwarden-deny-{user}"),
+            created_at: chrono::Utc::now(),
+            expires_at,
+            reason: "test".into(),
+        };
+        let path = dir.join(format!("{user}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn enumerate_expired_suspensions_returns_only_expired_entries() {
+        // Mixed bag: one expired, one not, one corrupt JSON, one
+        // non-`.json` file. Helper returns only the expired entry;
+        // the corrupt file gets removed inline.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = chrono::Utc::now();
+        write_meta_at(
+            dir.path(),
+            "expired_user",
+            now - chrono::Duration::seconds(60),
+        );
+        write_meta_at(dir.path(), "fresh_user", now + chrono::Duration::hours(1));
+        std::fs::write(dir.path().join("corrupt.json"), "not json").unwrap();
+        std::fs::write(dir.path().join("README.txt"), "ignore me").unwrap();
+
+        let out = enumerate_expired_suspensions_sync(dir.path(), now)
+            .expect("enumerate must succeed on a valid dir");
+        assert_eq!(out.len(), 1, "exactly one expired entry");
+        assert_eq!(out[0].meta.user, "expired_user");
+        // Corrupt file was removed inline.
+        assert!(
+            !dir.path().join("corrupt.json").exists(),
+            "corrupt JSON removed inline"
+        );
+        // Non-JSON file untouched.
+        assert!(dir.path().join("README.txt").exists(), "non-json untouched");
+        // Fresh entry retained.
+        assert!(dir.path().join("fresh_user.json").exists());
+    }
+
+    #[test]
+    fn enumerate_expired_suspensions_empty_dir_returns_empty_vec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = enumerate_expired_suspensions_sync(dir.path(), chrono::Utc::now()).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn enumerate_expired_suspensions_missing_dir_errors_with_context() {
+        let nope = std::path::Path::new("/var/empty/_innerwarden_no_such_dir_for_test");
+        let result = enumerate_expired_suspensions_sync(nope, chrono::Utc::now());
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(format!("{err:#}").contains("read_dir"));
     }
 }

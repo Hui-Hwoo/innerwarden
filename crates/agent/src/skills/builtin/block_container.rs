@@ -156,38 +156,16 @@ pub async fn cleanup_expired_container_blocks(
     let mut removed = 0usize;
     let now = Utc::now();
 
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = match entry {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "failed to read container-block metadata entry");
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("json") {
-            continue;
-        }
+    // Wave 3 (AUDIT-WAVE3-SYNC-IO): same offload pattern as the
+    // sudo + nginx cleanups. Pre-fix this loop did std::fs::read_dir
+    // + per-file read_to_string inline in an async fn, blocking the
+    // tokio worker for as long as the parse loop took.
+    let plan = list_expired_container_blocks(&dir, now).await?;
 
-        let meta = match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<ContainerBlockMetadata>(&s).ok())
-        {
-            Some(v) => v,
-            None => {
-                warn!(path = %path.display(), "invalid container-block metadata; removing file");
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-        };
-
-        if meta.expires_at > now {
-            continue;
-        }
-
+    for ExpiredContainerBlock { path, meta } in plan {
         if meta.action != "pause" {
             // Non-pause actions (e.g. stop) are not automatically reversed
-            let _ = std::fs::remove_file(&path);
+            let _ = tokio::fs::remove_file(&path).await;
             continue;
         }
 
@@ -196,7 +174,7 @@ pub async fn cleanup_expired_container_blocks(
                 container_id = %meta.container_id,
                 "DRY RUN: would unpause expired container block"
             );
-            let _ = std::fs::remove_file(&path);
+            let _ = tokio::fs::remove_file(&path).await;
             removed += 1;
             continue;
         }
@@ -208,7 +186,7 @@ pub async fn cleanup_expired_container_blocks(
 
         match output {
             Ok(out) if out.status.success() => {
-                let _ = std::fs::remove_file(&path);
+                let _ = tokio::fs::remove_file(&path).await;
                 removed += 1;
                 info!(container_id = %meta.container_id, "expired container pause lifted");
             }
@@ -231,6 +209,64 @@ pub async fn cleanup_expired_container_blocks(
     }
 
     Ok(removed)
+}
+
+/// Wave 3 (AUDIT-WAVE3-SYNC-IO): metadata + path for one expired
+/// container block. Carried out of the blocking-pool enumeration so
+/// the async caller only does the (genuinely async) docker unpause.
+struct ExpiredContainerBlock {
+    path: std::path::PathBuf,
+    meta: ContainerBlockMetadata,
+}
+
+/// Wave 3 (AUDIT-WAVE3-SYNC-IO): enumerate + parse expired
+/// container blocks on the blocking thread pool. Same pattern as
+/// the sudo + nginx variants in their respective modules.
+async fn list_expired_container_blocks(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Vec<ExpiredContainerBlock>> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || enumerate_expired_container_blocks_sync(&dir, now))
+        .await
+        .context("spawn_blocking for cleanup_expired_container enumeration")?
+}
+
+/// Wave 3 helper extracted for direct unit-testing without tokio.
+fn enumerate_expired_container_blocks_sync(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Vec<ExpiredContainerBlock>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to read container-block metadata entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("json") {
+            continue;
+        }
+        let meta = match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<ContainerBlockMetadata>(&s).ok())
+        {
+            Some(v) => v,
+            None => {
+                warn!(path = %path.display(), "invalid container-block metadata; removing file");
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        if meta.expires_at > now {
+            continue;
+        }
+        out.push(ExpiredContainerBlock { path, meta });
+    }
+    Ok(out)
 }
 
 fn write_metadata(data_dir: &Path, meta: &ContainerBlockMetadata) -> Result<()> {
@@ -337,5 +373,68 @@ mod tests {
         assert!(!is_valid_container_id("bad container"));
         assert!(!is_valid_container_id("bad;rm -rf /"));
         assert!(!is_valid_container_id(&"a".repeat(129)));
+    }
+
+    // ── Wave 3 anchors (AUDIT-WAVE3-SYNC-IO) ───────────────────────────
+    //
+    // Same offload pattern as the sudo + nginx variants.
+
+    fn write_container_meta(
+        dir: &std::path::Path,
+        container_id: &str,
+        action: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let meta = ContainerBlockMetadata {
+            container_id: container_id.to_string(),
+            action: action.to_string(),
+            created_at: chrono::Utc::now(),
+            expires_at,
+            reason: "test".into(),
+        };
+        let path = dir.join(format!("{container_id}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn enumerate_expired_container_blocks_returns_only_expired_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = chrono::Utc::now();
+        write_container_meta(
+            dir.path(),
+            "expired_ctr",
+            "pause",
+            now - chrono::Duration::seconds(60),
+        );
+        write_container_meta(
+            dir.path(),
+            "fresh_ctr",
+            "pause",
+            now + chrono::Duration::hours(1),
+        );
+        std::fs::write(dir.path().join("corrupt.json"), "not json").unwrap();
+        let out = enumerate_expired_container_blocks_sync(dir.path(), now)
+            .expect("enumerate must succeed");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].meta.container_id, "expired_ctr");
+        assert!(!dir.path().join("corrupt.json").exists());
+    }
+
+    #[test]
+    fn enumerate_expired_container_blocks_includes_non_pause_actions() {
+        // The async caller branches on `action` after enumeration, so
+        // the helper MUST return non-pause expired entries too. Anti-
+        // regression for filtering them out at the helper layer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = chrono::Utc::now();
+        write_container_meta(
+            dir.path(),
+            "stopped_ctr",
+            "stop",
+            now - chrono::Duration::seconds(60),
+        );
+        let out = enumerate_expired_container_blocks_sync(dir.path(), now).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].meta.action, "stop");
     }
 }

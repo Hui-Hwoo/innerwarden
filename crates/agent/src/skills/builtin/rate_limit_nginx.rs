@@ -206,33 +206,16 @@ pub async fn cleanup_expired_nginx_blocks(data_dir: &Path, dry_run: bool) -> Res
     let mut removed = 0usize;
     let now = Utc::now();
 
-    let entries: Vec<_> = std::fs::read_dir(&dir)
-        .with_context(|| format!("read_dir {}", dir.display()))?
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-        .collect();
+    // Wave 3 (AUDIT-WAVE3-SYNC-IO): same offload pattern as
+    // suspend_user_sudo's cleanup. Pre-fix the read_dir + per-file
+    // read_to_string ran inline in this async fn, blocking the tokio
+    // worker for as long as the parse loop took.
+    let plan = list_expired_nginx_blocks(&dir, now).await?;
 
-    for entry in entries {
-        let path = entry.path();
-        let meta = match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<NginxBlockMetadata>(&s).ok())
-        {
-            Some(v) => v,
-            None => {
-                warn!(path = %path.display(), "invalid nginx block metadata; removing");
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-        };
-
-        if meta.expires_at > now {
-            continue;
-        }
-
+    for ExpiredNginxBlock { path, meta } in plan {
         if dry_run {
             info!(ip = %meta.ip, "DRY RUN: would remove expired nginx block");
-            let _ = std::fs::remove_file(&path);
+            let _ = tokio::fs::remove_file(&path).await;
             removed += 1;
             continue;
         }
@@ -252,13 +235,67 @@ pub async fn cleanup_expired_nginx_blocks(data_dir: &Path, dry_run: bool) -> Res
         if let Err(e) = nginx_reload().await {
             warn!(ip = %meta.ip, error = %e, "nginx reload failed after block expiry");
         } else {
-            let _ = std::fs::remove_file(&path);
+            let _ = tokio::fs::remove_file(&path).await;
             removed += 1;
             info!(ip = %meta.ip, "expired nginx deny rule removed");
         }
     }
 
     Ok(removed)
+}
+
+/// Wave 3 (AUDIT-WAVE3-SYNC-IO): metadata + path for one expired
+/// nginx block; carried out of the blocking-pool enumeration so the
+/// async caller only does the (genuinely async) reload + reinstall.
+struct ExpiredNginxBlock {
+    path: std::path::PathBuf,
+    meta: NginxBlockMetadata,
+}
+
+/// Wave 3 (AUDIT-WAVE3-SYNC-IO): enumerate + parse expired blocks on
+/// the blocking thread pool. Same pattern as
+/// `crate::skills::builtin::suspend_user_sudo::list_expired_suspensions`.
+async fn list_expired_nginx_blocks(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<ExpiredNginxBlock>> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || enumerate_expired_nginx_blocks_sync(&dir, now))
+        .await
+        .context("spawn_blocking for cleanup_expired_nginx enumeration")?
+}
+
+/// Wave 3 helper extracted for direct unit-testing without tokio.
+fn enumerate_expired_nginx_blocks_sync(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<ExpiredNginxBlock>> {
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("read_dir {}", dir.display()))?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let meta = match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<NginxBlockMetadata>(&s).ok())
+        {
+            Some(v) => v,
+            None => {
+                warn!(path = %path.display(), "invalid nginx block metadata; removing");
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        if meta.expires_at > now {
+            continue;
+        }
+        out.push(ExpiredNginxBlock { path, meta });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -564,5 +601,51 @@ mod tests {
     fn applicable_to_search_abuse() {
         let skill = RateLimitNginx;
         assert!(skill.applicable_to().contains(&"search_abuse"));
+    }
+
+    // ── Wave 3 anchors (AUDIT-WAVE3-SYNC-IO) ───────────────────────────
+    //
+    // Same offload pattern as suspend_user_sudo. Pure-sync helper
+    // `enumerate_expired_nginx_blocks_sync` is unit-tested without a
+    // tokio runtime.
+
+    fn write_nginx_meta(
+        dir: &std::path::Path,
+        ip: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let meta = NginxBlockMetadata {
+            ip: ip.to_string(),
+            created_at: chrono::Utc::now(),
+            expires_at,
+            reason: "test".into(),
+        };
+        let path = dir.join(format!("{}.json", ip.replace('.', "_")));
+        std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn enumerate_expired_nginx_blocks_returns_only_expired_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = chrono::Utc::now();
+        write_nginx_meta(
+            dir.path(),
+            "203.0.113.10",
+            now - chrono::Duration::seconds(60),
+        );
+        write_nginx_meta(dir.path(), "203.0.113.20", now + chrono::Duration::hours(1));
+        std::fs::write(dir.path().join("corrupt.json"), "not json").unwrap();
+        let out =
+            enumerate_expired_nginx_blocks_sync(dir.path(), now).expect("enumerate must succeed");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].meta.ip, "203.0.113.10");
+        assert!(!dir.path().join("corrupt.json").exists());
+    }
+
+    #[test]
+    fn enumerate_expired_nginx_blocks_empty_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = enumerate_expired_nginx_blocks_sync(dir.path(), chrono::Utc::now()).unwrap();
+        assert!(out.is_empty());
     }
 }
