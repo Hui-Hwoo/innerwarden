@@ -10,6 +10,7 @@
 //! them via shared entities (PID, IP, user) within a time window.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,8 @@ use tracing::info;
 use innerwarden_core::entities::{EntityRef, EntityType};
 use innerwarden_core::event::Severity;
 use innerwarden_core::incident::Incident;
+
+use crate::knowledge_graph::intern::intern;
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -36,12 +39,28 @@ pub enum Layer {
 }
 
 /// A normalized event for cross-layer correlation.
+///
+/// Wave 6 (AUDIT-WAVE6-INTERN, 2026-05-05): `source` and `kind` are
+/// `Arc<str>` interned at insert time so the 10 000-entry
+/// `event_window` (and any `AttackChain.events` clones it produces)
+/// shares one allocation per distinct value. Pre-Wave-6 each entry
+/// held an independent `String`, so a window full of
+/// `kind = "ssh.login_failed"` paid 10 000 × (24-byte header + heap
+/// chars). On the prod jeprof baseline saved 2026-05-05 these two
+/// fields drove ~1 MB of duplicated heap inside the correlation
+/// engine alone.
+///
+/// Pinned by
+/// `correlation_engine::tests::correlation_event_source_and_kind_share_arc_allocations`.
+///
+/// `incident_id` stays `String` because it is unique per incident — no
+/// dedup possible. `details` stays `serde_json::Value` (Wave 7 target).
 #[derive(Debug, Clone, Serialize)]
 pub struct CorrelationEvent {
     pub ts: DateTime<Utc>,
     pub layer: Layer,
-    pub source: String,
-    pub kind: String,
+    pub source: Arc<str>,
+    pub kind: Arc<str>,
     pub severity: Severity,
     pub entities: Vec<EntityRef>,
     pub details: serde_json::Value,
@@ -325,8 +344,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: event.ts,
             layer,
-            source: event.source.clone(),
-            kind: event.kind.clone(),
+            source: intern(&event.source),
+            kind: intern(&event.kind),
             severity: event.severity.clone(),
             entities: event.entities.clone(),
             details: event.details.clone(),
@@ -341,8 +360,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: incident.ts,
             layer,
-            source: "detector".to_string(),
-            kind: detector.to_string(),
+            source: intern("detector"),
+            kind: intern(detector),
             severity: incident.severity.clone(),
             entities: incident.entities.clone(),
             details: incident.evidence.clone(),
@@ -356,8 +375,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: Utc::now(),
             layer: Layer::Firmware,
-            source: "smm".to_string(),
-            kind: kind.to_string(),
+            source: intern("smm"),
+            kind: intern(kind),
             severity: Severity::High,
             entities: vec![],
             details,
@@ -370,8 +389,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: Utc::now(),
             layer: Layer::Hypervisor,
-            source: "hypervisor".to_string(),
-            kind: kind.to_string(),
+            source: intern("hypervisor"),
+            kind: intern(kind),
             severity: Severity::High,
             entities: vec![],
             details,
@@ -384,8 +403,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: Utc::now(),
             layer: Layer::Kernel,
-            source: "killchain".to_string(),
-            kind: kind.to_string(),
+            source: intern("killchain"),
+            kind: intern(kind),
             severity: Severity::Critical,
             entities: vec![],
             details,
@@ -398,8 +417,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: Utc::now(),
             layer: Layer::Userspace,
-            source: "dna".to_string(),
-            kind: kind.to_string(),
+            source: intern("dna"),
+            kind: intern(kind),
             severity: Severity::Medium,
             entities: vec![],
             details,
@@ -417,8 +436,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: Utc::now(),
             layer: Layer::Userspace,
-            source: "baseline".to_string(),
-            kind: kind.to_string(),
+            source: intern("baseline"),
+            kind: intern(kind),
             severity,
             entities,
             details,
@@ -442,8 +461,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: Utc::now(),
             layer: Layer::Userspace,
-            source: "autoencoder".to_string(),
-            kind: "neural.anomaly".to_string(),
+            source: intern("autoencoder"),
+            kind: intern("neural.anomaly"),
             severity,
             entities,
             details,
@@ -456,8 +475,8 @@ impl CorrelationEngine {
         CorrelationEvent {
             ts: Utc::now(),
             layer: Layer::Network,
-            source: "shield".to_string(),
-            kind: kind.to_string(),
+            source: intern("shield"),
+            kind: intern(kind),
             severity: Severity::High,
             entities: vec![],
             details,
@@ -491,9 +510,14 @@ fn matches_stage(
             event.kind.starts_with(prefix)
         } else if pattern.contains('|') {
             // OR match: "ssh_bruteforce|credential_stuffing"
-            pattern.split('|').any(|p| event.kind == p.trim())
+            // Wave 6: event.kind is `Arc<str>` so we deref via `&*`
+            // to get a `&str` PartialEq with the trimmed pattern.
+            pattern.split('|').any(|p| &*event.kind == p.trim())
         } else {
-            event.kind == *pattern
+            // `*event.kind` derefs `Arc<str>` to `str`; matched against
+            // `*pattern` (also `str`). The clippy `op_ref` lint flags
+            // `&*event.kind` in this position so we deref directly.
+            *event.kind == *pattern
         }
     });
 
@@ -1964,7 +1988,10 @@ impl CorrelationEngine {
         }
 
         for (ip, events) in &ip_detectors {
-            let unique_kinds: HashSet<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+            // Wave 6: e.kind is `Arc<str>` so deref via `&*` to get `&str`.
+            // Avoids the unstable `Arc<str>::as_str` (Rust feature gate
+            // `str_as_str`).
+            let unique_kinds: HashSet<&str> = events.iter().map(|e| &*e.kind).collect();
             if unique_kinds.len() >= 3 {
                 let cooldown_key = format!("CL-010:ip:{ip}");
                 if self.chain_cooldowns.contains_key(&cooldown_key) {
@@ -2020,13 +2047,66 @@ impl CorrelationEngine {
 mod tests {
     use super::*;
     use innerwarden_core::entities::EntityRef;
+    use innerwarden_core::event::Event;
+
+    /// Wave 6 (AUDIT-WAVE6-INTERN) anchor: pushing 10 000 events that
+    /// share `source`/`kind` strings into a `CorrelationEngine`'s
+    /// `event_window` must produce one Arc<str> per distinct value,
+    /// not 10 000 independent String allocations. Verified by
+    /// pointer-equality on the resulting `Arc<str>` fields.
+    ///
+    /// Pre-Wave-6 the type was `String`, so `event_window` of length
+    /// 10 000 with kind="ssh.login_failed" paid ~250 KB just for that
+    /// one repeated string. With `Arc<str>` interning the same window
+    /// pays one 24-byte Arc + one 16-byte heap allocation, full stop.
+    #[test]
+    fn correlation_event_source_and_kind_share_arc_allocations() {
+        // Build N CorrelationEvents from raw `Event` shapes that share
+        // source/kind. The CorrelationEvent::From<Event> impl is the
+        // production interning point.
+        let mut engine = CorrelationEngine::new();
+        for _ in 0..1000 {
+            let raw_event = Event {
+                ts: Utc::now(),
+                host: "h".into(),
+                source: "auth_log".into(),
+                kind: "ssh.login_failed".into(),
+                severity: Severity::Medium,
+                summary: "s".into(),
+                details: serde_json::json!({}),
+                tags: vec![],
+                entities: vec![EntityRef::ip("1.2.3.4")],
+            };
+            let ce = CorrelationEngine::classify_event(&raw_event);
+            engine.event_window.push_back(ce);
+        }
+        assert_eq!(engine.event_window.len(), 1000);
+        // Pointer-equality on every entry's source — they MUST share
+        // the same Arc<str> backing allocation. If the impl ever
+        // regresses to `String`, this fails: two `String` instances
+        // never share heap memory even when their content matches.
+        let first_source = engine.event_window[0].source.clone();
+        let first_kind = engine.event_window[0].kind.clone();
+        for (i, ce) in engine.event_window.iter().enumerate() {
+            assert!(
+                std::sync::Arc::ptr_eq(&ce.source, &first_source),
+                "event[{i}].source should share Arc with event[0].source — \
+                 the interner deduplicates 'auth_log' across the window"
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&ce.kind, &first_kind),
+                "event[{i}].kind should share Arc with event[0].kind — \
+                 the interner deduplicates 'ssh.login_failed' across the window"
+            );
+        }
+    }
 
     fn make_event(layer: Layer, kind: &str, ip: &str) -> CorrelationEvent {
         CorrelationEvent {
             ts: Utc::now(),
             layer,
-            source: "test".into(),
-            kind: kind.into(),
+            source: intern("test"),
+            kind: intern(kind),
             severity: Severity::Medium,
             entities: vec![EntityRef::ip(ip)],
             details: serde_json::json!({}),
@@ -2038,8 +2118,8 @@ mod tests {
         CorrelationEvent {
             ts,
             layer,
-            source: "test".into(),
-            kind: kind.into(),
+            source: intern("test"),
+            kind: intern(kind),
             severity: Severity::Medium,
             entities: vec![EntityRef::ip(ip)],
             details: serde_json::json!({}),

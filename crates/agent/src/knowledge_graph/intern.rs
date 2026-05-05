@@ -88,19 +88,35 @@ mod tests {
 
     #[test]
     fn intern_pool_dedupes_high_volume() {
-        // Sanity: 1000 calls for 5 distinct keys produce a pool of 5.
-        let len_before = pool_len();
+        // 1000 calls for 5 distinct keys must return Arcs that share
+        // their underlying allocation by pointer equality.
+        //
+        // 2026-05-05 (Wave 6): the previous form of this test
+        // measured `pool_len()` deltas, which raced with other
+        // parallel tests that started using `intern()` (Wave 6
+        // expanded its use to correlation_engine, scoring, KG
+        // ingestion). The pool is a process-global static, so the
+        // delta could exceed 5 even when this test's own behaviour
+        // was correct. Pointer-equality on the returned Arcs is
+        // the actual contract — and is unaffected by parallel
+        // tests inserting their own keys.
+        let keys = [
+            "__wave6_intern_test_key_a",
+            "__wave6_intern_test_key_b",
+            "__wave6_intern_test_key_c",
+            "__wave6_intern_test_key_d",
+            "__wave6_intern_test_key_e",
+        ];
+        let mut firsts: Vec<Arc<str>> = keys.iter().map(|k| intern(k)).collect();
         for _ in 0..1000 {
-            for k in ["a-key", "b-key", "c-key", "d-key", "e-key"] {
-                let _ = intern(k);
+            for (i, k) in keys.iter().enumerate() {
+                let again = intern(k);
+                assert!(
+                    Arc::ptr_eq(&firsts[i], &again),
+                    "intern({k:?}) returned a non-shared Arc — deduplication broken"
+                );
+                firsts[i] = again;
             }
         }
-        let len_after = pool_len();
-        assert!(
-            len_after - len_before <= 5,
-            "pool grew by more than the 5 distinct keys: {} -> {}",
-            len_before,
-            len_after
-        );
     }
 }

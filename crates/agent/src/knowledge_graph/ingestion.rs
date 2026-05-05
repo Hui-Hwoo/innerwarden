@@ -253,8 +253,11 @@ impl KnowledgeGraph {
         // surfaces in the dashboard as e.g. a `file.read_access tokio-rt-worker`
         // event under an attacker IP's journey. Real prod observation
         // 2026-05-03 in the journey for IP 164.90.237.71.
-        self._current_event_source = Some(event.source.clone());
-        self._current_event_kind = Some(event.kind.clone());
+        // Wave 6: intern source/kind so the 145k+ edges produced from
+        // a busy day share `Arc<str>` allocations instead of paying
+        // a fresh String per event.
+        self._current_event_source = Some(crate::knowledge_graph::intern::intern(&event.source));
+        self._current_event_kind = Some(crate::knowledge_graph::intern::intern(&event.kind));
         self._current_event_summary = Some(event.summary.clone());
         self._current_event_severity = Some(format!("{:?}", event.severity).to_lowercase());
         match event.kind.as_str() {

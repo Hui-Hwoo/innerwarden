@@ -50,8 +50,17 @@ pub struct KnowledgeGraph {
     pub(crate) total_events_ingested: usize,
 
     // ── Transient: current event metadata (set during ingest, used by add_edge) ──
-    pub(crate) _current_event_source: Option<String>,
-    pub(crate) _current_event_kind: Option<String>,
+    //
+    // Wave 6 (memory-opt, 2026-05-05): `_current_event_source` and
+    // `_current_event_kind` are `Arc<str>` interned at the ingest site
+    // so the per-event clone is a 16-byte pointer bump instead of a
+    // fresh String allocation. Per-event matters: a busy host produces
+    // hundreds of ingest calls per second; pre-Wave-6 each call paid
+    // 2 × String alloc on these two fields. `summary` and `severity`
+    // stay `String` because they are unique-per-event (summary) or
+    // already cheap (severity is a 4-7 byte word).
+    pub(crate) _current_event_source: Option<std::sync::Arc<str>>,
+    pub(crate) _current_event_kind: Option<std::sync::Arc<str>>,
     pub(crate) _current_event_summary: Option<String>,
     pub(crate) _current_event_severity: Option<String>,
 
@@ -346,16 +355,18 @@ impl KnowledgeGraph {
         use crate::knowledge_graph::intern::intern;
         if let Some(ref src) = self._current_event_source {
             if !edge.properties.contains_key("event_source") {
-                edge.properties.insert(
-                    intern("event_source"),
-                    serde_json::Value::from(src.as_str()),
-                );
+                // Wave 6: src is now `Arc<str>` — deref to `&str` via
+                // `&**` for the serde_json::Value::from. The unstable
+                // `Arc::<str>::as_str` (feature gate `str_as_str`) is
+                // not available on stable, so this is the right form.
+                edge.properties
+                    .insert(intern("event_source"), serde_json::Value::from(&**src));
             }
         }
         if let Some(ref kind) = self._current_event_kind {
             if !edge.properties.contains_key("event_kind") {
                 edge.properties
-                    .insert(intern("event_kind"), serde_json::Value::from(kind.as_str()));
+                    .insert(intern("event_kind"), serde_json::Value::from(&**kind));
             }
         }
         if let Some(ref summary) = self._current_event_summary {

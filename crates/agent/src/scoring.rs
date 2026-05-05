@@ -140,8 +140,15 @@ const NUM_FEATURES: usize = 32;
 /// Rolling window of recent events for scoring.
 pub struct ScoringEngine {
     net: Option<ScoringNet>,
-    /// Recent event kinds (sliding window, last 20)
-    recent_kinds: std::collections::VecDeque<String>,
+    /// Recent event kinds (sliding window, last 20).
+    ///
+    /// Wave 6 (memory-opt, 2026-05-05): `Arc<str>` so the same kind
+    /// pushed many times shares one allocation. The window itself is
+    /// only 20 entries but `observe()` runs ~hundreds-of-times-per-sec
+    /// on a busy host, so the per-event allocation churn (the
+    /// `String::clone()` in `push_back(event.kind.clone())`) was the
+    /// hot path here, not the live-set size.
+    recent_kinds: std::collections::VecDeque<std::sync::Arc<str>>,
     /// Recent event severities
     recent_severities: std::collections::VecDeque<String>,
     /// Recent source IPs seen
@@ -183,7 +190,10 @@ impl ScoringEngine {
         let net = self.net.as_ref()?;
 
         // Update sliding window
-        self.recent_kinds.push_back(event.kind.clone());
+        // Wave 6: intern the kind so repeated pushes of the same value
+        // share a single Arc<str> allocation across the window.
+        self.recent_kinds
+            .push_back(crate::knowledge_graph::intern::intern(&event.kind));
         if self.recent_kinds.len() > 20 {
             self.recent_kinds.pop_front();
         }

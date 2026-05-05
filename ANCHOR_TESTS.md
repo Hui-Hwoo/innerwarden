@@ -352,6 +352,10 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/dashboard/auth.rs::tests::threat_model_md_does_not_quote_stale_rate_limit_value` - partial-edit anti-regression: walks every `<N> req/min/IP` shape in THREAT_MODEL.md and asserts each matches `GLOBAL_RATE_LIMIT_PER_MIN`. A future bump that updates only ONE doc mention while leaving a stale duplicate fails CI loudly.
 - `crates/agent/src/dashboard/auth.rs::tests::security_md_lists_only_current_minor_as_supported` - partial-edit anti-regression: walks every "Yes"-marked row in the SECURITY.md supported-versions table and asserts the version token matches the current `CARGO_PKG_VERSION` minor. A future minor bump that adds the new row but leaves a stale `v0.X.x | Yes` line elsewhere fails CI — older lines must be `No`.
 
+### String interning hot paths (Wave 6 - AUDIT-WAVE6-INTERN anchor)
+
+- `crates/agent/src/correlation_engine.rs::tests::correlation_event_source_and_kind_share_arc_allocations` - 1000 `CorrelationEvent` instances built from raw `Event` shapes that share `source="auth_log"` and `kind="ssh.login_failed"` produce a window where every entry's `source` and `kind` `Arc<str>` is pointer-equal to entry [0]'s. Anti-regression for reverting either field back to `String` (which would silently allocate 1000 independent heap copies, defeating the Wave 6 win on the 10 000-entry `event_window`).
+
 ### Number-consistency labels (Wave 10 - AUDIT-WAVE10-LABEL-HONESTY anchor)
 
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_home_activity_strip_reads_handled_not_stopped` - the home activity strip cell that aggregates blocked + observing + honeypot reads "handled automatically", NOT "stopped automatically". The pre-Wave-10 copy lied for the observing bucket (observing means we are watching, not stopping). Anti-regression: the old "stopped automatically" string must NOT come back.
