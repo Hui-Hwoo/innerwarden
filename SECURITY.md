@@ -4,7 +4,7 @@
 
 | Version | Supported |
 | --- | --- |
-| v0.1.x (latest release) | Yes |
+| v0.13.x (latest release) | Yes |
 | older releases | No |
 
 Always update to the latest release: `innerwarden upgrade`

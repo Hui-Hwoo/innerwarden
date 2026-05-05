@@ -754,4 +754,126 @@ mod tests {
             "successful write must not emit the failure warn — got: {captured_str}"
         );
     }
+
+    // ── Wave 5 anchors (AUDIT-WAVE5-DOC-DRIFT) ─────────────────────────
+    //
+    // Documentation that quotes a numeric value drifts when the source-
+    // of-truth constant changes. Pre-fix THREAT_MODEL.md said the
+    // global rate limit was 120 req/min/IP; the actual constant is
+    // GLOBAL_RATE_LIMIT_PER_MIN = 300. SECURITY.md said "v0.1.x" was
+    // the supported line; current version is v0.13.0. Both numbers
+    // are now anchored to the source-of-truth so a future bump
+    // breaks CI until the doc is also updated.
+
+    #[test]
+    fn threat_model_md_quotes_actual_global_rate_limit() {
+        // Read THREAT_MODEL.md from the workspace root and assert the
+        // documented rate limit matches GLOBAL_RATE_LIMIT_PER_MIN.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // CARGO_MANIFEST_DIR is crates/agent; THREAT_MODEL.md is at
+        // workspace root (../../).
+        let doc = manifest.join("../../THREAT_MODEL.md");
+        let content =
+            std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
+        let needle = format!("{} req/min/IP", GLOBAL_RATE_LIMIT_PER_MIN);
+        assert!(
+            content.contains(&needle),
+            "THREAT_MODEL.md must quote {needle:?} (matches GLOBAL_RATE_LIMIT_PER_MIN). \
+             If you bumped the constant, update THREAT_MODEL.md too."
+        );
+    }
+
+    #[test]
+    fn security_md_supported_versions_matches_current_minor() {
+        // CARGO_PKG_VERSION is e.g. "0.13.0"; the supported-versions
+        // table should mention "v0.13.x" (the current minor line).
+        // Anti-regression for the SECURITY.md / Cargo.toml drift that
+        // had us still claiming v0.1.x as the supported line at v0.13.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let doc = manifest.join("../../SECURITY.md");
+        let content =
+            std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
+        let pkg = env!("CARGO_PKG_VERSION");
+        // Extract major.minor from "0.13.0" -> "0.13".
+        let minor_prefix = pkg.split('.').take(2).collect::<Vec<_>>().join(".");
+        let needle = format!("v{minor_prefix}.x");
+        assert!(
+            content.contains(&needle),
+            "SECURITY.md must list {needle:?} as the supported line (matches CARGO_PKG_VERSION {pkg}). \
+             If you cut a minor release, update SECURITY.md too."
+        );
+    }
+
+    #[test]
+    fn threat_model_md_does_not_quote_stale_rate_limit_value() {
+        // Partial-edit anti-regression: pre-fix THREAT_MODEL.md said
+        // "120 req/min/IP" with the constant at 300. A future edit
+        // that bumps GLOBAL_RATE_LIMIT_PER_MIN but only updates one
+        // of the two doc mentions would let the stale number linger.
+        // This test fires whenever ANY non-current rate-limit-shape
+        // value appears in the doc.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let doc = manifest.join("../../THREAT_MODEL.md");
+        let content =
+            std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
+        let current = format!("{} req/min/IP", GLOBAL_RATE_LIMIT_PER_MIN);
+        // Walk every "<N> req/min/IP"-shaped substring and assert
+        // every one of them matches the current constant.
+        for line in content.lines() {
+            if let Some(idx) = line.find(" req/min/IP") {
+                let prefix = &line[..idx];
+                let num_start = prefix
+                    .rfind(|c: char| !c.is_ascii_digit())
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let quoted = &line[num_start..idx + " req/min/IP".len()];
+                assert_eq!(
+                    quoted, current,
+                    "THREAT_MODEL.md quotes a stale rate-limit value {quoted:?} on line: {line:?}. \
+                     The current constant is {GLOBAL_RATE_LIMIT_PER_MIN}; every mention must match."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn security_md_lists_only_current_minor_as_supported() {
+        // Partial-edit anti-regression: a future minor bump that
+        // updates the row but leaves an OLDER "v0.X.x | Yes" line
+        // would still falsely advertise an unsupported series.
+        // Walk the doc, find every `vMAJOR.MINOR.x` mention, and
+        // assert that any one marked "Yes" matches the current
+        // CARGO_PKG_VERSION minor.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let doc = manifest.join("../../SECURITY.md");
+        let content =
+            std::fs::read_to_string(&doc).unwrap_or_else(|e| panic!("read {}: {e}", doc.display()));
+        let pkg = env!("CARGO_PKG_VERSION");
+        let minor_prefix = pkg.split('.').take(2).collect::<Vec<_>>().join(".");
+        let current_supported = format!("v{minor_prefix}.x");
+
+        for line in content.lines() {
+            // Markdown table row that says "Yes": looks like
+            // `| v0.13.x (latest release) | Yes |` or `| v0.X.x | Yes |`.
+            if !line.contains("| Yes") && !line.contains("|Yes") {
+                continue;
+            }
+            // Extract the `v<digits>.<digits>.x` token from the row.
+            let v_idx = match line.find("| v") {
+                Some(i) => i + 2,
+                None => continue,
+            };
+            let after = &line[v_idx..];
+            let end = after
+                .find(|c: char| c == ' ' || c == '|')
+                .unwrap_or(after.len());
+            let token = &after[..end];
+            assert_eq!(
+                token, current_supported,
+                "SECURITY.md lists {token:?} as supported (Yes) but the current \
+                 minor is {current_supported:?}. Every 'Yes' row must match the \
+                 current CARGO_PKG_VERSION minor — older lines should be 'No'."
+            );
+        }
+    }
 }

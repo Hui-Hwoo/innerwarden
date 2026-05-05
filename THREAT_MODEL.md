@@ -23,7 +23,7 @@ Layers are stacked at `serve()` in `mod.rs`. Order at construction time: `auth_l
 
 - Reaches the bind address but has no Basic Auth secret and no session token.
 - Read attempts on the dashboard router → `require_auth` → `unauthorized_response()` (401).
-- Any rate of attempts → `rate_limit_layer` (120 req/min/IP) → 429.
+- Any rate of attempts → `rate_limit_layer` (300 req/min/IP, see `GLOBAL_RATE_LIMIT_PER_MIN`) → 429.
 - Failed-login storm → `is_rate_limited` (per-IP failed-login window) → 429 even before argon2 runs.
 
 **Not defended:** the public `live_api` is intentionally open. Sanitisation in `live_feed.rs` strips `host`, `evidence`, `recommended_checks`, and filters `is_internal` / `research_only` incidents. If the operator ever adds a field that leaks internal state, this assumption breaks.

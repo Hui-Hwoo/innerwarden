@@ -345,6 +345,13 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/ai/mod.rs::tests::validate_ai_base_url_still_accepts_existing_loopback_forms` - anti-regression: `localhost` and `127.0.0.1` still work.
 - `crates/agent/src/ai/mod.rs::tests::validate_ai_base_url_still_rejects_remote_http` - anti-regression: tightening the host extractor must NOT weaken the security gate. Remote HTTP (any non-loopback host, including remote IPv6 like `[2001:db8::1]`) is still refused.
 
+### Doc drift (Wave 5 - AUDIT-WAVE5-DOC-DRIFT anchor)
+
+- `crates/agent/src/dashboard/auth.rs::tests::threat_model_md_quotes_actual_global_rate_limit` - THREAT_MODEL.md quotes the literal `GLOBAL_RATE_LIMIT_PER_MIN` value. Anti-regression: pre-fix the doc said `120 req/min/IP` while the constant was 300; CI now fails if the two diverge so a future bump must update both.
+- `crates/agent/src/dashboard/auth.rs::tests::security_md_supported_versions_matches_current_minor` - SECURITY.md lists the current `vMAJOR.MINOR.x` line as supported. Pre-fix it still said `v0.1.x` at v0.13.0. CI fails on every minor bump until SECURITY.md is also updated.
+- `crates/agent/src/dashboard/auth.rs::tests::threat_model_md_does_not_quote_stale_rate_limit_value` - partial-edit anti-regression: walks every `<N> req/min/IP` shape in THREAT_MODEL.md and asserts each matches `GLOBAL_RATE_LIMIT_PER_MIN`. A future bump that updates only ONE doc mention while leaving a stale duplicate fails CI loudly.
+- `crates/agent/src/dashboard/auth.rs::tests::security_md_lists_only_current_minor_as_supported` - partial-edit anti-regression: walks every "Yes"-marked row in the SECURITY.md supported-versions table and asserts the version token matches the current `CARGO_PKG_VERSION` minor. A future minor bump that adds the new row but leaves a stale `v0.X.x | Yes` line elsewhere fails CI — older lines must be `No`.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
