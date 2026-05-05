@@ -104,12 +104,15 @@ fn build_sensors_payload(
     use crate::knowledge_graph::types::{Node, NodeType};
     let graph = kg.read().unwrap();
 
-    // Event telemetry — prefer graph counters, fall back to telemetry snapshot
+    // Event telemetry — prefer graph counters, fall back to telemetry snapshot.
+    // Wave 6c: graph.source_counts keys are now `Arc<str>`; convert to
+    // `String` at the boundary so the if/else branch element types
+    // match (the else branch produces `(String, usize)` already).
     let (total_events_val, sources) = if graph.total_events_ingested > 0 {
-        let mut s: Vec<_> = graph
+        let mut s: Vec<(String, usize)> = graph
             .source_counts
             .iter()
-            .map(|(s, &c)| (s.clone(), c))
+            .map(|(s, &c)| (s.to_string(), c))
             .collect();
         s.sort_by(|a, b| b.1.cmp(&a.1));
         (graph.total_events_ingested, s)
@@ -147,22 +150,27 @@ fn build_sensors_payload(
     // the format used by `event_timeline` (`YYYY-MM-DDTHH:MM`, see
     // `knowledge_graph::buckets`) so cross-day uptime no longer collapses
     // different days into the same time-of-day bucket.
-    let mut detector_counts: std::collections::HashMap<String, usize> =
+    // Wave 6c: match `KnowledgeGraph::event_timeline` key type
+    // (`Arc<str>`) so the `event_tl_source` reference can fall back
+    // to either source without a type-mismatch.
+    let mut detector_counts: std::collections::HashMap<std::sync::Arc<str>, usize> =
         std::collections::HashMap::new();
     let mut detector_timeline: std::collections::BTreeMap<
-        String,
-        std::collections::HashMap<String, usize>,
+        std::sync::Arc<str>,
+        std::collections::HashMap<std::sync::Arc<str>, usize>,
     > = std::collections::BTreeMap::new();
     let total_incidents = graph.nodes_of_type(NodeType::Incident).len();
 
     for id in graph.nodes_of_type(NodeType::Incident) {
         if let Some(Node::Incident { detector, ts, .. }) = graph.get_node(id) {
-            *detector_counts.entry(detector.clone()).or_insert(0) += 1;
+            let detector_arc = crate::knowledge_graph::intern::intern(detector);
+            *detector_counts.entry(detector_arc.clone()).or_insert(0) += 1;
             let bucket = crate::knowledge_graph::buckets::format_bucket_key(*ts);
+            let bucket_arc = crate::knowledge_graph::intern::intern(&bucket);
             *detector_timeline
-                .entry(bucket)
+                .entry(bucket_arc)
                 .or_default()
-                .entry(detector.clone())
+                .entry(detector_arc)
                 .or_insert(0) += 1;
         }
     }
@@ -173,8 +181,8 @@ fn build_sensors_payload(
     // event_timeline may be empty after restart (cursor/snapshot race).
     // Use detector_timeline as fallback — it's rebuilt from persisted Incident nodes.
     let event_tl_source: &std::collections::BTreeMap<
-        String,
-        std::collections::HashMap<String, usize>,
+        std::sync::Arc<str>,
+        std::collections::HashMap<std::sync::Arc<str>, usize>,
     > = if graph.event_timeline.is_empty() {
         &detector_timeline
     } else {
@@ -197,9 +205,14 @@ fn build_sensors_payload(
     // (report.rs::compute_recent_window); the Sensors HUD chart
     // explicitly shows TODAY ONLY.
     let today_prefix = format!("{today}T");
+    // Wave 6c: source maps now key on `Arc<str>`. Display structs keep
+    // `String` keys because they're built per-request and rendered to
+    // JSON immediately — no long-lived state to share, no benefit from
+    // interning here. Inner HashMap value type also references the
+    // updated `Arc<str>` map shape.
     let event_tl_display: std::collections::BTreeMap<
         String,
-        &std::collections::HashMap<String, usize>,
+        &std::collections::HashMap<std::sync::Arc<str>, usize>,
     > = event_tl_source
         .iter()
         .filter(|(k, _)| k.starts_with(&today_prefix))
@@ -213,7 +226,7 @@ fn build_sensors_payload(
     // Same today-only filter for the detector timeline — same reason.
     let detector_tl_display: std::collections::BTreeMap<
         String,
-        &std::collections::HashMap<String, usize>,
+        &std::collections::HashMap<std::sync::Arc<str>, usize>,
     > = detector_timeline
         .iter()
         .filter(|(k, _)| k.starts_with(&today_prefix))
@@ -415,7 +428,14 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
     drop(graph);
 
     let telem_source_counts: std::collections::HashMap<String, usize> = if graph_total > 0 {
+        // Wave 6c: graph.source_counts keys are now `Arc<str>`; convert
+        // at the boundary so the local `HashMap<String, usize>` adapter
+        // (used downstream by `count_source` lookups) keeps the same
+        // signature.
         graph_source_counts
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
     } else {
         // Graph counters empty (cursor/snapshot race after restart).
         // Fall back to telemetry snapshot which the agent writes every 30s.
@@ -862,16 +882,21 @@ mod tests {
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
-        let mut yesterday_03_15: std::collections::HashMap<String, usize> =
+        // Wave 6c: event_timeline keys are now `Arc<str>`.
+        let mut yesterday_03_15: std::collections::HashMap<std::sync::Arc<str>, usize> =
             std::collections::HashMap::new();
-        yesterday_03_15.insert("auth_log".to_string(), 9_999);
-        let mut today_22_00: std::collections::HashMap<String, usize> =
+        yesterday_03_15.insert(std::sync::Arc::<str>::from("auth_log"), 9_999);
+        let mut today_22_00: std::collections::HashMap<std::sync::Arc<str>, usize> =
             std::collections::HashMap::new();
-        today_22_00.insert("auth_log".to_string(), 7);
-        g.event_timeline
-            .insert(format!("{yesterday}T03:15"), yesterday_03_15);
-        g.event_timeline
-            .insert(format!("{today}T22:00"), today_22_00);
+        today_22_00.insert(std::sync::Arc::<str>::from("auth_log"), 7);
+        g.event_timeline.insert(
+            std::sync::Arc::<str>::from(format!("{yesterday}T03:15").as_str()),
+            yesterday_03_15,
+        );
+        g.event_timeline.insert(
+            std::sync::Arc::<str>::from(format!("{today}T22:00").as_str()),
+            today_22_00,
+        );
 
         let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
         let dir = tempfile::tempdir().expect("tempdir");

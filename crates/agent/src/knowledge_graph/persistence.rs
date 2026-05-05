@@ -216,13 +216,19 @@ struct GraphSnapshot {
     nodes: HashMap<NodeId, Node>,
     edges: Vec<Edge>,
     next_id: NodeId,
-    /// Event telemetry counters (added Phase 6A — persisted so Sensors tab works after restart)
+    /// Event telemetry counters (added Phase 6A — persisted so Sensors tab works after restart).
+    ///
+    /// Wave 6c (memory-opt, 2026-05-05): keys are `Arc<str>` to match
+    /// the in-memory `KnowledgeGraph` storage. Wire format is unchanged
+    /// — serde renders `Arc<str>` as a plain JSON string, so the
+    /// gzip+JSON snapshot round-trips with pre-Wave-6c agents.
     #[serde(default)]
-    source_counts: HashMap<String, usize>,
+    source_counts: HashMap<std::sync::Arc<str>, usize>,
     #[serde(default)]
-    kind_counts: HashMap<String, usize>,
+    kind_counts: HashMap<std::sync::Arc<str>, usize>,
     #[serde(default)]
-    event_timeline: std::collections::BTreeMap<String, HashMap<String, usize>>,
+    event_timeline:
+        std::collections::BTreeMap<std::sync::Arc<str>, HashMap<std::sync::Arc<str>, usize>>,
     #[serde(default)]
     total_events_ingested: usize,
 }
@@ -237,9 +243,10 @@ struct GraphSnapshotRef<'a> {
     nodes: &'a HashMap<NodeId, Node>,
     edges: &'a Vec<Edge>,
     next_id: NodeId,
-    source_counts: &'a HashMap<String, usize>,
-    kind_counts: &'a HashMap<String, usize>,
-    event_timeline: &'a std::collections::BTreeMap<String, HashMap<String, usize>>,
+    source_counts: &'a HashMap<std::sync::Arc<str>, usize>,
+    kind_counts: &'a HashMap<std::sync::Arc<str>, usize>,
+    event_timeline:
+        &'a std::collections::BTreeMap<std::sync::Arc<str>, HashMap<std::sync::Arc<str>, usize>>,
     total_events_ingested: usize,
 }
 

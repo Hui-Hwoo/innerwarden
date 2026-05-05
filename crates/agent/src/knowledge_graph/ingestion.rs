@@ -214,13 +214,19 @@ impl KnowledgeGraph {
     ) {
         let bucket = super::buckets::format_bucket_key(ts);
 
-        *self.source_counts.entry(source.to_string()).or_insert(0) += 1;
-        *self.kind_counts.entry(kind.to_string()).or_insert(0) += 1;
+        // Wave 6c: intern the three high-volume keys so the per-event
+        // insert pays a 16-byte pointer-clone instead of a fresh String.
+        let source_arc = super::intern::intern(source);
+        let kind_arc = super::intern::intern(kind);
+        let bucket_arc = super::intern::intern(&bucket);
+
+        *self.source_counts.entry(source_arc.clone()).or_insert(0) += 1;
+        *self.kind_counts.entry(kind_arc).or_insert(0) += 1;
         *self
             .event_timeline
-            .entry(bucket)
+            .entry(bucket_arc)
             .or_default()
-            .entry(source.to_string())
+            .entry(source_arc)
             .or_insert(0) += 1;
         self.total_events_ingested += 1;
     }
@@ -1833,6 +1839,70 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use innerwarden_core::entities::EntityRef;
     use innerwarden_core::event::Severity;
+
+    /// Wave 6c (AUDIT-WAVE6C-INTERN) anchor: 1000 calls to
+    /// `record_event_telemetry("auth_log", "ssh.login_failed", _)`
+    /// produce `source_counts` and `kind_counts` HashMaps each with
+    /// ONE entry whose key is pointer-equal to `intern("auth_log")` /
+    /// `intern("ssh.login_failed")`. Pre-Wave-6c each call did
+    /// `entry(source.to_string())` which allocated a fresh `String`
+    /// PER CALL — `HashMap::entry` takes owned keys, drops duplicates
+    /// after the lookup. With `Arc<str>` interned at the call site
+    /// the per-call cost is a 16-byte pointer-clone.
+    #[test]
+    fn record_event_telemetry_interns_source_and_kind_keys() {
+        let mut g = KnowledgeGraph::new();
+        let ts = Utc.with_ymd_and_hms(2026, 5, 5, 14, 0, 0).unwrap();
+        for _ in 0..1000 {
+            g.record_event_telemetry("auth_log", "ssh.login_failed", ts);
+        }
+        assert_eq!(g.source_counts.len(), 1, "source_counts dedupes");
+        assert_eq!(g.kind_counts.len(), 1, "kind_counts dedupes");
+        assert_eq!(g.source_counts.values().copied().sum::<usize>(), 1000);
+
+        let canonical_source = super::super::intern::intern("auth_log");
+        let canonical_kind = super::super::intern::intern("ssh.login_failed");
+        let stored_source = g.source_counts.keys().next().unwrap();
+        let stored_kind = g.kind_counts.keys().next().unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(stored_source, &canonical_source),
+            "source_counts key must share Arc allocation with intern(\"auth_log\")"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(stored_kind, &canonical_kind),
+            "kind_counts key must share Arc allocation with intern(\"ssh.login_failed\")"
+        );
+    }
+
+    /// Wave 6c: event_timeline bucket keys (date stamps) and inner
+    /// source keys are both interned. 200 calls with the same source
+    /// at the same bucket produce ONE outer entry with ONE inner
+    /// entry — both pointer-equal to their canonical Arc<str>.
+    #[test]
+    fn record_event_telemetry_interns_event_timeline_keys() {
+        let mut g = KnowledgeGraph::new();
+        let ts = Utc.with_ymd_and_hms(2026, 5, 5, 14, 0, 0).unwrap();
+        for _ in 0..200 {
+            g.record_event_telemetry("auth_log", "ssh.login_failed", ts);
+        }
+        assert_eq!(g.event_timeline.len(), 1, "event_timeline dedupes bucket");
+        let (bucket_key, inner) = g.event_timeline.iter().next().unwrap();
+        assert_eq!(inner.len(), 1, "inner map dedupes source");
+        assert_eq!(inner.values().copied().sum::<usize>(), 200);
+
+        let bucket = super::super::buckets::format_bucket_key(ts);
+        let canonical_bucket = super::super::intern::intern(&bucket);
+        let canonical_source = super::super::intern::intern("auth_log");
+        assert!(
+            std::sync::Arc::ptr_eq(bucket_key, &canonical_bucket),
+            "event_timeline outer key must share Arc with intern(<bucket>)"
+        );
+        let inner_key = inner.keys().next().unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(inner_key, &canonical_source),
+            "event_timeline inner key must share Arc with intern(\"auth_log\")"
+        );
+    }
 
     fn make_event(kind: &str, details: serde_json::Value) -> Event {
         Event {

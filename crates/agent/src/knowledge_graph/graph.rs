@@ -44,9 +44,19 @@ pub struct KnowledgeGraph {
     pub created_at: DateTime<Utc>,
 
     // ── Event telemetry (for sensors tab) ──
-    pub(crate) source_counts: HashMap<String, usize>,
-    pub(crate) kind_counts: HashMap<String, usize>,
-    pub(crate) event_timeline: std::collections::BTreeMap<String, HashMap<String, usize>>,
+    //
+    // Wave 6c (memory-opt, 2026-05-05): all three keyed collections
+    // here are populated per event via `record_event_telemetry`. Keys
+    // are low-cardinality (`source` ~10 distinct, `kind` ~50 distinct,
+    // bucket date ~24 distinct/day) but the per-event `.entry(...)`
+    // calls were pre-Wave-6c allocating fresh `String` PER EVENT. With
+    // `Arc<str>` interned at the call site, every repeat is a 16-byte
+    // pointer-clone. Wire format on snapshot is unchanged
+    // (serde renders `Arc<str>` as plain JSON string).
+    pub(crate) source_counts: HashMap<std::sync::Arc<str>, usize>,
+    pub(crate) kind_counts: HashMap<std::sync::Arc<str>, usize>,
+    pub(crate) event_timeline:
+        std::collections::BTreeMap<std::sync::Arc<str>, HashMap<std::sync::Arc<str>, usize>>,
     pub(crate) total_events_ingested: usize,
 
     // ── Transient: current event metadata (set during ingest, used by add_edge) ──

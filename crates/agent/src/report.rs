@@ -3327,10 +3327,11 @@ mod tests {
         // simulating a snapshot written before the fix.
         let mut g = KnowledgeGraph::new();
         g.ensure_ip("203.0.113.1", chrono::Utc::now());
+        // Wave 6c: event_timeline keys are now `Arc<str>`.
         g.event_timeline
-            .entry("20:30".to_string())
+            .entry(std::sync::Arc::<str>::from("20:30"))
             .or_default()
-            .insert("legacy_source".to_string(), 1);
+            .insert(std::sync::Arc::<str>::from("legacy_source"), 1);
         let path = dir.path().join("graph-snapshot-2026-04-22.json");
         g.save_snapshot(&path).expect("save snapshot");
 

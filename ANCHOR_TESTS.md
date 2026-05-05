@@ -365,6 +365,11 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/baseline.rs::tests::observe_event_interns_process_lineages_member` - 200 events for the same `parent→child` lineage produce ONE `process_lineages` set member pointer-equal to `intern("parent→child")`. Pins the interning on the lineage write path; lineage strings repeat across every observed event from the same parent chain.
 - `crates/agent/src/baseline.rs::tests::baseline_store_arc_str_keys_round_trip_through_json` - JSON serialize → deserialize on `BaselineStore` preserves keys as plain strings on disk. Pre- and post-Wave-6b agents must be able to load the same `baseline.json`.
 
+### String interning hot paths v3 (Wave 6c - AUDIT-WAVE6C-INTERN anchor)
+
+- `crates/agent/src/knowledge_graph/ingestion.rs::tests::record_event_telemetry_interns_source_and_kind_keys` - 1000 calls to `record_event_telemetry("auth_log", "ssh.login_failed", _)` produce `KnowledgeGraph::source_counts` and `KnowledgeGraph::kind_counts` HashMaps each with ONE entry, pointer-equal to `intern("auth_log")` / `intern("ssh.login_failed")`. Anti-regression for reverting the KG event-telemetry counter map types from `HashMap<Arc<str>, usize>` back to `HashMap<String, usize>` — that revert would silently re-introduce per-event String churn on the ingest hot path.
+- `crates/agent/src/knowledge_graph/ingestion.rs::tests::record_event_telemetry_interns_event_timeline_keys` - 200 calls at the same bucket produce a `event_timeline: BTreeMap<Arc<str>, HashMap<Arc<str>, _>>` with ONE outer entry whose key is pointer-equal to `intern(<bucket>)` AND ONE inner entry whose key is pointer-equal to `intern("auth_log")`. Pins both axes of the nested map; reverting either fails the test.
+
 ### Number-consistency labels (Wave 10 - AUDIT-WAVE10-LABEL-HONESTY anchor)
 
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_home_activity_strip_reads_handled_not_stopped` - the home activity strip cell that aggregates blocked + observing + honeypot reads "handled automatically", NOT "stopped automatically". The pre-Wave-10 copy lied for the observing bucket (observing means we are watching, not stopping). Anti-regression: the old "stopped automatically" string must NOT come back.
