@@ -22,7 +22,7 @@ hex = "0.4"
 axum = { version = "0.7", features = ["json"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-notify = { version = "7", default-features = false, features = ["macos_kqueue"], optional = true }
+notify = { version = "8", default-features = false, features = ["macos_kqueue"], optional = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }

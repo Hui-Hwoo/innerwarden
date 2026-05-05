@@ -1691,17 +1691,91 @@ mod tests {
         // increment in compute_overview_counts_from_sqlite) while the
         // list-section group below counts UNIQUE ATTACKERS. Operator
         // saw "Blocked 41" on top and "Blocked 24" right below for
-        // the same date and could not tell why. Renamed the KPI tile
-        // to "Blocks" so the unit (events not unique IPs) is clear.
-        // Anchor pins the rename — a future "consolidation" PR that
-        // re-aligns them to the same string brings the confusion back.
+        // the same date and could not tell why.
+        //
+        // Wave 10 (label honesty, 2026-05-05): the original "Blocks"
+        // / "Blocked attackers" disambiguation was not enough — the
+        // operator hit the same confusion class again on Home (26
+        // attackers handled today) vs Threats (12 Blocked attackers).
+        // Renamed both labels to make the snapshot-vs-aggregate axis
+        // explicit:
+        //   * KPI: "Block actions" / window "today" — aggregate, decision-level
+        //   * List: "Currently blocked attackers" — snapshot, IP-level
+        // The "Currently" prefix is the load-bearing word: it tells the
+        // operator that a smaller number on the list does not contradict
+        // a larger aggregate on the KPI / Home tile.
         assert!(
-            INDEX_HTML.contains("<div class=\"kpi-label\">Blocks</div>"),
-            "KPI tile must read 'Blocks' to disambiguate from list 'Blocked attackers'"
+            INDEX_HTML.contains("<div class=\"kpi-label\">Block actions</div>"),
+            "KPI tile must read 'Block actions' (Wave 10) to disambiguate aggregate decisions from snapshot list 'Currently blocked attackers'"
         );
         assert!(
-            JS_THREATS.contains("label: 'Blocked attackers'"),
-            "list group header must read 'Blocked attackers' to disambiguate from KPI 'Blocks'"
+            INDEX_HTML.contains("<div class=\"kpi-window\">today</div>"),
+            "KPI window must read 'today' (lowercase, since-midnight-UTC) to match the action's aggregation period"
+        );
+        assert!(
+            JS_THREATS.contains("label: 'Currently blocked attackers'"),
+            "list group header must read 'Currently blocked attackers' (Wave 10) so the operator reads the count as a snapshot, not an aggregate"
+        );
+        // Anti-regression: the pre-Wave-10 strings must NOT come back.
+        // A future "shorten the labels" PR would silently re-create the
+        // 2026-04-22 / 2026-05-05 confusion class.
+        assert!(
+            !INDEX_HTML.contains("<div class=\"kpi-label\">Blocks</div>"),
+            "KPI tile must NOT revert to 'Blocks' (pre-Wave-10); use 'Block actions' so the unit is explicit"
+        );
+        assert!(
+            !JS_THREATS.contains("label: 'Blocked attackers'"),
+            "list group header must NOT revert to bare 'Blocked attackers' (pre-Wave-10); use 'Currently blocked attackers' so the snapshot axis is explicit"
+        );
+    }
+
+    #[test]
+    fn wave10_home_activity_strip_reads_handled_not_stopped() {
+        // Wave 10 (label honesty, 2026-05-05): the home activity strip
+        // cell that aggregates blocked + observing + honeypot used to
+        // read "stopped automatically". That mis-described the
+        // observing bucket (we did NOT stop the attacker — we are
+        // watching). Operator's hard rule: every label discloses the
+        // actual operation. "Handled automatically" is honest about all
+        // three outcomes.
+        assert!(
+            INDEX_HTML.contains("<div class=\"activity-label\">handled automatically</div>"),
+            "home activity strip must read 'handled automatically' (Wave 10) — the cell sums blocked + observing + honeypot, and 'stopped' lied for the observing bucket"
+        );
+        assert!(
+            !INDEX_HTML.contains("<div class=\"activity-label\">stopped automatically</div>"),
+            "home activity strip must NOT revert to 'stopped automatically' (pre-Wave-10) — observing is not stopping"
+        );
+    }
+
+    #[test]
+    fn wave10_live_feed_clips_to_rolling_24h_matching_site_label() {
+        // Wave 10: the public site Live page hardcodes "(24h)" on
+        // every counter (`total_today`, `total_blocked`, `total_high`,
+        // `unique_sources`). Pre-Wave-10 the backend honoured NO time
+        // window and read every incident the KG retained — the label
+        // was a lie under hot-tier load. The fix clips `real_incidents`
+        // to `now - 24h` so the label matches the data. This anchor
+        // pins the cutoff variable + filter so a future
+        // "remove the cutoff for performance" PR fails CI.
+        let src = include_str!("live_feed.rs");
+        // Strip comment lines so the assertion below is checking ACTIVE
+        // code, not its own comments / panic messages.
+        let code: String = src
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with("*"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("cutoff_24h = now - chrono::Duration::hours(24)"),
+            "live_feed builder must compute a 24h cutoff to match the site's '(24h)' labels"
+        );
+        assert!(
+            code.contains("i.ts >= cutoff_24h"),
+            "live_feed real_incidents filter must apply the 24h cutoff (`i.ts >= cutoff_24h`); without it the public site shows numbers older than its label claims"
         );
     }
 
@@ -3947,15 +4021,22 @@ mod tests {
     fn home_activity_strip_carries_unit_and_timezone_labels() {
         // Audit 3.7 partial: the "29K -> 6 -> 5 -> 1" funnel had no
         // unit/timezone labels. The redesigned activity strip now
-        // labels each cell ("events watched" / "flagged as
-        // suspicious" / "stopped automatically" / "awaiting review")
-        // AND includes a time-window line "since midnight UTC".
-        // Anchor pins those labels so a future copy edit doesn't
-        // silently regress the audit fix.
+        // labels each cell AND includes a time-window line "since
+        // midnight UTC".
+        //
+        // Wave 10 (label honesty, 2026-05-05): the third cell was
+        // renamed "stopped automatically" -> "handled automatically".
+        // It sums blocked + observing + honeypot, and "stopped" lied
+        // for the observing bucket — observing means we are watching,
+        // not stopping. The Wave-10 anchor
+        // `wave10_home_activity_strip_reads_handled_not_stopped`
+        // asserts the new copy AND the absence of the old; this audit
+        // 3.7 check is updated to consume the new label so the two
+        // anchors agree.
         for label in [
             "events watched",
             "flagged as suspicious",
-            "stopped automatically",
+            "handled automatically",
             "awaiting review",
         ] {
             assert!(

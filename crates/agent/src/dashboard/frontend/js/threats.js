@@ -28,10 +28,17 @@ var OUTCOME_ORDER = ['needs_attention', 'blocked', 'honeypot', 'monitoring', 'al
 // Handshake (allowlisted), Check (dismissed). All inherit
 // `currentColor` so CSS controls per-row tint.
 //
-// Group label: "Blocked" was renamed to "Blocked attackers" so the
-// list-section count (unique IPs) does not visually collide with the
-// KPI tile labelled "Blocks" (action count). Two different answers,
-// two different labels.
+// Group label: "Blocked attackers" → "Currently blocked attackers"
+// (Wave 10, 2026-05-05). The list section is a SNAPSHOT of unique IPs
+// currently in the blocked-outcome bucket; the KPI tile above counts
+// BLOCK ACTIONS today (decisions, not unique IPs). Pre-Wave-10 the
+// labels read "Blocks · Today" and "Blocked attackers" — same page,
+// related concepts, different answers, with no copy disclosing the
+// "snapshot vs accumulator" axis. Operator looked at Home (26
+// attackers handled today), then Threats (12 Blocked attackers) and
+// could not reconcile the gap. The "Currently" prefix names the
+// snapshot axis explicitly so a future relabel back to "Blocked
+// attackers" without disclosing snapshot-vs-aggregate fails CI.
 var SVG_ATTRS = 'xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
 var ICON_BAN          = '<svg ' + SVG_ATTRS + '><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></svg>';
 var ICON_BUG          = '<svg ' + SVG_ATTRS + '><path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/><path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/><path d="M12 20v-9"/><path d="M6.53 9C4.6 8.8 3 7.1 3 5"/><path d="M6 13H2"/><path d="M3 21c0-2.1 1.7-3.9 3.8-4"/><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/><path d="M22 13h-4"/><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/></svg>';
@@ -41,7 +48,7 @@ var ICON_HANDSHAKE    = '<svg ' + SVG_ATTRS + '><path d="m11 17 2 2a1 1 0 1 0 3-
 var ICON_CHECK        = '<svg ' + SVG_ATTRS + '><path d="M20 6 9 17l-5-5"/></svg>';
 
 var OUTCOME_META = {
-  blocked:         { icon: ICON_BAN,          label: 'Blocked attackers',      cls: 'outcome-blocked' },
+  blocked:         { icon: ICON_BAN,          label: 'Currently blocked attackers', cls: 'outcome-blocked' },
   honeypot:        { icon: ICON_BUG,          label: 'Honeypot',               cls: 'outcome-honeypot' },
   monitoring:      { icon: ICON_EYE,          label: 'Observing',              cls: 'outcome-observing' },
   needs_attention: { icon: ICON_ALERT_CIRCLE, label: 'Needs your attention',   cls: 'outcome-attention' },

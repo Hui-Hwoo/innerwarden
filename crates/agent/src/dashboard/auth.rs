@@ -864,9 +864,7 @@ mod tests {
                 None => continue,
             };
             let after = &line[v_idx..];
-            let end = after
-                .find(|c: char| c == ' ' || c == '|')
-                .unwrap_or(after.len());
+            let end = after.find([' ', '|']).unwrap_or(after.len());
             let token = &after[..end];
             assert_eq!(
                 token, current_supported,

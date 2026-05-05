@@ -145,9 +145,9 @@
           <div class="activity-label">flagged as suspicious</div>
         </div>
         <span class="activity-sep" aria-hidden="true">&rarr;</span>
-        <div class="activity-cell" onclick="viewActivity()" role="button" tabindex="0" title="Attackers the system blocked or contained automatically.">
+        <div class="activity-cell" onclick="viewActivity()" role="button" tabindex="0" title="Attackers handled automatically today: blocked, observed, or honeypot-redirected. Since midnight UTC. Threats tab breaks this down by outcome.">
           <div class="activity-num activity-num-ok" id="homeActStopped">0</div>
-          <div class="activity-label">stopped automatically</div>
+          <div class="activity-label">handled automatically</div>
         </div>
         <span class="activity-sep" aria-hidden="true">&rarr;</span>
         <div class="activity-cell activity-cell-attention" onclick="viewActivity()" role="button" tabindex="0" title="Attackers awaiting your review.">
@@ -288,9 +288,9 @@
            in OUTCOME_META so the operator sees both numbers and
            understands they answer different questions. -->
       <div class="kpi-grid" style="grid-template-columns: repeat(3,1fr)">
-        <div class="kpi-card"><div class="kpi-value" id="kpi-confirmed" style="color:var(--ok)">0</div><div class="kpi-label">Blocks</div><div class="kpi-window">Today</div></div>
-        <div class="kpi-card"><div class="kpi-value" id="kpi-responded" style="color:var(--accent)">0</div><div class="kpi-label">Observing</div><div class="kpi-window">Now</div></div>
-        <div class="kpi-card"><div class="kpi-value" id="kpi-noise" style="color:var(--muted)">0</div><div class="kpi-label">Needs attention</div><div class="kpi-window">Today</div></div>
+        <div class="kpi-card" title="Block actions today: each block decision counts once, even if the same IP triggered multiple. See 'Currently blocked attackers' below for the unique-IP count."><div class="kpi-value" id="kpi-confirmed" style="color:var(--ok)">0</div><div class="kpi-label">Block actions</div><div class="kpi-window">today</div></div>
+        <div class="kpi-card" title="Attackers the AI is currently observing without blocking. Snapshot of right now."><div class="kpi-value" id="kpi-responded" style="color:var(--accent)">0</div><div class="kpi-label">Observing</div><div class="kpi-window">now</div></div>
+        <div class="kpi-card" title="Today's incidents still waiting for an AI decision or operator review. Since midnight UTC."><div class="kpi-value" id="kpi-noise" style="color:var(--muted)">0</div><div class="kpi-label">Needs attention</div><div class="kpi-window">today</div></div>
       </div>
       <div class="filters" style="grid-template-columns:1fr auto;margin-bottom:6px">
         <input id="flt-date" type="date" class="full" style="grid-column:1/-1" title="Pick a date with on-disk graph snapshot. Empty = full graph (today)." />

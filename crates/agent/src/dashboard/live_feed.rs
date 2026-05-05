@@ -283,7 +283,17 @@ pub(super) fn build_live_feed_response(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &std::path::Path,
 ) -> LiveFeedResponse {
-    let _now = chrono::Utc::now();
+    // Wave 10 (label honesty, 2026-05-05): the public site renders
+    // "(24h)" next to every count on this response. Pre-fix the
+    // builder honoured no time window and read every incident the KG
+    // retained — anywhere from minutes to days, depending on KG
+    // eviction state. The "(24h)" label was therefore a lie under any
+    // hot-tier load. Clipping incidents to `now - 24h` here makes the
+    // label match the data, and downstream surfaces (`total_today`,
+    // `total_blocked`, `total_high`, `unique_sources`) stay
+    // consistent because they all derive from `real_incidents`.
+    let now = chrono::Utc::now();
+    let cutoff_24h = now - chrono::Duration::hours(24);
     let reputation_map = load_ip_reputation_map(data_dir);
 
     // Read incidents from knowledge graph
@@ -422,8 +432,13 @@ pub(super) fn build_live_feed_response(
         .map(|d| (d.incident_id.clone(), d))
         .collect();
 
-    // Filter real attacks only (exclude internal noise) for consistent stats.
-    let real_incidents: Vec<&Incident> = incidents.iter().filter(|i| !is_internal(i)).collect();
+    // Filter real attacks only (exclude internal noise) AND clip to
+    // the rolling 24h window the public site labels claim. See the
+    // Wave-10 comment at the top of this fn for the why.
+    let real_incidents: Vec<&Incident> = incidents
+        .iter()
+        .filter(|i| !is_internal(i) && i.ts >= cutoff_24h)
+        .collect();
 
     // Build incident IDs set for matching decisions to real attacks only.
     let real_ids: std::collections::HashSet<&str> = real_incidents
