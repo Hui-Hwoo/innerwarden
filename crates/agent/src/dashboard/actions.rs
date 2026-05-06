@@ -1656,4 +1656,759 @@ mod tests {
         let s = "ção da AI";
         assert_eq!(truncate(s, 3), "ção…");
     }
+
+    // ── api_action_config: derived "mode" must reflect (enabled, dry_run) ─────
+    //
+    // The dashboard UI reads `mode` to decide which action buttons to render
+    // (read_only hides them, watch shows them with a DRY-RUN tag, guard shows
+    // them as live). A regression on the truth-table below silently changes
+    // operator-visible behaviour; pin every cell.
+
+    fn state_with_action_cfg(
+        dir: &std::path::Path,
+        cfg: DashboardActionConfig,
+    ) -> crate::dashboard::state::DashboardState {
+        let mut state = test_dashboard_state(dir);
+        state.action_cfg = std::sync::Arc::new(cfg);
+        state
+    }
+
+    #[tokio::test]
+    async fn api_action_config_returns_read_only_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = DashboardActionConfig::default();
+        cfg.enabled = false;
+        cfg.dry_run = false;
+        cfg.trusted_ips = vec!["10.0.0.1".to_string()];
+        cfg.trusted_users = vec!["root".to_string()];
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_config(State(state)).await;
+        let v = resp.0;
+        assert_eq!(v["mode"], "read_only");
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["block_backend"], "ufw");
+        assert_eq!(v["trusted_ips"][0], "10.0.0.1");
+        assert_eq!(v["trusted_users"][0], "root");
+        // Version always present so the UI can render it.
+        assert!(v["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn api_action_config_returns_watch_when_enabled_and_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = DashboardActionConfig::default();
+        cfg.enabled = true;
+        cfg.dry_run = true;
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_config(State(state)).await;
+        assert_eq!(resp.0["mode"], "watch");
+    }
+
+    #[tokio::test]
+    async fn api_action_config_returns_guard_when_enabled_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = DashboardActionConfig::default();
+        cfg.enabled = true;
+        cfg.dry_run = false;
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_config(State(state)).await;
+        assert_eq!(resp.0["mode"], "guard");
+    }
+
+    // ── api_quickwins async wrapper exercises spawn_blocking path ────────────
+
+    #[tokio::test]
+    async fn api_quickwins_async_wrapper_returns_payload_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = today_str();
+        write_jsonl(
+            dir.path(),
+            &format!("incidents-{date}.jsonl"),
+            &[high_incident("203.0.113.55", "ssh bruteforce")],
+        );
+        let state = test_dashboard_state(dir.path());
+        let resp = api_quickwins(State(state)).await;
+        let v = resp.0;
+        assert_eq!(v["count"].as_u64(), Some(1));
+        assert_eq!(v["suggestions"][0]["ip"].as_str(), Some("203.0.113.55"));
+    }
+
+    // ── api_action_block_ip: every guard-clause + dry-run happy path ─────────
+
+    fn enabled_dry_run_cfg(extra_skills: &[&str]) -> DashboardActionConfig {
+        let mut cfg = DashboardActionConfig::default();
+        cfg.enabled = true;
+        cfg.dry_run = true;
+        let mut allowed = vec!["block-ip-ufw".to_string()];
+        for s in extra_skills {
+            allowed.push((*s).to_string());
+        }
+        cfg.allowed_skills = allowed;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn api_action_block_ip_rejects_when_actions_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // Default config has enabled=false.
+        let state = test_dashboard_state(dir.path());
+        let resp = api_action_block_ip(
+            State(state),
+            Json(BlockIpRequest {
+                ip: "8.8.8.8".to_string(),
+                reason: "test".to_string(),
+                incident_id: None,
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("dashboard actions are disabled"));
+    }
+
+    #[tokio::test]
+    async fn api_action_block_ip_rejects_invalid_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_action_cfg(dir.path(), enabled_dry_run_cfg(&[]));
+        let resp = api_action_block_ip(
+            State(state),
+            Json(BlockIpRequest {
+                ip: "10.0.0.5".to_string(), // RFC1918 — must be rejected
+                reason: "test".to_string(),
+                incident_id: None,
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("internal IP"));
+    }
+
+    #[tokio::test]
+    async fn api_action_block_ip_rejects_unallowed_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = enabled_dry_run_cfg(&[]);
+        // Configure an iptables backend but with only ufw in allowed_skills:
+        // the resolved skill_id "block-ip-iptables" is not in the allowlist.
+        cfg.block_backend = "iptables".to_string();
+        cfg.allowed_skills = vec!["block-ip-ufw".to_string()];
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_block_ip(
+            State(state),
+            Json(BlockIpRequest {
+                ip: "8.8.8.8".to_string(),
+                reason: "test".to_string(),
+                incident_id: None,
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("not in allowed_skills"));
+        assert_eq!(resp.0.skill_id, "block-ip-iptables");
+    }
+
+    #[tokio::test]
+    async fn api_action_block_ip_dry_run_happy_path_writes_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enabled_dry_run_cfg(&[]);
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_block_ip(
+            State(state),
+            Json(BlockIpRequest {
+                ip: "8.8.8.8".to_string(),
+                reason: "manual block from test".to_string(),
+                incident_id: Some("inc-123".to_string()),
+            }),
+        )
+        .await;
+        assert!(resp.0.success, "got: {}", resp.0.message);
+        assert!(resp.0.dry_run);
+        assert_eq!(resp.0.skill_id, "block-ip-ufw");
+        // The decisions JSONL was created and a row was written.
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let dec_path = dir.path().join(format!("decisions-{date}.jsonl"));
+        let raw = std::fs::read_to_string(&dec_path).expect("decisions jsonl exists");
+        let line = raw.lines().next().expect("at least one line");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["action_type"], "block_ip");
+        assert_eq!(v["target_ip"], "8.8.8.8");
+        assert_eq!(v["incident_id"], "inc-123");
+        assert_eq!(v["dry_run"], true);
+    }
+
+    #[tokio::test]
+    async fn api_action_block_ip_logs_warning_when_insecure_http() {
+        // The insecure_http branch emits a `warn!`; the handler still proceeds
+        // with the rest of the validation. This test just exercises that
+        // branch alongside a normal disabled-actions short circuit so the
+        // `state.insecure_http` line is covered.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_dashboard_state(dir.path());
+        state.insecure_http = true;
+        let resp = api_action_block_ip(
+            State(state),
+            Json(BlockIpRequest {
+                ip: "8.8.8.8".to_string(),
+                reason: "test".to_string(),
+                incident_id: None,
+            }),
+        )
+        .await;
+        // actions are still disabled by default → short-circuit message
+        assert!(!resp.0.success);
+    }
+
+    // ── api_action_suspend_user: every guard-clause + dry-run happy path ─────
+
+    #[tokio::test]
+    async fn api_action_suspend_user_rejects_when_actions_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_dashboard_state(dir.path());
+        let resp = api_action_suspend_user(
+            State(state),
+            Json(SuspendUserRequest {
+                user: "alice".to_string(),
+                reason: "test".to_string(),
+                duration_secs: None,
+                incident_id: None,
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("dashboard actions are disabled"));
+        assert_eq!(resp.0.skill_id, "suspend-user-sudo");
+    }
+
+    #[tokio::test]
+    async fn api_action_suspend_user_rejects_empty_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = enabled_dry_run_cfg(&["suspend-user-sudo"]);
+        cfg.allowed_skills.push("suspend-user-sudo".to_string());
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_suspend_user(
+            State(state),
+            Json(SuspendUserRequest {
+                user: "   ".to_string(),
+                reason: "test".to_string(),
+                duration_secs: None,
+                incident_id: None,
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("user is required"));
+    }
+
+    #[tokio::test]
+    async fn api_action_suspend_user_rejects_empty_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enabled_dry_run_cfg(&["suspend-user-sudo"]);
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_suspend_user(
+            State(state),
+            Json(SuspendUserRequest {
+                user: "alice".to_string(),
+                reason: "  ".to_string(),
+                duration_secs: None,
+                incident_id: None,
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("reason is required"));
+    }
+
+    #[tokio::test]
+    async fn api_action_suspend_user_rejects_unallowed_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        // enabled, but skill list does NOT include suspend-user-sudo.
+        let cfg = enabled_dry_run_cfg(&[]);
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_suspend_user(
+            State(state),
+            Json(SuspendUserRequest {
+                user: "alice".to_string(),
+                reason: "test".to_string(),
+                duration_secs: Some(1800),
+                incident_id: Some("inc-x".to_string()),
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("not in allowed_skills"));
+    }
+
+    #[tokio::test]
+    async fn api_action_suspend_user_dry_run_happy_path_writes_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enabled_dry_run_cfg(&["suspend-user-sudo"]);
+        let mut state = state_with_action_cfg(dir.path(), cfg);
+        // Hit the insecure_http warn! branch on the way through.
+        state.insecure_http = true;
+        let resp = api_action_suspend_user(
+            State(state),
+            Json(SuspendUserRequest {
+                user: "alice".to_string(),
+                reason: "operator decision".to_string(),
+                duration_secs: Some(60),
+                incident_id: Some("inc-42".to_string()),
+            }),
+        )
+        .await;
+        assert!(resp.0.success, "got: {}", resp.0.message);
+        assert!(resp.0.dry_run);
+        assert_eq!(resp.0.skill_id, "suspend-user-sudo");
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let dec_path = dir.path().join(format!("decisions-{date}.jsonl"));
+        let raw = std::fs::read_to_string(&dec_path).expect("decisions jsonl exists");
+        let line = raw.lines().next().expect("at least one line");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["action_type"], "suspend_user_sudo");
+        assert_eq!(v["target_user"], "alice");
+        assert_eq!(v["incident_id"], "inc-42");
+    }
+
+    // ── api_action_honeypot: every guard-clause + dry-run happy path ─────────
+
+    #[tokio::test]
+    async fn api_action_honeypot_rejects_when_actions_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_dashboard_state(dir.path());
+        let resp = api_action_honeypot(
+            State(state),
+            Json(HoneypotTestRequest {
+                reason: "test".to_string(),
+                duration_secs: None,
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("dashboard actions are disabled"));
+    }
+
+    #[tokio::test]
+    async fn api_action_honeypot_rejects_empty_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enabled_dry_run_cfg(&["honeypot"]);
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_honeypot(
+            State(state),
+            Json(HoneypotTestRequest {
+                reason: "   ".to_string(),
+                duration_secs: None,
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("reason is required"));
+    }
+
+    #[tokio::test]
+    async fn api_action_honeypot_rejects_unallowed_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enabled_dry_run_cfg(&[]); // honeypot skill NOT allowed
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_honeypot(
+            State(state),
+            Json(HoneypotTestRequest {
+                reason: "operator test".to_string(),
+                duration_secs: Some(60),
+            }),
+        )
+        .await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("not in allowed_skills"));
+    }
+
+    #[tokio::test]
+    async fn api_action_honeypot_dry_run_happy_path_writes_audit_and_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = enabled_dry_run_cfg(&[]);
+        cfg.allowed_skills.push("honeypot".to_string());
+        let mut state = state_with_action_cfg(dir.path(), cfg);
+        state.insecure_http = true; // exercise the insecure_http warn!
+        let resp = api_action_honeypot(
+            State(state),
+            Json(HoneypotTestRequest {
+                reason: "operator manual test".to_string(),
+                duration_secs: Some(45),
+            }),
+        )
+        .await;
+        assert!(resp.0.success, "got: {}", resp.0.message);
+        assert_eq!(resp.0.skill_id, "honeypot");
+        assert!(resp.0.dry_run);
+        assert!(resp.0.message.contains("[DRY RUN]"));
+        // Synthetic incident was injected for the agent loop to pick up.
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let inc_path = dir.path().join(format!("incidents-{date}.jsonl"));
+        let raw = std::fs::read_to_string(&inc_path).expect("incidents jsonl exists");
+        let line = raw.lines().next().expect("at least one line");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["severity"], "high");
+        assert_eq!(v["entities"][0]["value"], "1.2.3.4");
+        // Decision row also written.
+        let dec_path = dir.path().join(format!("decisions-{date}.jsonl"));
+        let dec_raw = std::fs::read_to_string(&dec_path).expect("decisions jsonl exists");
+        let dec_line = dec_raw.lines().next().expect("at least one line");
+        let dv: serde_json::Value = serde_json::from_str(dec_line).unwrap();
+        assert_eq!(dv["action_type"], "honeypot");
+        assert_eq!(dv["execution_result"], "ok (dry_run)");
+    }
+
+    #[tokio::test]
+    async fn api_action_honeypot_live_mode_records_incident_injected_result() {
+        // Same as the dry-run happy path but with dry_run=false. The skill
+        // does not actually execute (dashboard does not call `execute()` on
+        // honeypot here — it injects an incident for the agent loop), so
+        // we can verify the live-mode bookkeeping branch (`incident_injected`
+        // in the audit) without touching real services.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = enabled_dry_run_cfg(&[]);
+        cfg.dry_run = false;
+        cfg.allowed_skills.push("honeypot".to_string());
+        let state = state_with_action_cfg(dir.path(), cfg);
+        let resp = api_action_honeypot(
+            State(state),
+            Json(HoneypotTestRequest {
+                reason: "live test".to_string(),
+                duration_secs: None, // exercises the `unwrap_or(120)` branch
+            }),
+        )
+        .await;
+        assert!(resp.0.success);
+        assert!(!resp.0.dry_run);
+        assert!(!resp.0.message.contains("[DRY RUN]"));
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let dec_path = dir.path().join(format!("decisions-{date}.jsonl"));
+        let raw = std::fs::read_to_string(&dec_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(v["execution_result"], "incident_injected");
+        assert_eq!(v["dry_run"], false);
+    }
+
+    // ── execute_block_ip: cover all three backends + audit-trail invariants ──
+
+    #[tokio::test]
+    async fn execute_block_ip_dry_run_ufw_returns_success_and_chains_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enabled_dry_run_cfg(&[]); // backend = ufw
+        let (success, msg) = execute_block_ip(
+            dir.path(),
+            None,
+            &cfg,
+            "8.8.8.8",
+            "audit reason",
+            Some("inc-1"),
+        )
+        .await
+        .unwrap();
+        assert!(success, "ufw dry-run must succeed: {msg}");
+        // Decision JSONL written with action_type=block_ip.
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let raw =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{date}.jsonl"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(v["action_type"], "block_ip");
+        assert_eq!(v["target_ip"], "8.8.8.8");
+        // The skill_id is the backend-resolved one; the dashboard resolved it
+        // via `format!("block-ip-{}", cfg.block_backend)`.
+        assert_eq!(v["skill_id"], "block-ip-ufw");
+        // Admin audit trail is also written.
+        let admin_date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        // Path is canonicalized inside append_admin_action so we just look
+        // up "admin-actions-*.jsonl" by glob scan.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("admin-actions-{admin_date}"))
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one admin-actions file must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_block_ip_dry_run_iptables_uses_correct_skill_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = enabled_dry_run_cfg(&[]);
+        cfg.block_backend = "iptables".to_string();
+        let (success, _msg) =
+            execute_block_ip(dir.path(), None, &cfg, "8.8.4.4", "iptables route", None)
+                .await
+                .unwrap();
+        assert!(success);
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let raw =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{date}.jsonl"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(v["skill_id"], "block-ip-iptables");
+        // incident_id default when None is provided.
+        assert_eq!(v["incident_id"], "dashboard:manual");
+    }
+
+    #[tokio::test]
+    async fn execute_block_ip_dry_run_nftables_uses_correct_skill_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = enabled_dry_run_cfg(&[]);
+        cfg.block_backend = "nftables".to_string();
+        let (success, _msg) = execute_block_ip(
+            dir.path(),
+            None,
+            &cfg,
+            "1.1.1.1",
+            "nftables route",
+            Some("inc-7"),
+        )
+        .await
+        .unwrap();
+        assert!(success);
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let raw =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{date}.jsonl"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(v["skill_id"], "block-ip-nftables");
+    }
+
+    // ── execute_suspend_user: dry-run happy path + audit invariants ──────────
+
+    #[tokio::test]
+    async fn execute_suspend_user_dry_run_writes_decision_and_admin_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enabled_dry_run_cfg(&["suspend-user-sudo"]);
+        let (success, msg) = execute_suspend_user(
+            dir.path(),
+            None,
+            &cfg,
+            "alice",
+            "audit reason",
+            900,
+            Some("inc-9"),
+        )
+        .await
+        .unwrap();
+        assert!(success, "suspend dry-run must succeed: {msg}");
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let raw =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{date}.jsonl"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(v["action_type"], "suspend_user_sudo");
+        assert_eq!(v["target_user"], "alice");
+        assert_eq!(v["skill_id"], "suspend-user-sudo");
+        assert_eq!(v["incident_id"], "inc-9");
+        assert_eq!(v["dry_run"], true);
+    }
+
+    #[tokio::test]
+    async fn execute_suspend_user_dry_run_default_incident_id_when_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enabled_dry_run_cfg(&["suspend-user-sudo"]);
+        let (success, _msg) = execute_suspend_user(dir.path(), None, &cfg, "bob", "test", 60, None)
+            .await
+            .unwrap();
+        assert!(success);
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let raw =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{date}.jsonl"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(v["incident_id"], "dashboard:manual");
+    }
+
+    // ── inject_honeypot_test_incident: appends parseable JSONL ───────────────
+
+    #[tokio::test]
+    async fn inject_honeypot_test_incident_writes_parseable_line() {
+        let dir = tempfile::tempdir().unwrap();
+        inject_honeypot_test_incident(dir.path(), "operator wants test", 90)
+            .await
+            .expect("inject must succeed");
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let path = dir.path().join(format!("incidents-{date}.jsonl"));
+        let raw = std::fs::read_to_string(&path).expect("incidents jsonl exists");
+        let line = raw.lines().next().expect("one line");
+        let v: serde_json::Value = serde_json::from_str(line).expect("parseable JSON");
+        assert_eq!(v["severity"], "high");
+        assert!(v["title"].as_str().unwrap().contains("operator wants test"));
+        assert!(v["title"].as_str().unwrap().contains("90s"));
+        assert_eq!(v["entities"][0]["type"], "ip");
+        assert_eq!(v["entities"][0]["value"], "1.2.3.4");
+        assert!(v["evidence"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    async fn inject_honeypot_test_incident_appends_when_called_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        inject_honeypot_test_incident(dir.path(), "first", 30)
+            .await
+            .unwrap();
+        inject_honeypot_test_incident(dir.path(), "second", 60)
+            .await
+            .unwrap();
+        let date = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let raw =
+            std::fs::read_to_string(dir.path().join(format!("incidents-{date}.jsonl"))).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "second call must append, not overwrite");
+    }
+
+    // ── hostname() best-effort returns non-empty ────────────────────────────
+
+    #[test]
+    fn hostname_returns_some_string() {
+        // The function is best-effort; the only invariant is that it never
+        // panics and returns a non-empty string (env var, /etc/hostname, or
+        // the literal "unknown" fallback).
+        let h = hostname();
+        assert!(!h.is_empty(), "hostname() must return non-empty");
+    }
+
+    // ── Override / reopen / label: cover the remaining handler branches ─────
+    //
+    // The 2026-05-01 audit endpoints already had reason/label/sqlite-store
+    // branches anchored above. The tests below pin the few remaining lines
+    // that exercise the empty-incident-id-only short circuit and the second
+    // `incident_id and reason are required` branch where reason is empty
+    // (the existing test only exercised empty incident_id). They also pin
+    // the override happy path's `original.reason = None` fallback (the
+    // existing test seeded a row WITH a reason).
+
+    #[tokio::test]
+    async fn api_action_reopen_incident_rejects_when_only_reason_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _store) = state_with_sqlite(dir.path());
+        let body = ReopenIncidentRequest {
+            incident_id: "inc-1".to_string(),
+            reason: "   ".to_string(),
+        };
+        let resp = api_action_reopen_incident(State(state), Json(body)).await;
+        assert!(!resp.0.success);
+        assert!(resp.0.message.contains("are required"));
+    }
+
+    #[tokio::test]
+    async fn api_action_override_decision_uses_default_when_original_reason_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, store) = state_with_sqlite(dir.path());
+        // Seed a row with reason = None to exercise the
+        // `original.reason.unwrap_or_default()` fallback.
+        let row = innerwarden_store::decisions::DecisionRow {
+            ts: "2026-05-01T12:00:00Z".to_string(),
+            incident_id: "inc-no-reason".to_string(),
+            action_type: "block_ip".to_string(),
+            target_ip: Some("8.8.8.8".to_string()),
+            target_user: None,
+            confidence: 0.5,
+            auto_executed: false,
+            reason: None,
+            data: "{}".to_string(),
+        };
+        let id = store.insert_decision(&row).unwrap();
+        let body = OverrideDecisionRequest {
+            decision_id: id,
+            new_action: "dismiss".to_string(),
+            reason: "operator dismisses".to_string(),
+        };
+        let resp = api_action_override_decision(State(state), Json(body)).await;
+        assert!(resp.0.success, "got: {}", resp.0.message);
+        assert!(resp.0.skill_id.starts_with("operator_override:dismiss"));
+    }
+
+    #[tokio::test]
+    async fn api_action_override_decision_truncates_long_original_reason() {
+        // The combined audit reason embeds `truncate(original.reason, 200)`.
+        // Pin the contract so a refactor that drops the truncation (and
+        // bloats every audit row) is caught.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, store) = state_with_sqlite(dir.path());
+        let long_reason = "x".repeat(500);
+        let row = innerwarden_store::decisions::DecisionRow {
+            ts: "2026-05-01T12:00:00Z".to_string(),
+            incident_id: "inc-long-reason".to_string(),
+            action_type: "block_ip".to_string(),
+            target_ip: Some("8.8.8.8".to_string()),
+            target_user: None,
+            confidence: 0.5,
+            auto_executed: false,
+            reason: Some(long_reason),
+            data: "{}".to_string(),
+        };
+        let id = store.insert_decision(&row).unwrap();
+        let body = OverrideDecisionRequest {
+            decision_id: id,
+            new_action: "monitor".to_string(),
+            reason: "operator says monitor".to_string(),
+        };
+        let resp = api_action_override_decision(State(state), Json(body)).await;
+        assert!(resp.0.success);
+        let trail = store.audit_trail(None, 5, None).unwrap();
+        let new_row = trail
+            .iter()
+            .find(|r| r.action_type == "operator_override:monitor")
+            .expect("override row");
+        let combined = new_row.reason.as_deref().unwrap_or("");
+        // 200 'x' chars + the ellipsis from `truncate`, plus surrounding text.
+        let xs = combined.matches('x').count();
+        assert_eq!(xs, 200, "original reason must be clamped to 200 chars");
+        assert!(combined.contains('…'));
+    }
+
+    #[tokio::test]
+    async fn api_action_label_decision_with_tp_label_writes_jsonl() {
+        // The existing tests exercise FP and the round-trip; this test pins
+        // the TP label specifically (the membership check branch with the
+        // other allowed value) and the empty-reason default-serde branch.
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_dashboard_state(dir.path());
+        let body = LabelDecisionRequest {
+            decision_id: 99,
+            label: "TP".to_string(),
+            reason: "".to_string(),
+        };
+        let resp = api_action_label_decision(State(state), Json(body)).await;
+        assert!(resp.0.success);
+        let raw = std::fs::read_to_string(dir.path().join("decision-labels.jsonl")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(v["label"], "TP");
+        assert_eq!(v["decision_id"], 99);
+    }
 }

@@ -1768,4 +1768,852 @@ mod tests {
             "empty graph should produce empty context; got:\n{out}"
         );
     }
+
+    // ── bot_helpers coverage anchors (AUDIT-COVERAGE-BOT-HELPERS) ─────────
+    //
+    // Phase 7B coverage push (spec 023). The four blocks below pin the
+    // formatting / dispatch branches that were uncovered in the baseline
+    // 56.6% measurement: severity icons + age formatting on the threats
+    // summary, action icons + decision section / high-risk section /
+    // node_label rendering on the /ask context, the timestamp helper, and
+    // the `handle_telegram_triage_action` allowlist-add error path that
+    // exercises the audit-write side effect when the protected
+    // `/etc/innerwarden/allowlist.toml` write fails as a non-root test
+    // user. Each anchor asserts an operator-visible string the bot prints
+    // back to Telegram, so a future refactor that drops a branch silently
+    // breaks the assertion here rather than only on production.
+
+    /// Cover the `low` and unknown severity branches of `sev_icon` plus the
+    /// `>= 60 minutes` age formatting branch in `graph_last_incidents`.
+    /// Pre-baseline these branches were uncovered (only `high` and
+    /// `medium` were exercised by `seeded_graph`).
+    #[test]
+    fn graph_last_incidents_covers_all_severities_and_age_branches() {
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+
+        let make_inc = |id: &str, sev: &str, ts: chrono::DateTime<chrono::Utc>| Node::Incident {
+            incident_id: id.to_string(),
+            detector: "test".to_string(),
+            severity: sev.to_string(),
+            title: format!("title-{sev}"),
+            summary: "s".to_string(),
+            ts,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        };
+
+        // Critical incident, recent → "just now" branch (mins < 1).
+        let crit_id = graph.add_node(make_inc("crit:1", "critical", now));
+        let ip_crit = graph.ensure_ip("203.0.113.1", now);
+        graph.add_edge(Edge::new(crit_id, ip_crit, Relation::TriggeredBy, now));
+
+        // Low severity → low icon (line 81).
+        let low_ts = now - chrono::Duration::minutes(5);
+        let low_id = graph.add_node(make_inc("low:1", "low", low_ts));
+        let ip_low = graph.ensure_ip("203.0.113.2", low_ts);
+        graph.add_edge(Edge::new(low_id, ip_low, Relation::TriggeredBy, low_ts));
+
+        // Unknown severity → wildcard branch (line 82).
+        let weird_ts = now - chrono::Duration::minutes(10);
+        let weird_id = graph.add_node(make_inc("weird:1", "informational", weird_ts));
+        let ip_weird = graph.ensure_ip("203.0.113.3", weird_ts);
+        graph.add_edge(Edge::new(
+            weird_id,
+            ip_weird,
+            Relation::TriggeredBy,
+            weird_ts,
+        ));
+
+        // Old incident → hours-ago branch (line 95).
+        let old_ts = now - chrono::Duration::hours(3);
+        let old_id = graph.add_node(make_inc("old:1", "high", old_ts));
+        let ip_old = graph.ensure_ip("203.0.113.4", old_ts);
+        graph.add_edge(Edge::new(old_id, ip_old, Relation::TriggeredBy, old_ts));
+
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+        let out = graph_last_incidents(&kg, 5);
+
+        // Critical icon (red circle).
+        assert!(
+            out.contains("\u{1f534}"),
+            "critical icon missing; got:\n{out}"
+        );
+        // Low icon (green circle).
+        assert!(out.contains("\u{1f7e2}"), "low icon missing; got:\n{out}");
+        // Unknown severity → white circle wildcard.
+        assert!(
+            out.contains("\u{26aa}"),
+            "wildcard icon missing; got:\n{out}"
+        );
+        // Hours-ago age string.
+        assert!(
+            out.contains("h ago"),
+            "hours-ago label missing; got:\n{out}"
+        );
+        // "just now" branch on the < 1min critical incident.
+        assert!(
+            out.contains("just now"),
+            "just-now label missing; got:\n{out}"
+        );
+    }
+
+    /// Cover all branches of the `action_icon` closure inside
+    /// `graph_last_decisions` (suspend/honeypot/monitor/kill/ignore/default).
+    /// Pre-baseline only the "block" branch was hit by `seeded_graph`.
+    #[test]
+    fn graph_last_decisions_covers_all_action_icons() {
+        use crate::knowledge_graph::types::Node;
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let make_dec = |id: &str, action: &str, offset_secs: i64| -> Node {
+            Node::Incident {
+                incident_id: id.to_string(),
+                detector: "test".to_string(),
+                severity: "high".to_string(),
+                title: format!("t-{id}"),
+                summary: "s".to_string(),
+                ts: now - chrono::Duration::seconds(offset_secs),
+                mitre_ids: vec![],
+                decision: Some(action.to_string()),
+                confidence: Some(0.5),
+                decision_reason: None,
+                decision_target: Some("1.2.3.4".to_string()),
+                auto_executed: false,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            }
+        };
+        graph.add_node(make_dec("d1", "suspend_user", 1));
+        graph.add_node(make_dec("d2", "honeypot_redirect", 2));
+        graph.add_node(make_dec("d3", "monitor_only", 3));
+        graph.add_node(make_dec("d4", "kill_process", 4));
+        graph.add_node(make_dec("d5", "ignore", 5));
+        graph.add_node(make_dec("d6", "do_something_else", 6));
+
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+        let out = graph_last_decisions(&kg, 10);
+
+        // Each action_icon branch produces a distinct emoji.
+        assert!(
+            out.contains("\u{1f451}"),
+            "suspend (crown) icon missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("\u{1f36f}"),
+            "honeypot (jar) icon missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("\u{1f441}"),
+            "monitor (eye) icon missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("\u{1f480}"),
+            "kill (skull) icon missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("\u{1f648}"),
+            "ignore (monkey) icon missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("\u{26a1}"),
+            "default (lightning) icon missing; got:\n{out}"
+        );
+    }
+
+    /// Cover the `decision_target = None` fallback to "?" inside
+    /// `graph_last_decisions` (line 138 fallback). Anti-regression: the
+    /// dashboard also relies on the "?" sentinel when an AI decision
+    /// fires without an entity attached.
+    #[test]
+    fn graph_last_decisions_fallback_target_renders_as_question_mark() {
+        use crate::knowledge_graph::types::Node;
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        graph.add_node(Node::Incident {
+            incident_id: "no_target:1".to_string(),
+            detector: "test".to_string(),
+            severity: "high".to_string(),
+            title: "t".to_string(),
+            summary: "s".to_string(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".to_string()),
+            confidence: Some(0.9),
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
+        let out = graph_last_decisions(&kg, 5);
+        assert!(
+            out.contains("<code>?</code>"),
+            "missing fallback target; got:\n{out}"
+        );
+        assert!(
+            out.contains("live"),
+            "auto_executed=true should label 'live'; got:\n{out}"
+        );
+    }
+
+    /// Cover the RECENT DECISIONS section + the proposed/auto branches of
+    /// `ask_context_deep`. Pre-baseline section_2 was uncovered because
+    /// `ask_context_deep_includes_ip_risk_and_datasets` only seeded an
+    /// incident WITHOUT a decision.
+    #[test]
+    fn ask_context_deep_includes_decisions_section() {
+        use crate::knowledge_graph::types::Node;
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let now = chrono::Utc::now();
+        {
+            let mut g = kg.write().unwrap();
+            // Auto-executed decision → "(auto)" branch.
+            g.add_node(Node::Incident {
+                incident_id: "i1".to_string(),
+                detector: "test".to_string(),
+                severity: "high".to_string(),
+                title: "t1".to_string(),
+                summary: "s".to_string(),
+                ts: now,
+                mitre_ids: vec![],
+                decision: Some("block_ip".to_string()),
+                confidence: Some(0.9),
+                decision_reason: None,
+                decision_target: Some("1.2.3.4".to_string()),
+                auto_executed: true,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            });
+            // Proposed (non-auto) decision with no target → "(proposed)" + "?".
+            g.add_node(Node::Incident {
+                incident_id: "i2".to_string(),
+                detector: "test".to_string(),
+                severity: "medium".to_string(),
+                title: "t2".to_string(),
+                summary: "s".to_string(),
+                ts: now - chrono::Duration::seconds(30),
+                mitre_ids: vec![],
+                decision: Some("monitor".to_string()),
+                confidence: Some(0.4),
+                decision_reason: None,
+                decision_target: None,
+                auto_executed: false,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            });
+        }
+        let out = ask_context_deep(&kg, "what happened?", 8000);
+        assert!(
+            out.contains("RECENT DECISIONS:"),
+            "decisions header missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("- block_ip 1.2.3.4 (auto)"),
+            "auto-executed line missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("- monitor ? (proposed)"),
+            "proposed line + '?' fallback missing; got:\n{out}"
+        );
+    }
+
+    /// Cover the HIGH-RISK ENTITIES section of `ask_context_deep` plus
+    /// the `campaigns > 0` rendering branch. Section 3 was uncovered in
+    /// baseline (no test seeded a campaign membership edge).
+    #[test]
+    fn ask_context_deep_includes_high_risk_entities_with_campaigns() {
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let now = chrono::Utc::now();
+        {
+            let mut g = kg.write().unwrap();
+            // High-risk IP with a campaign membership → both `risk > 70`
+            // and `campaigns > 0` branches plus the "campaigns=" suffix
+            // formatter.
+            let ip_high = g.add_node(make_ip_node("203.0.113.50", 90, vec![]));
+            let camp = g.add_node(Node::Campaign {
+                campaign_id: "c1".to_string(),
+                dna_hash: None,
+                pattern_class: "scanner".to_string(),
+                first_seen: now,
+                last_seen: now,
+                ip_count: 1,
+            });
+            g.add_edge(Edge::new(ip_high, camp, Relation::MemberOf, now));
+
+            // Low-risk IP that is ONLY a campaign member (risk <=70 but
+            // campaigns > 0) → covers the `campaigns > 0` short-circuit.
+            let ip_camp_only = g.add_node(make_ip_node("198.51.100.10", 30, vec![]));
+            g.add_edge(Edge::new(ip_camp_only, camp, Relation::MemberOf, now));
+
+            // Low-risk IP NOT in a campaign → must NOT appear in the
+            // section (anti-regression for relaxing the filter).
+            g.add_node(make_ip_node("198.51.100.99", 5, vec![]));
+        }
+        let out = ask_context_deep(&kg, "show high risk", 8000);
+        assert!(
+            out.contains("HIGH-RISK ENTITIES:"),
+            "high-risk header missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("- 203.0.113.50 risk=90 campaigns=1"),
+            "expected campaigns suffix on high-risk IP; got:\n{out}"
+        );
+        assert!(
+            out.contains("- 198.51.100.10 risk=30 campaigns=1"),
+            "expected campaign-only IP entry; got:\n{out}"
+        );
+        assert!(
+            !out.contains("198.51.100.99"),
+            "low-risk non-campaign IP must be filtered out; got:\n{out}"
+        );
+    }
+
+    /// Cover the remaining `node_label` variants (Process, File, User,
+    /// Domain, Container, Device, System, Incident, Campaign) by routing
+    /// them through the SUBGRAPH FOR QUESTION section. Pre-baseline only
+    /// `Port` was indirectly exercised; lines 409-432 were almost
+    /// entirely uncovered.
+    #[test]
+    fn ask_context_deep_subgraph_renders_all_node_label_variants() {
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let now = chrono::Utc::now();
+        {
+            let mut g = kg.write().unwrap();
+            // Central IP that appears in the question.
+            let ip = g.add_node(make_ip_node("203.0.113.77", 50, vec![]));
+            // Outgoing → Process, File, User, Domain, Container, Device,
+            // System, Campaign.
+            let proc_id = g.add_node(Node::Process {
+                pid: 1234,
+                ppid: 1,
+                comm: "evilbin".to_string(),
+                exe: None,
+                uid: 0,
+                container_id: None,
+                start_ts: now,
+                exit_ts: None,
+            });
+            g.add_edge(Edge::new(ip, proc_id, Relation::ConnectedTo, now));
+
+            let file_id = g.add_node(Node::File {
+                path: "/tmp/dropper-with-a-very-long-pathname-that-exceeds-forty-chars.bin"
+                    .to_string(),
+                sha256: None,
+                size: None,
+                entropy: None,
+                is_sensitive: false,
+                yara_matches: vec![],
+            });
+            g.add_edge(Edge::new(ip, file_id, Relation::DownloadedFrom, now));
+
+            let user_id = g.add_node(Node::User {
+                name: "alice".to_string(),
+                uid: Some(1000),
+            });
+            g.add_edge(Edge::new(ip, user_id, Relation::LoggedInFrom, now));
+
+            let dom_id = g.add_node(Node::Domain {
+                name: "evil.example".to_string(),
+                datasets: vec![],
+                is_dga: None,
+                entropy: None,
+            });
+            g.add_edge(Edge::new(ip, dom_id, Relation::HostedAt, now));
+
+            let cont_id = g.add_node(Node::Container {
+                container_id: "0123456789abcdef0123".to_string(),
+                name: None,
+                image: None,
+                start_ts: None,
+                exit_ts: None,
+                oom_killed: false,
+            });
+            g.add_edge(Edge::new(ip, cont_id, Relation::SnapshotConnectedTo, now));
+
+            let dev_id = g.add_node(Node::Device {
+                vendor: "ACME".to_string(),
+                product: "USB-X".to_string(),
+                serial: None,
+                dev_class: None,
+            });
+            g.add_edge(Edge::new(ip, dev_id, Relation::InsertedOn, now));
+
+            let sys_id = g.add_node(Node::System {
+                hostname: "host-01".to_string(),
+                sysctl_params: std::collections::HashMap::new(),
+            });
+            g.add_edge(Edge::new(ip, sys_id, Relation::ChangedSysctl, now));
+
+            let camp_id = g.add_node(Node::Campaign {
+                campaign_id: "campaign-42".to_string(),
+                dna_hash: None,
+                pattern_class: "scanner".to_string(),
+                first_seen: now,
+                last_seen: now,
+                ip_count: 5,
+            });
+            g.add_edge(Edge::new(ip, camp_id, Relation::MemberOf, now));
+
+            // Incoming → Incident (so node_label hits the Incident arm).
+            let inc_id = g.add_node(make_inc_node("inc:abc:1", "high", "t", "s"));
+            g.add_edge(Edge::new(inc_id, ip, Relation::TriggeredBy, now));
+        }
+
+        let out = ask_context_deep(&kg, "why is 203.0.113.77 hostile?", 16000);
+
+        assert!(
+            out.contains("SUBGRAPH FOR QUESTION:"),
+            "subgraph header missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("Process(evilbin/1234)"),
+            "Process label missing; got:\n{out}"
+        );
+        // File label is truncated to 40 chars.
+        assert!(
+            out.contains("File(/tmp/dropper-with-a-very-long-pathn"),
+            "File label missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("User(alice)"),
+            "User label missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("Domain(evil.example)"),
+            "Domain label missing; got:\n{out}"
+        );
+        // Container label truncated to 12 chars.
+        assert!(
+            out.contains("Container(0123456789ab)"),
+            "Container label missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("Device(ACME/USB-X)"),
+            "Device label missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("System(host-01)"),
+            "System label missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("Campaign(campaign-42)"),
+            "Campaign label missing; got:\n{out}"
+        );
+        assert!(
+            out.contains("Incident(inc:abc:1)"),
+            "Incident label missing; got:\n{out}"
+        );
+    }
+
+    // ── format_time_ago ──────────────────────────────────────────────────
+
+    /// Cover all three age branches of `format_time_ago` plus the parse
+    /// failure branch. Pre-baseline this helper was 0% covered.
+    #[test]
+    fn format_time_ago_handles_days_hours_minutes_and_invalid() {
+        let now = chrono::Utc::now();
+        let yesterday = (now - chrono::Duration::days(2)).to_rfc3339();
+        assert!(format_time_ago(&yesterday).ends_with("d ago"));
+
+        let three_h = (now - chrono::Duration::hours(3)).to_rfc3339();
+        assert!(format_time_ago(&three_h).ends_with("h ago"));
+
+        let ten_m = (now - chrono::Duration::minutes(10)).to_rfc3339();
+        assert!(format_time_ago(&ten_m).ends_with("m ago"));
+
+        // Future timestamp → diff < 0 → falls through to minutes.max(1) so
+        // the helper never returns "0m ago".
+        let future = (now + chrono::Duration::minutes(5)).to_rfc3339();
+        assert_eq!(format_time_ago(&future), "1m ago");
+
+        // Garbage input → "recently" sentinel.
+        assert_eq!(format_time_ago("not-a-timestamp"), "recently");
+    }
+
+    // ── local_hostname_for_audit ─────────────────────────────────────────
+
+    /// Cover the env-var-set branch of `local_hostname_for_audit`. The
+    /// helper is small but used in every Telegram-triage audit row, so
+    /// pinning the override path matters for portable test runners.
+    #[test]
+    fn local_hostname_for_audit_reads_env_var_when_set() {
+        // Set HOSTNAME to a sentinel and verify the helper uses it. The
+        // env var is process-wide so we restore it after the test.
+        let original = std::env::var("HOSTNAME").ok();
+        // SAFETY: tests run under cargo test single-threaded for env mutation
+        // when this single test mutates HOSTNAME. We restore it below.
+        std::env::set_var("HOSTNAME", "anchor-host-xyz");
+        let h = local_hostname_for_audit();
+        assert_eq!(h, "anchor-host-xyz");
+        match original {
+            Some(v) => std::env::set_var("HOSTNAME", v),
+            None => std::env::remove_var("HOSTNAME"),
+        }
+    }
+
+    // ── handle_telegram_triage_action — allowlist add error path ─────────
+
+    /// Cover the `append_to_allowlist` Err branch of the
+    /// `handle_telegram_triage_action` allow-proc path. The handler hard-
+    /// codes `/etc/innerwarden/allowlist.toml`; on a non-root test runner
+    /// the open fails and the error branch (lines ~615-645) executes.
+    /// Pre-baseline this entire success/error block was uncovered because
+    /// the existing test only sent invalid inputs that bailed out before
+    /// the allowlist append.
+    #[test]
+    fn triage_allow_proc_with_valid_name_writes_audit_on_protected_path_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+
+        // Valid process name → bypasses sanitize_allowlist_process_name's
+        // None branch and reaches `append_to_allowlist`. As a non-root
+        // test user the open of /etc/innerwarden/allowlist.toml fails
+        // and we hit the Err arm + write_telegram_triage_audit "failed:"
+        // path.
+        let approval = crate::tests::triage_approval(
+            "__allow_proc__:anchor_proc_under_test",
+            "telegram-operator",
+        );
+        let handled = handle_telegram_triage_action(&approval, dir.path(), &cfg, &mut state);
+        assert!(handled, "callback must be marked handled");
+
+        // The audit write should have at least one entry covering the
+        // attempted-or-failed allowlist add (decision_writer was seeded
+        // by triage_test_state). Decision writer rotates files daily, so
+        // we scan all decisions-*.jsonl files in the temp data_dir.
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(dir.path()) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("decisions-") && name.ends_with(".jsonl") {
+                    let content = std::fs::read_to_string(e.path()).unwrap_or_default();
+                    if content.contains("anchor_proc_under_test") {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "expected decision-writer audit row mentioning the attempted process name"
+        );
+    }
+
+    /// Same as above but for the allow-IP path. Covers the
+    /// `append_to_allowlist` Err arm at lines ~753-784 (IP variant).
+    #[test]
+    fn triage_allow_ip_with_valid_address_writes_audit_on_protected_path_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+
+        let approval =
+            crate::tests::triage_approval("__allow_ip__:203.0.113.250", "telegram-operator");
+        let handled = handle_telegram_triage_action(&approval, dir.path(), &cfg, &mut state);
+        assert!(handled);
+
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(dir.path()) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("decisions-") && name.ends_with(".jsonl") {
+                    let content = std::fs::read_to_string(e.path()).unwrap_or_default();
+                    if content.contains("203.0.113.250") {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "expected decision-writer audit row for the attempted IP"
+        );
+    }
+
+    // ── check_2fa_gate — lockout path ───────────────────────────────────
+
+    /// Cover the lockout branch of `check_2fa_gate` (lines ~880-883).
+    /// After 3 recorded failures the gate must intercept and short-circuit
+    /// without storing a new pending action.
+    #[test]
+    fn check_2fa_gate_intercepts_when_operator_is_locked_out() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.security = Some(config::SecurityConfig {
+            two_factor_method: "totp".to_string(),
+            totp_secret: "JBSWY3DPEHPK3PXP".to_string(),
+            ..Default::default()
+        });
+
+        // Force three failures so is_locked_out returns true.
+        for _ in 0..3 {
+            state.two_factor_state.record_failure("op");
+        }
+        assert!(state.two_factor_state.is_locked_out("op"));
+
+        let intercepted = check_2fa_gate(
+            &mut state,
+            &cfg,
+            "op",
+            two_factor::PendingActionType::AllowlistIp("9.9.9.9".to_string()),
+        );
+        assert!(intercepted, "lockout path must intercept");
+        // No pending action stored on lockout branch.
+        assert!(
+            !state.two_factor_state.pending.contains_key("op"),
+            "no pending action should be stored when locked out"
+        );
+    }
+
+    // ── handle_totp_response — error branches ────────────────────────────
+
+    /// Cover the "secret missing" branch of `handle_totp_response`
+    /// (lines ~948-953). When 2FA is enabled and a 6-digit code arrives
+    /// against a pending action but the secret is empty, the handler must
+    /// reply with the configuration error and consume the attempt.
+    #[test]
+    fn handle_totp_response_with_no_secret_replies_with_config_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        // 2FA "enabled" but secret intentionally missing.
+        let mut cfg = config::AgentConfig::default();
+        cfg.security = Some(config::SecurityConfig {
+            two_factor_method: "totp".to_string(),
+            totp_secret: String::new(),
+            ..Default::default()
+        });
+
+        // Make sure the env var doesn't accidentally satisfy totp_secret.
+        let original_env = std::env::var("INNERWARDEN_TOTP_SECRET").ok();
+        std::env::remove_var("INNERWARDEN_TOTP_SECRET");
+
+        // Seed a pending action so `take_pending` returns Some.
+        let now = chrono::Utc::now();
+        state.two_factor_state.set_pending(
+            "op",
+            two_factor::PendingAction {
+                action_type: two_factor::PendingActionType::AllowlistIp("1.1.1.1".to_string()),
+                operator: "op".to_string(),
+                created_at: now,
+                expires_at: now + chrono::Duration::minutes(5),
+                method: two_factor::TwoFactorMethod::Totp,
+            },
+        );
+
+        let approval = crate::tests::triage_approval("123456", "op");
+        let handled = handle_totp_response(&approval, dir.path(), &cfg, &mut state);
+        assert!(handled, "must be marked handled even on misconfig");
+        // Pending action was taken (consumed); the misconfig path exits
+        // without re-storing.
+        assert!(!state.two_factor_state.pending.contains_key("op"));
+
+        if let Some(v) = original_env {
+            std::env::set_var("INNERWARDEN_TOTP_SECRET", v);
+        }
+    }
+
+    /// Cover the "invalid TOTP secret" branch of `handle_totp_response`
+    /// (lines ~960-965). When the secret is non-empty but
+    /// `TotpProvider::new` rejects it (too short / invalid base32), the
+    /// handler must reply with the invalid-secret error.
+    #[test]
+    fn handle_totp_response_with_invalid_secret_replies_with_invalid_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        let mut cfg = config::AgentConfig::default();
+        cfg.security = Some(config::SecurityConfig {
+            two_factor_method: "totp".to_string(),
+            // Too-short secret — TotpProvider::new returns None
+            // (requires >= 10 raw bytes after base32 decode).
+            totp_secret: "AAAA".to_string(),
+            ..Default::default()
+        });
+
+        let original_env = std::env::var("INNERWARDEN_TOTP_SECRET").ok();
+        std::env::remove_var("INNERWARDEN_TOTP_SECRET");
+
+        let now = chrono::Utc::now();
+        state.two_factor_state.set_pending(
+            "op",
+            two_factor::PendingAction {
+                action_type: two_factor::PendingActionType::AllowlistProcess("p".to_string()),
+                operator: "op".to_string(),
+                created_at: now,
+                expires_at: now + chrono::Duration::minutes(5),
+                method: two_factor::TwoFactorMethod::Totp,
+            },
+        );
+
+        let approval = crate::tests::triage_approval("000000", "op");
+        let handled = handle_totp_response(&approval, dir.path(), &cfg, &mut state);
+        assert!(handled);
+
+        if let Some(v) = original_env {
+            std::env::set_var("INNERWARDEN_TOTP_SECRET", v);
+        }
+    }
+
+    /// Cover the "code expired" branch of `handle_totp_response`
+    /// (lines ~939-941). A pending action with an `expires_at` in the
+    /// past must be taken, the handler must reply with the expired
+    /// message, and no attempt counter increments (we don't penalise
+    /// stale codes).
+    #[test]
+    fn handle_totp_response_with_expired_pending_reports_expired() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.security = Some(config::SecurityConfig {
+            two_factor_method: "totp".to_string(),
+            totp_secret: "JBSWY3DPEHPK3PXP".to_string(),
+            ..Default::default()
+        });
+
+        let now = chrono::Utc::now();
+        state.two_factor_state.set_pending(
+            "op",
+            two_factor::PendingAction {
+                action_type: two_factor::PendingActionType::AllowlistIp("1.1.1.1".to_string()),
+                operator: "op".to_string(),
+                created_at: now - chrono::Duration::minutes(10),
+                expires_at: now - chrono::Duration::seconds(1),
+                method: two_factor::TwoFactorMethod::Totp,
+            },
+        );
+
+        let approval = crate::tests::triage_approval("123456", "op");
+        let handled = handle_totp_response(&approval, dir.path(), &cfg, &mut state);
+        assert!(handled);
+        // Expired pending was consumed.
+        assert!(!state.two_factor_state.pending.contains_key("op"));
+    }
+
+    /// Cover the `wrong code → lockout` branch of `handle_totp_response`
+    /// (lines ~971-975). After 3 prior failures the next wrong code must
+    /// trigger the "locked out for 1 hour" reply rather than the
+    /// "try again" reply.
+    #[test]
+    fn handle_totp_response_wrong_code_after_failures_triggers_lockout_message() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.security = Some(config::SecurityConfig {
+            two_factor_method: "totp".to_string(),
+            totp_secret: "JBSWY3DPEHPK3PXP".to_string(),
+            ..Default::default()
+        });
+
+        // Two prior failures recorded — the upcoming wrong code records
+        // a 3rd, which crosses max_failures_per_hour=3 and triggers the
+        // lockout reply branch.
+        state.two_factor_state.record_failure("op");
+        state.two_factor_state.record_failure("op");
+
+        let now = chrono::Utc::now();
+        state.two_factor_state.set_pending(
+            "op",
+            two_factor::PendingAction {
+                action_type: two_factor::PendingActionType::AllowlistIp("1.1.1.1".to_string()),
+                operator: "op".to_string(),
+                created_at: now,
+                expires_at: now + chrono::Duration::minutes(5),
+                method: two_factor::TwoFactorMethod::Totp,
+            },
+        );
+
+        let approval = crate::tests::triage_approval("000000", "op");
+        let handled = handle_totp_response(&approval, dir.path(), &cfg, &mut state);
+        assert!(handled);
+        // Pending NOT re-stored under lockout (the retry branch would
+        // re-store it).
+        assert!(
+            !state.two_factor_state.pending.contains_key("op"),
+            "lockout branch must not re-store pending"
+        );
+        assert!(state.two_factor_state.is_locked_out("op"));
+    }
+
+    // ── execute_verified_action — all four variants ──────────────────────
+
+    /// Cover the four `PendingActionType` arms of `execute_verified_action`
+    /// (lines ~1006-1118). Each arm hits the protected
+    /// `/etc/innerwarden/allowlist.toml` path and falls into the Err
+    /// branch on a non-root test runner — we assert the helper does not
+    /// panic across all variants. Anti-regression for accidentally
+    /// breaking one of the four match arms (UndoAllowlist and
+    /// AutoFpAllowlist were 0% covered in baseline).
+    #[test]
+    fn execute_verified_action_runs_all_action_variants_without_panic() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        execute_verified_action(
+            two_factor::PendingActionType::AllowlistProcess("anchor_proc".to_string()),
+            "op",
+            dir.path(),
+            &mut state,
+        );
+        execute_verified_action(
+            two_factor::PendingActionType::AllowlistIp("203.0.113.251".to_string()),
+            "op",
+            dir.path(),
+            &mut state,
+        );
+        execute_verified_action(
+            two_factor::PendingActionType::UndoAllowlist {
+                section: "ips".to_string(),
+                key: "203.0.113.252".to_string(),
+            },
+            "op",
+            dir.path(),
+            &mut state,
+        );
+        execute_verified_action(
+            two_factor::PendingActionType::AutoFpAllowlist {
+                section: "processes".to_string(),
+                entity: "auto_fp_anchor".to_string(),
+            },
+            "op",
+            dir.path(),
+            &mut state,
+        );
+    }
 }

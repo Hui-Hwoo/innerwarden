@@ -852,6 +852,226 @@ mod tests {
             .expect("listener task completed without panic");
     }
 
+    fn unused_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.local_addr().expect("local addr").port()
+    }
+
+    struct AcceptAnyServerKey;
+
+    impl russh::client::Handler for AcceptAnyServerKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_accepts_probe_connection_and_writes_evidence() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+        let token_for_task = token.clone();
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmpdir.path().to_path_buf();
+        let port = unused_local_port();
+
+        let listener_task = tokio::spawn({
+            let data_dir = data_dir.clone();
+            async move {
+                run_always_on_honeypot(
+                    port,
+                    "127.0.0.1".to_string(),
+                    3,
+                    Arc::new(Mutex::new(HashSet::new())),
+                    None,
+                    None,
+                    Arc::new(AtomicU64::new(0)),
+                    None,
+                    0,
+                    data_dir,
+                    None,
+                    false,
+                    true,
+                    "ufw".to_string(),
+                    vec![],
+                    "medium".to_string(),
+                    token_for_task,
+                )
+                .await;
+            }
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        let mut stream = None;
+        for _ in 0..20 {
+            match tokio::net::TcpStream::connect(&addr).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        drop(stream.expect("listener should accept a local TCP probe"));
+
+        let honeypot_dir = tmpdir.path().join("honeypot");
+        let mut evidence = None;
+        for _ in 0..40 {
+            if let Ok(entries) = std::fs::read_dir(&honeypot_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|name| name.starts_with("listener-session-"))
+                    {
+                        let content = std::fs::read_to_string(&path).expect("read evidence");
+                        if !content.trim().is_empty() {
+                            evidence = Some(content);
+                            break;
+                        }
+                    }
+                }
+            }
+            if evidence.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), listener_task)
+            .await
+            .expect("listener exits after cancellation")
+            .expect("listener task");
+
+        let evidence = evidence.expect("probe connection should write a session JSONL line");
+        let row: serde_json::Value =
+            serde_json::from_str(evidence.lines().next().expect("jsonl row")).expect("json");
+        assert_eq!(row["type"], "ssh_connection");
+        assert_eq!(row["peer_ip"], "127.0.0.1");
+        assert_eq!(row["auth_attempts_count"], 0);
+        assert_eq!(row["shell_commands_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn listener_password_attempt_writes_autoblock_audit_and_blocklist() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+        let token_for_task = token.clone();
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmpdir.path().to_path_buf();
+        let port = unused_local_port();
+        let filter_blocklist = Arc::new(Mutex::new(HashSet::new()));
+        let listener_blocklist = filter_blocklist.clone();
+
+        let listener_task = tokio::spawn({
+            let data_dir = data_dir.clone();
+            async move {
+                run_always_on_honeypot(
+                    port,
+                    "127.0.0.1".to_string(),
+                    3,
+                    listener_blocklist,
+                    None,
+                    None,
+                    Arc::new(AtomicU64::new(0)),
+                    None,
+                    0,
+                    data_dir,
+                    None,
+                    true,
+                    true,
+                    "ufw".to_string(),
+                    vec!["block-ip-ufw".to_string()],
+                    "medium".to_string(),
+                    token_for_task,
+                )
+                .await;
+            }
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        let mut client = None;
+        for _ in 0..20 {
+            match russh::client::connect(
+                Arc::new(russh::client::Config::default()),
+                addr.as_str(),
+                AcceptAnyServerKey,
+            )
+            .await
+            {
+                Ok(handle) => {
+                    client = Some(handle);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        let mut client = client.expect("listener should accept an SSH client");
+        let auth = client
+            .authenticate_password("root", "toor")
+            .await
+            .expect("auth response");
+        assert!(
+            !auth.success(),
+            "medium-interaction listener must capture and reject password auth"
+        );
+        let _ = client
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), client).await;
+
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let decision_path = tmpdir.path().join(format!("decisions-{today}.jsonl"));
+        let mut decision = None;
+        for _ in 0..40 {
+            if filter_blocklist
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains("127.0.0.1")
+            {
+                if let Ok(content) = std::fs::read_to_string(&decision_path) {
+                    if !content.trim().is_empty() {
+                        decision = Some(content);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), listener_task)
+            .await
+            .expect("listener exits after cancellation")
+            .expect("listener task");
+
+        let decision = decision.expect("password attempt should write auto-block decision");
+        let row: serde_json::Value =
+            serde_json::from_str(decision.lines().next().expect("decision row")).expect("json");
+        assert_eq!(row["ai_provider"], "honeypot:always-on");
+        assert_eq!(row["action_type"], "block_ip");
+        assert_eq!(row["target_ip"], "127.0.0.1");
+        assert_eq!(row["skill_id"], "block-ip-ufw");
+        assert_eq!(row["execution_result"], "ok");
+        assert!(
+            row["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("interacted with always-on honeypot session"),
+            "auto-block reason must explain the honeypot interaction: {row}"
+        );
+    }
+
     // ── Spec 037 I-13 PR-6 — evidence-write helper anchors ────────
     //
     // PR-6 of I-13 converts the two `let _ =` swallows in the
@@ -1070,6 +1290,50 @@ mod tests {
         assert!(
             captured_str.contains("no target IP in context"),
             "reason field missing skill-provided message — got: {captured_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn always_on_abuseipdb_block_writes_audit_and_executes_dry_run_skill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let allowed = vec!["block-ip-ufw".to_string()];
+
+        always_on_abuseipdb_block(
+            "203.0.113.88",
+            91,
+            80,
+            dir.path(),
+            None,
+            true,
+            true,
+            "ufw",
+            &allowed,
+        )
+        .await;
+
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let path = dir.path().join(format!("decisions-{today}.jsonl"));
+        let content = std::fs::read_to_string(&path).expect("decision audit jsonl");
+        let row: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("decision row")).expect("json");
+
+        assert_eq!(
+            row["incident_id"],
+            "honeypot:always-on:abuseipdb:203.0.113.88"
+        );
+        assert_eq!(row["ai_provider"], "honeypot:abuseipdb_gate");
+        assert_eq!(row["action_type"], "block_ip");
+        assert_eq!(row["target_ip"], "203.0.113.88");
+        assert_eq!(row["skill_id"], "block-ip-ufw");
+        assert_eq!(row["auto_executed"], true);
+        assert_eq!(row["dry_run"], true);
+        assert_eq!(row["estimated_threat"], "known-malicious");
+        assert!(
+            row["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("91/100 exceeded always-on honeypot gate threshold 80"),
+            "reason must preserve the AbuseIPDB score and threshold: {row}"
         );
     }
 

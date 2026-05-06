@@ -3333,4 +3333,516 @@ mod tests {
         let snapshot = counts.snapshot.expect("snapshot populated");
         assert_eq!(snapshot.events_today, 0);
     }
+
+    // ── api_incidents handler / compute_incidents_blocking coverage ──
+    //
+    // The body of compute_incidents_blocking walks the KG, builds
+    // IncidentView fixtures, sorts by ts desc, takes(limit). These
+    // tests exercise the full async wrapper end-to-end so the
+    // graph-walk closure and IncidentView projection get covered.
+
+    fn make_incidents_kg() -> crate::knowledge_graph::KnowledgeGraph {
+        use crate::knowledge_graph::types::*;
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        // Two real incidents from one IP: blocked + monitor.
+        let ip = g.ensure_ip("203.0.113.10", now);
+        let inc_a = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:1".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "SSH brute force".into(),
+            summary: "many failed logins".into(),
+            ts: now,
+            mitre_ids: vec!["T1110".into()],
+            decision: Some("block_ip".into()),
+            decision_target: Some("203.0.113.10".into()),
+            confidence: Some(0.95),
+            decision_reason: Some("brute force detected".into()),
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_a, ip, Relation::TriggeredBy, now));
+        let earlier = now - chrono::Duration::seconds(120);
+        let inc_b = g.add_node(Node::Incident {
+            incident_id: "port_scan:1".into(),
+            detector: "port_scan".into(),
+            severity: "low".into(),
+            title: "Port scan".into(),
+            summary: "scanning many ports".into(),
+            ts: earlier,
+            mitre_ids: vec![],
+            decision: Some("monitor".into()),
+            decision_target: Some("203.0.113.10".into()),
+            confidence: Some(0.6),
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc_b, ip, Relation::TriggeredBy, earlier));
+        // Research-only incident — must NOT appear in the list.
+        let inc_c = g.add_node(Node::Incident {
+            incident_id: "research:1".into(),
+            detector: "experimental".into(),
+            severity: "medium".into(),
+            title: "Research".into(),
+            summary: "for tuning only".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: None,
+            decision_target: None,
+            confidence: None,
+            decision_reason: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: true,
+        });
+        g.add_edge(Edge::new(inc_c, ip, Relation::TriggeredBy, now));
+        g
+    }
+
+    #[tokio::test]
+    async fn api_incidents_returns_visible_items_sorted_newest_first() {
+        // Walks compute_incidents_blocking through the spawn_blocking
+        // wrapper. Asserts:
+        //  - research_only filtered out
+        //  - sort by ts descending (newest first)
+        //  - entities populated from TriggeredBy edges (ip:<addr>)
+        //  - effective_severity is computed from outcome+severity
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(make_incidents_kg()));
+        let q = ListQuery {
+            limit: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+        };
+        let Json(out) = api_incidents(State(state), Query(q)).await;
+        // Research-only filtered out → 2 items.
+        assert_eq!(out.total, 2, "research_only must not appear in incidents");
+        assert_eq!(out.items.len(), 2);
+        // Newest first: ssh_bruteforce:1 (ts=now) then port_scan:1 (ts=now-120s)
+        assert_eq!(out.items[0].incident_id, "ssh_bruteforce:1");
+        assert_eq!(out.items[1].incident_id, "port_scan:1");
+        // Entities populated from outgoing TriggeredBy edges.
+        assert!(out.items[0].entities.iter().any(|e| e == "ip:203.0.113.10"));
+        // mitre_ids → tags
+        assert_eq!(out.items[0].tags, vec!["T1110".to_string()]);
+        // Outcome via threat_contract::classify_decision (block_ip → "blocked").
+        assert_eq!(out.items[0].outcome, "blocked");
+        // Action_taken mirrors raw decision.
+        assert_eq!(out.items[0].action_taken.as_deref(), Some("block_ip"));
+        // Effective severity downgrade: blocked + high → low.
+        assert_eq!(out.items[0].effective_severity, "low");
+        // monitor → "monitored" outcome.
+        assert_eq!(out.items[1].outcome, "monitoring");
+    }
+
+    #[tokio::test]
+    async fn api_incidents_respects_limit_query() {
+        // limit=1 must truncate items to 1 but `total` reports the
+        // full pre-truncation count so the front-end can show "X of Y".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(make_incidents_kg()));
+        let q = ListQuery {
+            limit: Some(1),
+            date: None,
+            severity_min: None,
+            detector: None,
+        };
+        let Json(out) = api_incidents(State(state), Query(q)).await;
+        assert_eq!(out.total, 2, "total counts pre-truncation");
+        assert_eq!(out.items.len(), 1, "limit truncates");
+    }
+
+    #[tokio::test]
+    async fn api_incidents_date_filter_drops_other_days() {
+        // When the operator picks a historical date that does NOT
+        // match the in-memory KG dates, compute_incidents_blocking
+        // filters every incident out (date_filter mismatch). Asserts
+        // the explicit-date branch executes (Some(target) match arm).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(make_incidents_kg()));
+        // Date far in the past — none of the in-memory incidents
+        // have a ts on this day.
+        let q = ListQuery {
+            limit: None,
+            date: Some("2020-01-01".to_string()),
+            severity_min: None,
+            detector: None,
+        };
+        let Json(out) = api_incidents(State(state), Query(q)).await;
+        assert_eq!(out.total, 0);
+        assert_eq!(out.items.len(), 0);
+    }
+
+    // ── api_decisions handler ─────────────────────────────────────
+    //
+    // The handler walks Incident nodes that have a `decision` field
+    // and projects them into DecisionView. Pin the projection so a
+    // refactor that drops `target_ip` or `confidence` fails loud.
+
+    #[tokio::test]
+    async fn api_decisions_projects_decision_fields_from_incidents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(make_incidents_kg()));
+        let q = ListQuery {
+            limit: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+        };
+        let Json(out) = api_decisions(State(state), Query(q)).await;
+        // research_only has no decision so it's already excluded by
+        // the matches!() pattern; ssh_bruteforce:1 + port_scan:1 each
+        // have a decision → 2 items.
+        assert_eq!(out.total, 2);
+        assert_eq!(out.items.len(), 2);
+        // Newest first by ts.
+        assert_eq!(out.items[0].incident_id, "ssh_bruteforce:1");
+        assert_eq!(out.items[0].action_type, "block_ip");
+        assert_eq!(out.items[0].target_ip.as_deref(), Some("203.0.113.10"),);
+        assert!((out.items[0].confidence - 0.95).abs() < 1e-6);
+        assert!(out.items[0].auto_executed);
+        // auto_executed=true → execution_result "ok".
+        assert_eq!(out.items[0].execution_result, "ok");
+        // decision_reason becomes the `reason` field.
+        assert_eq!(out.items[0].reason, "brute force detected");
+        // The non-auto-executed branch: ssh_bruteforce:1 was auto.
+        // For port_scan:1 (auto_executed=true) we still get "ok".
+        assert_eq!(out.items[1].execution_result, "ok");
+    }
+
+    #[tokio::test]
+    async fn api_decisions_marks_skipped_when_not_auto_executed() {
+        // Pin the auto_executed=false branch which renders execution_result
+        // as "skipped" (decision recorded but skill not run).
+        use crate::knowledge_graph::types::*;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let ip = g.ensure_ip("203.0.113.99", now);
+        let inc = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:5".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "ssh".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("block_ip".into()),
+            decision_target: Some("203.0.113.99".into()),
+            confidence: Some(0.5),
+            decision_reason: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, ip, Relation::TriggeredBy, now));
+        state.knowledge_graph = std::sync::Arc::new(std::sync::RwLock::new(g));
+
+        let q = ListQuery {
+            limit: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+        };
+        let Json(out) = api_decisions(State(state), Query(q)).await;
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].execution_result, "skipped");
+        // skill_id is not stored in graph — must be None on this path.
+        assert!(out.items[0].skill_id.is_none());
+        // decision_reason was None → reason defaults to empty string.
+        assert!(out.items[0].reason.is_empty());
+    }
+
+    // ── compute_overview_from_graph: extra decision branches ──────
+    //
+    // The flat graph compute helper has 4 decision arms:
+    // ignore / monitor / request_confirmation / fallback. The
+    // existing fixture only exercised monitor + fallback (block_ip).
+    // These tests pin the remaining two arms so coverage on
+    // 1605/1613/1629/1660-1661 lights up.
+
+    #[test]
+    fn compute_overview_counts_ignore_decision_into_ai_ignored() {
+        use crate::knowledge_graph::types::*;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let ip = g.ensure_ip("203.0.113.50", now);
+        let inc = g.add_node(Node::Incident {
+            incident_id: "noise:1".into(),
+            detector: "proto_anomaly".into(),
+            severity: "low".into(),
+            title: "weird ssh".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("ignore".into()),
+            decision_target: None,
+            confidence: None,
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, ip, Relation::TriggeredBy, now));
+        let out = compute_overview_from_graph(
+            &g,
+            dir.path(),
+            chrono::Utc::now().format("%Y-%m-%d").to_string().as_str(),
+        );
+        assert_eq!(out.ai_ignored, 1, "ignore branch increments ai_ignored");
+        assert_eq!(
+            out.ai_responded, 0,
+            "ignore must not count toward responded",
+        );
+        assert_eq!(out.safely_resolved, 0, "ignore is not safely_resolved");
+    }
+
+    #[test]
+    fn compute_overview_counts_request_confirmation_into_unresolved() {
+        use crate::knowledge_graph::types::*;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let ip = g.ensure_ip("203.0.113.60", now);
+        let inc = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:rc".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "ssh brute".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("request_confirmation".into()),
+            decision_target: Some("203.0.113.60".into()),
+            confidence: None,
+            decision_reason: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, ip, Relation::TriggeredBy, now));
+        let out = compute_overview_from_graph(
+            &g,
+            dir.path(),
+            chrono::Utc::now().format("%Y-%m-%d").to_string().as_str(),
+        );
+        assert_eq!(
+            out.unresolved_count, 1,
+            "request_confirmation increments unresolved",
+        );
+        assert_eq!(out.ai_confirmed, 1);
+        assert_eq!(
+            out.ai_responded, 0,
+            "request_confirmation is not auto-responded",
+        );
+    }
+
+    #[test]
+    fn compute_overview_counts_allowlisted_increments_separate_counter() {
+        // Pin line 1629: allowlisted incidents increment
+        // allowlisted_count even though they remain part of the
+        // detector tally — the operator-visible "X allowlisted" tile.
+        use crate::knowledge_graph::types::*;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let ip = g.ensure_ip("203.0.113.70", now);
+        let inc = g.add_node(Node::Incident {
+            incident_id: "ssh_bruteforce:al".into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "ssh brute".into(),
+            summary: "".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: Some("monitor".into()),
+            decision_target: Some("203.0.113.70".into()),
+            confidence: None,
+            decision_reason: None,
+            auto_executed: true,
+            is_allowlisted: true,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(inc, ip, Relation::TriggeredBy, now));
+        let out = compute_overview_from_graph(
+            &g,
+            dir.path(),
+            chrono::Utc::now().format("%Y-%m-%d").to_string().as_str(),
+        );
+        assert_eq!(
+            out.allowlisted_count, 1,
+            "is_allowlisted=true must bump allowlisted_count",
+        );
+    }
+
+    // ── read_degraded_signals JSON parsing ───────────────────────
+    //
+    // The fn reads responses.json (or the responses blob from
+    // SQLite) and extracts gauges.orphaned + totals.revert_failures.
+    // These tests pin the parsing branches so a future refactor
+    // that drops one of the JSON paths fails loud.
+
+    #[test]
+    fn read_degraded_signals_parses_gauges_orphaned() {
+        // The canonical PR #425 Wave 4d shape: gauges.orphaned is
+        // the current-count (what the banner reads).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let payload = serde_json::json!({
+            "gauges": {"orphaned": 7u64},
+            "totals": {"revert_failures": 42u64},
+        });
+        std::fs::write(
+            dir.path().join("responses.json"),
+            serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+        let signals = super::read_degraded_signals(&state);
+        assert_eq!(signals.orphaned_now, 7);
+        assert_eq!(signals.revert_failures_total, 42);
+    }
+
+    #[test]
+    fn read_degraded_signals_falls_back_to_state_counts_revert_failed() {
+        // Transitional shape during deploy: when the new
+        // gauges.orphaned key is absent, the helper reads
+        // state_counts.revert_failed instead of returning 0.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let payload = serde_json::json!({
+            "state_counts": {"revert_failed": 3u64},
+        });
+        std::fs::write(
+            dir.path().join("responses.json"),
+            serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+        let signals = super::read_degraded_signals(&state);
+        assert_eq!(signals.orphaned_now, 3);
+        assert_eq!(signals.revert_failures_total, 0);
+    }
+
+    #[test]
+    fn read_degraded_signals_returns_default_when_no_responses_file() {
+        // No SQLite store wired, no responses.json on disk → the
+        // helper produces a zero-valued DegradedSignals so the
+        // banner stays green.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let signals = super::read_degraded_signals(&state);
+        assert_eq!(signals.orphaned_now, 0);
+        assert_eq!(signals.revert_failures_total, 0);
+    }
+
+    #[test]
+    fn read_degraded_signals_default_when_responses_json_is_garbage() {
+        // Malformed JSON → the helper silently swallows the parse
+        // error and returns defaults. Operator's banner does not
+        // panic on a corrupt responses.json.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        std::fs::write(dir.path().join("responses.json"), b"{not valid json").unwrap();
+        let signals = super::read_degraded_signals(&state);
+        assert_eq!(signals.orphaned_now, 0);
+        assert_eq!(signals.revert_failures_total, 0);
+    }
+
+    // ── api_report endpoint ──────────────────────────────────────
+    //
+    // api_report pretty-prints a TrialReport JSON. Exercise the
+    // happy path so the (Json) serialisation branch is covered.
+
+    #[tokio::test]
+    async fn api_report_returns_json_for_empty_state() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let q = ReportQuery { date: None };
+        let resp = api_report(State(state), Query(q)).await;
+        let resp = resp.into_response();
+        assert_eq!(resp.status().as_u16(), 200);
+        let bytes = to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        // Pretty-printed JSON object → must start with '{'.
+        assert!(body.trim_start().starts_with('{'));
+        // Empty state has zero incidents — but the field exists.
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            v.get("detection_summary")
+                .and_then(|d| d.get("total_incidents"))
+                .is_some(),
+            "report JSON must carry detection_summary.total_incidents"
+        );
+    }
+
+    // ── api_briefing GET branch ───────────────────────────────────
+    //
+    // GET /api/briefing reads the cached latest_briefing. When the
+    // mutex contains None (default on a fresh state) the response
+    // carries available=false. When populated, available=true plus
+    // the threat_level and summary fields.
+
+    #[tokio::test]
+    async fn api_briefing_returns_unavailable_when_no_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let Json(body) = api_briefing(State(state)).await;
+        assert_eq!(body["available"], false);
+        // Helpful operator message must be present.
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("No briefing generated yet"));
+    }
+
+    #[tokio::test]
+    async fn api_briefing_returns_cached_briefing_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let cached = crate::briefing::Briefing {
+            generated_at: chrono::Utc::now(),
+            date: "2026-05-06".to_string(),
+            threat_level: "MODERATE".to_string(),
+            summary: "Two suspicious sources today.".to_string(),
+        };
+        *state.latest_briefing.lock().await = Some(cached);
+        let Json(body) = api_briefing(State(state)).await;
+        assert_eq!(body["available"], true);
+        assert_eq!(body["threat_level"], "MODERATE");
+        assert_eq!(body["date"], "2026-05-06");
+        assert_eq!(body["summary"], "Two suspicious sources today.");
+    }
 }

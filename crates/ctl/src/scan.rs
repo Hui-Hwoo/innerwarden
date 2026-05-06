@@ -259,36 +259,10 @@ fn stars(n: u8) -> String {
 // Security audit probes (fail-silent - never panic, never require root)
 // ---------------------------------------------------------------------------
 
-/// Inspect all running Docker containers for security misconfigurations.
-/// Requires `docker` CLI in PATH. Fail-silent on any error.
-fn audit_docker() -> Vec<ScanFinding> {
-    // Get running container IDs
-    let ids_out = Command::new("docker").args(["ps", "-q"]).output().ok();
-    let ids_out = match ids_out {
-        Some(o) if o.status.success() => o,
-        _ => return vec![],
-    };
-    let ids: Vec<String> = String::from_utf8_lossy(&ids_out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if ids.is_empty() {
-        return vec![];
-    }
-
-    // docker inspect <id1> <id2> ...
-    let mut cmd = Command::new("docker");
-    cmd.arg("inspect");
-    for id in &ids {
-        cmd.arg(id);
-    }
-    let inspect_out = match cmd.output() {
-        Ok(o) if o.status.success() => o,
-        _ => return vec![],
-    };
-    let json_str = String::from_utf8_lossy(&inspect_out.stdout);
-    let containers: serde_json::Value = match serde_json::from_str(&json_str) {
+/// Parse the JSON output of `docker inspect <ids...>` and return findings.
+/// Extracted as a separate function so tests can call it directly.
+pub(crate) fn parse_docker_inspect_json(json_str: &str) -> Vec<ScanFinding> {
+    let containers: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
@@ -404,6 +378,38 @@ fn audit_docker() -> Vec<ScanFinding> {
     }
 
     findings
+}
+
+/// Inspect all running Docker containers for security misconfigurations.
+/// Requires `docker` CLI in PATH. Fail-silent on any error.
+fn audit_docker() -> Vec<ScanFinding> {
+    // Get running container IDs
+    let ids_out = Command::new("docker").args(["ps", "-q"]).output().ok();
+    let ids_out = match ids_out {
+        Some(o) if o.status.success() => o,
+        _ => return vec![],
+    };
+    let ids: Vec<String> = String::from_utf8_lossy(&ids_out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return vec![];
+    }
+
+    // docker inspect <id1> <id2> ...
+    let mut cmd = Command::new("docker");
+    cmd.arg("inspect");
+    for id in &ids {
+        cmd.arg(id);
+    }
+    let inspect_out = match cmd.output() {
+        Ok(o) if o.status.success() => o,
+        _ => return vec![],
+    };
+    let json_str = String::from_utf8_lossy(&inspect_out.stdout);
+    parse_docker_inspect_json(&json_str)
 }
 
 /// Parse SSH config text (from `sshd -T` output or sshd_config file) and return findings.
@@ -610,6 +616,12 @@ fn read_nginx_configs() -> String {
 /// Audit nginx configuration for common security misconfigurations. Fail-silent.
 fn audit_nginx() -> Vec<ScanFinding> {
     let config = read_nginx_configs();
+    parse_nginx_config_content(&config)
+}
+
+/// Parse the concatenated nginx configuration string and return findings.
+/// Extracted as a separate function so tests can call it directly.
+pub(crate) fn parse_nginx_config_content(config: &str) -> Vec<ScanFinding> {
     if config.is_empty() {
         return vec![];
     }
@@ -682,8 +694,6 @@ fn audit_nginx() -> Vec<ScanFinding> {
 
 /// Audit fail2ban configuration for common security gaps. Fail-silent.
 fn audit_fail2ban() -> Vec<ScanFinding> {
-    let mut findings = vec![];
-
     // Check if sshd jail is active
     let status_out = Command::new("fail2ban-client")
         .arg("status")
@@ -692,6 +702,22 @@ fn audit_fail2ban() -> Vec<ScanFinding> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
+
+    let bantime_out = Command::new("fail2ban-client")
+        .args(["get", "sshd", "bantime"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    parse_fail2ban_findings(&status_out, &bantime_out)
+}
+
+/// Parse `fail2ban-client status` output (and optional `bantime` output) and return findings.
+/// Extracted as a separate function so tests can call it directly.
+pub(crate) fn parse_fail2ban_findings(status_out: &str, bantime_out: &str) -> Vec<ScanFinding> {
+    let mut findings = vec![];
 
     let sshd_jail_active = status_out
         .lines()
@@ -716,15 +742,6 @@ fn audit_fail2ban() -> Vec<ScanFinding> {
             ),
         });
     } else {
-        // sshd jail exists - check bantime
-        let bantime_out = Command::new("fail2ban-client")
-            .args(["get", "sshd", "bantime"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-
         // Parse bantime value - may be a plain number or have extra text
         let bantime_secs: i64 = bantime_out
             .split_whitespace()
@@ -760,8 +777,6 @@ fn audit_fail2ban() -> Vec<ScanFinding> {
 
 /// Audit UFW firewall configuration for common misconfigurations. Fail-silent.
 fn audit_ufw() -> Vec<ScanFinding> {
-    let mut findings = vec![];
-
     let status_out = Command::new("ufw")
         .arg("status")
         .output()
@@ -770,8 +785,16 @@ fn audit_ufw() -> Vec<ScanFinding> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
 
+    parse_ufw_status(&status_out)
+}
+
+/// Parse `ufw status` output and return findings.
+/// Extracted as a separate function so tests can call it directly.
+pub(crate) fn parse_ufw_status(status_out: &str) -> Vec<ScanFinding> {
+    let mut findings = vec![];
+
     if status_out.is_empty() {
-        return vec![];
+        return findings;
     }
 
     let ufw_active = status_out.contains("Status: active");
@@ -871,45 +894,56 @@ pub(crate) fn audit_system() -> Vec<ScanFinding> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
 
-    if !ss_out.is_empty() {
-        let dangerous_ports: &[(u16, &str)] = &[
-            (3306, "MySQL"),
-            (5432, "PostgreSQL"),
-            (6379, "Redis"),
-            (27017, "MongoDB"),
-            (9200, "Elasticsearch"),
-            (9300, "Elasticsearch cluster"),
-            (5984, "CouchDB"),
-            (11211, "Memcached"),
-            (8080, "HTTP alternate"),
-        ];
+    findings.extend(parse_listening_ports(&ss_out));
+    findings
+}
 
-        for (port, service_name) in dangerous_ports {
-            let needle = format!("0.0.0.0:{}", port);
-            if ss_out.lines().any(|l| l.contains(&needle)) {
-                findings.push(ScanFinding {
-                    severity: FindingSeverity::Medium,
-                    resource: format!("0.0.0.0:{}", port),
-                    title: format!(
-                        "Port {} ({}) listening on all interfaces (0.0.0.0)",
-                        port, service_name
-                    ),
-                    detail: format!(
-                        "A service on port {} ({}) is accessible from any IP address. If this is \
-                         a database or internal service, it should only listen on localhost \
-                         (127.0.0.1) or a private network interface.",
-                        port, service_name
-                    ),
-                    iw_handles: false,
-                    admin_action: Some(format!(
-                        "Configure the service on port {} to bind to 127.0.0.1 instead of \
-                         0.0.0.0.\nFor most services, look for a 'bind' or 'listen' directive in \
-                         the service config.\nAlternatively, block it at the firewall:\n\
-                         \x20 sudo ufw deny {}/tcp",
-                        port, port
-                    )),
-                });
-            }
+/// Parse `ss -tlnp` output for dangerous services listening on 0.0.0.0.
+/// Extracted as a separate function so tests can call it directly.
+pub(crate) fn parse_listening_ports(ss_out: &str) -> Vec<ScanFinding> {
+    let mut findings = vec![];
+
+    if ss_out.is_empty() {
+        return findings;
+    }
+
+    let dangerous_ports: &[(u16, &str)] = &[
+        (3306, "MySQL"),
+        (5432, "PostgreSQL"),
+        (6379, "Redis"),
+        (27017, "MongoDB"),
+        (9200, "Elasticsearch"),
+        (9300, "Elasticsearch cluster"),
+        (5984, "CouchDB"),
+        (11211, "Memcached"),
+        (8080, "HTTP alternate"),
+    ];
+
+    for (port, service_name) in dangerous_ports {
+        let needle = format!("0.0.0.0:{}", port);
+        if ss_out.lines().any(|l| l.contains(&needle)) {
+            findings.push(ScanFinding {
+                severity: FindingSeverity::Medium,
+                resource: format!("0.0.0.0:{}", port),
+                title: format!(
+                    "Port {} ({}) listening on all interfaces (0.0.0.0)",
+                    port, service_name
+                ),
+                detail: format!(
+                    "A service on port {} ({}) is accessible from any IP address. If this is \
+                     a database or internal service, it should only listen on localhost \
+                     (127.0.0.1) or a private network interface.",
+                    port, service_name
+                ),
+                iw_handles: false,
+                admin_action: Some(format!(
+                    "Configure the service on port {} to bind to 127.0.0.1 instead of \
+                     0.0.0.0.\nFor most services, look for a 'bind' or 'listen' directive in \
+                     the service config.\nAlternatively, block it at the firewall:\n\
+                     \x20 sudo ufw deny {}/tcp",
+                    port, port
+                )),
+            });
         }
     }
 
@@ -1725,12 +1759,60 @@ fn print_advisor(probes: &SystemProbes, recs: &[ModuleRec]) {
 // Interactive Q&A loop
 // ---------------------------------------------------------------------------
 
-fn interactive_loop(recs: &[ModuleRec], modules_dir: &Path) {
-    let available: Vec<_> = recs
-        .iter()
-        .filter(|r| r.tier != Tier::NotAvailable)
-        .collect();
+/// Result of dispatching one user input line in the interactive loop.
+/// Extracted from `interactive_loop` so the dispatch logic is testable.
+#[derive(Debug)]
+pub(crate) enum LoopAction<'a> {
+    Quit,
+    Show(&'a ModuleRec),
+    Unknown,
+}
 
+#[cfg(test)]
+impl LoopAction<'_> {
+    fn is_quit(&self) -> bool {
+        matches!(self, LoopAction::Quit)
+    }
+    fn is_unknown(&self) -> bool {
+        matches!(self, LoopAction::Unknown)
+    }
+    fn shown_id(&self) -> Option<&str> {
+        if let LoopAction::Show(rec) = self {
+            Some(rec.id)
+        } else {
+            None
+        }
+    }
+}
+
+/// Pure dispatch function for one user input line.
+///
+/// Looks up the user's input in `recs` (numeric index against `available`-only
+/// list, then case-insensitive id match against everything). Returns an action
+/// describing what the loop should do next.
+pub(crate) fn dispatch_input<'a>(input: &str, recs: &'a [ModuleRec]) -> LoopAction<'a> {
+    let trimmed = input.trim().to_lowercase();
+    match trimmed.as_str() {
+        "" | "q" | "quit" | "exit" => LoopAction::Quit,
+        other => {
+            let available: Vec<&'a ModuleRec> = recs
+                .iter()
+                .filter(|r| r.tier != Tier::NotAvailable)
+                .collect();
+            if let Ok(n) = other.parse::<usize>() {
+                if n >= 1 && n <= available.len() {
+                    return LoopAction::Show(available[n - 1]);
+                }
+            }
+            if let Some(rec) = recs.iter().find(|r| r.id == other) {
+                return LoopAction::Show(rec);
+            }
+            LoopAction::Unknown
+        }
+    }
+}
+
+fn interactive_loop(recs: &[ModuleRec], modules_dir: &Path) {
     loop {
         print!("> ");
         io::stdout().flush().ok();
@@ -1740,26 +1822,10 @@ fn interactive_loop(recs: &[ModuleRec], modules_dir: &Path) {
             break;
         }
         let trimmed = input.trim().to_lowercase();
-
-        match trimmed.as_str() {
-            "" | "q" | "quit" | "exit" => break,
-            other => {
-                // Try numeric index first.
-                if let Ok(n) = other.parse::<usize>() {
-                    if n >= 1 && n <= available.len() {
-                        let rec = available[n - 1];
-                        show_module_info(rec, modules_dir);
-                        continue;
-                    }
-                }
-
-                // Try module ID match (case-insensitive).
-                let all: Vec<_> = recs.iter().collect();
-                if let Some(rec) = all.iter().find(|r| r.id == other) {
-                    show_module_info(rec, modules_dir);
-                    continue;
-                }
-
+        match dispatch_input(&input, recs) {
+            LoopAction::Quit => break,
+            LoopAction::Show(rec) => show_module_info(rec, modules_dir),
+            LoopAction::Unknown => {
                 println!(
                     "Unknown module '{}'. Type a module name from the list above, or 'q' to exit.",
                     trimmed
@@ -2060,5 +2126,868 @@ mod tests {
         let findings = audit_system();
         // It's a Vec, even if empty on a well-configured system
         let _ = findings.len();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // FindingSeverity / Tier / IntegrationKind: pure logic
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn finding_severity_order_high_medium_low() {
+        assert_eq!(FindingSeverity::High.order(), 0);
+        assert_eq!(FindingSeverity::Medium.order(), 1);
+        assert_eq!(FindingSeverity::Low.order(), 2);
+    }
+
+    #[test]
+    fn tier_label_returns_uppercase_strings() {
+        assert_eq!(Tier::Essential.label(), "ESSENTIAL");
+        assert_eq!(Tier::Recommended.label(), "RECOMMENDED");
+        assert_eq!(Tier::Optional.label(), "OPTIONAL");
+        assert_eq!(Tier::NotAvailable.label(), "NOT AVAILABLE");
+    }
+
+    #[test]
+    fn tier_order_essential_first_not_available_last() {
+        assert_eq!(Tier::Essential.order(), 0);
+        assert_eq!(Tier::Recommended.order(), 1);
+        assert_eq!(Tier::Optional.order(), 2);
+        assert_eq!(Tier::NotAvailable.order(), 3);
+    }
+
+    #[test]
+    fn integration_kind_badge_padded_to_eight_chars() {
+        // Both badges must be 8 chars so columns align in the printed list.
+        assert_eq!(IntegrationKind::Native.badge(), "NATIVE  ");
+        assert_eq!(IntegrationKind::External.badge(), "EXTERNAL");
+        assert_eq!(IntegrationKind::Native.badge().len(), 8);
+        assert_eq!(IntegrationKind::External.badge().len(), 8);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // stars(): pure formatter
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stars_renders_zero_filled_five_empty() {
+        // 5 empty stars (☆☆☆☆☆) when n=0
+        let s = stars(0);
+        assert_eq!(s.chars().count(), 5);
+        assert_eq!(s.chars().filter(|c| *c == '\u{2605}').count(), 0);
+        assert_eq!(s.chars().filter(|c| *c == '\u{2606}').count(), 5);
+    }
+
+    #[test]
+    fn stars_renders_three_filled_two_empty() {
+        let s = stars(3);
+        assert_eq!(s.chars().filter(|c| *c == '\u{2605}').count(), 3);
+        assert_eq!(s.chars().filter(|c| *c == '\u{2606}').count(), 2);
+    }
+
+    #[test]
+    fn stars_caps_at_five_filled() {
+        let s = stars(5);
+        assert_eq!(s.chars().filter(|c| *c == '\u{2605}').count(), 5);
+        assert_eq!(s.chars().filter(|c| *c == '\u{2606}').count(), 0);
+    }
+
+    #[test]
+    fn stars_above_five_does_not_panic() {
+        // saturating_sub keeps the empty count >= 0 even when n > 5
+        let s = stars(7);
+        assert_eq!(s.chars().filter(|c| *c == '\u{2605}').count(), 7);
+        assert_eq!(s.chars().filter(|c| *c == '\u{2606}').count(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // wrap_text(): word wrapper
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_text_short_input_single_line() {
+        let lines = wrap_text("hello world", 80);
+        assert_eq!(lines, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn wrap_text_breaks_at_word_boundary() {
+        let lines = wrap_text("aaa bbb ccc ddd", 7);
+        // "aaa bbb" (7 chars, fits) — "ccc ddd" (7 chars, fits)
+        assert_eq!(lines, vec!["aaa bbb".to_string(), "ccc ddd".to_string()]);
+    }
+
+    #[test]
+    fn wrap_text_empty_input_returns_empty_vec() {
+        let lines = wrap_text("", 80);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn wrap_text_word_longer_than_width_kept_intact() {
+        // Long word does not get split, just emitted on its own line.
+        let lines = wrap_text("short verylongword next", 6);
+        assert!(lines.iter().any(|l| l == "verylongword"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // parse_docker_inspect_json
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_docker_inspect_invalid_json_returns_empty() {
+        let findings = parse_docker_inspect_json("not json");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_docker_inspect_non_array_json_returns_empty() {
+        let findings = parse_docker_inspect_json(r#"{"key": "value"}"#);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_docker_inspect_empty_array_returns_empty() {
+        let findings = parse_docker_inspect_json("[]");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_docker_inspect_detects_privileged_container() {
+        let json = r#"[{
+            "Name": "/badctr",
+            "HostConfig": { "Privileged": true, "Binds": null, "CapAdd": null },
+            "Mounts": []
+        }]"#;
+        let findings = parse_docker_inspect_json(json);
+        let priv_finding = findings
+            .iter()
+            .find(|f| f.title.contains("--privileged"))
+            .expect("privileged finding missing");
+        assert_eq!(priv_finding.severity, FindingSeverity::High);
+        assert_eq!(priv_finding.resource, "badctr");
+        assert!(priv_finding.iw_handles);
+        assert!(priv_finding.admin_action.is_some());
+    }
+
+    #[test]
+    fn parse_docker_inspect_detects_docker_sock_via_binds() {
+        let json = r#"[{
+            "Name": "/portainer",
+            "HostConfig": {
+                "Privileged": false,
+                "Binds": ["/var/run/docker.sock:/var/run/docker.sock"],
+                "CapAdd": null
+            },
+            "Mounts": []
+        }]"#;
+        let findings = parse_docker_inspect_json(json);
+        let sock_finding = findings
+            .iter()
+            .find(|f| f.title.contains("docker.sock"))
+            .expect("docker.sock finding missing");
+        assert_eq!(sock_finding.severity, FindingSeverity::High);
+        assert_eq!(sock_finding.resource, "portainer");
+    }
+
+    #[test]
+    fn parse_docker_inspect_detects_docker_sock_via_mounts() {
+        let json = r#"[{
+            "Name": "/watchtower",
+            "HostConfig": { "Privileged": false, "Binds": null, "CapAdd": null },
+            "Mounts": [
+                { "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock" }
+            ]
+        }]"#;
+        let findings = parse_docker_inspect_json(json);
+        assert!(
+            findings.iter().any(|f| f.title.contains("docker.sock")),
+            "should detect docker.sock when present in Mounts array"
+        );
+    }
+
+    #[test]
+    fn parse_docker_inspect_detects_dangerous_caps() {
+        let json = r#"[{
+            "Name": "/needycap",
+            "HostConfig": {
+                "Privileged": false,
+                "Binds": null,
+                "CapAdd": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYS_MODULE", "SYS_RAWIO", "MKNOD"]
+            },
+            "Mounts": []
+        }]"#;
+        let findings = parse_docker_inspect_json(json);
+        // 5 dangerous caps should fire; benign MKNOD should not
+        let cap_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.title.starts_with("dangerous capability"))
+            .collect();
+        assert_eq!(cap_findings.len(), 5);
+        for f in &cap_findings {
+            assert_eq!(f.severity, FindingSeverity::Medium);
+            assert_eq!(f.resource, "needycap");
+        }
+        assert!(
+            !findings.iter().any(|f| f.title.contains("MKNOD")),
+            "MKNOD is not on the dangerous list and must not produce a finding"
+        );
+    }
+
+    #[test]
+    fn parse_docker_inspect_clean_container_no_findings() {
+        let json = r#"[{
+            "Name": "/cleanapp",
+            "HostConfig": { "Privileged": false, "Binds": [], "CapAdd": [] },
+            "Mounts": []
+        }]"#;
+        let findings = parse_docker_inspect_json(json);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_docker_inspect_combines_findings_for_one_container() {
+        // privileged + docker.sock + dangerous cap on one container
+        let json = r#"[{
+            "Name": "/triple",
+            "HostConfig": {
+                "Privileged": true,
+                "Binds": ["/var/run/docker.sock:/sock"],
+                "CapAdd": ["SYS_ADMIN"]
+            },
+            "Mounts": []
+        }]"#;
+        let findings = parse_docker_inspect_json(json);
+        assert!(findings.iter().any(|f| f.title.contains("--privileged")));
+        assert!(findings.iter().any(|f| f.title.contains("docker.sock")));
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "dangerous capability: SYS_ADMIN"));
+        assert!(findings.iter().all(|f| f.resource == "triple"));
+    }
+
+    #[test]
+    fn parse_docker_inspect_unknown_name_falls_back() {
+        // Missing Name field falls back to "unknown"
+        let json = r#"[{
+            "HostConfig": { "Privileged": true, "Binds": null, "CapAdd": null },
+            "Mounts": []
+        }]"#;
+        let findings = parse_docker_inspect_json(json);
+        let f = findings
+            .iter()
+            .find(|f| f.title.contains("--privileged"))
+            .expect("privileged finding missing");
+        assert_eq!(f.resource, "unknown");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // parse_nginx_config_content
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_nginx_empty_string_returns_empty() {
+        assert!(parse_nginx_config_content("").is_empty());
+    }
+
+    #[test]
+    fn parse_nginx_emits_three_findings_on_default_config() {
+        // No server_tokens, no ssl_certificate, no limit_req_zone → all three findings.
+        let config = "http { server { listen 80; } }";
+        let findings = parse_nginx_config_content(config);
+        assert_eq!(findings.len(), 3);
+        assert!(findings.iter().any(|f| f.title.contains("version number")));
+        assert!(findings.iter().any(|f| f.title.contains("HTTPS/SSL")));
+        assert!(findings.iter().any(|f| f.title.contains("rate limiting")));
+    }
+
+    #[test]
+    fn parse_nginx_hardened_config_no_findings() {
+        let config = "http {\n    server_tokens off;\n    limit_req_zone $binary_remote_addr zone=g:10m rate=30r/m;\n    server { listen 443 ssl; ssl_certificate /etc/cert.pem; }\n}\n";
+        let findings = parse_nginx_config_content(config);
+        assert!(
+            findings.is_empty(),
+            "hardened nginx config should have no findings, got: {:?}",
+            findings.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_nginx_ssl_finding_is_medium_severity() {
+        // Only HTTPS missing
+        let config = "server_tokens off;\nlimit_req_zone $b zone=g:10m rate=10r/m;\n";
+        let findings = parse_nginx_config_content(config);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::Medium);
+        assert!(findings[0].title.contains("HTTPS/SSL"));
+    }
+
+    #[test]
+    fn parse_nginx_server_tokens_finding_is_low_severity() {
+        // Only server_tokens missing
+        let config = "ssl_certificate /tmp/x.pem;\nlimit_req_zone $b zone=g:10m rate=10r/m;\n";
+        let findings = parse_nginx_config_content(config);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::Low);
+        assert!(findings[0].title.contains("version number"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // parse_fail2ban_findings
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_fail2ban_no_jail_emits_medium_finding() {
+        // Status output without sshd/ssh substring → jail not active
+        let findings = parse_fail2ban_findings("Status\n|- Jail list:\n", "");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::Medium);
+        assert_eq!(findings[0].resource, "fail2ban");
+        assert!(findings[0].title.contains("SSH jail not enabled"));
+        assert!(findings[0].iw_handles);
+    }
+
+    #[test]
+    fn parse_fail2ban_jail_active_long_bantime_no_findings() {
+        let status = "Status\n|- Jail list:\tsshd\n";
+        let findings = parse_fail2ban_findings(status, "86400");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_fail2ban_jail_active_short_bantime_emits_low() {
+        let status = "Jail list: sshd\n";
+        let findings = parse_fail2ban_findings(status, "600"); // 10 min < 1h
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::Low);
+        assert!(findings[0].title.contains("ban duration"));
+        // detail should embed the seconds value
+        assert!(findings[0].detail.contains("600"));
+    }
+
+    #[test]
+    fn parse_fail2ban_jail_active_zero_bantime_no_findings() {
+        // bantime parsed as 0 (e.g. unparseable) skips the < 3600 finding
+        let status = "Jail list: sshd\n";
+        let findings = parse_fail2ban_findings(status, "");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_fail2ban_bantime_with_extra_text_is_extracted() {
+        // fail2ban-client may print prefixes; we look for the first numeric token
+        let status = "Jail list: sshd\n";
+        let findings = parse_fail2ban_findings(status, "Currently: 1800 seconds");
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].detail.contains("1800"));
+    }
+
+    #[test]
+    fn parse_fail2ban_ssh_substring_treated_as_jail() {
+        // "ssh" alone (without "sshd") still counts as a jail line
+        let status = "Status of jail: ssh-iptables\n";
+        let findings = parse_fail2ban_findings(status, "86400");
+        assert!(findings.is_empty(), "ssh* line should count as jail active");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // parse_ufw_status
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ufw_status_empty_no_findings() {
+        assert!(parse_ufw_status("").is_empty());
+    }
+
+    #[test]
+    fn parse_ufw_status_inactive_emits_high_finding() {
+        let status = "Status: inactive\n";
+        let findings = parse_ufw_status(status);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::High);
+        assert!(findings[0].title.contains("not active"));
+        assert!(findings[0].admin_action.is_some());
+    }
+
+    #[test]
+    fn parse_ufw_status_active_default_outgoing_emits_low_finding() {
+        // Production code looks for the literal substring "Default: allow (outgoing)".
+        // This anchors that contract — if the substring is reformatted, the helper
+        // silently stops detecting unrestricted outbound traffic.
+        let status = "Status: active\nDefault: allow (outgoing)\n";
+        let findings = parse_ufw_status(status);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::Low);
+        assert!(findings[0].title.contains("outbound"));
+    }
+
+    #[test]
+    fn parse_ufw_status_active_outgoing_locked_no_findings() {
+        // Active with outgoing not matching the literal substring → no findings
+        let status = "Status: active\nDefault: deny (outgoing)\n";
+        let findings = parse_ufw_status(status);
+        assert!(findings.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // parse_listening_ports
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_listening_ports_empty_no_findings() {
+        assert!(parse_listening_ports("").is_empty());
+    }
+
+    #[test]
+    fn parse_listening_ports_localhost_only_no_findings() {
+        // Bound to 127.0.0.1, not 0.0.0.0 → safe.
+        let ss = "State    Recv-Q    Send-Q    Local Address:Port    Peer\nLISTEN   0         128       127.0.0.1:3306        0.0.0.0:*\n";
+        assert!(parse_listening_ports(ss).is_empty());
+    }
+
+    #[test]
+    fn parse_listening_ports_detects_mysql_on_wildcard() {
+        let ss = "LISTEN   0   128   0.0.0.0:3306   0.0.0.0:*\n";
+        let findings = parse_listening_ports(ss);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::Medium);
+        assert_eq!(findings[0].resource, "0.0.0.0:3306");
+        assert!(findings[0].title.contains("MySQL"));
+        assert!(findings[0].admin_action.is_some());
+    }
+
+    #[test]
+    fn parse_listening_ports_detects_multiple_dangerous_services() {
+        let ss = "LISTEN 0 128 0.0.0.0:6379  0.0.0.0:*\n\
+                  LISTEN 0 128 0.0.0.0:27017 0.0.0.0:*\n\
+                  LISTEN 0 128 0.0.0.0:9200  0.0.0.0:*\n";
+        let findings = parse_listening_ports(ss);
+        assert_eq!(findings.len(), 3);
+        let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
+        assert!(titles.iter().any(|t| t.contains("Redis")));
+        assert!(titles.iter().any(|t| t.contains("MongoDB")));
+        assert!(titles.iter().any(|t| t.contains("Elasticsearch")));
+    }
+
+    #[test]
+    fn parse_listening_ports_ignores_unknown_ports() {
+        // Port 22 (SSH) is not in the dangerous list; should produce no finding.
+        let ss = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n";
+        assert!(parse_listening_ports(ss).is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // detect_conflicts
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_conflicts_abuseipdb_plus_fail2ban_emits_pair() {
+        // probes_with_fail2ban → fail2ban-integration is Essential (available)
+        // abuseipdb-enrichment is always available (Optional)
+        let recs = score_modules(&probes_with_fail2ban());
+        let conflicts = detect_conflicts(&recs);
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.module_a.contains("abuseipdb") && c.module_b.contains("fail2ban")),
+            "abuseipdb + fail2ban combo should be flagged"
+        );
+    }
+
+    #[test]
+    fn detect_conflicts_slack_alone_still_flagged() {
+        // slack-notify is Optional (always available); telegram conflict hint is always shown
+        let recs = score_modules(&probes_all_false());
+        let conflicts = detect_conflicts(&recs);
+        assert!(
+            conflicts.iter().any(|c| c.module_a == "slack-notify"),
+            "slack-notify entry should always be hinted (Telegram likely-configured)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // activation_sequence
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn activation_sequence_always_includes_geoip_telegram_abuseipdb() {
+        let seq = activation_sequence(&probes_all_false());
+        let cmds: Vec<&str> = seq.iter().map(|(c, _)| *c).collect();
+        assert!(cmds.iter().any(|c| c.contains("integrate geoip")));
+        assert!(cmds.iter().any(|c| c.contains("notify telegram")));
+        assert!(cmds.iter().any(|c| c.contains("integrate abuseipdb")));
+    }
+
+    #[test]
+    fn activation_sequence_starts_with_block_ip_when_sshd() {
+        let seq = activation_sequence(&probes_with_sshd());
+        // First entry must be the block-ip line (SSH protection is the foundation).
+        assert!(
+            seq.first()
+                .map(|(c, _)| c.contains("enable block-ip"))
+                .unwrap_or(false),
+            "sshd present → block-ip should be the first activation step"
+        );
+    }
+
+    #[test]
+    fn activation_sequence_includes_fail2ban_when_client_present() {
+        let p = probes_with_fail2ban();
+        let seq = activation_sequence(&p);
+        assert!(seq.iter().any(|(c, _)| c.contains("integrate fail2ban")));
+    }
+
+    #[test]
+    fn activation_sequence_includes_container_security_when_docker() {
+        let seq = activation_sequence(&probes_with_docker());
+        assert!(seq
+            .iter()
+            .any(|(c, _)| c.contains("install container-security")));
+    }
+
+    #[test]
+    fn activation_sequence_includes_nginx_step_when_logs_found() {
+        let p = SystemProbes {
+            has_nginx_access_log: true,
+            ..Default::default()
+        };
+        let seq = activation_sequence(&p);
+        assert!(seq.iter().any(|(c, _)| c.contains("nginx-error-monitor")));
+    }
+
+    #[test]
+    fn activation_sequence_no_nginx_step_without_logs() {
+        let seq = activation_sequence(&probes_all_false());
+        assert!(!seq.iter().any(|(c, _)| c.contains("nginx-error-monitor")));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // find_module_readme
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_module_readme_returns_caller_dir_when_present() {
+        let tmp = std::env::temp_dir().join(format!(
+            "iw-scan-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mod_dir = tmp.join("ssh-protection").join("docs");
+        std::fs::create_dir_all(&mod_dir).unwrap();
+        let readme = mod_dir.join("README.md");
+        std::fs::write(&readme, "# ssh-protection").unwrap();
+
+        let found = find_module_readme("ssh-protection", &tmp);
+        assert_eq!(found.as_ref(), Some(&readme));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn find_module_readme_returns_none_when_missing_everywhere() {
+        let tmp = std::env::temp_dir().join(format!(
+            "iw-scan-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let found = find_module_readme("nonexistent-module-xyz-9999", &tmp);
+        // None of the four candidate paths exist for this fake id.
+        assert!(found.is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // score_modules: tier transitions across more probe shapes
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn score_modules_includes_all_known_module_ids() {
+        let recs = score_modules(&probes_all_false());
+        for id in &[
+            "ssh-protection",
+            "network-defense",
+            "sudo-protection",
+            "file-integrity",
+            "container-security",
+            "search-protection",
+            "nginx-error-monitor",
+            "execution-guard",
+            "fail2ban-integration",
+            "geoip-enrichment",
+            "abuseipdb-enrichment",
+            "crowdsec-integration",
+            "slack-notify",
+            "threat-capture",
+        ] {
+            assert!(
+                recs.iter().any(|r| &r.id == id),
+                "score_modules should always emit rec with id={id}"
+            );
+        }
+    }
+
+    #[test]
+    fn score_modules_sudo_recommended_when_present() {
+        let recs = score_modules(&probes_with_sshd()); // has_sudo: true
+        let sudo = recs.iter().find(|r| r.id == "sudo-protection").unwrap();
+        assert_eq!(sudo.tier, Tier::Recommended);
+    }
+
+    #[test]
+    fn score_modules_sudo_optional_when_absent() {
+        let recs = score_modules(&probes_all_false());
+        let sudo = recs.iter().find(|r| r.id == "sudo-protection").unwrap();
+        assert_eq!(sudo.tier, Tier::Optional);
+    }
+
+    #[test]
+    fn score_modules_network_defense_essential_when_linux_with_firewall() {
+        let p = SystemProbes {
+            is_linux: true,
+            has_iptables: true,
+            ..Default::default()
+        };
+        let recs = score_modules(&p);
+        let nd = recs.iter().find(|r| r.id == "network-defense").unwrap();
+        assert_eq!(nd.tier, Tier::Essential);
+    }
+
+    #[test]
+    fn score_modules_network_defense_optional_without_firewall() {
+        let recs = score_modules(&probes_all_false());
+        let nd = recs.iter().find(|r| r.id == "network-defense").unwrap();
+        assert_eq!(nd.tier, Tier::Optional);
+    }
+
+    #[test]
+    fn score_modules_search_protection_recommended_with_access_log() {
+        let p = SystemProbes {
+            has_nginx: true,
+            has_nginx_access_log: true,
+            ..Default::default()
+        };
+        let recs = score_modules(&p);
+        let sp = recs.iter().find(|r| r.id == "search-protection").unwrap();
+        assert_eq!(sp.tier, Tier::Recommended);
+    }
+
+    #[test]
+    fn score_modules_search_protection_not_available_without_access_log() {
+        let recs = score_modules(&probes_all_false());
+        let sp = recs.iter().find(|r| r.id == "search-protection").unwrap();
+        assert_eq!(sp.tier, Tier::NotAvailable);
+    }
+
+    #[test]
+    fn score_modules_nginx_error_recommended_with_error_log() {
+        let p = SystemProbes {
+            has_nginx_error_log: true,
+            ..Default::default()
+        };
+        let recs = score_modules(&p);
+        let ne = recs.iter().find(|r| r.id == "nginx-error-monitor").unwrap();
+        assert_eq!(ne.tier, Tier::Recommended);
+    }
+
+    #[test]
+    fn score_modules_fail2ban_recommended_when_only_client_present() {
+        let p = SystemProbes {
+            has_fail2ban_client: true,
+            ..Default::default()
+        };
+        let recs = score_modules(&p);
+        let fb = recs
+            .iter()
+            .find(|r| r.id == "fail2ban-integration")
+            .unwrap();
+        assert_eq!(fb.tier, Tier::Recommended);
+    }
+
+    #[test]
+    fn score_modules_fail2ban_not_available_when_neither() {
+        let recs = score_modules(&probes_all_false());
+        let fb = recs
+            .iter()
+            .find(|r| r.id == "fail2ban-integration")
+            .unwrap();
+        assert_eq!(fb.tier, Tier::NotAvailable);
+    }
+
+    #[test]
+    fn score_modules_container_essential_with_docker() {
+        let recs = score_modules(&probes_with_docker());
+        let ct = recs.iter().find(|r| r.id == "container-security").unwrap();
+        assert_eq!(ct.tier, Tier::Essential);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Smoke tests for printers (cover the println! lines)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn print_probes_smoke_does_not_panic() {
+        // Both probe shapes exercise the "running" and "not found" branches.
+        print_probes(&probes_all_false());
+        print_probes(&probes_with_sshd());
+    }
+
+    #[test]
+    fn print_recommendations_smoke_with_findings_section() {
+        // Build recs that include findings + admin_action so all rendering branches fire.
+        let p = probes_with_sshd();
+        let mut recs = score_modules(&p);
+
+        // Inject synthetic findings into one rec to cover the inline-findings printer.
+        let sample_findings = vec![
+            ScanFinding {
+                severity: FindingSeverity::High,
+                resource: "demo".to_string(),
+                title: "high finding".to_string(),
+                detail: "lots of detail words to wrap".to_string(),
+                iw_handles: true,
+                admin_action: Some("step 1\nstep 2".to_string()),
+            },
+            ScanFinding {
+                severity: FindingSeverity::Medium,
+                resource: "demo".to_string(),
+                title: "medium finding".to_string(),
+                detail: "medium severity".to_string(),
+                iw_handles: false,
+                admin_action: None,
+            },
+            ScanFinding {
+                severity: FindingSeverity::Low,
+                resource: "demo".to_string(),
+                title: "low finding".to_string(),
+                detail: "low severity".to_string(),
+                iw_handles: true,
+                admin_action: Some("low-fix".to_string()),
+            },
+        ];
+        if let Some(r) = recs.iter_mut().find(|r| r.id == "ssh-protection") {
+            r.findings = sample_findings;
+        }
+
+        let system_findings = vec![
+            ScanFinding {
+                severity: FindingSeverity::High,
+                resource: "0.0.0.0:6379".to_string(),
+                title: "redis exposed".to_string(),
+                detail: "Redis on the public interface".to_string(),
+                iw_handles: false,
+                admin_action: Some("bind to 127.0.0.1".to_string()),
+            },
+            ScanFinding {
+                severity: FindingSeverity::Low,
+                resource: "system".to_string(),
+                title: "minor".to_string(),
+                detail: "a low-severity issue".to_string(),
+                iw_handles: false,
+                admin_action: None,
+            },
+        ];
+        print_recommendations(&recs, &system_findings);
+    }
+
+    #[test]
+    fn print_recommendations_smoke_no_findings() {
+        // Path with empty findings + empty system_findings (skips entire admin section).
+        let recs = score_modules(&probes_all_false());
+        print_recommendations(&recs, &[]);
+    }
+
+    #[test]
+    fn print_advisor_smoke_with_conflicts_and_sequence() {
+        let p = probes_with_fail2ban();
+        let recs = score_modules(&p);
+        // Should fire conflict path (abuseipdb + fail2ban) and full activation sequence.
+        print_advisor(&p, &recs);
+    }
+
+    #[test]
+    fn show_module_info_smoke_with_missing_readme() {
+        let recs = score_modules(&probes_with_sshd());
+        let rec = recs.iter().find(|r| r.id == "ssh-protection").unwrap();
+        let tmp = std::env::temp_dir();
+        // README absent → "(No detailed README found ...)" branch
+        show_module_info(rec, &tmp);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // dispatch_input: pure interactive-loop dispatcher
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_input_quit_keywords_return_quit() {
+        let recs = score_modules(&probes_with_sshd());
+        for cmd in ["", "q", "quit", "exit", "Q", "Quit", "  q  ", "EXIT"] {
+            assert!(
+                dispatch_input(cmd, &recs).is_quit(),
+                "input {cmd:?} should be Quit"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_input_numeric_index_in_range_shows_module() {
+        let recs = score_modules(&probes_with_sshd());
+        let action = dispatch_input("1", &recs);
+        let id = action.shown_id().expect("expected Show, got non-Show");
+        // First "available" entry must correspond to a non-NotAvailable rec.
+        let rec = recs.iter().find(|r| r.id == id).unwrap();
+        assert_ne!(rec.tier, Tier::NotAvailable);
+    }
+
+    #[test]
+    fn dispatch_input_numeric_index_out_of_range_returns_unknown() {
+        let recs = score_modules(&probes_with_sshd());
+        assert!(dispatch_input("99999", &recs).is_unknown());
+    }
+
+    #[test]
+    fn dispatch_input_module_id_match_shows_module() {
+        let recs = score_modules(&probes_with_sshd());
+        let action = dispatch_input("ssh-protection", &recs);
+        assert_eq!(action.shown_id(), Some("ssh-protection"));
+    }
+
+    #[test]
+    fn dispatch_input_module_id_case_insensitive() {
+        let recs = score_modules(&probes_with_sshd());
+        // Input is uppercased; loop lowercases it before lookup.
+        let action = dispatch_input("SSH-PROTECTION", &recs);
+        assert_eq!(action.shown_id(), Some("ssh-protection"));
+    }
+
+    #[test]
+    fn dispatch_input_unknown_module_id_returns_unknown() {
+        let recs = score_modules(&probes_with_sshd());
+        assert!(dispatch_input("not-a-real-module-id", &recs).is_unknown());
+    }
+
+    #[test]
+    fn show_module_info_smoke_with_present_readme() {
+        let recs = score_modules(&probes_with_sshd());
+        let rec = recs.iter().find(|r| r.id == "ssh-protection").unwrap();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "iw-scan-show-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mod_dir = tmp.join("ssh-protection").join("docs");
+        std::fs::create_dir_all(&mod_dir).unwrap();
+        std::fs::write(mod_dir.join("README.md"), "# real readme content").unwrap();
+
+        show_module_info(rec, &tmp);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
