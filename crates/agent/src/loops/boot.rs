@@ -179,11 +179,12 @@ pub(crate) fn backfill_015_research_only_backup_path(snapshot_path: &Path, stamp
 /// unit test without spinning up the agent loop.
 pub(crate) fn build_primary_provider(
     ai_cfg: &crate::config::AiConfig,
+    block_backend: &str,
 ) -> Option<Arc<dyn ai::AiProvider>> {
     if !ai_cfg.enabled {
         return None;
     }
-    match ai::build_provider(ai_cfg) {
+    match ai::build_provider(ai_cfg, block_backend) {
         Ok(p) => Some(Arc::from(p)),
         Err(e) => {
             warn!("failed to create AI provider: {e:#}");
@@ -365,13 +366,14 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     // (jeprof on 2026-04-22). Branch logic is in `build_primary_provider`
     // so the `enabled / build-err / disabled` paths are unit-tested
     // without spinning up the rest of the agent.
-    let ai_provider = build_primary_provider(&cfg.ai);
+    let ai_provider = build_primary_provider(&cfg.ai, &cfg.responder.block_backend);
     let ai_router = ai::router::build_from_config(
         ai_provider.as_ref().map(Arc::clone),
         &cfg.ai.classifier,
         &cfg.ai.llm,
         Some(&cfg.ai.shadow),
         cfg.ai.confidence_threshold,
+        &cfg.responder.block_backend,
         |slot, provider_name| {
             info!(
                 slot,
@@ -1971,11 +1973,17 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             daily_cap,
                         );
                         if let Some(ref client) = state.abuseipdb {
+                            // Top-5 #4 (AUDIT-WAVE-T5-4, 2026-05-06):
+                            // forward the bool from `client.report()` so
+                            // `dispatch_flush_outcomes` only consumes a
+                            // daily-quota slot when AbuseIPDB returned 2xx.
+                            // Pre-fix the closure swallowed the bool and
+                            // a 5xx would still consume the slot.
                             abuseipdb_report_budget::dispatch_flush_outcomes(
                                 outcomes,
                                 state.sqlite_store.as_deref(),
                                 |ip, categories, comment| async move {
-                                    client.report(&ip, &categories, &comment).await;
+                                    client.report(&ip, &categories, &comment).await
                                 },
                             )
                             .await;
@@ -2831,7 +2839,7 @@ url = "http://127.0.0.1:9/hooks"
     fn build_primary_provider_returns_none_when_disabled() {
         let mut cfg = crate::config::AiConfig::default();
         cfg.enabled = false;
-        assert!(build_primary_provider(&cfg).is_none());
+        assert!(build_primary_provider(&cfg, "ufw").is_none());
     }
 
     #[test]
@@ -2843,7 +2851,7 @@ url = "http://127.0.0.1:9/hooks"
         let mut cfg = crate::config::AiConfig::default();
         cfg.enabled = true;
         cfg.provider = "this-does-not-exist".into();
-        assert!(build_primary_provider(&cfg).is_none());
+        assert!(build_primary_provider(&cfg, "ufw").is_none());
     }
 
     #[test]
@@ -2855,7 +2863,25 @@ url = "http://127.0.0.1:9/hooks"
         let mut cfg = crate::config::AiConfig::default();
         cfg.enabled = true;
         cfg.provider = "ollama".into();
-        assert!(build_primary_provider(&cfg).is_some());
+        assert!(build_primary_provider(&cfg, "ufw").is_some());
+    }
+
+    #[test]
+    fn build_primary_provider_accepts_iptables_backend_signature() {
+        // Top-5 #3 anchor (AUDIT-WAVE-T5-3, 2026-05-06): the
+        // `block_backend` parameter must reach build_provider so the
+        // LocalClassifier branch picks up the operator-configured
+        // firewall variant. Pre-fix the signature did not even accept
+        // it - the classifier's skill_id was hardcoded to
+        // `block-ip-ufw`. We can't observe the classifier's internal
+        // field from this layer (no local-classifier feature on stub
+        // builds); the variant observation lives next to
+        // `build_action_from_prediction` in `local_classifier.rs::tests`.
+        // This anchor pins the call shape.
+        let mut cfg = crate::config::AiConfig::default();
+        cfg.enabled = true;
+        cfg.provider = "ollama".into();
+        assert!(build_primary_provider(&cfg, "iptables").is_some());
     }
 
     // ─────────────────────────────────────────────────────────────────

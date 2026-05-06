@@ -329,8 +329,20 @@ pub(crate) fn should_notify_with_counter(
 }
 
 fn evaluate_verdict(ctx: &NotificationContext) -> NotificationVerdict {
-    // Rule 1: Server compromise (persistence/exfil confirmed) -> always send.
-    if ctx.is_compromise {
+    // Rule 1: Server compromise NOT contained -> always send.
+    //
+    // 2026-05-06 fix: pre-fix this was unconditional `is_compromise -> SendNow`,
+    // which produced the operator-hit Telegram noise where the same
+    // `kill_chain:detected:DATA_EXFIL` Critical incident pinged the
+    // operator 3x for IP 20.26.156.215 even though killchain inline
+    // had already killed the process and blocked the IP. The body of
+    // the message even read "Handled automatically — no action
+    // needed". A compromise that's already CONTAINED (process killed,
+    // IP blocked, kill chain interrupted) is exactly what the daily
+    // briefing exists for: post-mortem record without paging the
+    // operator. Compromise + NOT contained still pages — that's a
+    // breach in flight.
+    if ctx.is_compromise && !ctx.is_contained {
         return NotificationVerdict::SendNow;
     }
 
@@ -506,7 +518,9 @@ mod tests {
     }
 
     #[test]
-    fn compromise_always_sends() {
+    fn compromise_uncontained_sends() {
+        // Real attack in progress, agent has not yet contained it →
+        // page the operator immediately.
         let ctx = make_ctx(
             "critical",
             "killchain.data_exfil",
@@ -518,10 +532,31 @@ mod tests {
         assert_eq!(should_notify(&ctx), NotificationVerdict::SendNow);
     }
 
+    /// 2026-05-06 anchor: the operator-observed bug. A
+    /// `kill_chain:detected:DATA_EXFIL` Critical incident pinged the
+    /// operator 3x for IP 20.26.156.215 even though killchain inline
+    /// had already killed the process and blocked the IP. The body of
+    /// the message read "Handled automatically — no action needed",
+    /// directly contradicting the SendNow decision. Pre-fix Rule 1
+    /// was unconditional `is_compromise → SendNow`. Post-fix it
+    /// requires `!is_contained` — a compromise that's already been
+    /// handled goes to the daily briefing where post-mortem records
+    /// belong.
     #[test]
-    fn compromise_sends_even_when_contained() {
-        let ctx = make_ctx("critical", "killchain.data_exfil", true, false, true, false);
-        assert_eq!(should_notify(&ctx), NotificationVerdict::SendNow);
+    fn compromise_contained_defers_to_daily_briefing() {
+        let ctx = make_ctx(
+            "critical",
+            "killchain.data_exfil",
+            true, // is_contained — killchain inline already blocked
+            false,
+            true, // is_compromise — Critical + data_exfil tag
+            false,
+        );
+        assert_eq!(
+            should_notify(&ctx),
+            NotificationVerdict::DailyBriefingOnly,
+            "compromise + contained must NOT page the operator (it's already handled)"
+        );
     }
 
     #[test]
@@ -806,10 +841,20 @@ mod tests {
         // an operator can point at when asking "why did this fire?".
         type Row = ((bool, bool, bool, bool), NotificationVerdict);
         let rows: &[Row] = &[
-            // compromise wins over everything.
+            // 2026-05-06 fix (Bug A — notification noise): compromise
+            // ALONE no longer forces SendNow. We require
+            // `compromise && !contained`, because the prod operator
+            // received 3 Critical pings for the same `kill_chain:
+            // detected:DATA_EXFIL` incident even though killchain inline
+            // had already auto-blocked the IP. The contained branch
+            // defers to the daily briefing.
             ((true, false, false, false), NotificationVerdict::SendNow),
             ((true, true, false, false), NotificationVerdict::SendNow),
-            ((true, false, true, false), NotificationVerdict::SendNow),
+            // compromise + contained: defer (the kill chain already ran).
+            (
+                (true, false, true, false),
+                NotificationVerdict::DailyBriefingOnly,
+            ),
             ((true, false, false, true), NotificationVerdict::SendNow),
             // active + not-contained: send.
             ((false, true, false, false), NotificationVerdict::SendNow),

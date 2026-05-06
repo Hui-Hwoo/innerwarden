@@ -237,12 +237,19 @@ impl AiRouter {
 ///
 /// Side-effect callbacks keep tracing concerns in the caller; this
 /// helper stays pure enough to unit-test without mocking a logger.
+// Top-5 #3 (AUDIT-WAVE-T5-3, 2026-05-06): adding `block_backend` pushed
+// the arg count to 8, one over clippy's default 7. Bundling the fields
+// into a struct would be busywork on a single-call-site signature; the
+// caller (loops/boot.rs) reads top-to-bottom and the parameter names
+// already document intent.
+#[allow(clippy::too_many_arguments)]
 pub fn build_from_config(
     primary: Option<Arc<dyn AiProvider>>,
     classifier_cfg: &crate::config::RoleProviderConfig,
     llm_cfg: &crate::config::RoleProviderConfig,
     shadow_cfg: Option<&crate::config::ShadowConfig>,
     confidence_threshold: f32,
+    block_backend: &str,
     mut on_slot_configured: impl FnMut(&'static str, &str),
     mut on_slot_fallback: impl FnMut(&'static str, &str, &anyhow::Error),
 ) -> AiRouter {
@@ -268,6 +275,7 @@ pub fn build_from_config(
         classifier_cfg,
         classifier_shadow,
         confidence_threshold,
+        block_backend,
         &mut on_slot_configured,
         &mut on_slot_fallback,
     );
@@ -277,6 +285,7 @@ pub fn build_from_config(
         llm_cfg,
         llm_shadow,
         confidence_threshold,
+        block_backend,
         &mut on_slot_configured,
         &mut on_slot_fallback,
     );
@@ -287,12 +296,15 @@ pub fn build_from_config(
     }
 }
 
+// See `build_from_config` above — same Top-5 #3 plumbing reason.
+#[allow(clippy::too_many_arguments)]
 fn resolve_slot(
     slot_name: &'static str,
     primary: &Option<Arc<dyn AiProvider>>,
     role_cfg: &crate::config::RoleProviderConfig,
     shadow_cfg: Option<&crate::config::ShadowConfig>,
     confidence_threshold: f32,
+    block_backend: &str,
     on_configured: &mut impl FnMut(&'static str, &str),
     on_fallback: &mut impl FnMut(&'static str, &str, &anyhow::Error),
 ) -> Option<Arc<dyn AiProvider>> {
@@ -300,7 +312,7 @@ fn resolve_slot(
         return primary.as_ref().map(Arc::clone);
     }
     let ai_cfg = role_cfg.to_ai_config();
-    match crate::ai::build_provider(&ai_cfg) {
+    match crate::ai::build_provider(&ai_cfg, block_backend) {
         Ok(primary_box) => {
             on_configured(slot_name, &ai_cfg.provider);
             let wrapped_box = match shadow_cfg {
@@ -311,6 +323,7 @@ fn resolve_slot(
                         &ai_cfg.base_url,
                         &ai_cfg.model,
                         confidence_threshold,
+                        block_backend,
                     ) {
                         Ok(shadow_opt) => {
                             crate::ai::wrap_with_shadow(primary_box, shadow_opt, &scfg.log_path)
@@ -671,6 +684,7 @@ mod tests {
             &RoleProviderConfig::default(),
             None,
             0.85_f32,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -713,6 +727,7 @@ mod tests {
             &llm_cfg,
             None,
             0.85_f32,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -759,6 +774,7 @@ mod tests {
             &llm_cfg,
             None,
             0.85_f32,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -809,6 +825,7 @@ mod tests {
             &llm_cfg,
             None,
             0.85_f32,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -858,6 +875,7 @@ mod tests {
             &RoleProviderConfig::default(),
             None,
             0.85_f32,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -901,6 +919,7 @@ mod tests {
             &RoleProviderConfig::default(),
             None,
             0.85_f32,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -941,6 +960,7 @@ mod tests {
             &RoleProviderConfig::default(),
             None,
             0.85_f32,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -992,6 +1012,7 @@ mod tests {
             &RoleProviderConfig::default(),
             Some(&shadow_cfg),
             0.85,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -1036,6 +1057,7 @@ mod tests {
             &RoleProviderConfig::default(),
             Some(&shadow_cfg),
             0.85,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -1086,6 +1108,7 @@ mod tests {
             &llm_cfg,
             Some(&shadow_cfg),
             0.85,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -1123,6 +1146,7 @@ mod tests {
             &RoleProviderConfig::default(),
             Some(&shadow_cfg),
             0.85,
+            "ufw",
             move |slot, p| {
                 cfg_configured
                     .lock()

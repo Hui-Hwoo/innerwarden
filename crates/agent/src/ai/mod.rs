@@ -425,7 +425,7 @@ fn extract_url_host(host_part: &str) -> &str {
     after_userinfo.split(':').next().unwrap_or("")
 }
 
-pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
+pub fn build_provider(cfg: &AiConfig, block_backend: &str) -> Result<Box<dyn AiProvider>> {
     build_single(
         &cfg.provider,
         cfg.resolved_api_key(),
@@ -433,6 +433,7 @@ pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
         &cfg.base_url,
         &cfg.api_version,
         cfg.confidence_threshold,
+        block_backend,
     )
 }
 
@@ -452,6 +453,7 @@ pub fn build_shadow_observer(
     decide_provider_base_url: &str,
     decide_provider_model: &str,
     confidence_threshold: f32,
+    block_backend: &str,
 ) -> Result<Option<Box<dyn AiProvider>>> {
     if !shadow_cfg.enabled {
         return Ok(None);
@@ -474,6 +476,7 @@ pub fn build_shadow_observer(
         &shadow_cfg.base_url,
         &shadow_cfg.api_version,
         confidence_threshold,
+        block_backend,
     )?;
     Ok(Some(shadow))
 }
@@ -510,9 +513,11 @@ fn build_single(
     base_url: &str,
     api_version: &str,
     #[allow(unused_variables)] confidence_threshold: f32,
+    #[allow(unused_variables)] block_backend: &str,
 ) -> Result<Box<dyn AiProvider>> {
     // Suppress unused warning when local-classifier feature is off
     let _ = confidence_threshold;
+    let _ = block_backend;
     // Spec 024 — deterministic stub used by the scenario-qa harness. Returns
     // fixed decisions per detector kind so scenario envelopes stay stable
     // across runs. Opt-in only (provider = "stub"); has no effect on
@@ -562,7 +567,9 @@ fn build_single(
                 0.85
             };
             Ok(Box::new(local_classifier::LocalClassifier::from_dir(
-                dir, threshold,
+                dir,
+                threshold,
+                block_backend,
             )?))
         }
         #[cfg(not(feature = "local-classifier"))]
@@ -891,7 +898,7 @@ mod tests {
             base_url: String::new(),
             ..Default::default()
         };
-        let result = build_provider(&cfg);
+        let result = build_provider(&cfg, "ufw");
         assert!(
             result.is_err(),
             "should fail for unknown provider without base_url"
@@ -913,7 +920,7 @@ mod tests {
             model: "my-model".into(),
             ..Default::default()
         };
-        let result = build_provider(&cfg);
+        let result = build_provider(&cfg, "ufw");
         assert!(
             result.is_ok(),
             "should accept unknown provider with base_url"
@@ -927,7 +934,7 @@ mod tests {
             provider: "ollama".into(),
             ..Default::default()
         };
-        let result = build_provider(&cfg);
+        let result = build_provider(&cfg, "ufw");
         assert!(result.is_ok());
     }
 
@@ -940,7 +947,7 @@ mod tests {
             provider: "stub".into(),
             ..Default::default()
         };
-        let provider = build_provider(&cfg).expect("stub provider must build offline");
+        let provider = build_provider(&cfg, "ufw").expect("stub provider must build offline");
         assert_eq!(provider.name(), "stub");
     }
 
@@ -950,7 +957,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let err = build_shadow_observer(&shadow, "stub", "", "", 0.85)
+        let err = build_shadow_observer(&shadow, "stub", "", "", 0.85, "ufw")
             .err()
             .unwrap()
             .to_string();
@@ -977,6 +984,7 @@ mod tests {
             "http://localhost:11434",
             "llama3.2",
             0.85,
+            "ufw",
         )
         .err()
         .unwrap()
@@ -997,7 +1005,7 @@ mod tests {
             model: "different".into(),
             ..Default::default()
         };
-        let observer = build_shadow_observer(&shadow, "stub", "", "", 0.85)
+        let observer = build_shadow_observer(&shadow, "stub", "", "", 0.85, "ufw")
             .expect("shadow observer must build")
             .expect("enabled shadow must return Some");
         assert_eq!(observer.name(), "stub");
@@ -1006,18 +1014,21 @@ mod tests {
     #[test]
     fn build_shadow_observer_disabled_returns_none() {
         let shadow = crate::config::ShadowConfig::default();
-        let observer = build_shadow_observer(&shadow, "stub", "", "", 0.85)
+        let observer = build_shadow_observer(&shadow, "stub", "", "", 0.85, "ufw")
             .expect("disabled shadow must not error");
         assert!(observer.is_none());
     }
 
     #[test]
     fn wrap_with_shadow_no_shadow_returns_primary_unchanged() {
-        let primary = build_provider(&crate::config::AiConfig {
-            enabled: true,
-            provider: "stub".into(),
-            ..Default::default()
-        })
+        let primary = build_provider(
+            &crate::config::AiConfig {
+                enabled: true,
+                provider: "stub".into(),
+                ..Default::default()
+            },
+            "ufw",
+        )
         .expect("stub builds");
         let wrapped = wrap_with_shadow(primary, None, "/tmp/unused.jsonl");
         assert_eq!(wrapped.name(), "stub");
@@ -1034,7 +1045,7 @@ mod tests {
             api_key: "dummy".into(),
             ..Default::default()
         };
-        let provider = build_provider(&cfg).expect("azure provider must build");
+        let provider = build_provider(&cfg, "ufw").expect("azure provider must build");
         assert_eq!(provider.name(), "azure_openai");
     }
 
@@ -1048,7 +1059,7 @@ mod tests {
             api_key: "dummy".into(),
             ..Default::default()
         };
-        let err = build_provider(&cfg).err().unwrap().to_string();
+        let err = build_provider(&cfg, "ufw").err().unwrap().to_string();
         assert!(err.contains("base_url"), "got: {err}");
     }
 
@@ -1062,7 +1073,7 @@ mod tests {
             api_key: "dummy".into(),
             ..Default::default()
         };
-        let err = build_provider(&cfg).err().unwrap().to_string();
+        let err = build_provider(&cfg, "ufw").err().unwrap().to_string();
         assert!(err.contains("model"), "got: {err}");
     }
 
@@ -1078,7 +1089,7 @@ mod tests {
             ..Default::default()
         };
         // Empty api_version should fall back to default (not a bail)
-        assert!(build_provider(&cfg).is_ok());
+        assert!(build_provider(&cfg, "ufw").is_ok());
     }
 
     #[cfg(not(feature = "local-classifier"))]
@@ -1090,7 +1101,7 @@ mod tests {
             base_url: "/tmp/nonexistent-model-dir".into(),
             ..Default::default()
         };
-        let err = build_provider(&cfg).err().unwrap().to_string();
+        let err = build_provider(&cfg, "ufw").err().unwrap().to_string();
         assert!(
             err.contains("local-classifier"),
             "expected build-feature guidance, got: {err}"

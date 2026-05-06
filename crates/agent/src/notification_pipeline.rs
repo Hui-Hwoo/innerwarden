@@ -142,6 +142,35 @@ pub(crate) enum GroupAction {
     Suppress,
 }
 
+/// 2026-05-06 fix: an entity IP is "self-traffic" when it points at
+/// the agent's own host — loopback, the VPC interface, or any local
+/// interface address. Pre-fix the briefing surfaced
+/// "🟠 4 dns_tunneling from 127.0.0.1" + "🟠 4 dns_tunneling from
+/// 10.0.0.238" lines because the grouping engine had no notion of
+/// "this IP is us, not an attacker".
+///
+/// Three checks layered cheapest-first:
+/// 1. Explicit loopback parse (catches 127.0.0.0/8 + ::1 deterministically,
+///    works in unit tests where `/proc/net/fib_trie` is not populated).
+/// 2. `is_local_interface_ip` (production path — eth0 / VPC RFC1918
+///    addresses populated from `/proc/net/fib_trie` at boot).
+/// 3. `is_self_traffic_ip` (covers the agent-process / known cloud
+///    metadata IP cases via `cloud_safelist`).
+///
+/// Note: we deliberately do NOT auto-suppress all RFC1918 ranges —
+/// 192.168.x.x can legitimately be a LAN attacker. The local-interface
+/// gate is what protects 10.0.0.238 (the operator's VPC eth0) without
+/// blinding the engine to lateral movement from elsewhere on the LAN.
+fn is_self_traffic_entity(ip: &str) -> bool {
+    if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+        if addr.is_loopback() {
+            return true;
+        }
+    }
+    crate::cloud_safelist::is_local_interface_ip(ip)
+        || crate::cloud_safelist::is_self_traffic_ip(ip)
+}
+
 // ---------------------------------------------------------------------------
 // Grouping Engine
 // ---------------------------------------------------------------------------
@@ -169,6 +198,22 @@ impl GroupingEngine {
     /// Insert an incident. Returns the action the caller should take.
     pub fn insert(&mut self, incident: &Incident) -> GroupAction {
         let (detector, entity_type, entity_value) = extract_group_key(incident);
+
+        // 2026-05-06 fix: skip incidents whose primary entity is the
+        // server's own self-traffic IP (loopback, RFC1918 VPC IP,
+        // local interface). Pre-fix the operator received daily
+        // briefings reading "🟠 4 dns_tunneling from 127.0.0.1" /
+        // "🟠 4 dns_tunneling from 10.0.0.238" — both IPs belong to
+        // the agent's own host, NOT a real attacker. Filtering at
+        // insert time means the group is never created, so neither
+        // the immediate notification nor the eventual `tick()`
+        // summary surfaces. Self-traffic still ends up in the
+        // research-only / dismiss path elsewhere; it just doesn't
+        // pollute the operator-facing briefing line.
+        if entity_type == EntityType::Ip && is_self_traffic_entity(&entity_value) {
+            return GroupAction::Suppress;
+        }
+
         let key = format!("{detector}:{entity_type:?}:{entity_value}");
 
         // Evict oldest groups if at capacity
@@ -1029,6 +1074,71 @@ mod tests {
             group_window_secs: 3600,
             group_count_threshold: 10,
         }
+    }
+
+    /// 2026-05-06 anchor: incidents whose primary entity is the
+    /// agent's own host (loopback / RFC1918 VPC IP) MUST NOT be
+    /// inserted into the grouping engine. Pre-fix the operator
+    /// received daily briefings reading "🟠 4 dns_tunneling from
+    /// 127.0.0.1" / "🟠 4 dns_tunneling from 10.0.0.238" — both
+    /// IPs belong to the host itself, NOT a real attacker.
+    #[test]
+    fn self_traffic_loopback_ip_is_suppressed_from_grouping() {
+        crate::cloud_safelist::init();
+        let mut engine = GroupingEngine::new(&default_config());
+        // 127.0.0.1 → self-traffic per `is_self_traffic_ip`.
+        let inc = make_incident("dns_tunneling", "127.0.0.1", Severity::High);
+        assert_eq!(
+            engine.insert(&inc),
+            GroupAction::Suppress,
+            "loopback IP must NOT create a grouping entry"
+        );
+        // No group exists.
+        let summaries = engine.tick();
+        assert!(
+            summaries.is_empty(),
+            "no summary should be emitted for self-traffic loopback IP"
+        );
+    }
+
+    /// 2026-05-06 anchor: IPv6 loopback (`::1`) is also self-traffic.
+    /// Pinning both IPv4 and IPv6 loopback so a future refactor of
+    /// `is_self_traffic_entity` cannot drop the IPv6 path.
+    ///
+    /// (The 10.0.0.238 prod case relied on the server's
+    /// `LOCAL_INTERFACE_IPS` being populated from `/proc/net/fib_trie` —
+    /// production-only, not deterministic in unit tests on macOS / CI
+    /// containers without that proc entry. The protection is real on
+    /// the live host; this anchor pins the deterministic fast-path.)
+    #[test]
+    fn self_traffic_ipv6_loopback_is_suppressed_from_grouping() {
+        crate::cloud_safelist::init();
+        let mut engine = GroupingEngine::new(&default_config());
+        let inc = make_incident("dns_tunneling", "::1", Severity::High);
+        assert_eq!(
+            engine.insert(&inc),
+            GroupAction::Suppress,
+            "IPv6 loopback must NOT create a grouping entry"
+        );
+        let summaries = engine.tick();
+        assert!(summaries.is_empty());
+    }
+
+    /// 2026-05-06 anchor: regression bound — real external attackers
+    /// MUST still create groups. Anti-regression for accidentally
+    /// widening the self-traffic filter to public IPs.
+    #[test]
+    fn external_attacker_ip_still_creates_grouping_entry() {
+        crate::cloud_safelist::init();
+        let mut engine = GroupingEngine::new(&default_config());
+        // 203.0.113.x is TEST-NET-3 (RFC 5737) — public, not
+        // self-traffic, must NOT be filtered.
+        let inc = make_incident("dns_tunneling", "203.0.113.42", Severity::High);
+        assert_eq!(
+            engine.insert(&inc),
+            GroupAction::NotifyImmediately,
+            "real external attacker must create a grouping entry"
+        );
     }
 
     #[test]

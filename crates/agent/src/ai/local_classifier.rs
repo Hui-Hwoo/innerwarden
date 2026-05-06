@@ -41,10 +41,19 @@ pub struct LocalClassifier {
     tokenizer: Arc<Tokenizer>,
     auto_exec_threshold: f32,
     model_path: PathBuf,
+    /// Operator-configured block backend (`ufw` / `iptables` / `nftables`
+    /// / `pf` / `xdp`). Threaded through from `cfg.responder.block_backend`
+    /// at provider build time so the classifier emits the same `skill_id`
+    /// shape as every other auto-block path. Pre-fix this was hardcoded
+    /// to `"ufw"` (Top-5 #3 — AUDIT-WAVE-T5-3, 2026-05-06): on a host
+    /// running the iptables / nftables / pf backend the classifier would
+    /// emit `skill_id="block-ip-ufw"`, which the executor either rejects
+    /// or — worse — runs ufw in parallel to the operator's real backend.
+    block_backend: String,
 }
 
 impl LocalClassifier {
-    pub fn from_dir(dir: &Path, auto_exec_threshold: f32) -> Result<Self> {
+    pub fn from_dir(dir: &Path, auto_exec_threshold: f32, block_backend: &str) -> Result<Self> {
         let model_path = dir.join("model.onnx");
         let tokenizer_path = dir.join("tokenizer.json");
         if !model_path.exists() {
@@ -82,6 +91,7 @@ impl LocalClassifier {
             tokenizer: Arc::new(tokenizer),
             auto_exec_threshold,
             model_path: dir.to_path_buf(),
+            block_backend: block_backend.to_string(),
         })
     }
 
@@ -154,6 +164,7 @@ impl LocalClassifier {
             tokenizer: Arc::clone(&self.tokenizer),
             auto_exec_threshold: self.auto_exec_threshold,
             model_path: self.model_path.clone(),
+            block_backend: self.block_backend.clone(),
         }
     }
 }
@@ -198,7 +209,8 @@ impl AiProvider for LocalClassifier {
         let action_name = LABELS[idx];
         let target_ip = Self::primary_ip(ctx);
 
-        let action = build_action_from_prediction(action_name, target_ip.clone(), conf);
+        let action =
+            build_action_from_prediction(action_name, target_ip.clone(), conf, &self.block_backend);
 
         let alternatives: Vec<String> = LABELS
             .iter()
@@ -250,16 +262,25 @@ fn pad_or_truncate(v: &mut Vec<i64>, len: usize, pad: i64) {
 /// and downgrades to `Ignore` when no IP is present. Pre-demotion the
 /// downgrade emitted a WARN; now it logs at DEBUG because the safety net
 /// works as designed and there is no operator action.
+///
+/// Top-5 #3 (AUDIT-WAVE-T5-3, 2026-05-06): `block_backend` is the
+/// operator-configured firewall backend (`ufw`/`iptables`/`nftables`/
+/// `pf`/`xdp`) threaded through `cfg.responder.block_backend`. Pre-fix
+/// the skill_id was hardcoded to `"block-ip-ufw"` here, which made the
+/// classifier the only auto-block path that ignored the operator's
+/// backend choice — every other site (`incident_obvious`, `bot_actions`,
+/// `correlation_response`, etc.) already used `format!("block-ip-{}", cfg.responder.block_backend)`.
 fn build_action_from_prediction(
     action_name: &str,
     target_ip: Option<String>,
     conf: f32,
+    block_backend: &str,
 ) -> AiAction {
     match action_name {
         "block_ip" => match target_ip {
             Some(ip) => AiAction::BlockIp {
                 ip,
-                skill_id: "block-ip-ufw".to_string(),
+                skill_id: format!("block-ip-{}", block_backend),
             },
             None => {
                 debug!(
@@ -338,7 +359,7 @@ mod tests {
         // but the incident had no IP entity to act on. Result must be
         // Ignore (NOT BlockIp), with a stable reason string the audit log
         // can grep for.
-        let action = build_action_from_prediction("block_ip", None, 0.95);
+        let action = build_action_from_prediction("block_ip", None, 0.95, "ufw");
         match action {
             AiAction::Ignore { reason } => {
                 assert!(
@@ -355,7 +376,7 @@ mod tests {
         // Anti-regression for over-coercing the downgrade: when the IP IS
         // present, the action MUST be BlockIp, not Ignore.
         let action =
-            build_action_from_prediction("block_ip", Some("203.0.113.42".to_string()), 0.92);
+            build_action_from_prediction("block_ip", Some("203.0.113.42".to_string()), 0.92, "ufw");
         match action {
             AiAction::BlockIp { ip, skill_id } => {
                 assert_eq!(ip, "203.0.113.42");
@@ -369,7 +390,7 @@ mod tests {
     fn monitor_without_ip_uses_unknown_placeholder() {
         // Document the existing fallback so future contributors cannot
         // remove the unwrap_or without changing the public action shape.
-        let action = build_action_from_prediction("monitor", None, 0.7);
+        let action = build_action_from_prediction("monitor", None, 0.7, "ufw");
         match action {
             AiAction::Monitor { ip } => assert_eq!(ip, "unknown"),
             other => panic!("expected Monitor, got {other:?}"),
@@ -382,7 +403,7 @@ mod tests {
         // recognise, the agent must fall back to Ignore (not panic, not
         // execute a partial decision). Confidence stays in the reason
         // string for audit visibility.
-        let action = build_action_from_prediction("frobnicate", None, 0.66);
+        let action = build_action_from_prediction("frobnicate", None, 0.66, "ufw");
         match action {
             AiAction::Ignore { reason } => {
                 assert!(reason.contains("unknown classifier action"));
@@ -397,12 +418,76 @@ mod tests {
         // Audit-trail anchor: the reason must include the confidence so
         // the operator can grep `dismiss (confidence 0.` for low-confidence
         // dismisses without re-querying the inference batch.
-        let action = build_action_from_prediction("dismiss", None, 0.123);
+        let action = build_action_from_prediction("dismiss", None, 0.123, "ufw");
         match action {
             AiAction::Dismiss { reason } => {
                 assert!(reason.contains("0.123"), "got: {reason}");
             }
             other => panic!("expected Dismiss, got {other:?}"),
+        }
+    }
+
+    // ── Top-5 #3 anchors (2026-05-06) — operator-configured backend ──────
+    //
+    // AUDIT-WAVE-T5-3: pre-fix the classifier hardcoded `block-ip-ufw`,
+    // ignoring `cfg.responder.block_backend`. Every other auto-block path
+    // (`incident_obvious`, `bot_actions`, `correlation_response`,
+    // `incident_abuseipdb`, `incident_crowdsec`, `correlation_response`,
+    // dashboard `actions.rs`, `honeypot_*`) already used
+    // `format!("block-ip-{}", cfg.responder.block_backend)`. The
+    // classifier was the lone outlier, which on a host configured for
+    // iptables / nftables / pf / xdp would emit a skill_id the
+    // executor would reject — or worse, run ufw in parallel to the
+    // operator's real backend.
+    //
+    // These anchors pin one parametric variant per supported backend so
+    // the format string contract cannot silently regress to a hardcoded
+    // value via well-meaning refactor.
+    #[test]
+    fn block_ip_skill_id_uses_operator_configured_backend_iptables() {
+        let action = build_action_from_prediction(
+            "block_ip",
+            Some("203.0.113.42".to_string()),
+            0.95,
+            "iptables",
+        );
+        match action {
+            AiAction::BlockIp { skill_id, .. } => assert_eq!(skill_id, "block-ip-iptables"),
+            other => panic!("expected BlockIp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_ip_skill_id_uses_operator_configured_backend_nftables() {
+        let action = build_action_from_prediction(
+            "block_ip",
+            Some("203.0.113.43".to_string()),
+            0.95,
+            "nftables",
+        );
+        match action {
+            AiAction::BlockIp { skill_id, .. } => assert_eq!(skill_id, "block-ip-nftables"),
+            other => panic!("expected BlockIp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_ip_skill_id_uses_operator_configured_backend_pf() {
+        let action =
+            build_action_from_prediction("block_ip", Some("203.0.113.44".to_string()), 0.95, "pf");
+        match action {
+            AiAction::BlockIp { skill_id, .. } => assert_eq!(skill_id, "block-ip-pf"),
+            other => panic!("expected BlockIp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_ip_skill_id_uses_operator_configured_backend_xdp() {
+        let action =
+            build_action_from_prediction("block_ip", Some("203.0.113.45".to_string()), 0.95, "xdp");
+        match action {
+            AiAction::BlockIp { skill_id, .. } => assert_eq!(skill_id, "block-ip-xdp"),
+            other => panic!("expected BlockIp, got {other:?}"),
         }
     }
 }

@@ -1127,7 +1127,7 @@ mod tests {
             provider: "stub".into(),
             ..Default::default()
         };
-        let provider = crate::ai::build_provider(&ai_cfg).expect("stub provider builds");
+        let provider = crate::ai::build_provider(&ai_cfg, "ufw").expect("stub provider builds");
         let provider_arc: Arc<dyn crate::ai::AiProvider> = Arc::from(provider);
         state.ai_router =
             crate::ai::AiRouter::new(Some(Arc::clone(&provider_arc)), Some(provider_arc))
@@ -1416,7 +1416,7 @@ mod tests {
             provider: "stub".into(),
             ..Default::default()
         };
-        let provider = crate::ai::build_provider(&ai_cfg).expect("stub builds");
+        let provider = crate::ai::build_provider(&ai_cfg, "ufw").expect("stub builds");
         let provider_arc: Arc<dyn crate::ai::AiProvider> = Arc::from(provider);
         state.ai_router =
             crate::ai::AiRouter::new(Some(Arc::clone(&provider_arc)), Some(provider_arc))

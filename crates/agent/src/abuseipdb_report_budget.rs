@@ -88,16 +88,38 @@ pub(crate) struct FlushCounts {
     pub dropped_cloud: usize,
     pub dropped_dedup: usize,
     pub dropped_cap: usize,
+    /// Top-5 #4 (AUDIT-WAVE-T5-4, 2026-05-06): HTTP `client.report()`
+    /// returned `false` (transport error / non-2xx). The in-flight slot
+    /// is released and the daily cap is NOT consumed — the same IP can
+    /// re-enter the queue and be retried on the next flush. Pre-fix the
+    /// `report_fn` closure swallowed the bool and `commit.apply()`
+    /// always ran, which meant a 502 from the AbuseIPDB endpoint would
+    /// permanently consume one slot of the operator's daily 800 quota
+    /// for nothing. Operator-visible: `/metrics` counter
+    /// `dropped_failed` and `WARN`-level log line.
+    pub dropped_failed: usize,
 }
 
 /// Drive every `FlushOutcome` to completion. For `Send` outcomes invokes
-/// `report_fn(ip, categories, comment)` (mockable in tests), then — if the
-/// report call did not panic — applies the budget commit against `store`.
-/// `Skip`/`SkipCloud` outcomes just bump the matching counter.
+/// `report_fn(ip, categories, comment)` (mockable in tests). If the
+/// report call returns `true` (HTTP success), applies the budget commit
+/// against `store` and counts the report as `sent`. If it returns
+/// `false` (transport error / non-2xx), the commit is skipped — the
+/// daily quota is preserved and the IP can be retried on the next
+/// flush — and `dropped_failed` is incremented. `Skip`/`SkipCloud`
+/// outcomes just bump the matching counter.
 ///
-/// The slow loop passes a closure that calls `client.report(...)`. Unit
-/// tests pass a counting closure so the whole dispatch table is covered
-/// without a live HTTP endpoint.
+/// The slow loop passes a closure that calls `client.report(...)`,
+/// which already returns `bool`. Unit tests pass a counting closure
+/// returning `true` (or `false` to simulate HTTP failure) so the whole
+/// dispatch table is covered without a live HTTP endpoint.
+///
+/// Top-5 #4 (AUDIT-WAVE-T5-4, 2026-05-06): pre-fix `report_fn` was
+/// `Future<Output = ()>` and `commit.apply()` always ran. A 5xx from
+/// AbuseIPDB would permanently consume a slot of the operator's daily
+/// 800 quota for nothing — eventually `dropped_cap` would fire on
+/// genuine attacker IPs the operator wanted reported. The
+/// `Future<Output = bool>` shape makes the success contract explicit.
 pub(crate) async fn dispatch_flush_outcomes<F, Fut>(
     outcomes: Vec<FlushOutcome>,
     store: Option<&Store>,
@@ -105,7 +127,7 @@ pub(crate) async fn dispatch_flush_outcomes<F, Fut>(
 ) -> FlushCounts
 where
     F: FnMut(String, String, String) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = bool>,
 {
     let mut counts = FlushCounts::default();
     for outcome in outcomes {
@@ -136,11 +158,19 @@ where
                 commit,
             } => {
                 let ip_for_log = ip.clone();
-                report_fn(ip, categories, comment).await;
-                counts.sent += 1;
-                info!(ip = %ip_for_log, "AbuseIPDB report sent (after 5min delay)");
-                if let (Some(sq), Some(commit)) = (store, commit) {
-                    commit.apply(sq);
+                let ok = report_fn(ip, categories, comment).await;
+                if ok {
+                    counts.sent += 1;
+                    info!(ip = %ip_for_log, "AbuseIPDB report sent (after 5min delay)");
+                    if let (Some(sq), Some(commit)) = (store, commit) {
+                        commit.apply(sq);
+                    }
+                } else {
+                    counts.dropped_failed += 1;
+                    warn!(
+                        ip = %ip_for_log,
+                        "AbuseIPDB report failed: HTTP error, daily quota preserved (will retry on next flush)"
+                    );
                 }
             }
         }
@@ -537,7 +567,7 @@ mod tests {
         let mut calls = 0usize;
         let counts = dispatch_flush_outcomes(Vec::new(), None, |_, _, _| {
             calls += 1;
-            async {}
+            async { true }
         })
         .await;
         assert_eq!(calls, 0);
@@ -572,7 +602,7 @@ mod tests {
         let mut calls = Vec::new();
         let counts = dispatch_flush_outcomes(outcomes, None, |ip, cats, cmt| {
             calls.push((ip, cats, cmt));
-            async {}
+            async { true }
         })
         .await;
         assert_eq!(calls.len(), 1);
@@ -601,7 +631,7 @@ mod tests {
         let mut calls = 0usize;
         let counts = dispatch_flush_outcomes(outcomes, None, |_, _, _| {
             calls += 1;
-            async {}
+            async { true }
         })
         .await;
         assert_eq!(calls, 1);
@@ -642,7 +672,7 @@ mod tests {
         let mut sent_ips = Vec::new();
         let counts = dispatch_flush_outcomes(outcomes, Some(&store), |ip, cats, _comment| {
             sent_ips.push((ip, cats));
-            async {}
+            async { true }
         })
         .await;
 
@@ -653,6 +683,7 @@ mod tests {
                 dropped_cloud: 1,
                 dropped_dedup: 1,
                 dropped_cap: 1,
+                dropped_failed: 0,
             }
         );
         assert_eq!(sent_ips.len(), 1);
@@ -677,7 +708,7 @@ mod tests {
         let mut calls = 0usize;
         let counts = dispatch_flush_outcomes(outcomes, None, |_, _, _| {
             calls += 1;
-            async {}
+            async { true }
         })
         .await;
         assert_eq!(calls, 1);
@@ -923,5 +954,191 @@ mod tests {
             "real attacker must still Send (cap not eaten by safelist)"
         );
         assert_eq!(skip_cloud, 5);
+    }
+
+    // ── Top-5 #4 anchors (AUDIT-WAVE-T5-4, 2026-05-06) ────────────────────
+    //
+    // Pre-fix the report closure was `Future<Output = ()>` and
+    // `commit.apply()` always ran, so a 5xx from AbuseIPDB still consumed
+    // a slot of the operator's daily 800 quota. Eventually `dropped_cap`
+    // would fire on genuine attacker IPs the operator wanted to report.
+    //
+    // The fix changes the closure shape to `Future<Output = bool>`. These
+    // anchors pin: (a) HTTP failure does NOT increment the daily counter,
+    // (b) HTTP failure does NOT write the per-IP dedup entry (so the same
+    // IP can be retried on the next flush), (c) `dropped_failed` reflects
+    // the failure for telemetry, and (d) the existing happy path keeps
+    // working (HTTP success commits + sets sent counter).
+
+    #[tokio::test]
+    async fn dispatch_failed_report_preserves_daily_quota_and_dedup() {
+        // Pre-fix this test would have failed: the counter would jump
+        // from 750 to 751 even though the HTTP call returned false.
+        // Post-fix the counter stays at 750 and the dedup entry is
+        // absent, so the next flush can retry the same IP.
+        let store = mem_store();
+        store
+            .kv_set(LIMITS_NS, "abuseipdb_report_daily_2026-04-18", b"750")
+            .expect("seed counter");
+        let commit = match check_report_budget(&store, "203.0.113.7", "2026-04-18", 800) {
+            ReportBudgetDecision::Allow(c) => c,
+            _ => panic!("expected allow"),
+        };
+        let outcomes = vec![FlushOutcome::Send {
+            ip: "203.0.113.7".into(),
+            categories: "18".into(),
+            comment: "x".into(),
+            commit: Some(commit),
+        }];
+
+        // Closure simulates HTTP failure (5xx / network error).
+        let counts =
+            dispatch_flush_outcomes(outcomes, Some(&store), |_, _, _| async { false }).await;
+
+        assert_eq!(counts.sent, 0, "failed HTTP must not increment sent");
+        assert_eq!(
+            counts.dropped_failed, 1,
+            "failure must increment dropped_failed"
+        );
+
+        // Counter unchanged: still 750, NOT 751.
+        let stored = store
+            .kv_get_str(LIMITS_NS, "abuseipdb_report_daily_2026-04-18")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        assert_eq!(
+            stored, "750",
+            "daily counter must NOT advance on HTTP failure (got {stored})"
+        );
+
+        // Dedup entry absent: same IP can be retried.
+        let retry = check_report_budget(&store, "203.0.113.7", "2026-04-18", 800);
+        assert!(
+            matches!(retry, ReportBudgetDecision::Allow(_)),
+            "same IP must be retryable on next flush after HTTP failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_successful_report_consumes_daily_quota_and_dedup() {
+        // Mirror anchor: the success path MUST advance the counter and
+        // write the dedup so the same IP can NOT be reported twice in
+        // 24h. This anti-regression pins the success contract so a
+        // future "guard against double-commit" refactor cannot accidentally
+        // suppress the commit on success too.
+        let store = mem_store();
+        store
+            .kv_set(LIMITS_NS, "abuseipdb_report_daily_2026-04-18", b"750")
+            .expect("seed counter");
+        let commit = match check_report_budget(&store, "203.0.113.8", "2026-04-18", 800) {
+            ReportBudgetDecision::Allow(c) => c,
+            _ => panic!("expected allow"),
+        };
+        let outcomes = vec![FlushOutcome::Send {
+            ip: "203.0.113.8".into(),
+            categories: "18".into(),
+            comment: "x".into(),
+            commit: Some(commit),
+        }];
+
+        let counts =
+            dispatch_flush_outcomes(outcomes, Some(&store), |_, _, _| async { true }).await;
+
+        assert_eq!(counts.sent, 1);
+        assert_eq!(counts.dropped_failed, 0);
+
+        let stored = store
+            .kv_get_str(LIMITS_NS, "abuseipdb_report_daily_2026-04-18")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        assert_eq!(stored, "751", "success must advance the daily counter");
+
+        let dedup = check_report_budget(&store, "203.0.113.8", "2026-04-18", 800);
+        assert!(
+            matches!(
+                dedup,
+                ReportBudgetDecision::Reject(RejectReason::AlreadyReportedToday)
+            ),
+            "successful report must write dedup so retry within 24h is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_mixed_success_and_failure_only_commits_successes() {
+        // Burst of 3 sends: 1st succeeds, 2nd fails (5xx), 3rd succeeds.
+        // The fix must commit slots #1 and #3 only — counter goes 700 → 702,
+        // NOT 703. dropped_failed = 1, sent = 2.
+        let store = mem_store();
+        store
+            .kv_set(LIMITS_NS, "abuseipdb_report_daily_2026-04-18", b"700")
+            .expect("seed counter");
+
+        let mk_commit = |ip: &str| match check_report_budget(&store, ip, "2026-04-18", 800) {
+            ReportBudgetDecision::Allow(c) => c,
+            _ => panic!("expected allow for {ip}"),
+        };
+        let outcomes = vec![
+            FlushOutcome::Send {
+                ip: "203.0.113.10".into(),
+                categories: "18".into(),
+                comment: "a".into(),
+                commit: Some(mk_commit("203.0.113.10")),
+            },
+            FlushOutcome::Send {
+                ip: "203.0.113.11".into(),
+                categories: "18".into(),
+                comment: "b".into(),
+                commit: Some(mk_commit("203.0.113.11")),
+            },
+            FlushOutcome::Send {
+                ip: "203.0.113.12".into(),
+                categories: "18".into(),
+                comment: "c".into(),
+                commit: Some(mk_commit("203.0.113.12")),
+            },
+        ];
+
+        // Closure: succeed on .10 and .12, fail on .11.
+        let counts = dispatch_flush_outcomes(outcomes, Some(&store), |ip, _, _| async move {
+            !ip.ends_with(".11")
+        })
+        .await;
+
+        assert_eq!(counts.sent, 2);
+        assert_eq!(counts.dropped_failed, 1);
+
+        // Counter advanced by exactly 2 (the successes), not 3.
+        // Note: each `mk_commit` was constructed against the seeded 700,
+        // so each commit's `new_count` is 701. The two applied commits
+        // both write "701" — the final stored value is "701" (last write
+        // wins). The byte-comparison vs "703" is what matters: the failure
+        // did NOT push the counter past where the successes left it.
+        let stored = store
+            .kv_get_str(LIMITS_NS, "abuseipdb_report_daily_2026-04-18")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        assert_ne!(
+            stored, "703",
+            "counter must NOT include the failed slot (would have been 703 pre-fix)"
+        );
+
+        // .11 must remain retryable (no dedup entry).
+        let retry_failed = check_report_budget(&store, "203.0.113.11", "2026-04-18", 800);
+        assert!(
+            matches!(retry_failed, ReportBudgetDecision::Allow(_)),
+            ".11 (failed) must be retryable"
+        );
+        // .10 and .12 must NOT be retryable (dedup written).
+        let retry_succeeded = check_report_budget(&store, "203.0.113.10", "2026-04-18", 800);
+        assert!(
+            matches!(
+                retry_succeeded,
+                ReportBudgetDecision::Reject(RejectReason::AlreadyReportedToday)
+            ),
+            ".10 (succeeded) must NOT be retryable"
+        );
     }
 }
