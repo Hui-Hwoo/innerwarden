@@ -140,6 +140,7 @@ pub fn extract_features_for_ip(
             ts,
             severity,
             false_positive,
+            decision,
             ..
         }) = kg.get_node(edge.from)
         {
@@ -148,7 +149,22 @@ pub fn extract_features_for_ip(
             }
             if *ts >= cutoff_7d {
                 let sev = severity.to_ascii_lowercase();
-                let benign_class = *false_positive || sev == "low" || sev == "info";
+                // Spec 043 Phase 1 maturity tweak (2026-05-06): count
+                // incidents whose AI decision was `dismiss` as benign,
+                // regardless of severity. Pre-tweak a Medium proto_anomaly
+                // that the agent already auto-dismissed counted as
+                // "malicious" in the ratio — effectively the agent's
+                // own FP-suppression decisions were poisoning their own
+                // benign_history signal. Real benign IPs (CDN edges,
+                // package mirrors) repeatedly trigger Medium incidents
+                // that get dismissed; counting those as benign lets
+                // them eventually reach the `>= 0.75` band that gates
+                // the modifier.
+                let dismissed = decision
+                    .as_deref()
+                    .map(|d| d.eq_ignore_ascii_case("dismiss"))
+                    .unwrap_or(false);
+                let benign_class = *false_positive || dismissed || sev == "low" || sev == "info";
                 if benign_class {
                     benign_count = benign_count.saturating_add(1);
                 } else {
@@ -244,14 +260,21 @@ pub fn incidents_24h_excluding_detectors(
 /// weaker `-0.10` band. Every band carries a reason string surfaced in
 /// the shadow log so an operator can audit why a decision was nudged.
 pub fn compute_modifier(f: &KgDecideFeatures) -> (f32, &'static str) {
+    // Spec 043 Phase 1 maturity tweak (2026-05-06): relaxed
+    // `age >= 30d` → `age >= 7d` in the strongest benign band. In
+    // prod with agent restarts and KG retention windows, age=30d is
+    // unrealistically rare — observed entities almost never crossed
+    // it before the operator's slow-loop tick had moved on. Lowering
+    // to 7d still requires a meaningful tenure signal (a 1-day-old
+    // attacker IP wouldn't qualify) but is reachable in practice.
     if f.benign_history_score >= 0.90
         && f.risk_score < 20
-        && f.first_seen_age_days >= 30
+        && f.first_seen_age_days >= 7
         && f.prior_incidents_24h == 0
     {
         return (
             -0.30,
-            "long-tenure benign entity (history>=0.90, risk<20, age>=30d, no recent activity)",
+            "long-tenure benign entity (history>=0.90, risk<20, age>=7d, no recent activity)",
         );
     }
     if f.benign_history_score >= 0.75 && f.risk_score < 40 && f.first_seen_age_days >= 7 {
@@ -586,5 +609,154 @@ mod tests {
         assert!(body.contains("\"incident_id\":\"test:1\""));
         assert!(body.contains("\"modifier_after_floor\":-0.3"));
         assert!(body.contains("\"would_change_action\":true"));
+    }
+
+    // ── Spec 043 Phase 1 maturity tweak anchors (2026-05-06) ───────────
+    //
+    // After Phase 1 had 22 records in 12h of prod uptime with ZERO
+    // would_change_action=true, operator audit found two issues:
+    //
+    // 1. Medium incidents that the agent itself dismissed counted as
+    //    "malicious" in benign_history_score. Real benign IPs (CDN
+    //    edges, package mirrors) repeatedly trigger Medium proto_anomaly
+    //    that the agent dismisses; their history was being poisoned by
+    //    the agent's OWN FP-suppression decisions.
+    // 2. The strongest benign band required `age_days >= 30`, which is
+    //    rarely reached in prod due to agent restarts and KG retention.
+    //
+    // These anchors pin the two tweaks.
+
+    fn make_dismissed_incident(id: &str, sev: &str, ago_secs: i64) -> Node {
+        Node::Incident {
+            incident_id: id.to_string(),
+            detector: "test_detector".to_string(),
+            severity: sev.to_string(),
+            title: format!("test {sev} incident"),
+            summary: "test".to_string(),
+            ts: fixed_now() - Duration::seconds(ago_secs),
+            mitre_ids: vec![],
+            decision: Some("dismiss".to_string()),
+            confidence: Some(0.95),
+            decision_reason: Some("auto-dismissed".to_string()),
+            decision_target: None,
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        }
+    }
+
+    /// Tweak 1 anchor: a Medium incident with `decision = Some("dismiss")`
+    /// counts as benign in `benign_history_score`. Pre-tweak this would
+    /// have counted as malicious because severity=Medium > Low. Real
+    /// CDN edges and package mirrors trigger this exact pattern.
+    #[test]
+    fn dismissed_incident_counts_as_benign_regardless_of_severity() {
+        let mut kg = KnowledgeGraph::new();
+        let ip_id = kg.add_node(make_ip_node("203.0.113.20", 5, 10));
+        // 10 dismissed-Medium incidents — pre-tweak would yield 0.0 ratio
+        // (all "malicious" because Medium != Low). Post-tweak yields 1.0.
+        for i in 0..10 {
+            let inc = kg.add_node(make_dismissed_incident(
+                &format!("dismissed:{i}"),
+                "medium",
+                3600 * 6,
+            ));
+            kg.add_edge(Edge::new(
+                inc,
+                ip_id,
+                Relation::TriggeredBy,
+                fixed_now() - Duration::hours(6),
+            ));
+        }
+
+        let inc = make_incident("203.0.113.20");
+        let f = extract_features(&kg, &inc, fixed_now()).expect("features extracted");
+
+        assert!(
+            (f.benign_history_score - 1.0).abs() < f32::EPSILON,
+            "10 dismissed-Medium incidents must yield benign_history_score=1.0 (all benign); \
+             got {} — tweak regression?",
+            f.benign_history_score
+        );
+    }
+
+    /// Tweak 1 mirror: incident with NO decision and severity=Medium
+    /// continues to count as malicious (un-dismissed Medium = real
+    /// signal). Anti-regression for accidentally widening "benign" to
+    /// every Medium incident.
+    #[test]
+    fn undismissed_medium_incident_still_counts_as_malicious() {
+        let mut kg = KnowledgeGraph::new();
+        let ip_id = kg.add_node(make_ip_node("203.0.113.21", 5, 10));
+        for i in 0..3 {
+            // make_incident_node creates with decision=None, severity=medium
+            let inc = kg.add_node(make_incident_node(
+                &format!("undecided:{i}"),
+                "medium",
+                3600 * 6,
+                false, // not false_positive
+            ));
+            kg.add_edge(Edge::new(
+                inc,
+                ip_id,
+                Relation::TriggeredBy,
+                fixed_now() - Duration::hours(6),
+            ));
+        }
+
+        let inc = make_incident("203.0.113.21");
+        let f = extract_features(&kg, &inc, fixed_now()).expect("features extracted");
+
+        // 0 benign / 3 malicious → ratio 0.0
+        assert!(
+            f.benign_history_score < 0.01,
+            "undecided Medium incidents must NOT count as benign; \
+             got benign_history_score = {}",
+            f.benign_history_score
+        );
+    }
+
+    /// Tweak 2 anchor: the strongest benign band (`-0.30`) now triggers
+    /// at `age_days >= 7` instead of 30. Pre-tweak an entity with 8 days
+    /// of pristine history would have failed the band. Post-tweak it
+    /// qualifies.
+    #[test]
+    fn compute_modifier_strongest_band_triggers_at_age_seven_days() {
+        let f = KgDecideFeatures {
+            prior_incidents_24h: 0,
+            benign_history_score: 0.95,
+            related_campaigns: 0,
+            cluster_size: 8,
+            risk_score: 10,
+            first_seen_age_days: 8, // >= 7 (post-tweak), < 30 (pre-tweak)
+        };
+        let (m, _reason) = compute_modifier(&f);
+        assert!(
+            (m - (-0.30)).abs() < f32::EPSILON,
+            "8-day age MUST qualify for -0.30 band post-tweak; got {m}"
+        );
+    }
+
+    /// Tweak 2 mirror: an entity with age=6d (still below the new 7d
+    /// threshold) does NOT qualify for the strongest band. Anti-
+    /// regression for accidentally lowering the threshold to zero.
+    #[test]
+    fn compute_modifier_strongest_band_does_not_trigger_below_seven_days() {
+        let f = KgDecideFeatures {
+            prior_incidents_24h: 0,
+            benign_history_score: 0.95,
+            related_campaigns: 0,
+            cluster_size: 8,
+            risk_score: 10,
+            first_seen_age_days: 6, // < 7 — should NOT qualify
+        };
+        let (m, _reason) = compute_modifier(&f);
+        assert!(
+            m > -0.20,
+            "6-day age must NOT qualify for -0.30 band; got {m}"
+        );
     }
 }

@@ -499,6 +499,13 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/cloud_safelist.rs::tests::cloudfront_specific_edge_detected` - mirror anchor for CloudFront prefixes that fall OUTSIDE the standard AWS 3/13/15/18/44/52/54/99 allocations (`64.252.x`, `130.176.x`, `143.204.x`, `144.220.x`). These would have escaped the existing AWS coverage; pinned so a future "AWS catches all" simplification doesn't drop them.
 - `crates/agent/src/cloud_safelist.rs::tests::cdn_coverage_does_not_widen_to_real_attackers` - anti-regression bound: TEST-NET-3 / TEST-NET-2 / TEST-NET-1 (RFC 5737) and random non-CDN allocations MUST still be detected as non-cloud. Adding 30+ CDN entries to `CLOUD_PROVIDER_RANGES` must not accidentally swallow real attacker territory.
 
+### Phase 1 maturity tweaks (Spec 043 - 2026-05-06 follow-up)
+
+- `crates/agent/src/kg_decide_features.rs::tests::dismissed_incident_counts_as_benign_regardless_of_severity` - operator-data-driven tweak (after 22 shadow records all "no actionable signal" in 12h prod): a Medium incident with `decision = Some("dismiss")` MUST count as benign in `benign_history_score`. Pre-tweak the agent's own dismiss decisions were poisoning the benign-history signal — CDN edges and package mirrors that repeatedly triggered Medium proto_anomaly that got auto-dismissed counted as malicious history, blocking the IP from ever reaching the `>= 0.75` band.
+- `crates/agent/src/kg_decide_features.rs::tests::undismissed_medium_incident_still_counts_as_malicious` - mirror anti-regression: incident with NO decision and severity=Medium continues to count as malicious. Anti-regression for accidentally widening "benign" to every Medium incident, which would let real attackers reach high benign_history_score.
+- `crates/agent/src/kg_decide_features.rs::tests::compute_modifier_strongest_band_triggers_at_age_seven_days` - tweak 2 anchor: the `-0.30` band now triggers at `age_days >= 7` (was 30). 30d was unrealistic in prod due to agent restarts and KG retention windows; 8-day age now qualifies (with the rest of the band's preconditions).
+- `crates/agent/src/kg_decide_features.rs::tests::compute_modifier_strongest_band_does_not_trigger_below_seven_days` - mirror anti-regression: 6-day age (still below the new 7d threshold) does NOT qualify. Anti-regression for accidentally lowering threshold to zero.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
