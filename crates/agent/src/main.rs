@@ -72,6 +72,7 @@ mod capped_log;
 mod circuit_breaker;
 mod cloud_safelist;
 mod cloudflare;
+mod cloudflare_attribution;
 mod config;
 mod correlation;
 mod correlation_engine;

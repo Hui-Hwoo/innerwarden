@@ -20,6 +20,17 @@ use innerwarden_core::event::Event;
 // ---------------------------------------------------------------------------
 
 /// Parsed HTTP request line + headers.
+///
+/// Wave 9 (AUDIT-WAVE9-CF-ATTRIBUTION, 2026-05-05): added
+/// `cf_connecting_ip` and `x_forwarded_for` so the agent's ingest
+/// pipeline can rewrite the event's `src_ip` to the real client when
+/// the socket peer is a Cloudflare edge. Without these, every request
+/// proxied through Cloudflare was attributed to one of ~14 CF CIDR
+/// ranges instead of the real attacker — inflating block decisions
+/// (one per CF edge IP) and putting CF datacenter geos on the public
+/// map. The agent verifies the socket peer IS a CF edge before
+/// honouring these headers (defence against spoofed headers from
+/// non-CF peers).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct HttpRequest {
@@ -30,6 +41,12 @@ pub struct HttpRequest {
     pub user_agent: String,
     pub content_type: String,
     pub content_length: usize,
+    /// Wave 9: `CF-Connecting-IP` header value. Empty when absent.
+    /// Cloudflare sets this to the real client IP at the CF edge.
+    pub cf_connecting_ip: String,
+    /// Wave 9: `X-Forwarded-For` header value. Empty when absent.
+    /// First entry is the original client; intermediate hops follow.
+    pub x_forwarded_for: String,
 }
 
 /// Ports to monitor for HTTP traffic.
@@ -69,6 +86,11 @@ pub fn parse_http_request(payload: &[u8]) -> Option<HttpRequest> {
     let mut user_agent = String::new();
     let mut content_type = String::new();
     let mut content_length = 0usize;
+    // Wave 9: CDN-attribution headers. Cloudflare sets these on every
+    // proxied request. The agent's ingest path verifies the socket
+    // peer is in a CF CIDR before honouring them.
+    let mut cf_connecting_ip = String::new();
+    let mut x_forwarded_for = String::new();
 
     for line in lines {
         if line.is_empty() {
@@ -84,6 +106,14 @@ pub fn parse_http_request(payload: &[u8]) -> Option<HttpRequest> {
             content_type = line[13..].trim().to_string();
         } else if lower.starts_with("content-length:") {
             content_length = line[15..].trim().parse().unwrap_or(0);
+        } else if lower.starts_with("cf-connecting-ip:") {
+            // Wave 9: `CF-Connecting-IP: <ip>` — Cloudflare-set, single value.
+            cf_connecting_ip = line["cf-connecting-ip:".len()..].trim().to_string();
+        } else if lower.starts_with("x-forwarded-for:") {
+            // Wave 9: `X-Forwarded-For: <client>, <proxy1>, <proxy2>` — first
+            // entry is the original client per RFC 7239. Stored raw; agent
+            // splits on `,` and takes the first when honouring.
+            x_forwarded_for = line["x-forwarded-for:".len()..].trim().to_string();
         }
     }
 
@@ -95,6 +125,8 @@ pub fn parse_http_request(payload: &[u8]) -> Option<HttpRequest> {
         user_agent,
         content_type,
         content_length,
+        cf_connecting_ip,
+        x_forwarded_for,
     })
 }
 
@@ -298,6 +330,13 @@ async fn run_linux(tx: mpsc::Sender<Event>, host: String) {
                 "src_port": src_port,
                 "dst_port": dst_port,
                 "http_version": req.version,
+                // Wave 9 (AUDIT-WAVE9-CF-ATTRIBUTION): CDN-attribution
+                // headers. Always emitted (empty string when absent)
+                // so the agent's ingest path can do a single .get()
+                // lookup without a presence check. The agent verifies
+                // socket peer is in CF CIDR before honouring.
+                "cf_connecting_ip": req.cf_connecting_ip,
+                "x_forwarded_for": req.x_forwarded_for,
             }),
             tags: vec!["http".to_string(), "network".to_string()],
             entities: vec![EntityRef::ip(&src_ip)],
@@ -370,6 +409,65 @@ mod tests {
     #[test]
     fn rejects_empty() {
         assert!(parse_http_request(b"").is_none());
+    }
+
+    /// Wave 9 (AUDIT-WAVE9-CF-ATTRIBUTION) anchor: parser extracts
+    /// `CF-Connecting-IP` (case-insensitive header name) from a real
+    /// Cloudflare-proxied request. Pre-Wave-9 the parser ignored this
+    /// header and the agent had no way to attribute traffic to the
+    /// real client behind a CF edge.
+    #[test]
+    fn parse_cf_connecting_ip_header_present() {
+        let raw = b"GET /api/status HTTP/1.1\r\n\
+                    Host: example.com\r\n\
+                    CF-Connecting-IP: 203.0.113.42\r\n\
+                    User-Agent: Mozilla/5.0\r\n\r\n";
+        let req = parse_http_request(raw).unwrap();
+        assert_eq!(
+            req.cf_connecting_ip, "203.0.113.42",
+            "CF-Connecting-IP must be extracted as the real-client field"
+        );
+        assert_eq!(req.user_agent, "Mozilla/5.0");
+    }
+
+    /// Wave 9: lowercase header name still parses (HTTP header names
+    /// are case-insensitive per RFC 7230 § 3.2). Real CF traffic uses
+    /// the canonical `CF-Connecting-IP` casing, but proxies in front
+    /// of the agent may normalise differently.
+    #[test]
+    fn parse_cf_connecting_ip_header_lowercase() {
+        let raw = b"GET / HTTP/1.1\r\n\
+                    host: example.com\r\n\
+                    cf-connecting-ip: 198.51.100.7\r\n\r\n";
+        let req = parse_http_request(raw).unwrap();
+        assert_eq!(req.cf_connecting_ip, "198.51.100.7");
+    }
+
+    /// Wave 9: missing header → empty string (NOT some sentinel).
+    /// The agent's ingest path treats empty as "header absent" and
+    /// falls back to socket-peer attribution (the pre-Wave-9 behaviour).
+    #[test]
+    fn parse_cf_connecting_ip_absent_yields_empty_string() {
+        let raw = b"GET /admin HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let req = parse_http_request(raw).unwrap();
+        assert_eq!(req.cf_connecting_ip, "");
+        assert_eq!(req.x_forwarded_for, "");
+    }
+
+    /// Wave 9: `X-Forwarded-For` parsing keeps the raw value
+    /// (comma-separated). Splitting + first-entry extraction is the
+    /// agent's responsibility, since policy on intermediate proxies
+    /// belongs there.
+    #[test]
+    fn parse_x_forwarded_for_keeps_raw_chain() {
+        let raw = b"GET /api HTTP/1.1\r\n\
+                    Host: example.com\r\n\
+                    X-Forwarded-For: 203.0.113.42, 172.71.103.154\r\n\r\n";
+        let req = parse_http_request(raw).unwrap();
+        assert_eq!(
+            req.x_forwarded_for, "203.0.113.42, 172.71.103.154",
+            "X-Forwarded-For preserved as raw header value for agent-side splitting"
+        );
     }
 
     #[test]

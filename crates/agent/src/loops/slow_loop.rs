@@ -889,7 +889,7 @@ pub(crate) async fn process_narrative_tick(
         .format("%Y-%m-%d")
         .to_string();
 
-    let (events_entries, events_count) = if let Some(ref sq) = state.sqlite_store {
+    let (mut events_entries, events_count) = if let Some(ref sq) = state.sqlite_store {
         let cval = sq.get_agent_cursor("events").unwrap_or(0);
         match sq.events_since(cval, 5000) {
             Ok(rows) if !rows.is_empty() => {
@@ -919,6 +919,29 @@ pub(crate) async fn process_narrative_tick(
         warn!("sqlite_store not available — cannot read events");
         (Vec::new(), 0)
     };
+
+    // Wave 9 (AUDIT-WAVE9-CF-ATTRIBUTION): rewrite each event's
+    // src_ip from the Cloudflare edge IP to the real client IP
+    // (`details.cf_connecting_ip`) when the socket peer is a CF
+    // edge. Done HERE — before telemetry / narrative / KG / baseline
+    // / correlation read the events — so every downstream surface
+    // (Threats tab, attacker-profiles, dashboard live-feed, public
+    // site) sees the resolved attribution. Original edge IP is
+    // preserved in `details.cdn_edge_ip` for forensic. The trust
+    // gate (`is_cloudflare_edge_ip` on the socket peer) prevents a
+    // non-CF attacker from spoofing `CF-Connecting-IP` to
+    // misattribute their traffic.
+    if !events_entries.is_empty() {
+        let rewrites =
+            crate::cloudflare_attribution::rewrite_events_for_cloudflare(&mut events_entries);
+        if rewrites > 0 {
+            tracing::debug!(
+                rewrites,
+                total_events = events_entries.len(),
+                "Wave 9: rewrote CF-edge events to real client IPs"
+            );
+        }
+    }
 
     record_telemetry_observation(state, &events_entries);
 

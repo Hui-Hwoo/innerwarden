@@ -46,6 +46,15 @@ impl CidrRange {
 static CLOUD_RANGES: OnceLock<Vec<CidrRange>> = OnceLock::new();
 static CLOUD_PROVIDER_COUNT: OnceLock<usize> = OnceLock::new();
 
+/// Wave 9 (AUDIT-WAVE9-CF-ATTRIBUTION): Cloudflare-only ranges,
+/// pre-parsed for the per-event CF-edge check. The general
+/// `CLOUD_RANGES` mixes CF, AWS, Azure, Telegram, Oracle peer ranges
+/// — the CF-attribution gate must NOT trust a `CF-Connecting-IP`
+/// header from an AWS or Telegram peer (they're not running CF
+/// edge proxies). A separate static keeps the trust narrow and
+/// audit-clear.
+static CLOUDFLARE_EDGE_RANGES: OnceLock<Vec<CidrRange>> = OnceLock::new();
+
 /// Local interface IPs of the host the agent runs on (eth0, bond0, etc.).
 /// Populated at startup via `init_local_interface_ips()`. Traffic with
 /// src_ip == one of these is the host itself talking to the outside world,
@@ -241,6 +250,19 @@ pub fn init() {
     let _ = CLOUD_PROVIDER_COUNT.set(count);
     info!(ranges = count, "Cloud provider safelist loaded");
 
+    // Wave 9: parse CF-only ranges into a separate static so the
+    // per-event CF-edge check is O(N_cf) instead of walking every
+    // cloud-provider range (CF + AWS + Telegram + Oracle).
+    let cf_ranges: Vec<CidrRange> = CLOUDFLARE_RANGES
+        .iter()
+        .filter_map(|c| CidrRange::from_str(c))
+        .collect();
+    info!(
+        cf_ranges = cf_ranges.len(),
+        "Cloudflare edge ranges loaded for CF-attribution"
+    );
+    let _ = CLOUDFLARE_EDGE_RANGES.set(cf_ranges);
+
     // Best-effort: read the host's own IPv4 interface addresses so
     // incidents with src/dst == own IP can be recognized as self-traffic.
     // Falls back to an empty list if /proc/net/fib_trie is unreadable;
@@ -352,6 +374,37 @@ pub fn is_agent_process(comm: &str) -> bool {
 }
 
 /// Check if an IP belongs to a known cloud provider.
+/// Wave 9 (AUDIT-WAVE9-CF-ATTRIBUTION): true when `ip_str` is a
+/// Cloudflare edge IP (one of the published CF CIDR ranges).
+///
+/// This is the trust gate for honouring the `CF-Connecting-IP`
+/// header during ingest: only requests whose **socket peer** is a
+/// Cloudflare edge can have their attribution rewritten. A non-CF
+/// peer setting `CF-Connecting-IP: 1.2.3.4` is spoofing — the
+/// attacker controls the header but not the routing.
+///
+/// Pre-Wave-9 the agent had `is_cloud_provider_ip` (CF + AWS +
+/// Telegram + Oracle), which was too broad for this gate — an AWS
+/// peer is not running a CF edge.
+pub fn is_cloudflare_edge_ip(ip_str: &str) -> bool {
+    let Ok(ip) = ip_str.parse::<IpAddr>() else {
+        return false;
+    };
+    let ip_u32 = match ip {
+        IpAddr::V4(v4) => u32::from(v4),
+        // IPv6 not yet supported by the parsed CIDR cache (CF
+        // publishes IPv6 ranges too — TODO if prod ever needs it).
+        _ => return false,
+    };
+    if let Some(ranges) = CLOUDFLARE_EDGE_RANGES.get() {
+        ranges.iter().any(|r| r.contains(ip_u32))
+    } else {
+        // `init()` not called yet — fail closed (no rewrite).
+        // Production calls `init()` before any event is ingested.
+        false
+    }
+}
+
 /// Returns true if the IP should NOT be auto-blocked.
 pub fn is_cloud_provider_ip(ip_str: &str) -> bool {
     let Ok(ip) = ip_str.parse::<IpAddr>() else {
