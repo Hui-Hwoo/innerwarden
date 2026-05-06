@@ -193,6 +193,34 @@ pub struct KgConfig {
     /// was write-only pre-Phase-5. Default: false.
     #[serde(default)]
     pub sysctl_drift_detector_enabled: bool,
+    /// Phase 4: packed_binary_detector. When true, the slow loop
+    /// emits Medium incidents for File nodes whose `entropy` exceeds
+    /// `packed_binary_entropy_threshold` AND that have at least one
+    /// incoming Executed edge. Activates `File.entropy` which was
+    /// write-only pre-Phase-4. Default: false.
+    #[serde(default)]
+    pub packed_binary_detector_enabled: bool,
+    /// Phase 4 threshold. Legit binaries score 5.5-6.5 on Shannon
+    /// entropy; packers / encrypted payloads approach 8.0. Default
+    /// 7.5 catches UPX / themida / vmprotect / generic obfuscators
+    /// without firing on lightly-compressed assets. Operators with
+    /// unusually high-entropy legit workloads can raise this.
+    #[serde(default = "default_packed_binary_entropy_threshold")]
+    pub packed_binary_entropy_threshold: f32,
+    /// Phase 6: short_lived_process_detector. When true, the slow
+    /// loop emits Medium incidents for Process nodes whose lifetime
+    /// is below `short_lived_process_threshold_ms` AND that connected
+    /// to at least one external IP during their lifetime. Activates
+    /// `Process.exit_ts` which was write-only pre-Phase-6. Default:
+    /// false.
+    #[serde(default)]
+    pub short_lived_process_detector_enabled: bool,
+    /// Phase 6 threshold in milliseconds. Sub-100ms processes that do
+    /// network I/O are a classic injection / shellcode shape (loader
+    /// → connect → exfil → exit). Default 100 catches the common
+    /// patterns; raise on slow hardware where legit tools dip below.
+    #[serde(default = "default_short_lived_process_threshold_ms")]
+    pub short_lived_process_threshold_ms: u64,
 }
 
 impl Default for KgConfig {
@@ -201,8 +229,20 @@ impl Default for KgConfig {
             decide_modifier_mode: default_kg_decide_modifier_mode(),
             yara_match_detector_enabled: false,
             sysctl_drift_detector_enabled: false,
+            packed_binary_detector_enabled: false,
+            packed_binary_entropy_threshold: default_packed_binary_entropy_threshold(),
+            short_lived_process_detector_enabled: false,
+            short_lived_process_threshold_ms: default_short_lived_process_threshold_ms(),
         }
     }
+}
+
+fn default_packed_binary_entropy_threshold() -> f32 {
+    7.5
+}
+
+fn default_short_lived_process_threshold_ms() -> u64 {
+    100
 }
 
 fn default_kg_decide_modifier_mode() -> String {

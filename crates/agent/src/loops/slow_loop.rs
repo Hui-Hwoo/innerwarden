@@ -798,6 +798,30 @@ fn kg_tick(
                     chrono::Utc::now(),
                 ));
             }
+            // Spec 043 Phase 4 — packed_binary detector. Activates
+            // File.entropy (write-only pre-Phase-4). Threshold and
+            // enable both come from config — operator can tune.
+            if cfg.kg.packed_binary_detector_enabled {
+                incidents.extend(knowledge_graph::detectors::detect_packed_binary(
+                    &graph,
+                    &mut state.graph_detector_state,
+                    &host,
+                    chrono::Utc::now(),
+                    cfg.kg.packed_binary_entropy_threshold,
+                ));
+            }
+            // Spec 043 Phase 6 — short_lived_process detector. Activates
+            // Process.exit_ts (write-only pre-Phase-6). Threshold and
+            // enable both come from config.
+            if cfg.kg.short_lived_process_detector_enabled {
+                incidents.extend(knowledge_graph::detectors::detect_short_lived_process(
+                    &graph,
+                    &mut state.graph_detector_state,
+                    &host,
+                    chrono::Utc::now(),
+                    cfg.kg.short_lived_process_threshold_ms,
+                ));
+            }
             (incidents, host)
         };
         {

@@ -478,6 +478,20 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/incident_autodismiss.rs::tests::try_dismiss_cdn_noise_does_not_dismiss_when_ip_has_other_recent_attack_history` - operator's safety case (2026-05-06: "não podemos ficar vulneráveis a alguém nos invadir usando a Azure"): an Azure / AWS / GCP / OCI / DO / Hetzner IP that has a non-`proto_anomaly` incident in the last 24h (e.g. ssh_bruteforce) MUST NOT have its proto_anomaly auto-dismissed. The initial Phase 3 fix would have silently silenced the noisy half of a real attack on a cloud VM. Hardening uses `kg_decide_features::incidents_24h_excluding_detectors` to check KG history before dismiss.
 
+### Packed binary detector (Spec 043 Phase 4 - AUDIT-SPEC043-PHASE4)
+
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::packed_binary_detector_emits_when_high_entropy_and_executed` - Phase 4 headline anchor: a File with entropy 7.8 (above 7.5 threshold) AND an Executed edge produces ONE Medium incident. Pre-Phase-4 the sensor wrote Shannon entropy onto File nodes but no consumer read it. Activates the field for the exact UPX-packed-dropper shape.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::packed_binary_detector_skips_high_entropy_when_not_executed` - anti-regression bound: a high-entropy file with NO Executed edge is suspicious-on-disk but not actionable for THIS detector. Pre-fix would have spammed every random-looking file in /var/cache.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::packed_binary_detector_skips_legit_low_entropy_executed_binary` - anti-regression bound: a legit ELF binary (entropy ~6.0) that ran on the host MUST NOT trigger. Otherwise every /usr/bin tool would fire.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::packed_binary_detector_respects_configurable_threshold` - threshold knob anchor: entropy 7.0 fires when threshold=6.5 but NOT when threshold=7.5 (default). Pins the operator's tuning surface for unusual workloads.
+
+### Short-lived process detector (Spec 043 Phase 6 - AUDIT-SPEC043-PHASE6)
+
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::short_lived_process_detector_emits_when_subms_and_external_connect` - Phase 6 headline anchor: a 50ms process that connected to an external IP fires Medium. Pre-Phase-6 the sensor wrote start_ts/exit_ts but no consumer measured the lifetime. Exact shape of a shellcode loader (loader → connect → exfil → exit).
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::short_lived_process_detector_skips_when_lifetime_above_threshold` - anti-regression: a 500ms process (above default 100ms) MUST NOT trigger. Real long-lived tools shouldn't fire.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::short_lived_process_detector_skips_when_only_internal_connect` - anti-regression: a fast process that connected ONLY to localhost / RFC1918 (health check) MUST NOT trigger. Network I/O alone isn't suspicious; EXTERNAL network I/O during a sub-100ms lifetime is.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::short_lived_process_detector_skips_when_no_exit_ts` - defensive bound: a process still running (no exit_ts) MUST NOT trigger. We only know a process is "short lived" once it has actually exited.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

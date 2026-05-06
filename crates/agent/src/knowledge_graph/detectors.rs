@@ -3413,6 +3413,224 @@ pub fn detect_sysctl_drift(
     incidents
 }
 
+/// Spec 043 Phase 4 — packed_binary_detector. Activates a KG field that
+/// was write-only pre-Phase-4 (`Node::File.entropy`). The sensor's
+/// `file_extract` collector computes Shannon entropy on every executed
+/// binary and writes it to the File node — but no consumer ever read
+/// it. High Shannon entropy (>~7.5 bits/byte) is a strong signal that
+/// the binary is packed (UPX, custom packer) or encrypted: legit
+/// binaries typically score 5.5-6.5; only random/encrypted/compressed
+/// data approaches the 8.0 ceiling.
+///
+/// This detector emits one Medium incident per File node whose
+/// `entropy > threshold` AND that has at least one incoming `Executed`
+/// edge from a Process node — i.e., the binary actually ran on the
+/// host. A high-entropy file sitting in /tmp untouched is suspicious
+/// but not actionable; a high-entropy file that JUST EXECUTED is the
+/// shape that warrants operator attention.
+///
+/// Stable incident_id by sha256 (when present) so re-execution of the
+/// same packed binary across slow-loop ticks deduplicates.
+///
+/// Disabled by default per Spec 043 promotion gate
+/// (`[kg].packed_binary_detector_enabled`). Default threshold 7.5 is
+/// configurable via `[kg].packed_binary_entropy_threshold` for
+/// operators with unusually high-entropy legit workloads (e.g.
+/// pre-compressed asset bundles).
+pub fn detect_packed_binary(
+    graph: &KnowledgeGraph,
+    _state: &mut GraphDetectorState,
+    host: &str,
+    now: DateTime<Utc>,
+    threshold: f32,
+) -> Vec<Incident> {
+    let mut incidents = Vec::new();
+    for id in graph.nodes_of_type(NodeType::File) {
+        let Some(node) = graph.get_node(id) else {
+            continue;
+        };
+        let (path, sha256, entropy) = match node {
+            Node::File {
+                path,
+                sha256,
+                entropy: Some(e),
+                ..
+            } if *e > threshold => (path, sha256, *e),
+            _ => continue,
+        };
+        // Require at least one incoming Executed edge — the file
+        // actually ran on the host. Otherwise this is just a
+        // suspicious-on-disk artifact (separate concern, would
+        // belong to a "static analysis" detector that doesn't exist).
+        let was_executed = graph
+            .incoming_edges(id)
+            .iter()
+            .any(|e| e.relation == Relation::Executed);
+        if !was_executed {
+            continue;
+        }
+        let stable_key = sha256.as_deref().unwrap_or(path);
+        let incident_id = format!(
+            "packed_binary:{}",
+            stable_key.chars().take(16).collect::<String>()
+        );
+        // Find the executing process (first Executed edge — usually
+        // there's only one) for the operator's at-a-glance context.
+        let executing_proc = graph
+            .incoming_edges(id)
+            .iter()
+            .find(|e| e.relation == Relation::Executed)
+            .and_then(|e| graph.get_node(e.from))
+            .map(|n| n.label())
+            .unwrap_or_else(|| "unknown".to_string());
+        incidents.push(Incident {
+            ts: now,
+            host: host.to_string(),
+            incident_id,
+            severity: Severity::Medium,
+            title: format!(
+                "Packed/encrypted binary executed: {}",
+                path.chars().take(60).collect::<String>()
+            ),
+            summary: format!(
+                "File {} has Shannon entropy {:.2} bits/byte (legit binaries are 5.5-6.5; \
+                 packers / encrypted payloads approach 8.0). Executed by {executing_proc}. \
+                 Investigate: is this a known packer (UPX, themida, vmprotect) or a \
+                 legit pre-compressed asset?",
+                stable_key, entropy
+            ),
+            evidence: serde_json::json!([{
+                "kind": "packed_binary",
+                "path": path,
+                "sha256": sha256,
+                "entropy": entropy,
+                "executing_process": executing_proc,
+            }]),
+            recommended_checks: vec![
+                format!("file {path}"),
+                format!("upx -t {path}"),
+                format!("strings {path} | head -20"),
+            ],
+            tags: vec!["packed_binary".to_string(), "T1027".to_string()],
+            entities: vec![EntityRef::path(path)],
+        });
+    }
+    incidents
+}
+
+/// Spec 043 Phase 6 — short_lived_process_detector. Activates a KG field
+/// that was write-only pre-Phase-6 (`Node::Process.exit_ts`). The
+/// sensor's `ebpf_syscall` collector records `start_ts` on `execve`
+/// and `exit_ts` on `process_exit`, both timestamps written onto the
+/// Process node — but no consumer ever measured the lifetime.
+/// Sub-100ms processes that ALSO connect to external IPs are a
+/// classic injection / shellcode shape: the parent forks a tiny
+/// loader that does ONE TCP connect to a C2, exfils a token, and
+/// dies. Real long-running tools take seconds at minimum.
+///
+/// Threshold 100ms is configurable via
+/// `[kg].short_lived_process_threshold_ms` for operators on slow
+/// hardware where legit tools (e.g. `whoami`, `id`) might dip below
+/// the default. Empirically on a 4-core Xeon E3, even `cat /etc/passwd`
+/// runs in 2-5ms — so the question isn't "is the process fast" but
+/// "did this fast process do network I/O", which the ConnectedTo
+/// edge gates.
+///
+/// Disabled by default per Spec 043 promotion gate
+/// (`[kg].short_lived_process_detector_enabled`).
+pub fn detect_short_lived_process(
+    graph: &KnowledgeGraph,
+    _state: &mut GraphDetectorState,
+    host: &str,
+    now: DateTime<Utc>,
+    threshold_ms: u64,
+) -> Vec<Incident> {
+    let mut incidents = Vec::new();
+    let threshold = Duration::milliseconds(threshold_ms as i64);
+    for id in graph.nodes_of_type(NodeType::Process) {
+        let Some(node) = graph.get_node(id) else {
+            continue;
+        };
+        let (pid, comm, start_ts, exit_ts) = match node {
+            Node::Process {
+                pid,
+                comm,
+                start_ts,
+                exit_ts: Some(exit),
+                ..
+            } => (*pid, comm, *start_ts, *exit),
+            _ => continue,
+        };
+        let lifetime = exit_ts - start_ts;
+        if lifetime >= threshold {
+            continue;
+        }
+        // Negative lifetime (clock skew) — skip rather than emit
+        // bogus incident.
+        if lifetime < Duration::zero() {
+            continue;
+        }
+        // Require at least one ConnectedTo edge to an EXTERNAL IP.
+        // Internal-only connections (loopback, RFC1918) are normal
+        // for short-lived health probes and shouldn't trigger.
+        let external_connect = graph
+            .outgoing_edges(id)
+            .iter()
+            .filter(|e| e.relation == Relation::ConnectedTo)
+            .filter_map(|e| graph.get_node(e.to))
+            .filter_map(|n| match n {
+                Node::Ip {
+                    addr, is_internal, ..
+                } if !is_internal => Some(addr.clone()),
+                _ => None,
+            })
+            .next();
+        let Some(external_ip) = external_connect else {
+            continue;
+        };
+        let lifetime_ms = lifetime.num_milliseconds();
+        // Stable id by pid + start_ts so the same short-lived
+        // process across slow-loop ticks deduplicates.
+        let incident_id = format!(
+            "short_lived_process:{pid}:{}",
+            start_ts.format("%Y-%m-%dT%H:%M:%S")
+        );
+        incidents.push(Incident {
+            ts: now,
+            host: host.to_string(),
+            incident_id,
+            severity: Severity::Medium,
+            title: format!(
+                "Short-lived process with external connect: {comm}/{pid} ({lifetime_ms}ms)"
+            ),
+            summary: format!(
+                "Process {comm} (pid {pid}) lived {lifetime_ms}ms before exit AND \
+                 connected to external IP {external_ip} during that window. Real \
+                 long-running tools take seconds at minimum; sub-{threshold_ms}ms \
+                 processes that do network I/O are a classic injection / shellcode \
+                 shape (tiny loader → connect → exfil → exit). Investigate: was \
+                 this a legit short-lived health check or a payload?"
+            ),
+            evidence: serde_json::json!([{
+                "kind": "short_lived_process",
+                "pid": pid,
+                "comm": comm,
+                "start_ts": start_ts.to_rfc3339(),
+                "exit_ts": exit_ts.to_rfc3339(),
+                "lifetime_ms": lifetime_ms,
+                "external_ip": external_ip,
+            }]),
+            recommended_checks: vec![
+                format!("Check parent process for pid {pid} via `auditd`"),
+                format!("Search the process binary path in `audit.log` for execve"),
+            ],
+            tags: vec!["short_lived_process".to_string(), "T1059".to_string()],
+            entities: vec![EntityRef::ip(&external_ip)],
+        });
+    }
+    incidents
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4516,6 +4734,292 @@ mod tests {
             second.is_empty(),
             "same drift must not re-emit on next tick; got {} incidents",
             second.len()
+        );
+    }
+
+    // ── Spec 043 Phase 4 packed_binary anchors (AUDIT-SPEC043-PHASE4) ──
+    //
+    // Pre-Phase-4 the sensor's file_extract collector wrote Shannon
+    // entropy onto File nodes but no consumer ever read it. Packed
+    // (UPX, themida) and encrypted payloads score >7.5; legit
+    // binaries score 5.5-6.5. These anchors pin the new detector that
+    // activates that field.
+
+    fn make_file_with_entropy(path: &str, entropy: f32) -> Node {
+        // Fake but stable sha256 derived from path bytes (not arithmetic
+        // — earlier draft overflowed u64 multiplication on long paths).
+        let fake_sha: String = path
+            .bytes()
+            .chain(std::iter::repeat(0u8))
+            .take(32)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Node::File {
+            path: path.to_string(),
+            sha256: Some(fake_sha),
+            size: Some(8192),
+            entropy: Some(entropy),
+            is_sensitive: false,
+            yara_matches: vec![],
+        }
+    }
+
+    fn make_process(pid: u32, comm: &str) -> Node {
+        Node::Process {
+            pid,
+            ppid: 1,
+            comm: comm.to_string(),
+            exe: Some(format!("/usr/bin/{comm}")),
+            uid: 0,
+            container_id: None,
+            start_ts: chrono::Utc::now(),
+            exit_ts: None,
+        }
+    }
+
+    #[test]
+    fn packed_binary_detector_emits_when_high_entropy_and_executed() {
+        // Headline anchor: a File with entropy 7.8 (above the 7.5
+        // threshold) AND an Executed edge from a Process produces ONE
+        // Medium incident. The exact shape of a UPX-packed dropper
+        // running on the host.
+        let mut graph = KnowledgeGraph::new();
+        let file_id = graph.add_node(make_file_with_entropy("/tmp/dropper", 7.8));
+        let proc_id = graph.add_node(make_process(12345, "dropper"));
+        graph.add_edge(Edge::new(
+            proc_id,
+            file_id,
+            Relation::Executed,
+            chrono::Utc::now(),
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_packed_binary(&graph, &mut state, "h", chrono::Utc::now(), 7.5);
+        assert_eq!(incidents.len(), 1, "exactly one incident expected");
+        let inc = &incidents[0];
+        assert_eq!(inc.severity, Severity::Medium);
+        assert!(inc.title.contains("/tmp/dropper"));
+        assert!(inc.summary.contains("7.8"));
+        assert!(
+            inc.summary.contains("dropper(12345)"),
+            "summary must name the executing process; got: {}",
+            inc.summary
+        );
+    }
+
+    #[test]
+    fn packed_binary_detector_skips_high_entropy_when_not_executed() {
+        // Anti-regression bound: a high-entropy file just sitting on
+        // disk (no Executed edge) is suspicious-on-disk but not
+        // actionable for THIS detector. Static analysis is a separate
+        // concern. Pre-fix would have spammed every random-looking
+        // file in /var/cache.
+        let mut graph = KnowledgeGraph::new();
+        graph.add_node(make_file_with_entropy("/var/cache/random.bin", 7.9));
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_packed_binary(&graph, &mut state, "h", chrono::Utc::now(), 7.5);
+        assert!(
+            incidents.is_empty(),
+            "high-entropy file with NO Executed edge must not trigger; got {}",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn packed_binary_detector_skips_legit_low_entropy_executed_binary() {
+        // Anti-regression bound: a legit ELF binary (entropy ~6.0)
+        // that ran on the host MUST NOT trigger. Otherwise every
+        // /usr/bin tool would fire the detector.
+        let mut graph = KnowledgeGraph::new();
+        let file_id = graph.add_node(make_file_with_entropy("/usr/bin/ls", 6.1));
+        let proc_id = graph.add_node(make_process(100, "ls"));
+        graph.add_edge(Edge::new(
+            proc_id,
+            file_id,
+            Relation::Executed,
+            chrono::Utc::now(),
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_packed_binary(&graph, &mut state, "h", chrono::Utc::now(), 7.5);
+        assert!(
+            incidents.is_empty(),
+            "legit-entropy executed binary must not trigger; got {}",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn packed_binary_detector_respects_configurable_threshold() {
+        // Threshold knob anchor: a 7.0-entropy executed binary fires
+        // when threshold=6.5 but NOT when threshold=7.5 (default).
+        // Pins the operator's tuning surface.
+        let mut graph = KnowledgeGraph::new();
+        let file_id = graph.add_node(make_file_with_entropy("/tmp/payload", 7.0));
+        let proc_id = graph.add_node(make_process(200, "payload"));
+        graph.add_edge(Edge::new(
+            proc_id,
+            file_id,
+            Relation::Executed,
+            chrono::Utc::now(),
+        ));
+        let mut state = GraphDetectorState::new();
+        let strict = detect_packed_binary(&graph, &mut state, "h", chrono::Utc::now(), 7.5);
+        assert!(
+            strict.is_empty(),
+            "entropy 7.0 with threshold 7.5 must not trigger"
+        );
+        let lenient = detect_packed_binary(&graph, &mut state, "h", chrono::Utc::now(), 6.5);
+        assert_eq!(
+            lenient.len(),
+            1,
+            "entropy 7.0 with threshold 6.5 MUST trigger"
+        );
+    }
+
+    // ── Spec 043 Phase 6 short_lived_process anchors ───────────────────
+    //
+    // Pre-Phase-6 the sensor wrote process start_ts and exit_ts onto
+    // Process nodes but no consumer ever measured the lifetime.
+    // Sub-100ms processes that ALSO connect to external IPs are a
+    // classic injection / shellcode shape (loader → connect → exfil
+    // → exit). These anchors pin the new detector.
+
+    fn make_short_process(pid: u32, comm: &str, lifetime_ms: i64) -> Node {
+        let start = chrono::Utc::now() - Duration::seconds(60);
+        Node::Process {
+            pid,
+            ppid: 1,
+            comm: comm.to_string(),
+            exe: Some(format!("/tmp/{comm}")),
+            uid: 0,
+            container_id: None,
+            start_ts: start,
+            exit_ts: Some(start + Duration::milliseconds(lifetime_ms)),
+        }
+    }
+
+    fn make_external_ip(addr: &str) -> Node {
+        Node::Ip {
+            addr: addr.to_string(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: chrono::Utc::now(),
+            last_seen: chrono::Utc::now(),
+            attempted_usernames: vec![],
+        }
+    }
+
+    fn make_internal_ip(addr: &str) -> Node {
+        Node::Ip {
+            addr: addr.to_string(),
+            is_internal: true,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: chrono::Utc::now(),
+            last_seen: chrono::Utc::now(),
+            attempted_usernames: vec![],
+        }
+    }
+
+    #[test]
+    fn short_lived_process_detector_emits_when_subms_and_external_connect() {
+        // Headline anchor: a 50ms process that connected to an
+        // external IP fires Medium. Exact shape of a shellcode loader.
+        let mut graph = KnowledgeGraph::new();
+        let proc_id = graph.add_node(make_short_process(8888, "loader", 50));
+        let ip_id = graph.add_node(make_external_ip("203.0.113.66"));
+        graph.add_edge(Edge::new(
+            proc_id,
+            ip_id,
+            Relation::ConnectedTo,
+            chrono::Utc::now(),
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents =
+            detect_short_lived_process(&graph, &mut state, "h", chrono::Utc::now(), 100);
+        assert_eq!(incidents.len(), 1);
+        let inc = &incidents[0];
+        assert_eq!(inc.severity, Severity::Medium);
+        assert!(inc.title.contains("loader/8888"));
+        assert!(
+            inc.summary.contains("203.0.113.66"),
+            "summary must name the external IP; got: {}",
+            inc.summary
+        );
+    }
+
+    #[test]
+    fn short_lived_process_detector_skips_when_lifetime_above_threshold() {
+        // Anti-regression: a 500ms process (above default 100ms) that
+        // connected to an external IP MUST NOT trigger. Real long-lived
+        // tools shouldn't fire the detector.
+        let mut graph = KnowledgeGraph::new();
+        let proc_id = graph.add_node(make_short_process(8889, "wget", 500));
+        let ip_id = graph.add_node(make_external_ip("8.8.8.8"));
+        graph.add_edge(Edge::new(
+            proc_id,
+            ip_id,
+            Relation::ConnectedTo,
+            chrono::Utc::now(),
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents =
+            detect_short_lived_process(&graph, &mut state, "h", chrono::Utc::now(), 100);
+        assert!(
+            incidents.is_empty(),
+            "process above threshold must not trigger; got {}",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn short_lived_process_detector_skips_when_only_internal_connect() {
+        // Anti-regression: a fast process that connected ONLY to
+        // localhost / RFC1918 (health check) MUST NOT trigger. Network
+        // I/O alone isn't suspicious; EXTERNAL network I/O during a
+        // sub-100ms lifetime is.
+        let mut graph = KnowledgeGraph::new();
+        let proc_id = graph.add_node(make_short_process(8890, "healthcheck", 30));
+        let ip_id = graph.add_node(make_internal_ip("127.0.0.1"));
+        graph.add_edge(Edge::new(
+            proc_id,
+            ip_id,
+            Relation::ConnectedTo,
+            chrono::Utc::now(),
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents =
+            detect_short_lived_process(&graph, &mut state, "h", chrono::Utc::now(), 100);
+        assert!(
+            incidents.is_empty(),
+            "internal-only connect must not trigger; got {}",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn short_lived_process_detector_skips_when_no_exit_ts() {
+        // Defensive bound: a process still running (no exit_ts) MUST
+        // NOT trigger. We only know it's "short lived" once it has
+        // actually exited.
+        let mut graph = KnowledgeGraph::new();
+        let proc_id = graph.add_node(make_process(9000, "long_runner")); // no exit_ts
+        let ip_id = graph.add_node(make_external_ip("203.0.113.99"));
+        graph.add_edge(Edge::new(
+            proc_id,
+            ip_id,
+            Relation::ConnectedTo,
+            chrono::Utc::now(),
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents =
+            detect_short_lived_process(&graph, &mut state, "h", chrono::Utc::now(), 100);
+        assert!(
+            incidents.is_empty(),
+            "process without exit_ts must not trigger; got {}",
+            incidents.len()
         );
     }
 }
