@@ -107,6 +107,13 @@ pub struct GraphDetectorState {
     /// so the operator can grep `/metrics` and audit what is being
     /// dampened. Without this, suppression is invisible.
     pub(crate) suppressed_counts: HashMap<(String, &'static str), u64>,
+    /// Spec 043 Phase 5 sysctl_drift baseline. First call to
+    /// `detect_sysctl_drift` populates this from
+    /// `Node::System.sysctl_params`; subsequent calls diff the current
+    /// params against this snapshot to surface drift. `None` until the
+    /// first observation. Per-process state — agent restart re-
+    /// baselines on the next tick (acceptable false-negative window).
+    sysctl_baseline: Option<HashMap<String, String>>,
 }
 
 /// 2026-05-03: stable label string per UserClass for the
@@ -128,6 +135,7 @@ impl GraphDetectorState {
             default_cooldown_secs: 300,
             recent_detections: HashMap::new(),
             suppressed_counts: HashMap::new(),
+            sysctl_baseline: None,
         }
     }
 
@@ -3223,6 +3231,188 @@ pub fn detect_yara_match(
     incidents
 }
 
+/// Spec 043 Phase 5 — sysctl_drift_detector. Activates a KG field that
+/// was write-only pre-Phase-5 (`Node::System.sysctl_params`). The
+/// sensor's `sysctl_drift` collector (`crates/sensor/src/collectors/
+/// sysctl_drift.rs`) reads kernel tunables at boot/refresh and writes
+/// them onto the System node — but no consumer ever diffed them.
+/// Real rootkits flip these to hide themselves; without a diff the
+/// signal is invisible.
+///
+/// Critical-class params (rootkit / persistence indicators):
+///   - kernel.modules_disabled        → rootkit blocks module unload
+///   - kernel.kptr_restrict           → rootkit relaxes pointer hiding
+///   - kernel.dmesg_restrict          → rootkit wants dmesg access
+///   - kernel.unprivileged_bpf_disabled → eBPF rootkit deployment
+///   - kernel.yama.ptrace_scope       → process-debug abuse
+///   - kernel.randomize_va_space      → ASLR weakening
+///   - net.ipv4.ip_forward            → traffic redirection / pivot
+///
+/// Other params drift → Medium (operator review, not Critical).
+///
+/// Baseline lives in `GraphDetectorState.sysctl_baseline` — first call
+/// snapshots, subsequent calls diff. Agent restart re-baselines on
+/// the next tick (acceptable false-negative window during restart;
+/// the alternative — persisting baseline to disk — invites schema
+/// migration headaches and was rejected for Phase 5 scope).
+///
+/// Disabled by default per Spec 043 promotion gate
+/// (`[kg].sysctl_drift_detector_enabled`); operator opts in on
+/// test001 first.
+pub fn detect_sysctl_drift(
+    graph: &KnowledgeGraph,
+    state: &mut GraphDetectorState,
+    host: &str,
+    now: DateTime<Utc>,
+) -> Vec<Incident> {
+    // Critical kernel tunables — drift on any of these is a
+    // rootkit / persistence indicator at high confidence. Order
+    // matters only for deterministic test output.
+    const CRITICAL_PARAMS: &[&str] = &[
+        "kernel.modules_disabled",
+        "kernel.kptr_restrict",
+        "kernel.dmesg_restrict",
+        "kernel.unprivileged_bpf_disabled",
+        "kernel.yama.ptrace_scope",
+        "kernel.randomize_va_space",
+        "net.ipv4.ip_forward",
+    ];
+
+    // Find the System node for this host — there should be exactly one.
+    let mut current_params: Option<HashMap<String, String>> = None;
+    for id in graph.nodes_of_type(NodeType::System) {
+        if let Some(Node::System { sysctl_params, .. }) = graph.get_node(id) {
+            current_params = Some(sysctl_params.clone());
+            break;
+        }
+    }
+    let Some(current) = current_params else {
+        return Vec::new();
+    };
+
+    // First observation: snapshot and emit nothing. Subsequent calls
+    // get the diff.
+    let Some(baseline) = state.sysctl_baseline.as_ref() else {
+        state.sysctl_baseline = Some(current);
+        return Vec::new();
+    };
+
+    let mut incidents = Vec::new();
+    let mut critical_changed: Vec<(String, String, String)> = Vec::new();
+    let mut other_changed: Vec<(String, String, String)> = Vec::new();
+
+    for (key, current_value) in &current {
+        let baseline_value = baseline.get(key);
+        if Some(current_value) != baseline_value {
+            let old = baseline_value
+                .cloned()
+                .unwrap_or_else(|| "(unset)".to_string());
+            if CRITICAL_PARAMS.contains(&key.as_str()) {
+                critical_changed.push((key.clone(), old, current_value.clone()));
+            } else {
+                other_changed.push((key.clone(), old, current_value.clone()));
+            }
+        }
+    }
+    // Detect deletions (baseline had it, current doesn't).
+    for (key, baseline_value) in baseline {
+        if !current.contains_key(key) {
+            let entry = (key.clone(), baseline_value.clone(), "(removed)".to_string());
+            if CRITICAL_PARAMS.contains(&key.as_str()) {
+                critical_changed.push(entry);
+            } else {
+                other_changed.push(entry);
+            }
+        }
+    }
+
+    // Sort for deterministic output.
+    critical_changed.sort();
+    other_changed.sort();
+
+    // Critical incidents — one per critical param drift. Each is
+    // important enough to escalate independently; aggregating would
+    // hide which param flipped.
+    for (key, old, new) in &critical_changed {
+        incidents.push(Incident {
+            ts: now,
+            host: host.to_string(),
+            incident_id: format!("sysctl_drift:critical:{key}"),
+            severity: Severity::Critical,
+            title: format!("Critical sysctl drift: {key}"),
+            summary: format!(
+                "Kernel tunable `{key}` changed from `{old}` to `{new}`. \
+                 This parameter is a rootkit / persistence indicator — \
+                 attackers flip it to hide kernel modules, expose pointer \
+                 addresses, suppress dmesg, or weaken ASLR. Verify the \
+                 change was intentional (system administrator action) \
+                 and audit `auditd` for the writing process."
+            ),
+            evidence: serde_json::json!([{
+                "kind": "sysctl_drift",
+                "param": key,
+                "baseline_value": old,
+                "current_value": new,
+                "class": "critical",
+            }]),
+            recommended_checks: vec![
+                format!("sysctl {key}"),
+                "ausearch -k sysctl_change | tail -20".to_string(),
+            ],
+            tags: vec!["sysctl_drift".to_string(), "rootkit".to_string()],
+            entities: vec![],
+        });
+    }
+
+    // Aggregated Medium incident for non-critical drift — operator
+    // sees one alert with all changes, not N alerts.
+    if !other_changed.is_empty() {
+        let summary_lines: Vec<String> = other_changed
+            .iter()
+            .take(20)
+            .map(|(k, o, n)| format!("- {k}: `{o}` → `{n}`"))
+            .collect();
+        let extra = if other_changed.len() > 20 {
+            format!("\n... and {} more", other_changed.len() - 20)
+        } else {
+            String::new()
+        };
+        incidents.push(Incident {
+            ts: now,
+            host: host.to_string(),
+            incident_id: "sysctl_drift:medium:aggregate".to_string(),
+            severity: Severity::Medium,
+            title: format!(
+                "Sysctl drift: {} kernel tunable(s) changed",
+                other_changed.len()
+            ),
+            summary: format!(
+                "Non-critical kernel tunables drifted from baseline. \
+                 Worth investigating but not necessarily compromise:\n{}{extra}",
+                summary_lines.join("\n")
+            ),
+            evidence: serde_json::json!([{
+                "kind": "sysctl_drift",
+                "class": "medium",
+                "changes": other_changed
+                    .iter()
+                    .map(|(k, o, n)| serde_json::json!({"param": k, "baseline": o, "current": n}))
+                    .collect::<Vec<_>>(),
+            }]),
+            recommended_checks: vec!["ausearch -k sysctl_change | tail -50".to_string()],
+            tags: vec!["sysctl_drift".to_string()],
+            entities: vec![],
+        });
+    }
+
+    // Update baseline to current so we don't re-emit the same drift on
+    // the next tick. Operator who intentionally changed a param sees
+    // ONE alert per change, not one per tick.
+    state.sysctl_baseline = Some(current);
+
+    incidents
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4144,5 +4334,188 @@ mod tests {
         assert!(inc.summary.contains("xmrig_miner"));
         assert!(inc.summary.contains("packed_upx"));
         assert!(inc.summary.contains("cryptominer_generic"));
+    }
+
+    // ── Spec 043 Phase 5 sysctl_drift anchors (AUDIT-SPEC043-PHASE5) ───
+    //
+    // Pre-Phase-5 the sensor's sysctl_drift collector wrote kernel
+    // tunables onto System.sysctl_params but no consumer ever diffed
+    // them. Real rootkits flip these to hide themselves; without a
+    // diff the signal was invisible. These anchors pin the new
+    // detector that activates that field.
+
+    fn make_system_node(params: Vec<(&str, &str)>) -> Node {
+        Node::System {
+            hostname: "test-host".to_string(),
+            sysctl_params: params
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn sysctl_drift_first_observation_emits_nothing_just_baselines() {
+        // Defensive contract: the first time we see the System node
+        // there's no baseline to diff against. Detector MUST emit
+        // zero incidents and just snapshot. Anti-regression for
+        // accidentally treating "first sight" as "all params drifted
+        // from /unset/" and spamming hundreds of false positives.
+        let mut graph = KnowledgeGraph::new();
+        graph.add_node(make_system_node(vec![
+            ("kernel.modules_disabled", "0"),
+            ("net.ipv4.ip_forward", "0"),
+        ]));
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_sysctl_drift(&graph, &mut state, "h", chrono::Utc::now());
+        assert!(
+            incidents.is_empty(),
+            "first observation must just baseline, not emit; got {} incidents",
+            incidents.len()
+        );
+        assert!(
+            state.sysctl_baseline.is_some(),
+            "baseline must be populated after first observation"
+        );
+    }
+
+    #[test]
+    fn sysctl_drift_critical_param_change_emits_critical() {
+        // The headline rootkit case: kernel.kptr_restrict relaxed
+        // from `2` (the safe default) to `0` (pointer addresses
+        // visible). Real rootkits do this to find their hooking
+        // targets. MUST emit a Critical incident with the param name
+        // in the title so the operator can ack-or-investigate at a
+        // glance.
+        let mut graph = KnowledgeGraph::new();
+        // First observation: baseline.
+        graph.add_node(make_system_node(vec![
+            ("kernel.kptr_restrict", "2"),
+            ("net.ipv4.ip_forward", "0"),
+        ]));
+        let mut state = GraphDetectorState::new();
+        let _ = detect_sysctl_drift(&graph, &mut state, "h", chrono::Utc::now());
+
+        // Replace System node with the drifted version.
+        let mut graph2 = KnowledgeGraph::new();
+        graph2.add_node(make_system_node(vec![
+            ("kernel.kptr_restrict", "0"), // <-- relaxed by attacker
+            ("net.ipv4.ip_forward", "0"),
+        ]));
+        let incidents = detect_sysctl_drift(&graph2, &mut state, "h", chrono::Utc::now());
+
+        // Exactly one Critical incident for the kptr_restrict change.
+        assert_eq!(incidents.len(), 1, "exactly one Critical incident expected");
+        assert_eq!(incidents[0].severity, Severity::Critical);
+        assert!(
+            incidents[0].title.contains("kernel.kptr_restrict"),
+            "title must name the changed param; got: {}",
+            incidents[0].title
+        );
+        assert!(
+            incidents[0].summary.contains("`2`") && incidents[0].summary.contains("`0`"),
+            "summary must show both old and new values; got: {}",
+            incidents[0].summary
+        );
+    }
+
+    #[test]
+    fn sysctl_drift_medium_class_aggregates_into_one_incident() {
+        // Anti-spam contract: 5 non-critical params drifting in one
+        // tick produce ONE Medium incident with all 5 in the summary,
+        // not 5 separate incidents. Pre-aggregation (an earlier draft
+        // of the detector) would have flooded the dashboard on a
+        // benign system-wide tunable refresh (e.g. operator running
+        // `sysctl --system` after editing /etc/sysctl.d).
+        let mut graph = KnowledgeGraph::new();
+        graph.add_node(make_system_node(vec![
+            ("net.core.rmem_max", "131072"),
+            ("net.core.wmem_max", "131072"),
+            ("vm.swappiness", "60"),
+            ("fs.file-max", "100000"),
+            ("net.ipv4.tcp_keepalive_time", "7200"),
+        ]));
+        let mut state = GraphDetectorState::new();
+        let _ = detect_sysctl_drift(&graph, &mut state, "h", chrono::Utc::now());
+
+        let mut graph2 = KnowledgeGraph::new();
+        graph2.add_node(make_system_node(vec![
+            ("net.core.rmem_max", "262144"),        // changed
+            ("net.core.wmem_max", "262144"),        // changed
+            ("vm.swappiness", "10"),                // changed
+            ("fs.file-max", "200000"),              // changed
+            ("net.ipv4.tcp_keepalive_time", "600"), // changed
+        ]));
+        let incidents = detect_sysctl_drift(&graph2, &mut state, "h", chrono::Utc::now());
+
+        // ONE incident for all 5 medium drifts.
+        assert_eq!(
+            incidents.len(),
+            1,
+            "5 medium drifts must aggregate to one incident; got {}",
+            incidents.len()
+        );
+        assert_eq!(incidents[0].severity, Severity::Medium);
+        // Summary lists all 5 changed params.
+        for param in [
+            "net.core.rmem_max",
+            "net.core.wmem_max",
+            "vm.swappiness",
+            "fs.file-max",
+            "net.ipv4.tcp_keepalive_time",
+        ] {
+            assert!(
+                incidents[0].summary.contains(param),
+                "summary must list {param}; got: {}",
+                incidents[0].summary
+            );
+        }
+    }
+
+    #[test]
+    fn sysctl_drift_no_change_emits_nothing() {
+        // Anti-regression bound: when the System node is unchanged
+        // tick-over-tick, the detector MUST emit zero incidents.
+        // Pre-aggregation a buggy "always emit on every observation"
+        // implementation would have flooded the dashboard at 30s
+        // intervals.
+        let mut graph = KnowledgeGraph::new();
+        graph.add_node(make_system_node(vec![("kernel.kptr_restrict", "2")]));
+        let mut state = GraphDetectorState::new();
+        let _ = detect_sysctl_drift(&graph, &mut state, "h", chrono::Utc::now());
+        // Second tick, same params.
+        let mut graph2 = KnowledgeGraph::new();
+        graph2.add_node(make_system_node(vec![("kernel.kptr_restrict", "2")]));
+        let incidents = detect_sysctl_drift(&graph2, &mut state, "h", chrono::Utc::now());
+        assert!(
+            incidents.is_empty(),
+            "unchanged System node must emit zero incidents; got {}",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn sysctl_drift_does_not_re_emit_same_change_on_next_tick() {
+        // Operator-facing rule: a single intentional change (operator
+        // editing /etc/sysctl.d) should produce ONE alert, not one
+        // alert per slow-loop tick. The detector updates baseline to
+        // current after each emit so the same drift is not surfaced
+        // again. This pins that behaviour.
+        let mut graph = KnowledgeGraph::new();
+        graph.add_node(make_system_node(vec![("kernel.kptr_restrict", "2")]));
+        let mut state = GraphDetectorState::new();
+        let _ = detect_sysctl_drift(&graph, &mut state, "h", chrono::Utc::now());
+        // Drift.
+        let mut graph2 = KnowledgeGraph::new();
+        graph2.add_node(make_system_node(vec![("kernel.kptr_restrict", "0")]));
+        let first = detect_sysctl_drift(&graph2, &mut state, "h", chrono::Utc::now());
+        assert_eq!(first.len(), 1);
+        // Same drift, second tick — must NOT re-emit.
+        let second = detect_sysctl_drift(&graph2, &mut state, "h", chrono::Utc::now());
+        assert!(
+            second.is_empty(),
+            "same drift must not re-emit on next tick; got {} incidents",
+            second.len()
+        );
     }
 }

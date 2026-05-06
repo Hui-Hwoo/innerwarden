@@ -77,6 +77,12 @@ pub struct KgDecideFeatures {
 ///
 /// `now` is injected so the caller controls the clock (tests set it to
 /// a fixed instant; production passes `Utc::now()`).
+///
+/// Spec 043 Phase 5 (2026-05-06): split into a thin Incident-finding
+/// shim plus the IP-only `extract_features_for_ip` so callers that
+/// already have an IP string (e.g. CDN-noise hardening, future
+/// direct-block paths) can reuse the feature extraction without
+/// constructing a synthetic Incident.
 pub fn extract_features(
     kg: &KnowledgeGraph,
     incident: &Incident,
@@ -87,7 +93,24 @@ pub fn extract_features(
         .iter()
         .find(|e| e.r#type == EntityType::Ip)
         .map(|e| e.value.as_str())?;
+    extract_features_for_ip(kg, ip, now)
+}
 
+/// IP-only variant of `extract_features`. Same logic, but the caller
+/// supplies the IP string directly. Used by:
+/// - `extract_features` (the Incident-aware wrapper).
+/// - CDN-noise hardening in `incident_autodismiss::try_dismiss_cdn_noise`
+///   (Phase 5 follow-up): gate the dismiss on whether the IP has
+///   non-proto_anomaly history. We need the IP only at that call site
+///   so threading a synthetic Incident would be needless ceremony.
+/// - Future direct-block paths in `correlation_response` and
+///   `honeypot_always_on` if they ever need to ask the modifier
+///   directly without owning an Incident struct.
+pub fn extract_features_for_ip(
+    kg: &KnowledgeGraph,
+    ip: &str,
+    now: DateTime<Utc>,
+) -> Option<KgDecideFeatures> {
     let ip_id = kg.find_by_ip(ip)?;
     let ip_node = kg.get_node(ip_id)?;
 
@@ -169,6 +192,50 @@ pub fn extract_features(
         risk_score,
         first_seen_age_days,
     })
+}
+
+/// Spec 043 Phase 5 follow-up: count incidents on this IP in the last
+/// 24h whose detector prefix is NOT in `excluded_detector_prefixes`.
+/// Used by the CDN-noise hardening: if a CDN edge IP has any
+/// non-proto_anomaly hit in the last 24h, the new proto_anomaly is
+/// likely the noisy half of a real attack and MUST stay visible
+/// (not auto-dismissed by the network-layer suppression).
+///
+/// Returns 0 when the IP is not yet a node in the graph.
+///
+/// Detector prefix is parsed as the substring before the first `:`
+/// (matches `incident_id` shape used everywhere else in the agent).
+pub fn incidents_24h_excluding_detectors(
+    kg: &KnowledgeGraph,
+    ip: &str,
+    excluded_detector_prefixes: &[&str],
+    now: DateTime<Utc>,
+) -> u32 {
+    let Some(ip_id) = kg.find_by_ip(ip) else {
+        return 0;
+    };
+    let cutoff_24h = now - Duration::hours(24);
+    let mut count: u32 = 0;
+    for edge in kg.incoming_edges(ip_id) {
+        if edge.relation != Relation::TriggeredBy {
+            continue;
+        }
+        let Some(Node::Incident {
+            incident_id, ts, ..
+        }) = kg.get_node(edge.from)
+        else {
+            continue;
+        };
+        if *ts < cutoff_24h {
+            continue;
+        }
+        let detector = incident_id.split(':').next().unwrap_or("");
+        if excluded_detector_prefixes.contains(&detector) {
+            continue;
+        }
+        count = count.saturating_add(1);
+    }
+    count
 }
 
 /// Translate features into a confidence modifier in `[-0.30, +0.20]`.

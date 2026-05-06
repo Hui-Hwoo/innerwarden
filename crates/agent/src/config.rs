@@ -183,6 +183,16 @@ pub struct KgConfig {
     /// test001 first to observe rate before prod promotion).
     #[serde(default)]
     pub yara_match_detector_enabled: bool,
+    /// Phase 5: sysctl_drift_detector. When true, the slow loop
+    /// snapshots the System node's `sysctl_params` on first tick and
+    /// emits incidents on subsequent ticks for any drift. Critical-
+    /// class params (kernel.modules_disabled, kptr_restrict,
+    /// dmesg_restrict, unprivileged_bpf_disabled, yama.ptrace_scope,
+    /// randomize_va_space, net.ipv4.ip_forward) → Critical;
+    /// other drifts → aggregated Medium. Activates a KG field that
+    /// was write-only pre-Phase-5. Default: false.
+    #[serde(default)]
+    pub sysctl_drift_detector_enabled: bool,
 }
 
 impl Default for KgConfig {
@@ -190,6 +200,7 @@ impl Default for KgConfig {
         Self {
             decide_modifier_mode: default_kg_decide_modifier_mode(),
             yara_match_detector_enabled: false,
+            sysctl_drift_detector_enabled: false,
         }
     }
 }

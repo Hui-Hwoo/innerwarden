@@ -786,6 +786,18 @@ fn kg_tick(
                     chrono::Utc::now(),
                 ));
             }
+            // Spec 043 Phase 5 — sysctl_drift detector. Same pattern
+            // as yara_match: gated at outermost layer, default OFF.
+            // First tick after enable snapshots the baseline; subsequent
+            // ticks diff and emit Critical/Medium per change-class.
+            if cfg.kg.sysctl_drift_detector_enabled {
+                incidents.extend(knowledge_graph::detectors::detect_sysctl_drift(
+                    &graph,
+                    &mut state.graph_detector_state,
+                    &host,
+                    chrono::Utc::now(),
+                ));
+            }
             (incidents, host)
         };
         {

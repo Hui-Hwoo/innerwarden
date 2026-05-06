@@ -466,6 +466,18 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/knowledge_graph/detectors.rs::tests::yara_match_detector_emits_nothing_when_yara_matches_empty` - anti-regression bound: a File node with EMPTY `yara_matches` MUST NOT produce an incident. The detector activates a write-only field; it must not spam every File node in the graph.
 - `crates/agent/src/knowledge_graph/detectors.rs::tests::yara_match_detector_emits_one_incident_per_file_for_multiple_matches` - aggregation anchor: a single binary that matched 3 YARA rules produces ONE incident (not 3), with all rule names in the summary. Anti-regression for accidentally emitting one-per-rule (would 3x operator alert volume on hits like `xmrig_miner + packed_upx + cryptominer_generic`).
 
+### Sysctl drift detector (Spec 043 Phase 5 - AUDIT-SPEC043-PHASE5)
+
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::sysctl_drift_first_observation_emits_nothing_just_baselines` - defensive contract: the first observation has no baseline to diff against; detector MUST emit zero incidents and just snapshot. Anti-regression for accidentally treating "first sight" as "all params drifted from /unset/" and spamming hundreds of false positives.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::sysctl_drift_critical_param_change_emits_critical` - Phase 5 headline anchor: `kernel.kptr_restrict` relaxed from `2` to `0` (the rootkit pointer-hiding bypass) emits a Critical incident with the param name in title and old/new values in summary. Pre-Phase-5 the sensor wrote sysctl_params onto System nodes but no consumer diffed them — real rootkits flip these to hide themselves and the signal was invisible.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::sysctl_drift_medium_class_aggregates_into_one_incident` - aggregation anchor: 5 non-critical params drifting in one tick produce ONE Medium incident with all 5 in the summary, not 5 separate incidents. Anti-regression for accidentally flooding the dashboard on a benign system-wide tunable refresh (e.g. `sysctl --system` after editing /etc/sysctl.d).
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::sysctl_drift_no_change_emits_nothing` - anti-regression bound: when the System node is unchanged tick-over-tick, detector MUST emit zero incidents. Pre-aggregation a buggy "always emit on every observation" implementation would have flooded the dashboard at 30s intervals.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::sysctl_drift_does_not_re_emit_same_change_on_next_tick` - operator-facing rule anchor: a single intentional change (operator editing /etc/sysctl.d) produces ONE alert, not one per slow-loop tick. Detector updates baseline to current after each emit so the same drift is not surfaced again.
+
+### CDN-noise KG-history hardening (Spec 043 Phase 5 follow-up - AUDIT-SPEC043-CDN-HARDENING)
+
+- `crates/agent/src/incident_autodismiss.rs::tests::try_dismiss_cdn_noise_does_not_dismiss_when_ip_has_other_recent_attack_history` - operator's safety case (2026-05-06: "não podemos ficar vulneráveis a alguém nos invadir usando a Azure"): an Azure / AWS / GCP / OCI / DO / Hetzner IP that has a non-`proto_anomaly` incident in the last 24h (e.g. ssh_bruteforce) MUST NOT have its proto_anomaly auto-dismissed. The initial Phase 3 fix would have silently silenced the noisy half of a real attack on a cloud VM. Hardening uses `kg_decide_features::incidents_24h_excluding_detectors` to check KG history before dismiss.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

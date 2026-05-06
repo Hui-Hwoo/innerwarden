@@ -360,6 +360,50 @@ pub(crate) fn try_dismiss_cdn_noise(
         Some(p) => p,
         None => return false,
     };
+
+    // Spec 043 Phase 5 hardening: BEFORE auto-dismissing, check the KG
+    // for OTHER detector hits on this same IP in the last 24h. The
+    // initial Phase 3 fix would have suppressed proto_anomaly on ANY
+    // cloud-provider edge, opening a small but real attack vector: an
+    // attacker on Azure / AWS who triggers a slowloris-style proto
+    // anomaly while ALSO running ssh_bruteforce / port_scan / threat
+    // intel hits would have the noisy half silently dropped from the
+    // dashboard, even though the IP was clearly under attack. The
+    // hardening: if the IP has any non-proto_anomaly incident in the
+    // last 24h, KEEP the proto_anomaly visible (don't dismiss). CDN
+    // edges with pure proxy traffic never trigger other detectors so
+    // they still get the suppression.
+    let other_hits = match state.knowledge_graph.read() {
+        Ok(kg) => crate::kg_decide_features::incidents_24h_excluding_detectors(
+            &kg,
+            primary_ip,
+            &["proto_anomaly"],
+            chrono::Utc::now(),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                "cdn-noise-fp: knowledge_graph lock poisoned: {e}; skipping hardening check"
+            );
+            // Without history, fall through to dismiss to preserve
+            // pre-hardening behaviour. Lock-poisoning is a separate
+            // alarm operator should chase via watchdog metrics, not
+            // a reason to spam the dashboard.
+            0
+        }
+    };
+    if other_hits > 0 {
+        info!(
+            incident_id = %incident.incident_id,
+            ip = %primary_ip,
+            provider,
+            other_hits,
+            "CDN-noise: NOT dismissing proto_anomaly — IP has {other_hits} \
+             non-proto_anomaly incident(s) in last 24h; the proto anomaly is \
+             likely the noisy half of a real attack, must stay visible"
+        );
+        return false;
+    }
+
     info!(
         incident_id = %incident.incident_id,
         detector,
@@ -793,6 +837,93 @@ mod tests {
             !dismissed,
             "data_exfil_ebpf on a Cloudflare IP MUST still surface — \
              real exploitation through a CDN edge is still real"
+        );
+    }
+
+    // ── Spec 043 Phase 5 CDN-noise hardening anchor ────────────────────
+    //
+    // Operator's safety question 2026-05-06: "se fosse Akamai funcionaria?
+    // não podemos ficar vulneráveis a alguém nos invadir usando a Azure".
+    //
+    // Initial Phase 3 fix would have suppressed proto_anomaly on ANY
+    // cloud-provider edge. An attacker on Azure / AWS / GCP / OCI who
+    // triggers slowloris-style proto anomaly WHILE ALSO running
+    // ssh_bruteforce / port_scan / threat_intel hits would have the
+    // noisy half silently dismissed even though the IP was clearly
+    // under attack — small but real attack vector.
+    //
+    // The hardening: dismiss proto_anomaly on a cloud-provider edge
+    // ONLY when the IP has zero non-proto_anomaly incidents in last
+    // 24h. CDN edges with pure proxy traffic stay suppressed; cloud
+    // VMs running a real attack stay visible.
+
+    fn seed_kg_with_ssh_bruteforce(
+        kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+        ip: &str,
+    ) {
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        use chrono::{Duration, Utc};
+        let mut g = kg.write().unwrap();
+        let now = Utc::now();
+        let ip_id = g.add_node(Node::Ip {
+            addr: ip.to_string(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 30,
+            is_tor: false,
+            first_seen: now - Duration::hours(2),
+            last_seen: now,
+            attempted_usernames: vec![],
+        });
+        // One ssh_bruteforce incident in the last hour — proves attack
+        // is in progress; CDN-noise dismiss MUST hold off.
+        let inc_id = g.add_node(Node::Incident {
+            incident_id: format!("ssh_bruteforce:{ip}:test"),
+            detector: "ssh_bruteforce".to_string(),
+            severity: "high".to_string(),
+            title: "SSH brute force".to_string(),
+            summary: "test".to_string(),
+            ts: now - Duration::minutes(15),
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(
+            inc_id,
+            ip_id,
+            Relation::TriggeredBy,
+            now - Duration::minutes(15),
+        ));
+    }
+
+    #[test]
+    fn try_dismiss_cdn_noise_does_not_dismiss_when_ip_has_other_recent_attack_history() {
+        // The exact safety case the operator raised: an Azure / AWS /
+        // CDN-edge IP that ALSO has ssh_bruteforce hits in the last 24h
+        // MUST keep the proto_anomaly visible. Pre-hardening this
+        // would have been silently dismissed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        crate::cloud_safelist::init();
+        // 20.x.x.x is in CLOUD_PROVIDER_RANGES (Azure).
+        let attacker_ip = "20.50.100.42";
+        seed_kg_with_ssh_bruteforce(&state.knowledge_graph, attacker_ip);
+
+        let inc = make_proto_anomaly_incident(attacker_ip, Severity::Medium);
+        let dismissed = try_dismiss_cdn_noise(&inc, &mut state);
+        assert!(
+            !dismissed,
+            "proto_anomaly on Azure IP with prior ssh_bruteforce in last 24h \
+             MUST NOT be auto-dismissed — operator's 2026-05-06 safety case \
+             (real attacker on cloud VM)"
         );
     }
 }
