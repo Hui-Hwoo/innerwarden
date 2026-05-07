@@ -683,6 +683,15 @@ Operator ran `innerwarden doctor` over an SSH non-login session. Output had `Fai
 - `crates/ctl/src/harden/mod.rs::tests::check_services_silent_when_systemctl_returns_unknown` — Bug 8 integration anchor: full `check_services(env)` path with `unknown\n` stdout produces NO finding AND NO passed line. Anti-regression for the 16/100 "Critical" score the operator saw when the agent was alive but harden could not query the bus.
 - `crates/ctl/src/harden/mod.rs::tests::check_services_silent_when_systemctl_stdout_is_empty` — same rule for the empty-stdout shape. Pins both bus-failure variants since distros differ in which one they emit.
 
+### Harden auditd cluster (Bugs 7/9/10 — 2026-05-06 prod observation)
+
+Operator's `innerwarden system harden` printed Score 16/100 "Critical" with SSH/firewall/kernel/permissions/docker/TLS all green; ten of the eleven Auditd findings were the auditd category (one Medium per missing rule + one High summary = 9*5 + 10 = 55pp from auditd alone, disproportionate). Inline hints embedded `auditctl …` directly after the prose with no visual break (Bug 9). The summary mentioned `innerwarden harden --install-audit-rules` but that flag was never implemented (Bug 10).
+
+- `crates/ctl/src/harden/auditd.rs::tests::check_auditd_missing_9_of_10_emits_single_finding` — Bug 7 anchor: with 9 missing rules, harden emits exactly ONE auditd-category finding instead of nine + one summary. Pins the new "auditd contributes one severity-bounded penalty" rule so a future refactor cannot re-introduce per-rule penalties.
+- `crates/ctl/src/harden/auditd.rs::tests::check_auditd_severity_scales_with_missing_count` — Bug 7 anchor: severity scales (1 missing = Low, 4 missing = Medium, 7+ missing = High). Caps the auditd category's score impact at one High penalty (10pp) instead of N*5pp + 10pp.
+- `crates/ctl/src/harden/auditd.rs::tests::check_auditd_missing_rules_fix_is_bullet_formatted` — Bug 9 anchor: the fix text presents each missing rule on its own indented bullet line and includes the `augenrules --load` reload hint. Anti-regression for the prose-collides-with-command shape that confused operator copy-paste.
+- `crates/ctl/src/harden/auditd.rs::tests::check_auditd_missing_rules_fix_does_not_promise_unimplemented_flag` — Bug 10 anchor: the fix text MUST NOT mention `--install-audit-rules`. Pins the rule that any flag promised in operator-facing text must exist in the CLI; the alternative ("implement the flag") is a separate feature PR. Honesty hard rule applied to CLI affordances.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
