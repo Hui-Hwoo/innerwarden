@@ -656,6 +656,19 @@ re-inlines them and breaks the wizard's branching is caught at CI time.
 - `crates/ctl/src/commands/setup.rs::tests::compute_setup_existing_channels_slack_needs_env_and_enabled` — Slack is only "configured" when both the env var and `slack.enabled = true` are present. Anti-regression for the half-configured-but-treated-as-OK bug shape.
 - `crates/ctl/src/commands/setup.rs::tests::cmd_setup_dry_run_returns_ok_when_everything_preconfigured_basic_mode` — `cmd_setup` orchestration test: with everything pre-set and `dry_run = true`, the wizard runs end-to-end without modifying the agent config (apply phase guarded).
 
+### Daily Briefing honesty (Bug 5 — 2026-05-06 prod observation)
+
+Operator pasted a Telegram briefing that said "Detected 0 critical, **3 high** severity threats" + listed `crontab_persistence` and `prctl_rename` under "Handled silently:", then immediately closed with "✅ All clear. Nothing needs you." That contradiction is the **same operator-honesty class** as the dashboard re-audit's "honesty > vanity in metric labels" hard rule (Wave 10 cousin).
+
+- `crates/agent/src/telegram/burst.rs::tests::format_daily_digest_enriched_high_count_suppresses_all_clear` — `format_daily_digest_enriched` MUST NOT emit "All clear. Nothing needs you." when `high_count > 0`. Pins the honest "Auto-handled — review when convenient." copy. Anti-regression for accidentally restoring the pre-2026-05-06 contradiction.
+- `crates/agent/src/telegram/burst.rs::tests::format_daily_digest_enriched_critical_count_suppresses_all_clear` — same for `critical_count > 0`. The two counts share the gate but the test pins each branch independently so a future refactor that splits the gate cannot regress one half silently.
+- `crates/agent/src/telegram/burst.rs::tests::format_daily_digest_enriched_deferred_entry_suppresses_all_clear` — when `pipeline.deferred` lists any detector (the briefing's "Handled silently:" section), "All clear" must also be suppressed. Pins that the briefing cannot list a detector and then claim there is nothing to acknowledge.
+- `crates/agent/src/telegram/burst.rs::tests::format_daily_digest_enriched_truly_quiet_day_keeps_all_clear` — positive case: with all zeros AND empty deferred, "All clear. Nothing needs you." remains the right copy. Pins the no-false-positive contract (we did not break the genuine quiet-day signal).
+- `crates/agent/src/telegram/burst.rs::tests::format_daily_digest_enriched_renders_deferred_entries` — pre-existing test now asserts the post-fix contract (deferred non-empty + high_count=1 ⇒ Auto-handled, not All clear).
+- `crates/agent/src/telegram/formatting.rs::tests::format_daily_digest_simple` — non-enriched simple-mode digest with critical+high > 0 must also use "Auto-handled" instead of "All clear". The non-enriched function is still `pub` and the same honesty contract applies.
+- `crates/agent/src/telegram/formatting.rs::tests::format_daily_digest_simple_quiet_day_keeps_all_clear` — non-enriched positive case for the truly-quiet-day branch.
+- `crates/agent/src/telegram/formatting.rs::tests::format_daily_digest_simple_high_only_suppresses_all_clear` — non-enriched, only `high_count > 0` (no critical) still suppresses "All clear". Pins that high-without-critical is still a fail of the gate, not a pass.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

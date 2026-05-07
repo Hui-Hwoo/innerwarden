@@ -25,6 +25,16 @@ pub fn format_daily_digest(
             "\u{1f534}" // 🔴
         };
 
+        // Bug 5 (2026-05-06): the simple-mode digest hardcoded
+        // "All clear. Nothing needs you." even with non-zero
+        // critical/high counts, contradicting the lines above. Mirror
+        // the gate from the enriched variant.
+        let footer = if critical_count == 0 && high_count == 0 {
+            "All clear. Nothing needs you."
+        } else {
+            "Auto-handled \u{2014} review when convenient."
+        };
+
         format!(
             "\u{2600}\u{fe0f} Good morning! Your server in the last 24h:\n\
              \n\
@@ -32,7 +42,7 @@ pub fn format_daily_digest(
              \u{00a0}\u{00a0}{critical_count} critical threats\n\
              \u{00a0}\u{00a0}Health: {score}/100 {health_emoji}\n\
              \n\
-             All clear. Nothing needs you."
+             {footer}"
         )
     } else {
         let date = chrono::Local::now().format("%Y-%m-%d");
@@ -112,6 +122,16 @@ pub fn format_daily_digest_enriched(
                 "\n\n\u{26a0}\u{fe0f} <b>{} groups need your review</b>",
                 pipeline.needs_review_groups
             ));
+        } else if critical_count > 0 || high_count > 0 || !pipeline.deferred.is_empty() {
+            // Bug 5 (2026-05-06): the same briefing announced
+            // "Detected N critical, M high severity threats" + listed
+            // deferred detectors under "Handled silently:" — saying
+            // "All clear. Nothing needs you." right after lied to the
+            // operator. Operator-honesty hard rule: only emit "All
+            // clear" when there is genuinely nothing to acknowledge.
+            // Auto-resolved is fine on its own; high+ activity or any
+            // deferred entry means the briefing must say so honestly.
+            msg.push_str("\n\n\u{2705} Auto-handled \u{2014} review when convenient.");
         } else {
             msg.push_str("\n\n\u{2705} All clear. Nothing needs you.");
         }
@@ -281,7 +301,11 @@ mod tests {
         assert!(simple.contains("12"));
         assert!(simple.contains("5"));
         assert!(simple.contains("2 threat groups auto-resolved"));
-        assert!(simple.contains("All clear. Nothing needs you."));
+        // Bug 5 anchor (2026-05-06): with high_count=1 AND deferred non-empty,
+        // the briefing MUST NOT say "All clear" — it must use the honest
+        // "Auto-handled" copy instead.
+        assert!(!simple.contains("All clear. Nothing needs you."));
+        assert!(simple.contains("Auto-handled \u{2014} review when convenient."));
 
         let technical = format_daily_digest_enriched(20, 17, 0, 1, "waf", 12, false, &pipeline);
         assert!(technical.contains("Daily Digest"));
@@ -311,6 +335,70 @@ mod tests {
         let pipeline = empty_pipeline();
         let msg = format_daily_digest_enriched(1, 0, 0, 0, "evil<script>&", 1, false, &pipeline);
         assert!(msg.contains("evil&lt;script&gt;&amp;"));
+    }
+
+    /// Bug 5 anchor (2026-05-06 prod observation): operator saw the
+    /// briefing emit "Detected 0 critical, 3 high severity threats"
+    /// and immediately after "✅ All clear. Nothing needs you." That
+    /// contradicted the same paragraph the operator had just read.
+    /// The fix gates "All clear" on critical+high+deferred; this test
+    /// pins the high_count > 0 branch.
+    #[test]
+    fn format_daily_digest_enriched_high_count_suppresses_all_clear() {
+        let pipeline = empty_pipeline();
+        let msg = format_daily_digest_enriched(5, 0, 0, 3, "n/a", 0, true, &pipeline);
+        assert!(
+            !msg.contains("All clear. Nothing needs you."),
+            "high_count > 0 must suppress \"All clear\""
+        );
+        assert!(
+            msg.contains("Auto-handled \u{2014} review when convenient."),
+            "high_count > 0 must emit the honest auto-handled copy"
+        );
+    }
+
+    /// Bug 5 anchor: critical_count > 0 must also suppress "All clear".
+    #[test]
+    fn format_daily_digest_enriched_critical_count_suppresses_all_clear() {
+        let pipeline = empty_pipeline();
+        let msg = format_daily_digest_enriched(5, 0, 1, 0, "n/a", 0, true, &pipeline);
+        assert!(
+            !msg.contains("All clear. Nothing needs you."),
+            "critical_count > 0 must suppress \"All clear\""
+        );
+        assert!(msg.contains("Auto-handled \u{2014} review when convenient."));
+    }
+
+    /// Bug 5 anchor: any deferred entry (incident silently routed to
+    /// "Handled silently:" list) must suppress "All clear" because the
+    /// briefing already announces those detectors as something the
+    /// operator can review.
+    #[test]
+    fn format_daily_digest_enriched_deferred_entry_suppresses_all_clear() {
+        let pipeline = PipelineDigestStats {
+            suppressed_count: 0,
+            auto_resolved_groups: 0,
+            needs_review_groups: 0,
+            deferred: vec![("crontab_persistence".to_string(), 1)],
+        };
+        let msg = format_daily_digest_enriched(1, 0, 0, 0, "n/a", 0, true, &pipeline);
+        assert!(
+            !msg.contains("All clear. Nothing needs you."),
+            "non-empty deferred must suppress \"All clear\""
+        );
+        assert!(msg.contains("Auto-handled \u{2014} review when convenient."));
+        assert!(msg.contains("crontab_persistence") || msg.contains("Persistence"));
+    }
+
+    /// Bug 5 anchor: positive case — when there is genuinely no
+    /// activity (zero counts AND empty deferred AND zero needs-review),
+    /// "All clear" is still the right copy.
+    #[test]
+    fn format_daily_digest_enriched_truly_quiet_day_keeps_all_clear() {
+        let pipeline = empty_pipeline();
+        let msg = format_daily_digest_enriched(0, 0, 0, 0, "n/a", 0, true, &pipeline);
+        assert!(msg.contains("All clear. Nothing needs you."));
+        assert!(!msg.contains("Auto-handled"));
     }
 
     #[test]

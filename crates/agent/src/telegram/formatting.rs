@@ -1240,9 +1240,29 @@ mod tests {
         assert!(msg.contains("30 attacks blocked"));
         assert!(msg.contains("2 critical threats"));
         assert!(msg.contains("Health:"));
-        assert!(msg.contains("All clear. Nothing needs you."));
+        // Bug 5 anchor (2026-05-06): with critical+high > 0 the digest
+        // MUST NOT say "All clear" — that lied to the operator.
+        assert!(!msg.contains("All clear. Nothing needs you."));
+        assert!(msg.contains("Auto-handled \u{2014} review when convenient."));
         // Score = 100 - 2*20 - 5*5 = 35 → 🔴
         assert!(msg.contains("\u{1f534}"));
+    }
+
+    /// Bug 5 anchor (2026-05-06): non-enriched simple digest with
+    /// truly zero critical/high keeps "All clear" — the positive case.
+    #[test]
+    fn format_daily_digest_simple_quiet_day_keeps_all_clear() {
+        let msg = format_daily_digest(0, 0, 0, 0, "n/a", 0, true);
+        assert!(msg.contains("All clear. Nothing needs you."));
+        assert!(!msg.contains("Auto-handled"));
+    }
+
+    /// Bug 5 anchor: only high_count > 0 (no critical) still suppresses.
+    #[test]
+    fn format_daily_digest_simple_high_only_suppresses_all_clear() {
+        let msg = format_daily_digest(5, 3, 0, 2, "n/a", 0, true);
+        assert!(!msg.contains("All clear. Nothing needs you."));
+        assert!(msg.contains("Auto-handled \u{2014} review when convenient."));
     }
 
     #[test]
@@ -1283,7 +1303,10 @@ mod tests {
         };
         let msg = format_daily_digest_enriched(42, 30, 0, 3, "ssh_bruteforce", 15, true, &stats);
         assert!(msg.contains("12 threat groups auto-resolved"));
-        assert!(msg.contains("All clear"));
+        // Bug 5 anchor (2026-05-06): high_count=3 means we cannot say
+        // "All clear"; the honest copy is "Auto-handled".
+        assert!(!msg.contains("All clear"));
+        assert!(msg.contains("Auto-handled \u{2014} review when convenient."));
         assert!(!msg.contains("need your review"));
     }
 
