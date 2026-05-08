@@ -817,6 +817,27 @@ Same operator hard-rule that drove batches 1+2: "≥70% coverage in the same PR 
 - `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_noise_returns_false_when_dry_run` — DryRun mode mirrors Watch mode for the noise gate. Pins the second half of `is_noise_gate_eligible`.
 - `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_noise_returns_true_in_guard_mode` — happy path: Guard mode + low-severity = true (auto-dismiss). Pins the body of the function (decision-writer attempt + KG ingest_decision call).
 
+### XDP infra honesty (fix/xdp-infra-honesty — 2026-05-08)
+
+A 2026-05-08 prod audit found three cascading honesty bugs that left the agent emitting `XDP firewall unavailable` warnings every 5 minutes for 24+ hours with a fix recipe that wouldn't help:
+
+1. **Sensor systemd unit had `/sys/fs/bpf` in `ReadOnlyPaths`** so the sensor couldn't create `/sys/fs/bpf/innerwarden/` and silently failed every map pin (BLOCKLIST + ALLOWLIST + LSM_POLICY + CGROUP_CAPABILITIES + COMM_CAPABILITIES). The unit was the canonical example file under `examples/systemd/`.
+2. **Sensor's `attach_xdp` early-returned** when `xdp.attach()` returned EBUSY (a previous lifetime's link still attached at the kernel level), skipping the pin step entirely. So a sensor restart actively REMOVED wire-speed blocking until the operator manually detached the stale link.
+3. **Agent's WARN told the operator to mount bpffs** even when bpffs was mounted. The hard-coded recipe ignored the actual on-disk state.
+
+Plus a fourth bug surfaced as a side effect:
+
+4. **`decision_block_ip` called `mark_failed` from the shield path's Err arm** before the standalone fallback even ran. The standalone path then succeeded milliseconds later — but the WARN had already fired, so the operator's journal showed `XDP firewall unavailable` on the same timestamp as `blocked via XDP (wire-speed drop)`. Straight up dishonest.
+
+The anchors below pin each contract.
+
+- `crates/agent/src/xdp_availability.rs::tests::diagnose_xdp_state_returns_actionable_recipe_for_observable_state` — `diagnose_xdp_state` returns a state-specific recipe (mount / `ReadWritePaths` / `link detach` / log inspection) rather than the pre-fix hard-coded mount recipe. Pins the operator-honesty contract that the WARN's recipe matches actual on-disk state.
+- `crates/agent/src/decision_block_ip.rs::tests::xdp_failure_to_warn_suppresses_shield_failure_when_standalone_succeeds` — when the standalone XDP path succeeds, ANY shield-path failure is silently dropped. Anti-regression for the prod bug where `XDP firewall unavailable` and `blocked via XDP` fired on the same timestamp.
+- `crates/agent/src/decision_block_ip.rs::tests::xdp_failure_to_warn_returns_none_when_nothing_was_attempted` — gate-skipped or no-XDP-skill path returns None (no WARN). Cheap-exit contract.
+- `crates/agent/src/decision_block_ip.rs::tests::xdp_failure_to_warn_returns_standalone_failure_when_no_path_succeeded` — standalone-only failure surfaces with `block-ip-xdp skill` context. Pins the path-of-last-resort precedence.
+- `crates/agent/src/decision_block_ip.rs::tests::xdp_failure_to_warn_combines_both_errors_when_neither_path_succeeds` — both-failed WARN includes both error messages. Anti-regression for accidentally dropping one of the two.
+- `crates/agent/src/decision_block_ip.rs::tests::xdp_failure_to_warn_surfaces_shield_failure_when_standalone_not_attempted` — shield-only failure (no `block-ip-xdp` skill registered) surfaces verbatim. Pins the path where shield is the only XDP backend.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

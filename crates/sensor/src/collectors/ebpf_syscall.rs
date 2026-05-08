@@ -418,6 +418,26 @@ const XDP_PIN_DIR: &str = "/sys/fs/bpf/innerwarden";
 const XDP_BLOCKLIST_PIN: &str = "/sys/fs/bpf/innerwarden/blocklist";
 const XDP_ALLOWLIST_PIN: &str = "/sys/fs/bpf/innerwarden/allowlist";
 
+/// 2026-05-08: ensure the BPF pin directory exists before any attach
+/// step tries to pin a map. Both `attach_lsm` and `attach_xdp` write
+/// pinned maps under `/sys/fs/bpf/innerwarden/`; pre-fix, the dir was
+/// only created inside `attach_xdp`, which runs AFTER `attach_lsm`. So
+/// LSM/CGROUP/COMM pins always failed silently on first boot until
+/// `attach_xdp` ran. Operator-visible: `LSM: failed to pin policy map`
+/// + `CGROUP_CAPABILITIES: failed to pin` warnings during sensor
+/// startup, with the (only) recovery path being a sensor restart.
+///
+/// Returns `Ok(())` if the dir already exists or was created. Returns
+/// `Err` only when bpffs is unwritable from the sensor's namespace
+/// (e.g. systemd unit has `/sys/fs/bpf` in `ReadOnlyPaths`). The
+/// caller then logs and proceeds without pins — same as the legacy
+/// behaviour, but with the dir-creation failure surfaced exactly
+/// once instead of cascading through every map pin.
+#[cfg(feature = "ebpf")]
+fn ensure_bpf_pin_dir() -> std::io::Result<()> {
+    std::fs::create_dir_all(XDP_PIN_DIR)
+}
+
 /// Detect the default network interface for XDP attachment.
 fn detect_default_interface() -> Option<String> {
     // Read /proc/net/route - first non-loopback default route
@@ -678,11 +698,44 @@ fn attach_xdp(bpf: &mut aya::Ebpf) {
             }
             // Use SKB mode (generic) for maximum compatibility.
             // Native mode (XdpFlags::default()) is faster but requires driver support.
-            if let Err(e) = xdp.attach(&iface, XdpFlags::SKB_MODE) {
-                warn!(error = %e, iface = %iface, "innerwarden_xdp: failed to attach");
-                return;
+            //
+            // 2026-05-08: do NOT early-return on attach failure. The most
+            // common cause is `EBUSY` because the previous sensor instance
+            // left an XDP link attached to the same interface (kernel-level
+            // attachments survive the userspace process exit). Pre-fix, the
+            // sensor would warn + return without pinning the BLOCKLIST /
+            // ALLOWLIST maps — leaving the agent unable to push blocks even
+            // though the in-kernel XDP program from the previous lifetime
+            // was still happily dropping packets. That meant a restart of
+            // the sensor (e.g. from `systemctl restart`) actively REMOVED
+            // wire-speed blocking until the operator manually detached the
+            // stale link with `bpftool link detach`. By falling through to
+            // the pin step we keep the previous-instance program functional
+            // (the maps it references can still be updated by the agent)
+            // until either the kernel reaps the orphaned link or the
+            // operator triggers a clean detach + re-attach cycle.
+            let attach_outcome = xdp.attach(&iface, XdpFlags::SKB_MODE);
+            match &attach_outcome {
+                Ok(_) => {
+                    info!(iface = %iface, "eBPF: innerwarden_xdp → {iface} (XDP firewall) ✅");
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        iface = %iface,
+                        "innerwarden_xdp: failed to attach (likely EBUSY — \
+                         previous sensor lifetime's XDP link is still active \
+                         on this interface). Continuing to pin maps so the \
+                         agent can push blocks via the existing in-kernel \
+                         program. To trigger a clean re-attach: \
+                         `sudo bpftool link list` to find the xdp link id, \
+                         then `sudo bpftool link detach id <ID>` and restart \
+                         the sensor."
+                    );
+                    // Fall through — pin the maps anyway so the agent's
+                    // bpftool path still finds them.
+                }
             }
-            info!(iface = %iface, "eBPF: innerwarden_xdp → {iface} (XDP firewall) ✅");
         }
         None => {
             info!("eBPF: innerwarden_xdp program not found - XDP firewall not available");
@@ -690,11 +743,9 @@ fn attach_xdp(bpf: &mut aya::Ebpf) {
         }
     }
 
-    // Pin the BLOCKLIST map so the agent can access it via bpftool
-    if let Err(e) = std::fs::create_dir_all(XDP_PIN_DIR) {
-        warn!(error = %e, "XDP: failed to create pin directory {XDP_PIN_DIR}");
-        return;
-    }
+    // Pin the BLOCKLIST map so the agent can access it via bpftool.
+    // The pin directory is created earlier in `run_collector` via
+    // `ensure_bpf_pin_dir`; we no longer recreate it here.
     if let Some(map) = bpf.map_mut("BLOCKLIST") {
         let _ = std::fs::remove_file(XDP_BLOCKLIST_PIN);
         if let Err(e) = map.pin(XDP_BLOCKLIST_PIN) {
@@ -1296,6 +1347,26 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         "io_uring",
         "io_uring_create",
     );
+
+    // Create the BPF pin directory once before any attach step tries
+    // to pin a map. attach_lsm pins LSM_POLICY/CGROUP_CAP/COMM_CAP
+    // immediately; attach_xdp pins BLOCKLIST/ALLOWLIST. Pre-2026-05-08
+    // the dir was only created inside attach_xdp, so LSM pins always
+    // failed silently on first boot. If this fails (e.g. systemd unit
+    // restricts /sys/fs/bpf to read-only), every subsequent pin will
+    // fail too — the warn here gives the operator one clear signal
+    // instead of three confusing ones.
+    if let Err(e) = ensure_bpf_pin_dir() {
+        warn!(
+            error = %e,
+            "eBPF: failed to create pin directory {XDP_PIN_DIR} — \
+             check that /sys/fs/bpf is in `ReadWritePaths` (not \
+             `ReadOnlyPaths`) of the sensor's systemd unit. \
+             Map pinning will be skipped; XDP firewall + LSM \
+             policy enforcement will fall back to in-memory state \
+             that does not survive sensor restart."
+        );
+    }
 
     // Attach LSM execution policy (non-critical - requires lsm=bpf in kernel cmdline)
     attach_lsm(&mut bpf);

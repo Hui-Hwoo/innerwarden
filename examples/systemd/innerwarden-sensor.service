@@ -39,8 +39,14 @@ AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/innerwarden
-ReadOnlyPaths=/var/log /etc/innerwarden /proc /sys/fs/bpf
+# /sys/fs/bpf MUST be writable so the sensor can create
+# /sys/fs/bpf/innerwarden/ and pin the BLOCKLIST + ALLOWLIST + LSM
+# policy maps. Putting it in ReadOnlyPaths breaks XDP firewall pinning
+# silently — the agent then emits "XDP firewall unavailable" warnings
+# with a misleading "mount bpffs" hint (bpffs is fine, the issue is
+# this systemd path constraint).
+ReadWritePaths=/var/lib/innerwarden /sys/fs/bpf
+ReadOnlyPaths=/var/log /etc/innerwarden /proc
 ProtectHome=yes
 ProtectKernelTunables=no
 ProtectKernelModules=yes

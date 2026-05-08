@@ -8,6 +8,59 @@ use crate::{
     skills, AgentState,
 };
 
+/// Outcome of the standalone `block-ip-xdp` skill, captured so the
+/// shield-vs-standalone decision can defer the XDP-unavailable WARN.
+///
+/// Pre-2026-05-08 the shield-path failure called `mark_failed`
+/// inline, which fired the operator-facing "XDP firewall unavailable"
+/// WARN immediately. The standalone fallback that ran milliseconds
+/// later might succeed (the prod regression on 2026-05-08 was exactly
+/// this — the operator saw "XDP unavailable" + "blocked via XDP" on
+/// the same timestamp). The fix collects both outcomes and only
+/// emits the WARN when no XDP path succeeded.
+pub(crate) enum StandaloneXdpOutcome {
+    /// Standalone path was not run (gate skipped, shield already
+    /// succeeded, or no `block-ip-xdp` skill registered).
+    NotAttempted,
+    /// Standalone path ran and the bpftool map update succeeded.
+    Succeeded,
+    /// Standalone path ran and the bpftool map update failed; carries
+    /// the error message destined for `mark_failed`.
+    Failed(String),
+}
+
+/// Decide whether the XDP-unavailable WARN should fire given the
+/// outcomes of both XDP attempts in a single block decision.
+///
+/// Returns:
+/// - `None` when no WARN should fire — either no path failed, or at
+///   least one path succeeded (the gate is healthy from the operator's
+///   perspective even if one of the two attempts errored).
+/// - `Some((context, details))` to pass to
+///   `xdp_availability::mark_failed` when ALL XDP paths failed. The
+///   standalone failure wins precedence because it's the path-of-last
+///   -resort; if shield ALSO failed its details are folded in.
+pub(crate) fn xdp_failure_to_warn(
+    shield_failure: Option<(&'static str, String)>,
+    standalone: StandaloneXdpOutcome,
+) -> Option<(&'static str, String)> {
+    match standalone {
+        StandaloneXdpOutcome::Succeeded => None,
+        StandaloneXdpOutcome::Failed(msg) => Some((
+            "block-ip-xdp skill",
+            // Fold the shield error into the message if both failed —
+            // operator's recovery work then sees the full picture.
+            match shield_failure {
+                Some((_, shield_err)) => {
+                    format!("{msg}; shield xdp_manager also failed: {shield_err}")
+                }
+                None => msg,
+            },
+        )),
+        StandaloneXdpOutcome::NotAttempted => shield_failure,
+    }
+}
+
 /// Execute the layered `BlockIp` decision path (XDP + firewall + Cloudflare + AbuseIPDB report).
 pub(crate) async fn execute_block_ip_decision(
     ip: &str,
@@ -120,7 +173,22 @@ pub(crate) async fn execute_block_ip_decision(
     // recovery recipe. Without the gate, prod was emitting two WARN
     // lines per block decision while bpffs was unmounted, drowning
     // out real warnings.
+    // 2026-05-08: collect failures from both XDP paths and only call
+    // `xdp_availability::mark_failed` if NEITHER succeeded. Pre-fix,
+    // the shield path's failure called `mark_failed` immediately,
+    // which fired the operator-facing "XDP firewall unavailable" WARN
+    // — even when the standalone skill that ran milliseconds later
+    // succeeded. Operator's prod logs showed the WARN and "blocked
+    // via XDP (wire-speed drop)" on the same timestamp, which is
+    // straight up dishonest: XDP was working, the warning lied.
+    //
+    // The gate state must still record a failure when ALL XDP paths
+    // fail, so `should_attempt_xdp` skips the next ~5 min and the
+    // fallback (UFW/iptables) takes over silently. But a single-path
+    // failure with a parallel success is no longer operator-visible.
     let xdp_should_try = crate::xdp_availability::should_attempt_xdp();
+    let mut shield_failure: Option<(&'static str, String)> = None;
+    let mut standalone_xdp_outcome = StandaloneXdpOutcome::NotAttempted;
     let xdp_blocked = if !xdp_should_try {
         false
     } else if let Some(ref mut shield) = state.shield_state {
@@ -146,7 +214,7 @@ pub(crate) async fn execute_block_ip_decision(
                 true
             }
             Err(e) => {
-                crate::xdp_availability::mark_failed("shield xdp_manager", &format!("{e}"));
+                shield_failure = Some(("shield xdp_manager", format!("{e}")));
                 false
             }
         }
@@ -171,13 +239,14 @@ pub(crate) async fn execute_block_ip_decision(
                 state
                     .store
                     .set_xdp_block_time(ip, blocked_at, block_ttl_secs);
+                standalone_xdp_outcome = StandaloneXdpOutcome::Succeeded;
             } else {
-                // Standalone skill carries its own message string; pass
-                // it through to the gate so the (rate-limited) WARN
-                // names the failure surface.
-                crate::xdp_availability::mark_failed("block-ip-xdp skill", &xdp_result.message);
+                standalone_xdp_outcome = StandaloneXdpOutcome::Failed(xdp_result.message);
             }
         }
+    }
+    if let Some((context, details)) = xdp_failure_to_warn(shield_failure, standalone_xdp_outcome) {
+        crate::xdp_availability::mark_failed(context, &details);
     }
 
     // Layer 2: Firewall rule (ufw/iptables/nftables - configured backend).
@@ -771,5 +840,77 @@ mod tests {
         assert!(!is_valid_block_target("10.0.0.0/-1")); // negative prefix
         assert!(!is_valid_block_target("10.0.0.0/abc")); // non-numeric
         assert!(!is_valid_block_target("/16")); // empty IP
+    }
+
+    /// 2026-05-08 anchor (fix/xdp-infra-honesty): when the standalone
+    /// XDP path succeeds, ANY shield-path failure must be silently
+    /// dropped. Pre-fix, the agent emitted "XDP firewall unavailable"
+    /// to the operator's journal even when the parallel standalone
+    /// fallback succeeded — the warning + the success message hit
+    /// the journal on the same timestamp, which made the "unavailable"
+    /// claim a straight lie. The healthy gate state is "at least one
+    /// XDP path succeeded".
+    #[test]
+    fn xdp_failure_to_warn_suppresses_shield_failure_when_standalone_succeeds() {
+        let shield_failure = Some(("shield xdp_manager", "EPERM".to_string()));
+        let result = xdp_failure_to_warn(shield_failure, StandaloneXdpOutcome::Succeeded);
+        assert!(
+            result.is_none(),
+            "standalone success must suppress shield-path failure WARN"
+        );
+    }
+
+    /// Mirror anchor: when neither path attempted XDP (gate skipped
+    /// or no shield + no standalone skill), no WARN should fire. Pins
+    /// the cheap-exit contract — `xdp_failure_to_warn` is only called
+    /// once per decision so the no-op path matters.
+    #[test]
+    fn xdp_failure_to_warn_returns_none_when_nothing_was_attempted() {
+        assert!(xdp_failure_to_warn(None, StandaloneXdpOutcome::NotAttempted).is_none());
+    }
+
+    /// When the standalone path failed and shield was not configured
+    /// (or also failed), the WARN must fire with the standalone's
+    /// failure context. The standalone is the path-of-last-resort
+    /// when shield is unavailable; surfacing its error to the operator
+    /// gives the actionable signal.
+    #[test]
+    fn xdp_failure_to_warn_returns_standalone_failure_when_no_path_succeeded() {
+        let result = xdp_failure_to_warn(
+            None,
+            StandaloneXdpOutcome::Failed("bpftool stderr: Operation not permitted".into()),
+        );
+        let (context, details) = result.expect("must warn when no path succeeded");
+        assert_eq!(context, "block-ip-xdp skill");
+        assert!(details.contains("Operation not permitted"));
+    }
+
+    /// When BOTH paths failed, the WARN message folds the shield
+    /// error into the standalone's so the operator sees the full
+    /// picture in a single log line. Anti-regression for accidentally
+    /// dropping one of the two error messages.
+    #[test]
+    fn xdp_failure_to_warn_combines_both_errors_when_neither_path_succeeds() {
+        let shield_failure = Some(("shield xdp_manager", "shield: ENOENT".to_string()));
+        let result = xdp_failure_to_warn(
+            shield_failure,
+            StandaloneXdpOutcome::Failed("standalone: EACCES".into()),
+        );
+        let (_context, details) = result.expect("both-failed must warn");
+        assert!(details.contains("standalone: EACCES"));
+        assert!(details.contains("shield: ENOENT"));
+    }
+
+    /// Shield failure with no standalone attempt (e.g. the
+    /// `block-ip-xdp` skill is not registered) must surface the
+    /// shield error verbatim. Pins the path where shield is the
+    /// only XDP backend.
+    #[test]
+    fn xdp_failure_to_warn_surfaces_shield_failure_when_standalone_not_attempted() {
+        let shield_failure = Some(("shield xdp_manager", "shield: ENOENT".to_string()));
+        let result = xdp_failure_to_warn(shield_failure, StandaloneXdpOutcome::NotAttempted);
+        let (context, details) = result.expect("shield-only failure must warn");
+        assert_eq!(context, "shield xdp_manager");
+        assert_eq!(details, "shield: ENOENT");
     }
 }
