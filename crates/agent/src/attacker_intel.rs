@@ -385,7 +385,22 @@ pub fn compute_dna(profile: &mut AttackerProfile) {
         profile.detectors_triggered.len(),
     );
 
-    // Canonical hash input (deterministic)
+    // Canonical hash input (deterministic).
+    //
+    // 2026-05-08 (fix/dna-stable-fingerprint): the hash is intentionally
+    // built only from CATEGORICAL fingerprint dimensions — detectors,
+    // ports, users, tool signatures. `hour_distribution` is *temporal*
+    // (it grows as the attacker keeps hitting) and was making the hash
+    // change over time for the same actor. Worse, it exploded the
+    // cross-IP collapse: operator's prod 2026-05-08 had six
+    // `92.118.39.{195,196,197,235,236,...}` profiles (same `AS47890
+    // Unmanaged LTD`, same detector set `[proto_anomaly]`, same empty
+    // ports/users/tools, same `regular_scanner` pattern_class) but six
+    // distinct DNA hashes because each IP's hourly histogram differed
+    // by 1-2 hits per bucket. Removing `hour_distribution` from the
+    // hash collapses such clusters to one DNA — `target_ports` is
+    // added so scanners targeting different port sets keep distinct
+    // DNAs even when other fields are empty.
     let mut hasher = Sha256::new();
 
     // Detectors (already sorted via BTreeSet)
@@ -395,8 +410,13 @@ pub fn compute_dna(profile: &mut AttackerProfile) {
     }
     hasher.update(b"##");
 
-    // Hour distribution
-    hasher.update(profile.dna.hour_distribution);
+    // Target ports (sorted)
+    let mut ports = profile.dna.target_ports.clone();
+    ports.sort();
+    for p in &ports {
+        hasher.update(p.to_be_bytes());
+        hasher.update(b"|");
+    }
     hasher.update(b"##");
 
     // Target users (sorted)
@@ -1102,6 +1122,90 @@ mod tests {
 
         assert!(!p1.dna.hash.is_empty());
         assert_eq!(p1.dna.hash, p2.dna.hash);
+    }
+
+    /// 2026-05-08 anchor (fix/dna-stable-fingerprint): the exact prod
+    /// audit scenario. Six profiles in `92.118.39.x` shared the SAME
+    /// detector set `[proto_anomaly]`, the SAME empty target_users /
+    /// target_ports / tool_signatures, and the SAME `regular_scanner`
+    /// pattern_class — but six DIFFERENT DNA hashes because each IP's
+    /// `hour_distribution` differed by 1-2 hits per bucket from timing
+    /// jitter. The dashboard's Campaigns tab couldn't collapse them.
+    /// Pin the contract that two profiles with identical categorical
+    /// fingerprint produce IDENTICAL DNA hash regardless of
+    /// hour_distribution differences.
+    #[test]
+    fn dna_hash_collapses_for_same_categorical_fingerprint_with_jitter_in_hour_distribution() {
+        let now = Utc::now();
+        let mut p_a = new_profile("92.118.39.196", now);
+        p_a.detectors_triggered.insert("proto_anomaly".into());
+        p_a.dna.hour_distribution = [
+            8, 3, 3, 3, 4, 4, 6, 6, 16, 12, 0, 0, 1, 4, 7, 9, 17, 11, 13, 5, 6, 5, 12, 9,
+        ];
+
+        let mut p_b = new_profile("92.118.39.197", now);
+        p_b.detectors_triggered.insert("proto_anomaly".into());
+        // Different hourly histogram (real prod jitter).
+        p_b.dna.hour_distribution = [
+            13, 1, 0, 3, 4, 4, 5, 11, 14, 9, 0, 0, 1, 4, 5, 7, 5, 12, 18, 3, 4, 5, 7, 13,
+        ];
+
+        compute_dna(&mut p_a);
+        compute_dna(&mut p_b);
+        assert_eq!(
+            p_a.dna.hash, p_b.dna.hash,
+            "profiles with identical categorical fingerprint must share DNA \
+             regardless of hour_distribution timing jitter"
+        );
+    }
+
+    /// Anti-regression: `target_ports` IS in the hash so two scanners
+    /// hitting different ports get different DNAs even when other
+    /// fields match. Pre-fix `target_ports` was not in the hash —
+    /// added in this PR for symmetry with users / tools / detectors.
+    #[test]
+    fn dna_hash_distinguishes_profiles_by_target_ports() {
+        let now = Utc::now();
+        let mut p_a = new_profile("203.0.113.1", now);
+        p_a.detectors_triggered.insert("port_scan".into());
+        p_a.dna.target_ports = vec![22, 80, 443];
+
+        let mut p_b = new_profile("203.0.113.2", now);
+        p_b.detectors_triggered.insert("port_scan".into());
+        p_b.dna.target_ports = vec![3389, 5985];
+
+        compute_dna(&mut p_a);
+        compute_dna(&mut p_b);
+        assert_ne!(
+            p_a.dna.hash, p_b.dna.hash,
+            "different target_ports must produce different DNAs"
+        );
+    }
+
+    /// Anti-regression: changing only `hour_distribution` MUST NOT
+    /// change the DNA hash. This is the explicit no-op contract for
+    /// the temporal field; a future "include timing in fingerprint"
+    /// refactor would have to update this test on purpose.
+    #[test]
+    fn dna_hash_is_stable_across_hour_distribution_changes() {
+        let now = Utc::now();
+        let mut p_a = new_profile("203.0.113.10", now);
+        p_a.detectors_triggered.insert("ssh_bruteforce".into());
+        p_a.dna.target_users.push("root".into());
+        p_a.dna.hour_distribution[3] = 5;
+
+        let mut p_b = p_a.clone();
+        // Wholesale shift the histogram — every bucket different.
+        for i in 0..24 {
+            p_b.dna.hour_distribution[i] = (i as u8) + 1;
+        }
+
+        compute_dna(&mut p_a);
+        compute_dna(&mut p_b);
+        assert_eq!(
+            p_a.dna.hash, p_b.dna.hash,
+            "hour_distribution changes must not affect DNA hash"
+        );
     }
 
     #[test]

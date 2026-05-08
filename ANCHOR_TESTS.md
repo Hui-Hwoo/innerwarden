@@ -895,6 +895,18 @@ The fix consolidates at READ time inside `api_attacker_profiles`. When ≥3 prof
 - `crates/agent/src/dashboard/intelligence.rs::tests::consolidate_geo_by_asn_does_not_consolidate_below_threshold` — an ASN with only 2 profiles is below the `≥3` floor and must NOT trigger the override. Pins the floor that prevents one-off lookups from getting steamrolled by a single sibling.
 - `crates/agent/src/dashboard/intelligence.rs::tests::consolidate_geo_by_asn_keeps_real_split_asns_intact` — a 60/40 split (3 NL + 2 US) in one ASN must stay intact (below the 80% agreement threshold). Pins the over-correction guard so legit multi-country ASNs (AWS / GCP) are not flattened.
 
+### DNA stable fingerprint (fix/dna-stable-fingerprint — 2026-05-08)
+
+Operator's prod audit 2026-05-08 found six `92.118.39.{195,196,197,235,236,...}` profiles all in `AS47890 Unmanaged LTD` (Hosting24 NL bulletproof) — same detector set `[proto_anomaly]`, same empty target_users / target_ports / tool_signatures, same `regular_scanner` pattern_class — but **six distinct DNA hashes**. The dashboard's Campaigns tab couldn't collapse them into one cluster, defeating the whole point of behavioral fingerprinting.
+
+Root cause: `compute_dna` was hashing the raw `[u8; 24]` `hour_distribution` array as a hash input. That field is *temporal* — it grows as the attacker keeps hitting and differs between IPs by 1-2 hits per bucket purely from timing jitter. Same actor controlling 5 IPs got 5 hashes. Same actor over time also got new hashes as their histogram filled in.
+
+Fix: drop `hour_distribution` from the hash inputs; it stays in the `AttackerDna` struct for visualization and pattern classification but no longer affects identity. Add `target_ports` to the hash inputs for symmetry with users / tools / detectors so scanners hitting different port sets keep distinct DNAs. Pure read-side change to a derived value — operator-visible effect: same-actor clusters now collapse to one DNA.
+
+- `crates/agent/src/attacker_intel.rs::tests::dna_hash_collapses_for_same_categorical_fingerprint_with_jitter_in_hour_distribution` — uses the exact prod hour_distributions of `92.118.39.196` and `92.118.39.197` (same detectors, same empty fields, different histograms) and asserts the DNA hashes are now identical. Pins the prod-fix scenario.
+- `crates/agent/src/attacker_intel.rs::tests::dna_hash_distinguishes_profiles_by_target_ports` — two `port_scan` profiles with different `target_ports` produce different DNAs. Pins the new `target_ports` symmetry contract added in this PR.
+- `crates/agent/src/attacker_intel.rs::tests::dna_hash_is_stable_across_hour_distribution_changes` — wholesale-shifting the `hour_distribution` array does NOT change the DNA. Anti-regression that locks the temporal field out of identity computation; a future "include timing in fingerprint" refactor would have to update this test on purpose.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
