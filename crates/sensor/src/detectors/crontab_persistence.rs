@@ -103,9 +103,28 @@ impl CrontabPersistenceDetector {
             return true;
         }
 
-        // crontab -e or crontab - (pipe)
-        if lower.contains("crontab -e") || lower.contains("crontab -") {
+        // crontab modification flags + stdin pipe.
+        //
+        // 2026-05-09 (crontab -l FP fix): the operator received 3
+        // high-severity persistence alerts on `crontab -l` because the
+        // prior `lower.contains("crontab -")` check matched ANY flag
+        // including the read-only list. Match only the modification
+        // flags (`-e` edit, `-r` remove) and the stdin-pipe form
+        // (`crontab -` followed by whitespace, `<`, or end of string).
+        // `-l` (list), `-u` (specify user — paired with -e/-r in real
+        // commands, which the first check already catches), and
+        // `--help` are read-only and must NOT trigger persistence.
+        if lower.contains("crontab -e") || lower.contains("crontab -r") {
             return true;
+        }
+        if let Some(idx) = lower.find("crontab -") {
+            let rest = &lower[idx + "crontab -".len()..];
+            match rest.chars().next() {
+                None => return true,                         // ends in "crontab -"
+                Some(c) if c.is_whitespace() => return true, // "crontab - <file"
+                Some('<') => return true,                    // "crontab -<file"
+                _ => {} // -l, -u, --help — read-only; fall through
+            }
         }
 
         // echo ... >> ... cron pattern
@@ -506,6 +525,58 @@ mod tests {
             now,
         ));
         assert!(inc.is_some());
+    }
+
+    /// 2026-05-09 anchor (crontab -l FP fix): `crontab -l` is the
+    /// read-only listing of the current user's crontab. Before this
+    /// fix the detector matched ANY `crontab -*` token via
+    /// `lower.contains("crontab -")` and fired three high-severity
+    /// persistence alerts on prod within an hour as the operator
+    /// inspected their cron table. Pin the exact regression so a
+    /// future refactor that loosens the check fails CI.
+    #[test]
+    fn crontab_list_flag_does_not_trigger_persistence_alert() {
+        let mut det = CrontabPersistenceDetector::new("test", 300);
+        let now = Utc::now();
+        let inc = det.process(&command_event("crontab -l", "bash", 1234, now));
+        assert!(
+            inc.is_none(),
+            "crontab -l is read-only and MUST NOT trigger a persistence alert"
+        );
+    }
+
+    /// Mirror anchor: `-r` (remove) modifies the crontab and MUST
+    /// still fire. Pre-fix this was bundled into the broad
+    /// `contains("crontab -")` match; the new logic checks `-r`
+    /// explicitly. Anti-regression for "tightening accidentally
+    /// dropped a real signal".
+    #[test]
+    fn crontab_remove_flag_still_triggers_persistence_alert() {
+        let mut det = CrontabPersistenceDetector::new("test", 300);
+        let now = Utc::now();
+        let inc = det.process(&command_event("crontab -r", "bash", 1234, now));
+        assert!(
+            inc.is_some(),
+            "crontab -r removes the crontab and MUST trigger persistence detection"
+        );
+    }
+
+    /// Mirror anchor: `crontab -u alice -l` (list someone else's
+    /// crontab) is also read-only and MUST NOT fire. Pre-fix this
+    /// would match because of the broad substring; the new logic
+    /// falls through on `-u` since the bare `-u` is just a user
+    /// selector that ALWAYS pairs with another action flag in real
+    /// commands, and modifying actions (`-e`, `-r`) are caught by the
+    /// explicit checks above.
+    #[test]
+    fn crontab_list_other_user_flag_does_not_trigger_persistence_alert() {
+        let mut det = CrontabPersistenceDetector::new("test", 300);
+        let now = Utc::now();
+        let inc = det.process(&command_event("crontab -u alice -l", "bash", 1234, now));
+        assert!(
+            inc.is_none(),
+            "crontab -u <user> -l is read-only and MUST NOT trigger a persistence alert"
+        );
     }
 
     #[test]

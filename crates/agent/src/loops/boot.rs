@@ -876,7 +876,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             }
         },
         last_narrative_at: load_last_narrative_instant(&cli.data_dir),
-        last_daily_summary_telegram: None,
+        // Hydrate the daily briefing dedup marker from kv_state so a
+        // restart after `daily_summary_hour` does not re-emit today's
+        // digest. Pre-2026-05-09 this defaulted to `None` and every
+        // restart fired a fresh "Daily Security Briefing" message.
+        last_daily_summary_telegram: store.get_last_daily_briefing_date(),
         telegram_daily_sent: 0,
         telegram_budget_date: None,
         telegram_deferred: HashMap::new(),

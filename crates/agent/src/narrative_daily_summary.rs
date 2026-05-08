@@ -123,6 +123,15 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                             match tg.send_text_message(&text).await {
                                 Ok(()) => {
                                     state.last_daily_summary_telegram = Some(today_naive);
+                                    // Persist the dedup marker so the next agent
+                                    // restart skips re-emitting today's briefing.
+                                    // Pre-2026-05-09 this was in-memory only —
+                                    // operator received multiple "Daily Security
+                                    // Briefing" messages on the same day because
+                                    // every restart after `daily_summary_hour`
+                                    // (default 9 UTC) hit a fresh `None` and
+                                    // re-fired the digest.
+                                    state.store.set_last_daily_briefing_date(today_naive);
                                     info!(date = today, "daily Telegram digest sent");
                                 }
                                 Err(e) => warn!("failed to send daily Telegram digest: {e:#}"),

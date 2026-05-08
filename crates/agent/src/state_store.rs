@@ -12,6 +12,7 @@
 //!   - recent_blocks:           timestamp_ms_str → [1u8] (rate-limiter window)
 //!   - trust_rules:             "detector:action" → [1u8]
 //!   - attacker_profiles:       IP → JSON (AttackerProfile)
+//!   - agent_kv:                singleton-style state (e.g. last_daily_summary_telegram → "YYYY-MM-DD")
 
 use anyhow::{Context, Result};
 use innerwarden_store::Store;
@@ -27,6 +28,18 @@ const NS_XDP_BLOCK_TIMES: &str = "xdp_block_times";
 const NS_RECENT_BLOCKS: &str = "recent_blocks";
 const NS_TRUST_RULES: &str = "trust_rules";
 const NS_ATTACKER_PROFILES: &str = "attacker_profiles";
+const NS_AGENT_KV: &str = "agent_kv";
+
+/// Key inside `NS_AGENT_KV` for the last-sent date of the daily
+/// Telegram briefing. Persists across restarts so the briefing fires
+/// at most once per local day. Pre-2026-05-09 the dedup field was
+/// in-memory only (`AgentState::last_daily_summary_telegram`), so
+/// every agent restart after `daily_summary_hour` (default 9 UTC)
+/// re-emitted the briefing — operator received multiple "Daily
+/// Security Briefing" messages in one day. Stored as a UTF-8
+/// `YYYY-MM-DD` local-date string (matches the field's
+/// `chrono::NaiveDate` in `AgentState`).
+const KEY_LAST_DAILY_BRIEFING: &str = "last_daily_summary_telegram";
 
 /// Persistent state store for the agent.
 pub struct StateStore {
@@ -505,6 +518,44 @@ impl StateStore {
             warn!(error = %e, "state store WAL checkpoint failed");
         }
     }
+
+    // ── Daily briefing dedup (cross-restart) ────────────────────────
+
+    /// Read the persisted "last day the daily Telegram briefing was
+    /// sent" marker. Returns `None` if absent or unparseable.
+    ///
+    /// 2026-05-09 (fix/chain-suppress-operator-fp-rules): companion
+    /// to the briefing-on-restart fix in
+    /// `narrative_daily_summary::maybe_write_daily_summary_and_digest`.
+    /// The in-memory `AgentState::last_daily_summary_telegram` is
+    /// hydrated from this row at boot; without it every restart after
+    /// `daily_summary_hour` (default 9 UTC) re-fired the briefing.
+    pub fn get_last_daily_briefing_date(&self) -> Option<chrono::NaiveDate> {
+        match self.store.kv_get(NS_AGENT_KV, KEY_LAST_DAILY_BRIEFING) {
+            Ok(Some(bytes)) => {
+                let s = std::str::from_utf8(&bytes).ok()?;
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "get_last_daily_briefing_date failed");
+                None
+            }
+        }
+    }
+
+    /// Persist the "last day the daily Telegram briefing was sent"
+    /// marker so the next agent restart sees today's date and skips
+    /// re-emitting. Stored as `YYYY-MM-DD`.
+    pub fn set_last_daily_briefing_date(&self, date: chrono::NaiveDate) {
+        let key_bytes = date.format("%Y-%m-%d").to_string();
+        if let Err(e) =
+            self.store
+                .kv_set(NS_AGENT_KV, KEY_LAST_DAILY_BRIEFING, key_bytes.as_bytes())
+        {
+            warn!(error = %e, "set_last_daily_briefing_date failed");
+        }
+    }
 }
 
 /// Which cooldown table to operate on.
@@ -579,6 +630,47 @@ mod tests {
         let (dt, ttl) = store.get_xdp_block_time("5.6.7.8").unwrap();
         assert_eq!(ttl, 3600);
         assert!((dt - now).num_seconds().abs() < 1);
+    }
+
+    /// 2026-05-09 anchor (briefing-on-restart fix): the daily Telegram
+    /// briefing dedup marker MUST round-trip through SQLite so a fresh
+    /// agent process boots into the same "already sent" state. Pre-fix
+    /// the dedup field was in-memory only, so every restart after
+    /// `daily_summary_hour` re-emitted the briefing — operator
+    /// received multiple "Daily Security Briefing" messages on the
+    /// same day. Anti-regression for that exact failure mode.
+    #[test]
+    fn last_daily_briefing_date_roundtrip() {
+        let (_dir, store) = make_store();
+        assert!(
+            store.get_last_daily_briefing_date().is_none(),
+            "fresh store MUST report no prior briefing date"
+        );
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 9).unwrap();
+        store.set_last_daily_briefing_date(today);
+        assert_eq!(
+            store.get_last_daily_briefing_date(),
+            Some(today),
+            "persisted date MUST round-trip exactly so the in-memory \
+             dedup field can be hydrated correctly at boot"
+        );
+    }
+
+    /// Mirror anchor: a malformed payload (non-UTF8 or non-ISO-date)
+    /// resolves to `None` instead of panicking, matching the "fail
+    /// open and re-emit" behaviour the rest of the agent expects when
+    /// kv_state is corrupt.
+    #[test]
+    fn last_daily_briefing_date_returns_none_on_malformed_payload() {
+        let (_dir, store) = make_store();
+        store
+            .store
+            .kv_set(NS_AGENT_KV, KEY_LAST_DAILY_BRIEFING, b"not-a-date")
+            .expect("raw kv_set");
+        assert!(
+            store.get_last_daily_briefing_date().is_none(),
+            "malformed payload MUST resolve to None"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────

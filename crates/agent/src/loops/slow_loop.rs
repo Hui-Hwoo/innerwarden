@@ -1279,7 +1279,7 @@ pub(crate) async fn process_narrative_tick(
 
     narrative_anomaly::process_anomalies(data_dir, &today, &events_entries, state);
 
-    narrative_incident_ingest::ingest_new_incidents(data_dir, &today, state)?;
+    narrative_incident_ingest::ingest_new_incidents(data_dir, &today, cfg, state)?;
 
     // Spec 021 — Observation verification (Fase 3).
     // Score undecided incidents and auto-dismiss/escalate clear-cut cases.

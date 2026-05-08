@@ -974,6 +974,42 @@ Operator audited the Intelligence > Chains tab on prod 2026-05-08 and found **fi
 - `intel.js`: case-insensitive severity comparison + relaxed dedup key.
 - `index.html`: dropped `value="0"` from Min risk input so placeholder renders.
 
+### Chain persistence filters operator-FP chains (fix/chain-suppress-operator-fp-rules — 2026-05-08)
+
+PR #500 fixed the kill_chain DATA_EXFIL specific FP. PR #500 deploy + manual cleanup of `attack-chains.json` removed 39 of 100 chains as operator self-traffic. But the underlying rule firings will keep producing FPs whenever the operator works (CL-038 "Off-Hours Login to Destructive Action" on operator SSH+sudo at any "off-hours" UTC time, CL-046 "Neural-Confirmed Attack" on operator git fetches via libcurl-renamed comm).
+
+This adds a generic operator-FP filter at the chain-persistence boundary (`narrative_incident_ingest::ingest_new_incidents`). Any chain whose entities are ENTIRELY operator-tagged — cloud_safelist destinations + static/dynamic trusted IPs + active operator sessions — gets dropped before the synthetic Incident graph node and the JSON persist. Real attackers that happen to ALSO touch a single operator IP at some stage are theoretically over-suppressed, but the operator-honesty win on prod is significantly larger than the FN risk.
+
+- `crates/agent/src/narrative_incident_ingest.rs::tests::is_chain_operator_fp_returns_true_for_cloud_safelisted_destination` — uses Azure UK 20.26.156.215 (the operator's git-fetch FP) to pin the cloud_safelist branch.
+- `crates/agent/src/narrative_incident_ingest.rs::tests::is_chain_operator_fp_returns_true_for_active_operator_session_ip` — uses 80.195.183.53 (operator's UK home BT IP, the exact prod CL-038 trigger) to pin the operator_ips branch.
+- `crates/agent/src/narrative_incident_ingest.rs::tests::is_chain_operator_fp_returns_false_for_real_attacker_ip` — TEST-NET-3 keeps reaching the dashboard. Pins the cheap-exit so the new filter doesn't over-suppress real attacks.
+- `crates/agent/src/narrative_incident_ingest.rs::tests::is_chain_operator_fp_returns_true_for_static_trusted_ip` — pins `cfg.allowlist.trusted_ips` (TOML-configured static list, the bastion / VPN exit / CI runner path).
+- `crates/agent/src/narrative_incident_ingest.rs::tests::is_chain_operator_fp_returns_true_for_dynamic_trusted_ip` — pins `state.dynamic_trusted_ips` (runtime-learned operator IPs).
+- `crates/agent/src/narrative_incident_ingest.rs::tests::is_chain_operator_fp_skips_non_ip_entities_and_returns_false` — pins the non-IP entity skip branch (chain made of `User` + `Path` entities is not flagged operator-FP).
+- `crates/agent/src/narrative_incident_ingest.rs::tests::is_chain_operator_fp_skips_empty_ip_value` — pins the empty-string IP skip branch.
+- `crates/agent/src/narrative_incident_ingest.rs::tests::filter_operator_fp_chains_keeps_real_attacker_drops_operator_fp` — pins the actual filter loop with a mixed batch (operator-FP chain + TEST-NET-3 attacker chain), driving both `info!` branches and the accounting subtraction.
+- `crates/agent/src/narrative_incident_ingest.rs::tests::filter_operator_fp_chains_no_op_when_no_chains_suppressed` — pins the pass-through path so the summary `info!` doesn't fire when nothing was suppressed.
+- `crates/agent/src/narrative_incident_ingest.rs::tests::filter_operator_fp_chains_empty_input_returns_empty` — pins the empty-input cheap exit.
+
+### Daily Telegram briefing dedup persists across restart (fix/chain-suppress-operator-fp-rules — 2026-05-09)
+
+Operator received multiple "🛡 Daily Security Briefing" messages on 2026-05-09 — one per agent restart instead of the configured 1×/day at `daily_summary_hour = 9 UTC`. Root cause: `AgentState::last_daily_summary_telegram` was in-memory only, so every restart hit a fresh `None`, the hour check passed (any restart after 09:00 UTC), and a new digest fired.
+
+Fix: persist the dedup marker through `state_store::StateStore` (`agent_kv` namespace, `last_daily_summary_telegram` key, `YYYY-MM-DD` UTF-8 payload). Hydrate on boot in `run_agent` (`crates/agent/src/loops/boot.rs`); write through after a successful Telegram send in `maybe_write_daily_summary_and_digest` (`crates/agent/src/narrative_daily_summary.rs`).
+
+- `crates/agent/src/state_store.rs::tests::last_daily_briefing_date_roundtrip` — set/get round-trip with a known `NaiveDate`. Anti-regression for the in-memory-only failure mode.
+- `crates/agent/src/state_store.rs::tests::last_daily_briefing_date_returns_none_on_malformed_payload` — corrupt UTF-8 / non-ISO date resolves to `None` instead of panicking. Matches the rest of the agent's "fail open and re-emit" behaviour for kv_state corruption.
+
+### crontab -l does not trigger persistence detection (crontab-list-fp — 2026-05-09)
+
+Operator received three high-severity `crontab_persistence` alerts on 2026-05-09 within an hour. Root cause: `crates/sensor/src/detectors/crontab_persistence.rs::is_crontab_command` matched ANY `crontab -*` token via `lower.contains("crontab -")`, including the read-only `crontab -l` (list).
+
+Fix: tighten the check. Match `crontab -e` (edit) and `crontab -r` (remove) explicitly; for the stdin-pipe form (`crontab -`), require the next character to be whitespace, `<`, or end-of-string. `-l`, `-u <user>`, and `--help` fall through.
+
+- `crates/sensor/src/detectors/crontab_persistence.rs::tests::crontab_list_flag_does_not_trigger_persistence_alert` — exact regression: `crontab -l` MUST NOT fire.
+- `crates/sensor/src/detectors/crontab_persistence.rs::tests::crontab_remove_flag_still_triggers_persistence_alert` — `crontab -r` (remove) MUST still fire — anti-regression for "tightening dropped a real signal".
+- `crates/sensor/src/detectors/crontab_persistence.rs::tests::crontab_list_other_user_flag_does_not_trigger_persistence_alert` — `crontab -u alice -l` (list someone else's crontab) is also read-only.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
