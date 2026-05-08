@@ -922,6 +922,17 @@ Fix: new `cloud_safelist::safelist_label(ip)` walks the CIDR set first (using `i
 - `crates/agent/src/cloud_safelist.rs::tests::safelist_label_returns_some_for_prod_audit_ips_that_were_wrongly_blocked` — uses the four exact prod IPs (208.95.112.1, 91.189.91.102, 199.232.58.137, 185.125.190.48) and confirms each is now safelisted. Pins the gate predicate AND the Canonical /22 widening.
 - `crates/agent/src/cloud_safelist.rs::tests::safelist_label_returns_none_for_real_attacker_ips` — TEST-NET-3 (RFC 5737) and random unassigned space return None. Pins the cheap-exit contract so the new gate doesn't tag everything.
 
+### Automated block paths reject CIDR targets (fix/automated-block-paths-reject-cidr — 2026-05-08)
+
+Operator's prod audit 2026-05-08 found `136.216.0.0/16` in `ip_reputations` cycling through the repeat-offender loop every 2 hours since 2026-05-07. Each tick the loop pulled the CIDR key out of the map, re-emitted `AiAction::BlockIp { ip: "136.216.0.0/16" }`, and the safeguards path bumped its block_count. Had any automated XDP / UFW path actually reached the firewall successfully, this would have banned a `/16` of public IP space (~65 thousand addresses) per UFW rule.
+
+Root cause: `is_valid_block_target` accepts CIDRs by design — operators can manually run `innerwarden block 10.0.0.0/24` to ban a botnet network. But the AUTOMATED emitters (repeat-offender, multi-technique, AI router output) had no separate gate, so a CIDR that ever entered `ip_reputations` (e.g. from an AI hallucination, an upstream feed quirk, or a one-off operator typo) cycled forever.
+
+Fix: new `is_single_ip_block_target(ip)` rejects every CIDR. Automated paths use it; the manual CLI path keeps using `is_valid_block_target`.
+
+- `crates/agent/src/decision_block_ip.rs::tests::is_single_ip_block_target_rejects_cidrs_and_accepts_plain_ips` — pins that the new helper accepts plain IPv4 / IPv6 and rejects every CIDR including the exact prod regression IP `136.216.0.0/16`.
+- `crates/agent/src/correlation_response.rs::tests::drop_invalid_drops_cidr_from_automated_path` — pins that `drop_invalid_repeat_offender` (the gate at the entry of `check_repeat_offenders`) drops + removes CIDR keys from `ip_reputations`. **Contract changed** from the previous `drop_invalid_keeps_valid_cidr` anchor: the new contract is "automated path rejects CIDRs", not "automated path tolerates them". Manual operator commands still accept CIDRs.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

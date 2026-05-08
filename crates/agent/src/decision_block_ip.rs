@@ -29,6 +29,32 @@ pub(crate) enum StandaloneXdpOutcome {
     Failed(String),
 }
 
+/// Stricter target validator for AUTOMATED block paths
+/// (repeat-offender, multi-technique, AI router output).
+///
+/// `is_valid_block_target` deliberately accepts CIDRs because operators
+/// can manually run `innerwarden block 10.0.0.0/24` to ban a botnet
+/// network. But automated paths must NEVER emit CIDRs — a single
+/// hallucinated `/16` from the AI router or a CIDR slipping into
+/// `ip_reputations` from a downstream upstream feed creates a
+/// self-reinforcing loop: the repeat-offender path reads the key,
+/// re-emits BlockIp on the CIDR, the safeguards bump its block_count,
+/// and on the next tick the same CIDR re-fires. Operator's prod
+/// 2026-05-08 had `136.216.0.0/16` cycling every 2h since 2026-05-07
+/// (15 historical "blocks", same target_ip = a /16 CIDR — that would
+/// have been a UFW rule banning a /16 of public IP space).
+///
+/// 2026-05-08 (fix/automated-block-paths-reject-cidr): this helper is
+/// the gate at the entry of every automated block emitter. Manual
+/// operator commands keep using `is_valid_block_target` so the
+/// `innerwarden block` CLI path is unchanged.
+pub(crate) fn is_single_ip_block_target(ip: &str) -> bool {
+    if ip.contains('/') {
+        return false;
+    }
+    is_valid_block_target(ip)
+}
+
 /// Decide whether the XDP-unavailable WARN should fire given the
 /// outcomes of both XDP attempts in a single block decision.
 ///
@@ -806,6 +832,37 @@ mod tests {
         assert!(is_valid_block_target("::/0"));
         assert!(is_valid_block_target("2001:db8::/32"));
         assert!(is_valid_block_target("fe80::/10"));
+    }
+
+    /// 2026-05-08 anchor (fix/automated-block-paths-reject-cidr):
+    /// `is_single_ip_block_target` accepts plain IPv4 / IPv6 but
+    /// rejects every CIDR — single-IP-only contract for automated
+    /// block emitters. Operator's prod 2026-05-08 had `136.216.0.0/16`
+    /// cycling every 2h via the repeat-offender path because
+    /// `is_valid_block_target` accepted CIDRs. The new helper is the
+    /// gate that prevents the automated paths from ever pushing a
+    /// CIDR to the firewall.
+    #[test]
+    fn is_single_ip_block_target_rejects_cidrs_and_accepts_plain_ips() {
+        // Plain IPs: still accepted (manual operator-tier operations
+        // can still run through the legacy `is_valid_block_target`
+        // when they specifically need CIDR support).
+        assert!(is_single_ip_block_target("203.0.113.42"));
+        assert!(is_single_ip_block_target("2001:db8::1"));
+        assert!(is_single_ip_block_target("::1"));
+
+        // CIDRs: rejected (the prod regression IP).
+        assert!(
+            !is_single_ip_block_target("136.216.0.0/16"),
+            "the exact prod CIDR that cycled every 2h MUST be rejected"
+        );
+        assert!(!is_single_ip_block_target("10.0.0.0/8"));
+        assert!(!is_single_ip_block_target("192.168.1.1/32"));
+        assert!(!is_single_ip_block_target("2001:db8::/32"));
+
+        // Garbage: still rejected.
+        assert!(!is_single_ip_block_target(""));
+        assert!(!is_single_ip_block_target("not-an-ip"));
     }
 
     #[test]

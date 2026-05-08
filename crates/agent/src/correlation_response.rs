@@ -296,10 +296,19 @@ pub(crate) fn drop_invalid_repeat_offender(
     ip: &str,
     ip_reputations: &mut std::collections::HashMap<String, crate::ip_reputation::LocalIpReputation>,
 ) -> bool {
-    if !crate::decision_block_ip::is_valid_block_target(ip) {
+    // 2026-05-08 (fix/automated-block-paths-reject-cidr): use the
+    // stricter `is_single_ip_block_target` so CIDR keys get pruned
+    // from the automated path. Operator's prod 2026-05-08 had
+    // `136.216.0.0/16` cycling every 2h since 2026-05-07 because
+    // `is_valid_block_target` accepts CIDRs (intentional for
+    // manual operator commands), and the repeat-offender loop then
+    // happily re-emitted BlockIp on the /16. A real UFW rule of
+    // `deny from 136.216.0.0/16` would have banned a public /16
+    // (~65k IPs).
+    if !crate::decision_block_ip::is_single_ip_block_target(ip) {
         warn!(
             ip = %ip,
-            "repeat-offender: skipping invalid target — removing from ip_reputations"
+            "repeat-offender: skipping invalid or CIDR target — removing from ip_reputations"
         );
         ip_reputations.remove(ip);
         return true;
@@ -482,6 +491,22 @@ async fn check_multi_technique(data_dir: &Path, cfg: &config::AgentConfig, state
     };
 
     for (ip, detectors) in multi_technique_ips {
+        // 2026-05-08 (fix/automated-block-paths-reject-cidr): the
+        // KG can carry a CIDR string in an Ip node if some upstream
+        // populated it that way. Reject CIDR + invalid targets at
+        // the entry of the automated path. Operator's prod 2026-05-08
+        // proved this happens (136.216.0.0/16 was cycling via the
+        // repeat-offender twin of this loop); the same protection
+        // belongs here in case multi-technique ever sees the same
+        // shape.
+        if !crate::decision_block_ip::is_single_ip_block_target(&ip) {
+            warn!(
+                ip = %ip,
+                "multi-technique: skipping invalid or CIDR target"
+            );
+            continue;
+        }
+
         let cooldown_key = format!("multi-technique:{ip}");
         let cooldown_cutoff = Utc::now() - chrono::Duration::seconds(3600);
         if state
@@ -690,16 +715,36 @@ mod tests {
         assert!(map.contains_key("8.8.8.8"));
     }
 
+    /// 2026-05-08 (fix/automated-block-paths-reject-cidr): contract
+    /// CHANGED. Previously this anchor asserted that CIDRs were KEPT
+    /// in `ip_reputations` (the rationale was "operators can manually
+    /// block /24s of botnet networks"). Operator's prod 2026-05-08
+    /// proved the operational cost: `136.216.0.0/16` cycled every 2h
+    /// for two days because the repeat-offender loop happily re-fired
+    /// BlockIp on the CIDR, and a successful UFW path would have
+    /// banned a /16 of public IP space (~65k IPs). The new contract:
+    /// the AUTOMATED repeat-offender path rejects every CIDR. Manual
+    /// operator commands keep using `is_valid_block_target` (which
+    /// still accepts CIDRs) — only the automated emitter is locked
+    /// down. The exact prod IP `136.216.0.0/16` is the test fixture
+    /// so a regression here fires loud.
     #[test]
-    fn drop_invalid_keeps_valid_cidr() {
+    fn drop_invalid_drops_cidr_from_automated_path() {
         use crate::ip_reputation::LocalIpReputation;
         use std::collections::HashMap;
 
         let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
         map.insert("136.216.0.0/16".to_string(), LocalIpReputation::new());
         let dropped = drop_invalid_repeat_offender("136.216.0.0/16", &mut map);
-        assert!(!dropped);
-        assert!(map.contains_key("136.216.0.0/16"));
+        assert!(
+            dropped,
+            "CIDR target MUST be dropped from the automated path (prod regression IP)"
+        );
+        assert!(
+            !map.contains_key("136.216.0.0/16"),
+            "the CIDR entry MUST be removed from ip_reputations so the next \
+             tick doesn't re-emit BlockIp on it"
+        );
     }
 
     #[test]
