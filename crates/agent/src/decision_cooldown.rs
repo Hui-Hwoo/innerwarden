@@ -9,6 +9,33 @@ pub(crate) const DECISION_COOLDOWN_SECS: i64 = 3600;
 /// same detector+entity within this window. Prevents alert spam when the same attacker
 /// triggers multiple incidents in rapid succession.
 pub(crate) const NOTIFICATION_COOLDOWN_SECS: i64 = 600;
+
+/// Storage retention for decision-cooldown rows (must be >= the LONGEST
+/// cooldown semantic that consults `state.store.get_cooldown(Decision, ...)`).
+///
+/// The slow loop trims cooldown rows older than this — anything past the
+/// horizon is gone, so consumers that check `is_some_and(|ts| ts > cutoff)`
+/// see `None` even when the IP hit the gate well within its semantic
+/// window. Operator's prod 2026-05-08 had `repeat-offender:136.216.0.0/16`
+/// firing every 2h instead of every 24h because the trim was hard-coded
+/// to 2h while `check_repeat_offenders` uses a 24h cooldown_cutoff. The
+/// shorter retention silently defeated the longer cooldown.
+///
+/// Current decision-cooldown consumers and their durations:
+///   - correlation chain (correlation_response.rs:117): 600s
+///   - DECISION_COOLDOWN_SECS used by evaluate_pre_ai_flow:    3600s
+///   - check_multi_technique (correlation_response.rs:511):    3600s
+///   - check_repeat_offenders (correlation_response.rs:341): **86400s** ← max
+///
+/// Bumping retention to 24h costs ~12x more cooldown rows but they're
+/// 8 bytes each — bounded by IP cardinality, not problematic at any
+/// practical scale.
+pub(crate) const DECISION_COOLDOWN_RETENTION_SECS: i64 = 86400;
+
+/// Storage retention for notification-cooldown rows. Notification cooldowns
+/// only need to survive the longest notification window; 2h covers
+/// NOTIFICATION_COOLDOWN_SECS (600s) with margin.
+pub(crate) const NOTIFICATION_COOLDOWN_RETENTION_SECS: i64 = 7200;
 /// Max block actions per minute - prevents false-positive cascades.
 pub(crate) const MAX_BLOCKS_PER_MINUTE: usize = 20;
 /// Default XDP blocklist TTL (24h) - retained as reference; adaptive TTL now per-IP.
@@ -510,5 +537,38 @@ mod tests {
         };
         let key = decision_cooldown_key_from_entry(&entry);
         assert_eq!(key, Some("block_ip:nginx:ip:10.0.0.1".to_string()));
+    }
+
+    /// 2026-05-08 anchor (fix/cooldown-retention-matches-longest-semantic):
+    /// `DECISION_COOLDOWN_RETENTION_SECS` must be at least as long as the
+    /// LONGEST cooldown_cutoff used by any decision-cooldown consumer.
+    /// Today the longest is `check_repeat_offenders` at 86400s (24h).
+    /// Pre-fix the slow-loop trim hard-coded 2h, which silently nuked
+    /// repeat-offender's 24h cooldown rows after only 2h — operator's
+    /// prod 2026-05-08 had `136.216.0.0/16` re-firing every 2h instead
+    /// of every 24h because of this mismatch. If a future patch adds a
+    /// 7-day decision cooldown without updating this constant, this
+    /// test fires and the patch author has to choose: bump retention
+    /// or accept the silent-defeat regression.
+    #[test]
+    fn decision_cooldown_retention_covers_longest_consumer() {
+        const REPEAT_OFFENDER_COOLDOWN_SECS: i64 = 86400;
+        assert!(
+            DECISION_COOLDOWN_RETENTION_SECS >= REPEAT_OFFENDER_COOLDOWN_SECS,
+            "DECISION_COOLDOWN_RETENTION_SECS ({}) must be >= the longest \
+             cooldown_cutoff in any decision-cooldown consumer ({}s for \
+             repeat-offender). Pre-fix prod regression: /16 firing every \
+             2h instead of 24h because retention < cooldown_cutoff.",
+            DECISION_COOLDOWN_RETENTION_SECS,
+            REPEAT_OFFENDER_COOLDOWN_SECS
+        );
+        // Also pin that NOTIFICATION retention covers its own consumer.
+        assert!(
+            NOTIFICATION_COOLDOWN_RETENTION_SECS >= NOTIFICATION_COOLDOWN_SECS,
+            "NOTIFICATION_COOLDOWN_RETENTION_SECS ({}) must be >= \
+             NOTIFICATION_COOLDOWN_SECS ({})",
+            NOTIFICATION_COOLDOWN_RETENTION_SECS,
+            NOTIFICATION_COOLDOWN_SECS
+        );
     }
 }

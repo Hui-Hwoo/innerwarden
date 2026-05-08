@@ -1716,11 +1716,29 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     // AI router. Local Warden Model inference happens in the
                     // hot path, no nightly retrain needed.
 
-                    // Trim in-memory structures to prevent unbounded memory growth
+                    // Trim in-memory structures to prevent unbounded memory growth.
                     state.blocklist.trim_if_needed(10_000);
-                    let cutoff_2h = chrono::Utc::now() - chrono::Duration::hours(2);
-                    state.store.retain_cooldowns(state_store::CooldownTable::Decision, cutoff_2h);
-                    state.store.retain_cooldowns(state_store::CooldownTable::Notification, cutoff_2h);
+                    // 2026-05-08 (fix/cooldown-retention-matches-longest-semantic):
+                    // each cooldown table gets its own retention horizon — the
+                    // Decision table needs 24h to cover the repeat-offender
+                    // 86400s cooldown_cutoff, the Notification table is fine
+                    // at 2h because all notification windows are minutes-scale.
+                    // Pre-fix the trim was 2h for both, which silently nuked
+                    // repeat-offender's 24h cooldown rows after only 2h and
+                    // re-fired the same /16 block every 2h until the IP
+                    // dropped out of `ip_reputations`.
+                    let now = chrono::Utc::now();
+                    let decision_cutoff = now
+                        - chrono::Duration::seconds(crate::DECISION_COOLDOWN_RETENTION_SECS);
+                    let notification_cutoff = now
+                        - chrono::Duration::seconds(crate::NOTIFICATION_COOLDOWN_RETENTION_SECS);
+                    state
+                        .store
+                        .retain_cooldowns(state_store::CooldownTable::Decision, decision_cutoff);
+                    state.store.retain_cooldowns(
+                        state_store::CooldownTable::Notification,
+                        notification_cutoff,
+                    );
                     // Cap block_counts to 5000 entries
                     if state.store.block_counts_len() > 5000 {
                         state.store.clear_block_counts();

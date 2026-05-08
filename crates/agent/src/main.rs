@@ -652,7 +652,8 @@ pub(crate) use decision_cooldown::DECISION_COOLDOWN_SECS;
 pub(crate) use decision_cooldown::{
     decision_cooldown_candidates, decision_cooldown_key_for_decision, load_last_narrative_instant,
     load_startup_decision_state, notification_cooldown_keys, ABUSEIPDB_REPORT_DELAY_SECS,
-    MAX_BLOCKS_PER_MINUTE, NOTIFICATION_COOLDOWN_SECS,
+    DECISION_COOLDOWN_RETENTION_SECS, MAX_BLOCKS_PER_MINUTE, NOTIFICATION_COOLDOWN_RETENTION_SECS,
+    NOTIFICATION_COOLDOWN_SECS,
 };
 pub(crate) use ip_reputation::{
     adaptive_block_ttl_secs, append_blocked_ip, load_ip_reputations, persist_ip_reputations,

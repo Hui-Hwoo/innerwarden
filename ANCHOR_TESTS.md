@@ -933,6 +933,14 @@ Fix: new `is_single_ip_block_target(ip)` rejects every CIDR. Automated paths use
 - `crates/agent/src/decision_block_ip.rs::tests::is_single_ip_block_target_rejects_cidrs_and_accepts_plain_ips` — pins that the new helper accepts plain IPv4 / IPv6 and rejects every CIDR including the exact prod regression IP `136.216.0.0/16`.
 - `crates/agent/src/correlation_response.rs::tests::drop_invalid_drops_cidr_from_automated_path` — pins that `drop_invalid_repeat_offender` (the gate at the entry of `check_repeat_offenders`) drops + removes CIDR keys from `ip_reputations`. **Contract changed** from the previous `drop_invalid_keeps_valid_cidr` anchor: the new contract is "automated path rejects CIDRs", not "automated path tolerates them". Manual operator commands still accept CIDRs.
 
+### Cooldown retention covers longest consumer (fix/cooldown-retention-matches-longest-semantic — 2026-05-08)
+
+Operator's prod audit 2026-05-08 found `repeat-offender:136.216.0.0/16` firing exactly every 2h+1min for two days straight, even though `check_repeat_offenders` uses a 24h `cooldown_cutoff`. Root cause: the slow-loop hygiene tick at `loops/boot.rs:1721` was trimming cooldown rows older than 2h via `retain_cooldowns(Decision, cutoff_2h)`. Since the trim horizon (2h) was shorter than the longest consumer's cooldown_cutoff (24h for repeat-offender), the trim silently nuked the cooldown row after only 2h and the next slow-loop tick saw `None` from `get_cooldown` → fired again → set_cooldown(now) → next 2h elapsed → trim → repeat.
+
+The Decision and Notification cooldown tables now have separate retention horizons matching their respective longest consumer, declared as named constants. A future contributor adding a longer cooldown semantic without updating the retention constant trips the anchor test.
+
+- `crates/agent/src/decision_cooldown.rs::tests::decision_cooldown_retention_covers_longest_consumer` — pins `DECISION_COOLDOWN_RETENTION_SECS >= 86400s` (the repeat-offender cooldown_cutoff) AND `NOTIFICATION_COOLDOWN_RETENTION_SECS >= NOTIFICATION_COOLDOWN_SECS`. Pre-fix retention was 2h for both tables; this anchor would have caught the regression.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
