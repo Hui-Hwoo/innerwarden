@@ -385,6 +385,37 @@ pub(super) fn reputation_score_bar(score: u8) -> String {
     format!("[{bar}]")
 }
 
+/// Operator-honest label for the reputation tier corresponding to an
+/// AbuseIPDB confidence score. Mirrors AbuseIPDB's own UI thresholds.
+///
+/// 2026-05-08 (fix/abuseipdb-telegram-honesty): pre-fix the
+/// `send_abuseipdb_autoblock` Telegram alert hard-coded "known threat"
+/// for every score, regardless of how well-evidenced the block was.
+/// Score 8/100 + 3 reports + AWS Ireland came through worded the same
+/// as score 95/100 + 1200 reports + Tor exit, which read like the
+/// agent was crying wolf at any hint of reputation. The tiered copy
+/// matches AbuseIPDB's published bands so the alert does not over-
+/// state the evidence.
+pub(super) fn reputation_tier_label(score: u8) -> &'static str {
+    match score {
+        0..=24 => "AbuseIPDB low-reputation gate",
+        25..=49 => "AbuseIPDB medium-risk gate",
+        50..=74 => "AbuseIPDB high-risk gate",
+        _ => "AbuseIPDB known-threat gate",
+    }
+}
+
+/// Sentence fragment describing what the block does given the
+/// confidence score. Slots into `action_line` of the Telegram alert.
+pub(super) fn reputation_action_phrase(score: u8) -> &'static str {
+    match score {
+        0..=24 => "low-reputation IP — has at least one historical report but no strong evidence",
+        25..=49 => "medium-risk IP per AbuseIPDB",
+        50..=74 => "high-risk IP per AbuseIPDB",
+        _ => "known-threat IP per AbuseIPDB",
+    }
+}
+
 /// Convert a 2-letter ISO country code to a flag emoji.
 pub(super) fn country_flag_emoji(code: &str) -> String {
     if code.len() != 2 {
@@ -1061,6 +1092,60 @@ mod tests {
         assert_eq!(
             friendly_detector_name("unknown-detector"),
             "unknown-detector"
+        );
+    }
+
+    /// 2026-05-08 anchor (fix/abuseipdb-telegram-honesty): the
+    /// AbuseIPDB autoblock Telegram alert text must reflect the
+    /// score's tier, not hard-code "known threat" for every score.
+    /// Pre-fix the operator's prod alert about a Score 8/100 IP
+    /// (Amazon AWS Ireland) read "known threat from reputation
+    /// database", which is operator-honesty-broken — score 8 is
+    /// "low risk" per AbuseIPDB's own UI bands. Pin the four-tier
+    /// boundary mapping so a future "simplify the labels" refactor
+    /// can't collapse them back into one over-confident slogan.
+    #[test]
+    fn reputation_tier_label_uses_abuseipdb_band_thresholds() {
+        // 0-24: low. The exact prod IP score that triggered the fix.
+        assert_eq!(reputation_tier_label(0), "AbuseIPDB low-reputation gate");
+        assert_eq!(reputation_tier_label(8), "AbuseIPDB low-reputation gate");
+        assert_eq!(reputation_tier_label(24), "AbuseIPDB low-reputation gate");
+        // 25-49: medium.
+        assert_eq!(reputation_tier_label(25), "AbuseIPDB medium-risk gate");
+        assert_eq!(reputation_tier_label(49), "AbuseIPDB medium-risk gate");
+        // 50-74: high.
+        assert_eq!(reputation_tier_label(50), "AbuseIPDB high-risk gate");
+        assert_eq!(reputation_tier_label(74), "AbuseIPDB high-risk gate");
+        // 75-100: known.
+        assert_eq!(reputation_tier_label(75), "AbuseIPDB known-threat gate");
+        assert_eq!(reputation_tier_label(100), "AbuseIPDB known-threat gate");
+    }
+
+    /// Mirror anchor: the action_phrase used in the alert body must
+    /// also reflect the tier. Pins the inline sentence the operator
+    /// reads in the Telegram message — pre-fix this said "known
+    /// threat from reputation database" for every score.
+    #[test]
+    fn reputation_action_phrase_does_not_hard_code_known_threat_for_low_scores() {
+        // Score 8 (the prod alert): the phrase MUST NOT contain
+        // "known threat" or any equivalent strong claim.
+        let phrase = reputation_action_phrase(8);
+        assert!(
+            !phrase.to_lowercase().contains("known"),
+            "score 8 must not be labelled as 'known' anything (got {phrase})"
+        );
+        assert!(
+            phrase.to_lowercase().contains("low-reputation")
+                || phrase.to_lowercase().contains("historical report"),
+            "score 8 phrase must call out the low-evidence shape (got {phrase})"
+        );
+        // Score 95 SHOULD use strong language since the evidence is
+        // strong. Anti-regression for accidentally softening the
+        // language across the board.
+        let strong = reputation_action_phrase(95);
+        assert!(
+            strong.to_lowercase().contains("known-threat"),
+            "score 95 must keep 'known-threat' wording (got {strong})"
         );
     }
 

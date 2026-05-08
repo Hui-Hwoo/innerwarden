@@ -924,6 +924,31 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     "AbuseIPDB enrichment enabled (max_age_days={})",
                     cfg.abuseipdb.max_age_days
                 );
+                // 2026-05-08 (fix/abuseipdb-telegram-honesty):
+                // operator's prod 2026-05-07 had `auto_block_threshold = 1`
+                // which silently auto-blocks any IP with even one
+                // historical AbuseIPDB report — including AWS/Azure/GCP
+                // edge IPs that have a single FP. The Telegram alert
+                // then claimed "known threat" for score 8/100, which
+                // damaged operator trust. AbuseIPDB's own UI labels
+                // anything below 25 as "low risk"; the docstring on
+                // the config field recommends 75-90. Anything ≤ 25
+                // is almost certainly a misconfiguration. Emit a
+                // single-line WARN at boot so the operator sees it
+                // alongside the "AbuseIPDB enrichment enabled" line.
+                let t = cfg.abuseipdb.auto_block_threshold;
+                if (1..=25).contains(&t) {
+                    warn!(
+                        threshold = t,
+                        "abuseipdb.auto_block_threshold = {t} is implausibly low \
+                         (AbuseIPDB labels < 25 as 'low risk'). Auto-block will \
+                         fire on IPs with little or no real evidence — including \
+                         cloud-edge / CDN IPs that get one historical FP report. \
+                         Recommended: 75 (aggressive) or 90 (conservative). Set \
+                         to 0 to disable the auto-block path entirely while \
+                         keeping enrichment."
+                    );
+                }
                 Some(abuseipdb::AbuseIpDbClient::new(
                     key,
                     cfg.abuseipdb.max_age_days,

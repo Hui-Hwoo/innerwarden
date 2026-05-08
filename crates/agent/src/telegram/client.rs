@@ -12,7 +12,8 @@ use super::explain_detector;
 use super::formatting::{
     callback_data, country_flag_emoji, enforce_length, entity_summary, escape_html,
     first_ip_entity, format_incident_message, format_simple_message, parse_callback, plain_action,
-    reputation_score_bar, sanitize_url, severity_label, source_icon, strip_bot_suffix,
+    reputation_action_phrase, reputation_score_bar, reputation_tier_label, sanitize_url,
+    severity_label, source_icon, strip_bot_suffix,
 };
 use super::{ApprovalResult, GuardianMode};
 
@@ -865,26 +866,52 @@ impl TelegramClient {
             String::new()
         };
 
-        let (action_line, header) = if dry_run {
-            (
-                format!(
-                    "Would've dropped <code>{}</code> - dry-run, standing down.",
-                    escape_html(ip)
-                ),
-                "🧪 <b>Dry-run</b> - known bad actor flagged",
+        // 2026-05-08 (fix/abuseipdb-telegram-honesty): tier the copy by
+        // observed score so the alert text matches the data the operator
+        // reads in the same message. AbuseIPDB confidence ranges 0-100;
+        // their own UI labels 0-24 as "low risk", 25-49 "medium",
+        // 50-74 "high", 75-100 "very high / known malicious". The
+        // pre-fix copy hard-coded "known threat" / "known bad actor" for
+        // every score, which made a Score 8/100 + 3 reports + AWS-IRE
+        // hit (operator's prod 2026-05-07) read like the agent was
+        // calling AWS infrastructure a "known threat" — actively
+        // damaging the operator's trust in every alert that follows.
+        // We keep the alert firing (the operator may have legitimately
+        // chosen `auto_block_threshold = 1`), but the copy now tells
+        // the truth about how well-evidenced the block is.
+        let tier = reputation_tier_label(score);
+        let header_label = if dry_run {
+            "🧪 <b>Dry-run</b> - "
+        } else {
+            "🛡 <b>Instant kill</b> - "
+        };
+        let header = format!("{header_label}{tier}");
+
+        let action_line = if dry_run {
+            format!(
+                "Would've dropped <code>{}</code> - dry-run, standing down.",
+                escape_html(ip)
             )
         } else {
-            (
-                format!(
-                    "Blocked <code>{}</code> - known threat from reputation database.",
-                    escape_html(ip)
-                ),
-                "🛡 <b>Instant kill</b> - AbuseIPDB reputation gate",
+            // The copy mentions both the threshold the operator chose
+            // AND the score the IP earned, so the journal entry is
+            // self-explanatory when the operator reviews it later.
+            format!(
+                "Blocked <code>{}</code> - {} (score {} ≥ threshold {}).",
+                escape_html(ip),
+                reputation_action_phrase(score),
+                score,
+                threshold,
             )
         };
 
         let score_bar = reputation_score_bar(score);
 
+        // Footer was previously `Score ≥ {threshold} - handled before
+        // AI analysis.` but the new `action_line` already states the
+        // score-vs-threshold relationship. Keeping only the routing
+        // hint ("handled before AI analysis") so the operator knows
+        // why no AI verdict will appear in the dashboard for this IP.
         let text = format!(
             "{header}\n\
              \n\
@@ -893,7 +920,7 @@ impl TelegramClient {
              🔍 <i>{incident_title}</i>\n\
              \n\
              {action_line}\n\
-             <i>Score ≥ {threshold} - handled before AI analysis.</i>",
+             <i>Reputation gate ran before AI analysis.</i>",
             ip = escape_html(ip),
             incident_title = escape_html(incident_title),
         );

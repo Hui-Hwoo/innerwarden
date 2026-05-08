@@ -838,6 +838,36 @@ The anchors below pin each contract.
 - `crates/agent/src/decision_block_ip.rs::tests::xdp_failure_to_warn_combines_both_errors_when_neither_path_succeeds` — both-failed WARN includes both error messages. Anti-regression for accidentally dropping one of the two.
 - `crates/agent/src/decision_block_ip.rs::tests::xdp_failure_to_warn_surfaces_shield_failure_when_standalone_not_attempted` — shield-only failure (no `block-ip-xdp` skill registered) surfaces verbatim. Pins the path where shield is the only XDP backend.
 
+### AbuseIPDB + Telegram honesty (fix/abuseipdb-telegram-honesty — 2026-05-08)
+
+Operator's prod 2026-05-07 received a Telegram alert reading "🛡 Instant kill - AbuseIPDB reputation gate ... Blocked 34.253.181.30 - known threat from reputation database. Score 8/100, 3 reports worldwide, Amazon Technologies Inc., Ireland". Calling Score 8/100 a "known threat" is dishonest — AbuseIPDB's own UI bands 0-24 as "low risk". Investigation surfaced four interlocking bugs that together make the alert worse than nothing:
+
+1. `cloud_safelist::CLOUD_PROVIDER_RANGES` had a hole — `34.0.0.0/9` is GCP, AWS owns `34.192.0.0/10` (covering 34.192-34.255 = eu-west-1, eu-west-2, ap-northeast-1) and we never listed it. The IP leaked through the safelist gate.
+2. `cloud_safelist::identify_provider`'s first-octet heuristic blanket-tagged 34.x as Google Cloud, so the journal log line said "Google Cloud" while the WHOIS panel said "Amazon" — operator-distrust amplifier.
+3. `telegram::send_abuseipdb_autoblock` hard-coded "known threat from reputation database" for every score, regardless of how well-evidenced the block was.
+4. The agent shipped with `auto_block_threshold = 1` in operator's prod (config doc recommends 75-90). At threshold 1 any IP with a single historical AbuseIPDB report auto-blocks. No startup signal told the operator their config was implausible.
+5. `incident_autodismiss::try_autodismiss_sensor_self_traffic_fp` covered the `data_exfil_ebpf` and `reverse_shell` NSS-init FPs but not the `kill_chain` detector, which fires DATA_EXFIL on the same wget/curl/apt/cargo NSS-bundle-read pattern with a different evidence shape.
+
+The anchors below pin each contract.
+
+#### Cloud safelist AWS gap
+
+- `crates/agent/src/cloud_safelist.rs::tests::aws_eu_west_1_range_is_in_safelist` — `34.253.181.30` (the prod IP) plus `34.192.0.0` and `34.255.255.255` (CIDR boundaries) are in the safelist; pre-fix the CIDR didn't exist. Anti-regression for the gap.
+- `crates/agent/src/cloud_safelist.rs::tests::aws_eu_west_1_identifies_as_aws_not_google` — `identify_provider` for the same prod IP labels "AWS", not "Google Cloud". Pins the second-octet split at 34.128 boundary so the operator's journal log line matches the WHOIS data.
+
+#### Telegram tier-aware copy
+
+- `crates/agent/src/telegram/formatting.rs::tests::reputation_tier_label_uses_abuseipdb_band_thresholds` — `reputation_tier_label` returns four distinct labels at AbuseIPDB's published 25/50/75 boundaries. Pre-fix every score got "known threat".
+- `crates/agent/src/telegram/formatting.rs::tests::reputation_action_phrase_does_not_hard_code_known_threat_for_low_scores` — score 8 phrase MUST NOT contain "known"; score 95 phrase MUST keep "known-threat" wording. Anti-regression for accidentally softening the strong language across the board.
+
+#### kill_chain wget FP suppression
+
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_dismisses_kill_chain_wget_pattern` — the exact prod incident shape (kill_chain DATA_EXFIL on wget, chain_bits = [socket, sensitive_read], c2_port = 0) is auto-dismissed.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_dismisses_kill_chain_for_all_nss_init_tools` — coverage for curl/apt/cargo/git/pip3 (the rest of NSS_INIT_TOOL_PREFIXES). Anti-regression for accidentally narrowing the comm match to just wget.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_with_extra_bits` — a 3-bit chain (socket + sensitive_read + privesc) keeps the incident visible. Pins the bare-2-bit-only suppression so real attacker chains escape the filter.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_with_c2_port` — non-zero c2_port (4444 / 1337 / etc) keeps the incident visible. Anti-regression for the kill_chain seeing an attacker-flagged port.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_unknown_comm` — unknown comm with the bare 2-bit chain still routes to AI. Pins the comm-allowlist gate so a bespoke attacker binary doesn't get the operator-tool free pass.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

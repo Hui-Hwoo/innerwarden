@@ -158,10 +158,24 @@ const CLOUD_PROVIDER_RANGES: &[&str] = &[
     "216.58.192.0/19", // Google services
     "209.85.128.0/17", // Google mail/services
     // AWS (major allocations)
-    "3.0.0.0/9",     // 3.0-127.x — EC2
-    "13.0.0.0/8",    // 13.x — EC2 various
-    "15.0.0.0/11",   // 15.0-31.x — EC2
-    "18.0.0.0/10",   // 18.0-63.x — EC2
+    "3.0.0.0/9",   // 3.0-127.x — EC2
+    "13.0.0.0/8",  // 13.x — EC2 various
+    "15.0.0.0/11", // 15.0-31.x — EC2
+    "18.0.0.0/10", // 18.0-63.x — EC2
+    // 2026-05-08 (fix/abuseipdb-telegram-honesty): operator's prod hit
+    // an `Instant kill - AbuseIPDB reputation gate` Telegram alert on
+    // 34.253.181.30 (Score 8/100, Amazon Technologies Inc., Ireland
+    // eu-west-1). The gap: 34.0.0.0/9 above is GCP, AWS owns
+    // 34.192.0.0/10 (covers 34.192-34.255 = eu-west-1, eu-west-2,
+    // ap-northeast-1 EC2 + ELB) and we never listed it. So the
+    // safelist let through every AWS IP starting with 34.128+,
+    // and with `auto_block_threshold = 1` in agent.toml the
+    // reputation gate auto-blocked any AWS IP with even a single
+    // historical report. Source: AWS-published ip-ranges.json
+    // (service=EC2, region=eu-west-1) — `34.240.0.0/13` and
+    // `34.248.0.0/13` are explicit, this /10 covers both plus the
+    // 34.192-239 chunks for ap-northeast-1/us-east-2.
+    "34.192.0.0/10", // 34.192-255.x — EC2 (eu-west-1/2, ap-northeast-1, us-east-2)
     "44.192.0.0/11", // 44.192-223.x — EC2
     "52.0.0.0/11",   // 52.0-31.x — EC2
     "54.0.0.0/8",    // 54.x — EC2
@@ -473,10 +487,12 @@ pub fn identify_provider(ip_str: &str) -> Option<&'static str> {
     let Ok(ip) = ip_str.parse::<IpAddr>() else {
         return None;
     };
-    let (ip_u32, first_octet) = match ip {
-        IpAddr::V4(v4) => (u32::from(v4), v4.octets()[0]),
+    let (ip_u32, octets) = match ip {
+        IpAddr::V4(v4) => (u32::from(v4), v4.octets()),
         _ => return None,
     };
+    let first_octet = octets[0];
+    let second_octet = octets[1];
 
     // Authoritative Cloudflare-first check. The first-octet heuristic below
     // misclassifies large Cloudflare blocks (104.16.0.0/13, 104.24.0.0/14,
@@ -502,11 +518,26 @@ pub fn identify_provider(ip_str: &str) -> Option<&'static str> {
     // 23 is mostly Akamai). 151 is overwhelmingly Fastly. 64 / 130 /
     // 143 / 144 / 216 are added for CloudFront edges that don't fall
     // in the standard AWS allocations.
+    //
+    // 2026-05-08 (fix/abuseipdb-telegram-honesty): the 34.x first-octet
+    // is split between GCP (34.0-127) and AWS (34.128-255 — eu-west-1/2,
+    // ap-northeast-1, us-east-2 EC2 + ELB). Pre-fix the operator's
+    // alert about 34.253.181.30 (AWS Ireland, Score 8/100) showed
+    // "Amazon Technologies Inc." in the WHOIS panel but every safelist
+    // log line tagged the IP "Google Cloud", which made the warning
+    // even more confusing.
     match first_octet {
         23 | 96 | 184 => Some("Akamai"),
         151 => Some("Fastly"),
         64 | 130 | 143 | 144 => Some("CloudFront"),
-        34 | 35 | 142 | 172 | 209 => Some("Google Cloud"),
+        34 => {
+            if second_octet < 128 {
+                Some("Google Cloud")
+            } else {
+                Some("AWS")
+            }
+        }
+        35 | 142 | 172 | 209 => Some("Google Cloud"),
         3 | 13 | 15 | 18 | 44 | 52 | 54 | 99 => Some("AWS"),
         20 | 40 | 168 | 191 => Some("Azure"),
         129 | 132 | 134 | 140 | 150 | 152 => Some("Oracle Cloud"),
@@ -574,6 +605,64 @@ mod tests {
                 "{cloudflare_ip} must resolve to provider=Cloudflare"
             );
         }
+    }
+
+    /// 2026-05-08 anchor (fix/abuseipdb-telegram-honesty): the
+    /// AWS allocation `34.192.0.0/10` (eu-west-1, eu-west-2,
+    /// ap-northeast-1, us-east-2) was missing from
+    /// `CLOUD_PROVIDER_RANGES`, so AWS Ireland IPs starting with
+    /// 34.x leaked through `is_cloud_provider_ip` returning false
+    /// and reached the AbuseIPDB autoblock gate — exactly the
+    /// shape that produced the operator's prod alert about
+    /// 34.253.181.30 (Score 8/100 + Amazon Technologies Inc.). The
+    /// anchor uses the actual prod IP plus the boundary endpoints
+    /// of the new CIDR so a future "tighten allocations" refactor
+    /// can't silently re-open the gap.
+    #[test]
+    fn aws_eu_west_1_range_is_in_safelist() {
+        init();
+        // The exact prod IP from the 2026-05-07 alert.
+        assert!(
+            is_cloud_provider_ip("34.253.181.30"),
+            "34.253.181.30 (AWS Ireland eu-west-1, the prod IP that \
+             triggered this fix) must be in the safelist"
+        );
+        // Boundary endpoints of 34.192.0.0/10.
+        assert!(
+            is_cloud_provider_ip("34.192.0.0"),
+            "34.192.0.0 (low end of AWS 34.192/10) must be in the safelist"
+        );
+        assert!(
+            is_cloud_provider_ip("34.255.255.255"),
+            "34.255.255.255 (high end of AWS 34.192/10) must be in the safelist"
+        );
+        // GCP 34.0.0.0/9 must still match — that range was already
+        // in the safelist and this PR must not regress it.
+        assert!(
+            is_cloud_provider_ip("34.95.197.36"),
+            "34.95.197.36 (GCP) must remain in the safelist"
+        );
+    }
+
+    /// Mirror anchor: `identify_provider` for the same prod IP must
+    /// label it "AWS", not "Google Cloud" (the pre-fix first-octet
+    /// heuristic blanket-tagged 34.x as Google). Operator-honesty:
+    /// the journal log line that says "skipped: ip belongs to AWS"
+    /// has to match the WHOIS panel the operator sees in the same
+    /// dashboard, otherwise the suppression looks wrong even when
+    /// it is correct.
+    #[test]
+    fn aws_eu_west_1_identifies_as_aws_not_google() {
+        // Below the 34.128 boundary: GCP. Above: AWS.
+        assert_eq!(identify_provider("34.95.197.36"), Some("Google Cloud"));
+        assert_eq!(identify_provider("34.127.255.255"), Some("Google Cloud"));
+        assert_eq!(identify_provider("34.128.0.0"), Some("AWS"));
+        assert_eq!(
+            identify_provider("34.253.181.30"),
+            Some("AWS"),
+            "34.253.181.30 (the prod alert IP) must label as AWS"
+        );
+        assert_eq!(identify_provider("34.255.255.255"), Some("AWS"));
     }
 
     #[test]

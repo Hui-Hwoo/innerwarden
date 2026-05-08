@@ -129,7 +129,18 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
     // Critical reverse_shell incident with comm=ssh / target_port=22
     // / target_ip=github.com (Azure 20.x). Same FP class as the
     // kill_chain DATA_EXFIL and data_exfil_ebpf paths.
-    const SENSOR_NSS_INIT_DETECTORS: &[&str] = &["data_exfil_ebpf", "reverse_shell"];
+    // 2026-05-08 (fix/abuseipdb-telegram-honesty): added "kill_chain".
+    // Operator's prod 2026-05-07 hit a Critical kill_chain DATA_EXFIL
+    // incident from `wget` (uid=0, c2_ip=34.253.181.30 AWS Ireland,
+    // c2_port=0, chain_bits=[socket, sensitive_read]). The operator
+    // was running `sudo apt update` or similar — wget reads NSS/CA
+    // bundles before the outbound TLS handshake, which the kill_chain
+    // detector binarises as `sensitive_read + socket = DATA_EXFIL`.
+    // Same FP class as data_exfil_ebpf but the kill_chain detector
+    // lacks the `sensitive_file` field, so the suppression matches on
+    // a stricter shape (see the `"kill_chain"` arm of `signature_match`
+    // below).
+    const SENSOR_NSS_INIT_DETECTORS: &[&str] = &["data_exfil_ebpf", "reverse_shell", "kill_chain"];
     // Mirror of `NSS_INIT_CLI_TOOLS` in
     // `crates/sensor/src/detectors/data_exfil_ebpf.rs`. Keep this list
     // in lock-step — a tool prefix in one side but not the other
@@ -212,6 +223,46 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
                 .unwrap_or(0);
             target_port == 22
         }
+        "kill_chain" => {
+            // Pattern: DATA_EXFIL with the bare-minimum chain_bits
+            // (`["socket", "sensitive_read"]`). The kill_chain
+            // detector does NOT expose which file was read, so we
+            // can't filter by `/etc/passwd` like data_exfil_ebpf
+            // does. Instead we match on the narrowest signature:
+            //   * pattern == DATA_EXFIL (not C2_BEACON, not PRIVESC)
+            //   * chain_bits exact = [socket, sensitive_read] (no
+            //     escalation, no privesc, no c2_callback)
+            //   * c2_port == 0 (the kill_chain didn't observe an
+            //     attacker-flavored connect; just any outbound)
+            //
+            // Real exfil chains pick up additional bits before
+            // emitting (privesc, c2_callback, lateral_move). A bare
+            // 2-bit chain on a known-fetcher comm is the wget/curl/
+            // apt/cargo startup pattern.
+            let pattern = evidence
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if pattern != "DATA_EXFIL" {
+                false
+            } else {
+                let chain_bits_exact = evidence
+                    .get("chain_bits")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        let bits: Vec<&str> = a.iter().filter_map(|b| b.as_str()).collect();
+                        bits.len() == 2
+                            && bits.contains(&"socket")
+                            && bits.contains(&"sensitive_read")
+                    })
+                    .unwrap_or(false);
+                let c2_port = evidence
+                    .get("c2_port")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                chain_bits_exact && c2_port == 0
+            }
+        }
         _ => false,
     };
     if !signature_match {
@@ -254,6 +305,15 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
              reverse-shell at the kernel level. Real reverse shells use \
              non-22 ports (4444, 1337, ...). Mirrors the sensor's NSS-init \
              suppression in reverse_shell.rs."
+        ),
+        "kill_chain" => format!(
+            "Auto-dismissed: {detector} fired DATA_EXFIL on {comm} \
+             (chain_bits = [socket, sensitive_read], c2_port = 0). This \
+             is the operator-tool startup pattern (wget/curl/apt/cargo \
+             etc reading NSS/CA bundles before TLS handshake). Real exfil \
+             chains pick up additional bits (privesc, c2_callback) and \
+             carry a non-zero c2_port. Suppression matches only the bare \
+             2-bit chain from a known fetcher binary."
         ),
         _ => format!(
             "Auto-dismissed: {detector} fired on {comm} (NSS-init \
@@ -982,6 +1042,166 @@ mod tests {
             "proto_anomaly on Azure IP with prior ssh_bruteforce in last 24h \
              MUST NOT be auto-dismissed — operator's 2026-05-06 safety case \
              (real attacker on cloud VM)"
+        );
+    }
+
+    // ── kill_chain wget FP anchors (fix/abuseipdb-telegram-honesty 2026-05-08) ──
+    //
+    // Operator's prod 2026-05-07 23:40 hit a Critical kill_chain
+    // DATA_EXFIL incident on `wget` running as root, target
+    // 34.253.181.30 (AWS Ireland). Real story: operator was running
+    // `sudo apt update` (or any wget-based package manager / cargo
+    // install / GitHub release fetch). The kill_chain detector
+    // captures `socket + sensitive_read` as a 2-bit DATA_EXFIL
+    // pattern; wget reads NSS/CA bundles before its TLS handshake
+    // and that's bit-identical to "sensitive_read + outbound
+    // socket". Same FP class as the data_exfil_ebpf NSS-init fix
+    // (PR #350) and reverse_shell ssh fix, but kill_chain is a
+    // separate detector path and was not covered.
+
+    fn make_kill_chain_data_exfil_incident(
+        comm: &str,
+        chain_bits: &[&str],
+        c2_ip: &str,
+        c2_port: u64,
+    ) -> innerwarden_core::incident::Incident {
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::incident::Incident;
+        Incident {
+            ts: Utc::now(),
+            host: "test-host".into(),
+            incident_id: format!(
+                "kill_chain:detected:DATA_EXFIL:612279:{}",
+                Utc::now().format("%Y-%m-%dT%H:%MZ")
+            ),
+            severity: Severity::Critical,
+            title: format!("Kill chain detected: DATA_EXFIL (PID 612279, {comm})"),
+            summary: format!("PID 612279 ({comm}) completed DATA_EXFIL pattern"),
+            evidence: serde_json::json!([{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "chain_bits": chain_bits,
+                "comm": comm,
+                "pid": 612279,
+                "uid": 0,
+                "c2_ip": c2_ip,
+                "c2_port": c2_port,
+            }]),
+            recommended_checks: vec![],
+            tags: vec!["kill_chain".to_string(), "data_exfil".to_string()],
+            entities: vec![EntityRef::ip(c2_ip)],
+        }
+    }
+
+    /// The exact prod incident shape: kill_chain DATA_EXFIL on wget
+    /// with chain_bits = [socket, sensitive_read] and c2_port = 0.
+    /// Pre-fix: this fell through to the AbuseIPDB autoblock path
+    /// and the operator got an "Instant kill — known threat" Telegram
+    /// alert about an AWS-hosted apt repo.
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_dismisses_kill_chain_wget_pattern() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_kill_chain_data_exfil_incident(
+            "wget",
+            &["socket", "sensitive_read"],
+            "34.253.181.30",
+            0,
+        );
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            dismissed,
+            "kill_chain DATA_EXFIL with bare 2-bit chain on wget MUST be \
+             auto-dismissed (the prod FP class from 2026-05-07)"
+        );
+    }
+
+    /// Mirror for curl/apt/cargo: the suppression must hit the whole
+    /// NSS_INIT_TOOL_PREFIXES list, not just wget.
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_dismisses_kill_chain_for_all_nss_init_tools() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        for tool in ["curl", "apt", "apt-get", "cargo", "git", "pip3"] {
+            let inc = make_kill_chain_data_exfil_incident(
+                tool,
+                &["socket", "sensitive_read"],
+                "34.253.181.30",
+                0,
+            );
+            let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+            assert!(
+                dismissed,
+                "{tool} kill_chain DATA_EXFIL with bare 2-bit chain MUST be \
+                 auto-dismissed (NSS-init operator-tool pattern)"
+            );
+        }
+    }
+
+    /// Anti-regression: a real attacker chain has more bits than
+    /// just socket+sensitive_read (privesc, c2_callback, etc.). The
+    /// suppression must NOT fire when the chain has additional bits.
+    /// Pre-fix this test would have been irrelevant (no kill_chain
+    /// suppression existed); post-fix it pins that we only suppress
+    /// the bare-2-bit shape.
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_with_extra_bits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        // 3-bit chain: socket + sensitive_read + privesc — clearly
+        // an attacker pattern even from a known fetcher comm.
+        let inc = make_kill_chain_data_exfil_incident(
+            "wget",
+            &["socket", "sensitive_read", "privesc"],
+            "34.253.181.30",
+            0,
+        );
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            !dismissed,
+            "kill_chain with 3+ bits must reach AI router (real attacker shape)"
+        );
+    }
+
+    /// Anti-regression: a non-zero c2_port indicates the kill_chain
+    /// observed a flagged attacker-port (e.g. 4444, 1337). Even with
+    /// the bare 2-bit chain, that's enough signal to keep the
+    /// incident visible.
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_with_c2_port() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_kill_chain_data_exfil_incident(
+            "wget",
+            &["socket", "sensitive_read"],
+            "10.0.0.5",
+            4444,
+        );
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            !dismissed,
+            "kill_chain with c2_port != 0 must reach AI router (attacker-flagged port)"
+        );
+    }
+
+    /// Anti-regression: an unknown comm with the bare 2-bit chain
+    /// must still fire. Operator's bespoke binary doing
+    /// sensitive_read + outbound is suspicious.
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_unknown_comm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_kill_chain_data_exfil_incident(
+            "evil-tool",
+            &["socket", "sensitive_read"],
+            "10.0.0.5",
+            0,
+        );
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            !dismissed,
+            "unknown comm doing kill_chain DATA_EXFIL must reach AI router"
         );
     }
 }
