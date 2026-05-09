@@ -202,6 +202,18 @@
       </div>
     </div>
 
+    <!-- 5b. HOST POSTURE (spec 044 Phase 4): live snapshot of sshd /
+         services / sudo / firewall. Read-only — refreshed by the
+         agent's slow loop every 10 min. The downgrade engine reads
+         this same data; surfacing it here lets the operator see WHY
+         certain alerts get demoted. -->
+    <div class="home-section" id="postureSection">
+      <div class="home-section-title">Host posture</div>
+      <div id="postureContent" style="font-size:0.78rem;color:var(--text);line-height:1.55">
+        <div style="color:var(--muted)">Loading posture&hellip;</div>
+      </div>
+    </div>
+
     <!-- 6. SYSTEM HEALTH LINE: 1-row summary. ✓ when healthy. -->
     <div class="home-health-line" id="homeHealthLine">
       <span class="home-health-icon" id="homeHealthIcon" aria-hidden="true">

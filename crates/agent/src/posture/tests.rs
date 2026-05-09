@@ -570,6 +570,112 @@ fn firewall_would_drop_port_only_when_drop_policy_and_not_allowed() {
 }
 
 // ---------------------------------------------------------------------------
+// telegram_summary
+// ---------------------------------------------------------------------------
+
+/// Spec 044 Phase 4 anchor: `/posture` Telegram command renders all
+/// four sections (sshd / services / sudo / firewall). When every
+/// probe is Ok and populated, the message must include each section's
+/// header, the captured-at timestamp, and the snapshot age footer.
+#[test]
+fn telegram_summary_renders_all_sections_when_probes_ok() {
+    let posture = HostPosture {
+        sshd: parse_sshd_dump(
+            "\
+port 22
+passwordauthentication no
+kbdinteractiveauthentication no
+permitrootlogin no
+pubkeyauthentication yes
+maxauthtries 3
+",
+        ),
+        services: super::services::ServicesPosture {
+            probe_state: ProbeState::Ok,
+            listeners: vec![super::services::Listener {
+                proto: super::services::Proto::Tcp,
+                port: 22,
+                addr: "0.0.0.0".to_string(),
+                comm: "sshd".to_string(),
+            }],
+            error: None,
+        },
+        sudo: super::sudo::SudoPosture {
+            probe_state: ProbeState::Ok,
+            sudo_group_members: vec!["ubuntu".to_string()],
+            ..Default::default()
+        },
+        firewall: super::firewall::FirewallPosture {
+            probe_state: ProbeState::Ok,
+            active_backends: vec![super::firewall::FirewallBackend::Ufw],
+            default_policy: super::firewall::DefaultPolicy::Drop,
+            allowed_tcp_ports: vec![22, 8787],
+            error: None,
+        },
+        captured_at: chrono::Utc::now(),
+    };
+    let msg = telegram_summary(&posture);
+    assert!(msg.contains("Host posture"));
+    assert!(msg.contains("SSHD"));
+    assert!(msg.contains("Listening services"));
+    assert!(msg.contains("Sudo"));
+    assert!(msg.contains("Firewall"));
+    assert!(msg.contains("ubuntu"));
+    assert!(msg.contains("22"));
+    assert!(msg.contains("8787"));
+    assert!(msg.contains("Last refresh:"));
+}
+
+/// Failed/Unavailable probe states render a "(probe …)" hint instead
+/// of fabricating fields. The downgrade engine treats those surfaces
+/// as permissive; the operator must see the same truth on Telegram.
+#[test]
+fn telegram_summary_renders_probe_failed_states_without_panic() {
+    let posture = HostPosture {
+        sshd: super::sshd::SshdPosture {
+            probe_state: ProbeState::Unavailable,
+            error: Some("sshd binary not found".to_string()),
+            ..Default::default()
+        },
+        services: super::services::ServicesPosture {
+            probe_state: ProbeState::Failed,
+            listeners: vec![],
+            error: Some("ss exit 1".to_string()),
+        },
+        sudo: super::sudo::SudoPosture {
+            probe_state: ProbeState::Unavailable,
+            ..Default::default()
+        },
+        firewall: super::firewall::FirewallPosture {
+            probe_state: ProbeState::Unavailable,
+            ..Default::default()
+        },
+        captured_at: chrono::Utc::now(),
+    };
+    let msg = telegram_summary(&posture);
+    assert!(msg.contains("Host posture"));
+    assert!(msg.contains("probe unavailable") || msg.contains("probe failed"));
+}
+
+/// HTML-injection probe: a sudoers.d filename containing `<script>`
+/// must be escaped, otherwise a malicious filename on the host could
+/// break Telegram rendering or hide content.
+#[test]
+fn telegram_summary_html_escapes_sudoers_filenames() {
+    let posture = HostPosture {
+        sudo: super::sudo::SudoPosture {
+            probe_state: ProbeState::Ok,
+            sudoers_d_filenames: vec!["evil<script>".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let msg = telegram_summary(&posture);
+    assert!(msg.contains("evil&lt;script&gt;"));
+    assert!(!msg.contains("evil<script>"));
+}
+
+// ---------------------------------------------------------------------------
 // Test-only helper to expose the otherwise-private from_yes_no /
 // from_permit_root_login parsers without leaking them from the module.
 // ---------------------------------------------------------------------------

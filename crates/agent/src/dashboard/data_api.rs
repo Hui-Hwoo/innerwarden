@@ -1329,6 +1329,34 @@ pub(super) async fn api_report_dates(State(state): State<DashboardState>) -> Jso
 // AI Intelligence Briefing
 // ---------------------------------------------------------------------------
 
+/// GET /api/posture — returns the live host posture snapshot.
+///
+/// Spec 044 Phase 4. Reads `data_dir/posture.json` written by the
+/// agent's slow-loop refresh tick (every 10 min). Returns a small
+/// envelope with the snapshot itself plus an `age_seconds` so the
+/// dashboard JS can render a "stale" badge when the snapshot has
+/// drifted past the refresh window.
+///
+/// When the file is missing the response shape is `{ "available": false }`
+/// — the dashboard JS shows a "snapshot pending" hint, the same way the
+/// briefing API handles a never-generated briefing.
+pub(super) async fn api_posture(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    match crate::posture::load(&state.data_dir) {
+        Some(posture) => {
+            let raw = serde_json::to_value(&posture).unwrap_or(serde_json::Value::Null);
+            Json(serde_json::json!({
+                "available": true,
+                "age_seconds": posture.age_seconds(),
+                "snapshot": raw,
+            }))
+        }
+        None => Json(serde_json::json!({
+            "available": false,
+            "message": "No posture snapshot yet. The agent writes posture.json at boot and refreshes every 10 min — restart the agent if this persists.",
+        })),
+    }
+}
+
 /// GET /api/briefing — returns the latest generated briefing
 pub(super) async fn api_briefing(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     let briefing = state.latest_briefing.lock().await;

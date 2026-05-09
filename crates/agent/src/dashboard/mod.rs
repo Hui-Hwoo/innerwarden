@@ -614,6 +614,9 @@ pub async fn serve(
         // AI Intelligence Briefing
         .route("/api/briefing", get(api_briefing))
         .route("/api/briefing/generate", post(api_briefing_generate))
+        // Spec 044 Phase 4 — live host posture snapshot consumed by
+        // the Health tab's posture card.
+        .route("/api/posture", get(api_posture))
         // AI Explain — plain-language threat explanation for non-technical operators
         .route("/api/ai-explain", get(api_ai_explain))
         // Sensors activity

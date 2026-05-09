@@ -1412,6 +1412,12 @@ impl TelegramClient {
                                     "__watch__".to_string()
                                 } else if text == "/doctor" || text.starts_with("/doctor ") {
                                     "__doctor__".to_string()
+                                } else if text == "/posture" || text.starts_with("/posture ") {
+                                    // Spec 044 Phase 4: prints the live host
+                                    // posture snapshot the downgrade engine
+                                    // reads. Format mirrors `innerwarden get
+                                    // posture` but as Telegram HTML.
+                                    "__posture__".to_string()
                                 } else if text == "/capabilities"
                                     || text.starts_with("/capabilities ")
                                     || text == "/list"

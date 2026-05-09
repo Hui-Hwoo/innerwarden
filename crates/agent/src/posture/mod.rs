@@ -136,6 +136,194 @@ pub fn load(data_dir: &Path) -> Option<HostPosture> {
     }
 }
 
+/// Render a Telegram-flavoured (HTML) summary of the snapshot.
+/// Used by the `/posture` bot command (Phase 4). Mirrors the same
+/// information as `innerwarden get posture` but with `<b>` markup
+/// and per-section emoji so it reads as one coherent message in a
+/// chat thread.
+///
+/// Probe sections that returned `Unavailable` / `Failed` render a
+/// short "(probe failed)" line with the captured error rather than
+/// fabricating data — the operator sees the truth: the agent has
+/// no opinion on that surface, so the downgrade engine treated it
+/// as permissive.
+pub fn telegram_summary(posture: &HostPosture) -> String {
+    let mut s = String::with_capacity(1024);
+    s.push_str("\u{1f6e1}\u{fe0f} <b>Host posture</b>\n");
+    s.push_str(&format!(
+        "<i>Snapshot: {}</i>\n\n",
+        posture.captured_at.format("%Y-%m-%d %H:%M UTC")
+    ));
+
+    // SSHD ────────────────────────────────────────────────────────────────
+    s.push_str("\u{1f511} <b>SSHD</b>");
+    match posture.sshd.probe_state {
+        sshd::ProbeState::Ok => {
+            s.push('\n');
+            s.push_str(&format!(
+                "  PasswordAuthentication: <b>{:?}</b>\n",
+                posture.sshd.password_authentication
+            ));
+            s.push_str(&format!(
+                "  KbdInteractiveAuthentication: <b>{:?}</b>\n",
+                posture.sshd.kbd_interactive_authentication
+            ));
+            s.push_str(&format!(
+                "  PermitRootLogin: <b>{:?}</b>\n",
+                posture.sshd.permit_root_login
+            ));
+            s.push_str(&format!(
+                "  PubkeyAuthentication: <b>{:?}</b>\n",
+                posture.sshd.pubkey_authentication
+            ));
+            if let Some(n) = posture.sshd.max_auth_tries {
+                s.push_str(&format!("  MaxAuthTries: <b>{n}</b>\n"));
+            }
+            if !posture.sshd.ports.is_empty() {
+                let ports = posture
+                    .sshd
+                    .ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                s.push_str(&format!("  Ports: <b>{ports}</b>\n"));
+            }
+        }
+        state => {
+            s.push_str(&format!(" (probe {})\n", state.label()));
+            if let Some(err) = posture.sshd.error.as_ref() {
+                let trimmed = err.chars().take(120).collect::<String>();
+                s.push_str(&format!(
+                    "  <i>{}</i>\n",
+                    crate::telegram::escape_html_pub(&trimmed)
+                ));
+            }
+        }
+    }
+
+    // Listening services ──────────────────────────────────────────────────
+    s.push_str("\n\u{1f4e1} <b>Listening services</b>");
+    match posture.services.probe_state {
+        sshd::ProbeState::Ok => {
+            s.push_str(&format!(
+                " ({} listeners)\n",
+                posture.services.listeners.len()
+            ));
+            // Cap to 12 listeners in the Telegram message — the rest is
+            // paginated via `innerwarden get posture` on the host.
+            for l in posture.services.listeners.iter().take(12) {
+                let proto = match l.proto {
+                    services::Proto::Tcp => "tcp",
+                    services::Proto::Udp => "udp",
+                };
+                let comm = if l.comm.is_empty() {
+                    "?"
+                } else {
+                    l.comm.as_str()
+                };
+                s.push_str(&format!(
+                    "  {proto} {addr}:{port}  <i>{comm}</i>\n",
+                    addr = crate::telegram::escape_html_pub(&l.addr),
+                    port = l.port,
+                    comm = crate::telegram::escape_html_pub(comm),
+                ));
+            }
+            if posture.services.listeners.len() > 12 {
+                s.push_str(&format!(
+                    "  <i>+{} more — see `innerwarden get posture`</i>\n",
+                    posture.services.listeners.len() - 12
+                ));
+            }
+        }
+        state => {
+            s.push_str(&format!(" (probe {})\n", state.label()));
+        }
+    }
+
+    // Sudo ────────────────────────────────────────────────────────────────
+    s.push_str("\n\u{1f6a8} <b>Sudo</b>");
+    match posture.sudo.probe_state {
+        sshd::ProbeState::Ok => {
+            s.push('\n');
+            for (label, members) in [
+                ("group sudo", &posture.sudo.sudo_group_members),
+                ("group wheel", &posture.sudo.wheel_group_members),
+                ("group admin", &posture.sudo.admin_group_members),
+            ] {
+                if !members.is_empty() {
+                    let names = members
+                        .iter()
+                        .map(|n| crate::telegram::escape_html_pub(n))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    s.push_str(&format!("  {label}: <b>{names}</b>\n"));
+                }
+            }
+            if !posture.sudo.sudoers_d_filenames.is_empty() {
+                let names = posture
+                    .sudo
+                    .sudoers_d_filenames
+                    .iter()
+                    .map(|n| crate::telegram::escape_html_pub(n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                s.push_str(&format!("  /etc/sudoers.d: <b>{names}</b>\n"));
+            }
+        }
+        state => {
+            s.push_str(&format!(" (probe {})\n", state.label()));
+        }
+    }
+
+    // Firewall ────────────────────────────────────────────────────────────
+    s.push_str("\n\u{1f6e1}\u{fe0f} <b>Firewall</b>");
+    match posture.firewall.probe_state {
+        sshd::ProbeState::Ok => {
+            s.push('\n');
+            if !posture.firewall.active_backends.is_empty() {
+                let backends = posture
+                    .firewall
+                    .active_backends
+                    .iter()
+                    .map(|b| match b {
+                        firewall::FirewallBackend::Ufw => "ufw",
+                        firewall::FirewallBackend::Iptables => "iptables",
+                        firewall::FirewallBackend::Nftables => "nftables",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                s.push_str(&format!("  Backends: <b>{backends}</b>\n"));
+            }
+            s.push_str(&format!(
+                "  Default INPUT: <b>{:?}</b>\n",
+                posture.firewall.default_policy
+            ));
+            if !posture.firewall.allowed_tcp_ports.is_empty() {
+                let ports = posture
+                    .firewall
+                    .allowed_tcp_ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                s.push_str(&format!("  Allowed TCP: <b>{ports}</b>\n"));
+            }
+        }
+        state => {
+            s.push_str(&format!(" (probe {})\n", state.label()));
+        }
+    }
+
+    let age = posture.age_seconds();
+    if age >= 0 {
+        s.push_str(&format!(
+            "\n<i>Last refresh: {age}s ago (slow loop refreshes every 600s)</i>"
+        ));
+    }
+    s
+}
+
 /// Take a fresh snapshot, log a one-line summary, and persist. Called
 /// at boot (Phase 2 wiring) and from the slow loop refresh tick (Phase
 /// 2.2). Errors are logged but not propagated — posture is best-effort.

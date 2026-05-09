@@ -78,6 +78,7 @@ async function loadHome() {
     // contradictory state on one screen.
     syncModeBadgeFromHealth(overview, actionCfg);
     loadBriefing();
+    loadPosture();
   } catch(e) { console.warn('loadHome error:', e); }
 }
 
@@ -917,6 +918,123 @@ async function loadBriefing() {
         esc("Briefing temporarily unavailable. Click Regenerate to retry.") +
         '</div>';
     }
+  }
+}
+
+// Spec 044 Phase 4: render the live host posture snapshot the
+// downgrade engine reads. The card always shows something — fresh
+// snapshot, stale snapshot warning, or "snapshot pending" hint when
+// the agent has not produced one yet. The dashboard never renders
+// fabricated fields; if a probe failed, the operator sees the truth.
+async function loadPosture() {
+  var content = document.getElementById('postureContent');
+  if (!content) return;
+  try {
+    var data = await loadJson('/api/posture');
+    if (!data.available) {
+      content.innerHTML = '<div style="color:var(--muted)">' +
+        esc(data.message || 'Snapshot pending — restart the agent if this persists.') +
+        '</div>';
+      return;
+    }
+    var snap = data.snapshot || {};
+    var sshd = snap.sshd || {};
+    var services = snap.services || {};
+    var sudo = snap.sudo || {};
+    var firewall = snap.firewall || {};
+
+    var ageSecs = data.age_seconds || 0;
+    var stale = ageSecs > 1800;  // 30 min — past the 10-min refresh window with margin.
+    var ageLabel = (stale ? '⚠️ stale ' : '') +
+      (ageSecs < 60 ? ageSecs + 's' : Math.floor(ageSecs/60) + 'm') + ' ago';
+    var ageColor = stale ? 'var(--warn)' : 'var(--muted)';
+
+    function probeBadge(state) {
+      if (state === 'ok') return '<span style="color:var(--ok);font-size:0.6rem;font-weight:700">OK</span>';
+      if (state === 'failed') return '<span style="color:var(--warn);font-size:0.6rem;font-weight:700">FAILED</span>';
+      if (state === 'unavailable') return '<span style="color:var(--muted);font-size:0.6rem;font-weight:700">N/A</span>';
+      return '<span style="color:var(--muted);font-size:0.6rem;font-weight:700">PENDING</span>';
+    }
+
+    function row(label, value) {
+      return '<div style="display:flex;justify-content:space-between;padding:2px 0">' +
+        '<span style="color:var(--muted)">' + esc(label) + '</span>' +
+        '<span style="font-weight:600">' + esc(value) + '</span>' +
+        '</div>';
+    }
+
+    var html = '<div style="display:flex;justify-content:space-between;font-size:0.65rem;color:' + ageColor + ';margin-bottom:6px">' +
+      '<span>Snapshot ' + esc(ageLabel) + '</span>' +
+      '<span>' + esc(snap.captured_at || '') + '</span>' +
+      '</div>';
+
+    // SSHD
+    html += '<div style="margin-bottom:8px"><div style="font-weight:700;margin-bottom:4px">SSHD ' + probeBadge(sshd.probe_state) + '</div>';
+    if (sshd.probe_state === 'ok') {
+      html += row('PasswordAuthentication', sshd.password_authentication || '?');
+      html += row('KbdInteractiveAuthentication', sshd.kbd_interactive_authentication || '?');
+      html += row('PermitRootLogin', sshd.permit_root_login || '?');
+      html += row('PubkeyAuthentication', sshd.pubkey_authentication || '?');
+      if (sshd.max_auth_tries != null) html += row('MaxAuthTries', sshd.max_auth_tries);
+      if (sshd.ports && sshd.ports.length) html += row('Ports', sshd.ports.join(', '));
+    } else if (sshd.error) {
+      html += '<div style="color:var(--muted);font-size:0.7rem">' + esc(sshd.error) + '</div>';
+    }
+    html += '</div>';
+
+    // Services
+    html += '<div style="margin-bottom:8px"><div style="font-weight:700;margin-bottom:4px">Listening services ' + probeBadge(services.probe_state) + '</div>';
+    if (services.probe_state === 'ok' && services.listeners) {
+      html += row('Listener count', services.listeners.length);
+      var topListeners = services.listeners.slice(0, 8);
+      html += '<div style="font-family:monospace;font-size:0.7rem;margin-top:4px">';
+      topListeners.forEach(function(l) {
+        html += esc(l.proto + ' ' + l.addr + ':' + l.port + (l.comm ? '  ' + l.comm : '')) + '<br>';
+      });
+      if (services.listeners.length > 8) {
+        html += '<em>+' + (services.listeners.length - 8) + ' more</em>';
+      }
+      html += '</div>';
+    } else if (services.error) {
+      html += '<div style="color:var(--muted);font-size:0.7rem">' + esc(services.error) + '</div>';
+    }
+    html += '</div>';
+
+    // Sudo
+    html += '<div style="margin-bottom:8px"><div style="font-weight:700;margin-bottom:4px">Sudo ' + probeBadge(sudo.probe_state) + '</div>';
+    if (sudo.probe_state === 'ok') {
+      ['sudo_group_members', 'wheel_group_members', 'admin_group_members'].forEach(function(key) {
+        if (sudo[key] && sudo[key].length) {
+          html += row(key.replace(/_/g, ' '), sudo[key].join(', '));
+        }
+      });
+      if (sudo.sudoers_d_filenames && sudo.sudoers_d_filenames.length) {
+        html += row('/etc/sudoers.d', sudo.sudoers_d_filenames.join(', '));
+      }
+    } else if (sudo.error) {
+      html += '<div style="color:var(--muted);font-size:0.7rem">' + esc(sudo.error) + '</div>';
+    }
+    html += '</div>';
+
+    // Firewall
+    html += '<div><div style="font-weight:700;margin-bottom:4px">Firewall ' + probeBadge(firewall.probe_state) + '</div>';
+    if (firewall.probe_state === 'ok') {
+      if (firewall.active_backends && firewall.active_backends.length) {
+        html += row('Active backends', firewall.active_backends.join(', '));
+      }
+      html += row('Default INPUT', firewall.default_policy || '?');
+      if (firewall.allowed_tcp_ports && firewall.allowed_tcp_ports.length) {
+        html += row('Allowed TCP', firewall.allowed_tcp_ports.join(', '));
+      }
+    } else if (firewall.error) {
+      html += '<div style="color:var(--muted);font-size:0.7rem">' + esc(firewall.error) + '</div>';
+    }
+    html += '</div>';
+
+    content.innerHTML = html;
+  } catch(e) {
+    console.warn('loadPosture error:', e);
+    content.innerHTML = '<div style="color:var(--warn);font-size:0.7rem">Posture temporarily unavailable.</div>';
   }
 }
 

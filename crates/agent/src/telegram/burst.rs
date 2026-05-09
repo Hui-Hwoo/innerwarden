@@ -72,13 +72,21 @@ pub fn format_daily_digest_enriched(
     // posture, and so was anti-informative. Phase 3 of spec 044 introduces posture-aware
     // severity to fix the underlying signal-vs-noise problem; this phase just stops lying.
     if is_simple {
+        // Spec 044 Phase 4 (2026-05-09): "real compromises" wording. The
+        // counts here are POST-downgrade (see narrative_daily_summary.rs::
+        // maybe_write_daily_summary_and_digest, which routes every
+        // incident through posture::downgrade::effective_severity before
+        // tallying). So a "high" count of 0 with 60 silent SSH
+        // bruteforces below means "60 attempts, none would have worked
+        // given the host's posture", not "no high-severity detections
+        // happened today". The wording reflects what the count means.
         let mut msg = format!(
             "\u{1f6e1}\u{fe0f} <b>Daily Security Briefing</b>\n\
              \n\
              While you were away, InnerWarden:\n\
              \u{00a0}\u{00a0}\u{2022} Blocked <b>{blocks_today}</b> attacks\n\
              \u{00a0}\u{00a0}\u{2022} Analyzed <b>{incidents_today}</b> security events\n\
-             \u{00a0}\u{00a0}\u{2022} Detected <b>{critical_count}</b> critical, <b>{high_count}</b> high severity threats"
+             \u{00a0}\u{00a0}\u{2022} Detected <b>{critical_count}</b> real compromises, <b>{high_count}</b> high-severity threats (post-posture)"
         );
 
         // Deferred incident breakdown — the bulk of silent work.
@@ -452,6 +460,50 @@ mod tests {
                 "found 🔴 (health emoji) in: {msg}"
             );
         }
+    }
+
+    /// Spec 044 Phase 4 anchor (2026-05-09): the `Detected X critical, Y
+    /// high severity threats` wording was renamed to "real compromises"
+    /// after the Phase 3 downgrade engine landed. The counts are now
+    /// post-downgrade — a high count of 0 alongside 60 silent SSH
+    /// bruteforces means "60 attempts, none would have worked given
+    /// posture", not "no high-severity detections happened today". The
+    /// wording must reflect what the count means, otherwise the
+    /// briefing is back to lying about what 'high' is. This anchor pins
+    /// the new copy so future edits to this template trigger an
+    /// explicit conversation.
+    #[test]
+    fn format_daily_digest_enriched_uses_real_compromises_wording() {
+        let pipeline = PipelineDigestStats {
+            suppressed_count: 30,
+            auto_resolved_groups: 160,
+            needs_review_groups: 30,
+            deferred: vec![("proto_anomaly".to_string(), 60)],
+        };
+        let msg = format_daily_digest_enriched(
+            316,
+            47,
+            1,  // critical (post-downgrade)
+            61, // high (post-downgrade)
+            "proto_anomaly",
+            60,
+            true,
+            &pipeline,
+        );
+        assert!(
+            msg.contains("real compromises"),
+            "Phase 4 wording missing in: {msg}"
+        );
+        assert!(
+            msg.contains("post-posture"),
+            "Phase 4 hint about post-downgrade meaning missing in: {msg}"
+        );
+        // The previous "high severity threats" wording is retained
+        // (with "high-severity" hyphenated) so the operator still sees
+        // the high-count line — the change is the *meaning*, not the
+        // disappearance of the high count.
+        assert!(msg.contains("61"), "high count must still be visible");
+        assert!(msg.contains("1"), "critical count must still be visible");
     }
 
     #[test]

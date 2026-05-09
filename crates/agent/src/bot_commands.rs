@@ -219,6 +219,7 @@ pub(crate) async fn handle_telegram_bot_command(
                 /enable &lt;id&gt; - activate a capability\n\
                 /disable &lt;id&gt; - deactivate a capability\n\
                 /doctor - full health check with fix hints\n\
+                /posture - host posture snapshot (sshd / sudo / firewall)\n\
                 \n\
                 <b>Mode</b>\n\
                 /guard - auto-defend (I act autonomously)\n\
@@ -765,6 +766,22 @@ pub(crate) async fn handle_telegram_bot_command(
                     let _ = tg.send_text_message(&text).await;
                 }
             });
+        }
+        return true;
+    }
+
+    // /posture - render the live host posture snapshot. Spec 044 Phase 4.
+    //
+    // Renders directly from `state.host_posture` (not from disk) so the
+    // operator sees the same in-memory snapshot the downgrade engine
+    // is using right now. The slow loop refreshes every 10 min; the
+    // message footer prints the snapshot age so the operator can tell
+    // whether they are seeing a fresh probe or a stale one.
+    if result.incident_id == "__posture__" {
+        info!(operator = %result.operator_name, "Telegram /posture command received");
+        if cfg.telegram.bot.enabled {
+            let text = crate::posture::telegram_summary(&state.host_posture);
+            tg_reply(state, text);
         }
         return true;
     }
