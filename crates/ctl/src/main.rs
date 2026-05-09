@@ -1254,6 +1254,16 @@ enum GetCommand {
     ///   innerwarden get sensors
     Sensors,
 
+    /// Show the host posture snapshot (sshd / services / sudo / firewall).
+    ///
+    /// Read-only view of the snapshot the agent uses for severity
+    /// downgrade (spec 044 Phase 2). Refreshed by the agent every
+    /// 10 min — this command just pretty-prints `data_dir/posture.json`.
+    ///
+    /// Examples:
+    ///   innerwarden get posture
+    Posture,
+
     /// Show the full activity history for an IP or user.
     ///
     /// Examples:
@@ -2215,6 +2225,7 @@ fn main() -> Result<()> {
             }
             GetCommand::Metrics => commands::status::cmd_metrics(&cli, &cli.data_dir.clone()),
             GetCommand::Sensors => commands::status::cmd_sensor_status(&cli, &cli.data_dir.clone()),
+            GetCommand::Posture => commands::status::cmd_posture(&cli, &cli.data_dir.clone()),
             GetCommand::Entity { ref target, days } => {
                 commands::history::cmd_entity(&cli, target, *days, &cli.data_dir.clone())
             }

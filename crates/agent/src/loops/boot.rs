@@ -906,6 +906,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             profile
         },
         last_env_census_at: None,
+        host_posture: {
+            // Spec 044 Phase 2 (2026-05-09): take an initial posture
+            // snapshot at boot so the severity downgrade engine has a
+            // baseline before the first slow-loop refresh tick. Probes
+            // are best-effort — failures log a warn! and the snapshot
+            // is "permissive" until the next refresh.
+            posture::refresh_and_save(&cli.data_dir)
+        },
+        last_host_posture_at: Some(std::time::Instant::now()),
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(neural_lifecycle::AnomalyConfig {
             data_dir: cli.data_dir.clone(),
             ..Default::default()
@@ -2282,6 +2291,29 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                     }
                                 }
                                 state.last_env_census_at = Some(Instant::now());
+                            }
+                        }
+
+                        // Spec 044 Phase 2.2 (2026-05-09): refresh host
+                        // posture every 10 min so operator changes
+                        // (sshd_config edit, port opened, sudoers
+                        // modified) are picked up before the daily
+                        // briefing. The downgrade engine (Phase 3)
+                        // refuses to demote based on a snapshot older
+                        // than ~30 min — a 10 min cadence keeps the
+                        // freshness margin while shell-out cost stays
+                        // bounded.
+                        {
+                            const POSTURE_REFRESH_INTERVAL: std::time::Duration =
+                                std::time::Duration::from_secs(10 * 60);
+                            let due = state
+                                .last_host_posture_at
+                                .map(|t| t.elapsed() >= POSTURE_REFRESH_INTERVAL)
+                                .unwrap_or(true);
+                            if due {
+                                state.host_posture =
+                                    posture::refresh_and_save(&cli.data_dir);
+                                state.last_host_posture_at = Some(Instant::now());
                             }
                         }
 

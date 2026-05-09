@@ -24,8 +24,13 @@ async function testHoneypot() {
     const reason = 'Teste manual via dashboard';
     const resp = await fetch('/api/action/honeypot', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reason, duration_secs: 120 })
+      // x-requested-with required by CSRF middleware (audit I-14).
+      headers: {
+        'Content-Type': 'application/json',
+        'x-requested-with': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ reason, duration_secs: 120 }),
+      credentials: 'include',
     });
     const data = await resp.json();
     if (data.success) {

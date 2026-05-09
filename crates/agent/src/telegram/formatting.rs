@@ -1324,13 +1324,15 @@ mod tests {
         assert!(msg.contains("Good morning!"));
         assert!(msg.contains("30 attacks blocked"));
         assert!(msg.contains("2 critical threats"));
-        assert!(msg.contains("Health:"));
         // Bug 5 anchor (2026-05-06): with critical+high > 0 the digest
         // MUST NOT say "All clear" — that lied to the operator.
         assert!(!msg.contains("All clear. Nothing needs you."));
         assert!(msg.contains("Auto-handled \u{2014} review when convenient."));
-        // Score = 100 - 2*20 - 5*5 = 35 → 🔴
-        assert!(msg.contains("\u{1f534}"));
+        // Spec 044 Phase 1 (2026-05-09): "Health: X/100" line + health emoji
+        // removed. See burst.rs::format_daily_digest_omits_health_score for
+        // the canonical absence anchor.
+        assert!(!msg.contains("Health:"));
+        assert!(!msg.contains("/100"));
     }
 
     /// Bug 5 anchor (2026-05-06): non-enriched simple digest with
@@ -1358,24 +1360,6 @@ mod tests {
         assert!(msg.contains("30 blocks"));
         assert!(msg.contains("ssh_bruteforce: 15"));
         assert!(msg.contains("Critical: 2 | High: 5"));
-    }
-
-    #[test]
-    fn format_daily_digest_health_score() {
-        // Perfect score
-        let msg = format_daily_digest(5, 5, 0, 0, "port_scan", 5, true);
-        assert!(msg.contains("100/100"));
-        assert!(msg.contains("\u{1f7e2}")); // 🟢
-
-        // Yellow zone: 100 - 0*20 - 6*5 = 70
-        let msg = format_daily_digest(10, 10, 0, 6, "port_scan", 6, true);
-        assert!(msg.contains("70/100"));
-        assert!(msg.contains("\u{1f7e1}")); // 🟡
-
-        // Red zone: 100 - 3*20 - 10*5 = -10 → clamped to 0
-        let msg = format_daily_digest(50, 50, 3, 10, "ssh_bruteforce", 20, true);
-        assert!(msg.contains("0/100"));
-        assert!(msg.contains("\u{1f534}")); // 🔴
     }
 
     #[test]

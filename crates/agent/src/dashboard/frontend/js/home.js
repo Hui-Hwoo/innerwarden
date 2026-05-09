@@ -926,7 +926,15 @@ async function generateBriefing() {
   if (btn) { btn.textContent = 'Generating...'; btn.disabled = true; }
   if (content) content.innerHTML = '<div style="color:var(--accent)">Analyzing knowledge graph and generating briefing via AI...</div>';
   try {
-    var r = await fetch('/api/briefing/generate', { method: 'POST', cache: 'no-store' });
+    var r = await fetch('/api/briefing/generate', {
+      method: 'POST',
+      // CSRF middleware (audit I-14, mod.rs::csrf_protection) rejects every
+      // POST/PUT/PATCH/DELETE without this header with HTTP 403. Operator
+      // 2026-05-09 prod report: "tentei gerar briefing... Error: HTTP 403".
+      headers: { 'x-requested-with': 'XMLHttpRequest' },
+      credentials: 'include',
+      cache: 'no-store',
+    });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     var data = await r.json();
     if (data.error) {

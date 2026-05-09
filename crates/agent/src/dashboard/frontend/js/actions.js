@@ -190,8 +190,13 @@ async function submitAction() {
     }
     const resp = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      // x-requested-with required by CSRF middleware (audit I-14).
+      headers: {
+        'Content-Type': 'application/json',
+        'x-requested-with': 'XMLHttpRequest',
+      },
       body,
+      credentials: 'include',
       cache: 'no-store',
     });
     const data = await resp.json();

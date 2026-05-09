@@ -706,6 +706,98 @@ mod tests {
         );
         cmd_metrics(&cli, &data_dir).expect("populated telemetry metrics should render");
     }
+
+    /// Spec 044 Phase 2.3: `innerwarden get posture` reads the snapshot
+    /// the agent writes and pretty-prints it. The hint message when the
+    /// file is missing is the visible signal that the operator is on a
+    /// pre-spec-044 binary or that the agent has not booted yet.
+    #[test]
+    fn cmd_posture_missing_file_emits_hint_and_returns_ok() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("posture-data");
+        // Function returns Ok even when the file is missing — the
+        // operator sees the diagnostic via println, not via stderr.
+        cmd_posture(&cli, &data_dir).expect("missing snapshot is not an error");
+    }
+
+    /// All four probe surfaces present + ok: exercises every branch
+    /// of the pretty-printer (sshd directive lines, listener loop,
+    /// sudo group lines, sudoers.d list, firewall backend list,
+    /// allowed-ports list).
+    #[test]
+    fn cmd_posture_renders_full_snapshot_branches() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("posture-data");
+        let path = data_dir.join("posture.json");
+        let snap = r#"{
+          "captured_at": "2026-05-09T15:00:00Z",
+          "sshd": {
+            "probe_state": "ok",
+            "password_authentication": "no",
+            "kbd_interactive_authentication": "no",
+            "permit_root_login": "no",
+            "pubkey_authentication": "yes",
+            "max_auth_tries": 6,
+            "ports": [22, 2222]
+          },
+          "services": {
+            "probe_state": "ok",
+            "listeners": [
+              {"proto": "tcp", "port": 22, "addr": "0.0.0.0", "comm": "sshd"},
+              {"proto": "tcp", "port": 8787, "addr": "0.0.0.0", "comm": "innerwarden-age"}
+            ]
+          },
+          "sudo": {
+            "probe_state": "ok",
+            "sudo_group_members": ["alice", "deploy"],
+            "wheel_group_members": [],
+            "admin_group_members": [],
+            "sudoers_d_filenames": ["deploy", "zz-innerwarden-deny-bob"]
+          },
+          "firewall": {
+            "probe_state": "ok",
+            "active_backends": ["ufw"],
+            "default_policy": "drop",
+            "allowed_tcp_ports": [22, 8787]
+          }
+        }"#;
+        write_file(&path, snap);
+        cmd_posture(&cli, &data_dir).expect("full ok snapshot renders");
+    }
+
+    /// Failed / unavailable probes: exercises the error branch in each
+    /// section. Anchors that the command does NOT panic when probe
+    /// states are not Ok — the operator might have an agent running on
+    /// a host without sshd / nft / sudo.
+    #[test]
+    fn cmd_posture_renders_failed_and_unavailable_probe_states() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("posture-data");
+        let path = data_dir.join("posture.json");
+        let snap = r#"{
+          "captured_at": "2026-05-09T15:00:00Z",
+          "sshd": {"probe_state": "unavailable", "error": "sshd binary not found"},
+          "services": {"probe_state": "failed", "listeners": [], "error": "ss exit 1"},
+          "sudo": {"probe_state": "unavailable", "error": "getent: not found"},
+          "firewall": {"probe_state": "unavailable"}
+        }"#;
+        write_file(&path, snap);
+        cmd_posture(&cli, &data_dir).expect("error states render without panic");
+    }
+
+    #[test]
+    fn cmd_posture_malformed_json_returns_err() {
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("posture-data");
+        let path = data_dir.join("posture.json");
+        write_file(&path, "{not json");
+        let err = cmd_posture(&cli, &data_dir).expect_err("malformed JSON must error");
+        assert!(err.to_string().contains("malformed JSON"));
+    }
 }
 
 pub(crate) fn cmd_metrics(cli: &Cli, data_dir: &Path) -> Result<()> {
@@ -834,5 +926,161 @@ pub(crate) fn cmd_metrics(cli: &Cli, data_dir: &Path) -> Result<()> {
     }
 
     println!();
+    Ok(())
+}
+
+/// `innerwarden get posture` — pretty-print the host posture snapshot
+/// the agent uses for severity downgrade decisions (spec 044 Phase 2).
+///
+/// Reads `data_dir/posture.json` written by the agent's slow loop. The
+/// command is read-only — refreshing the snapshot is the agent's job
+/// (10 min cadence + boot snapshot + fanotify-triggered refresh).
+///
+/// When the file is missing the operator gets a hint: usually means
+/// the agent is on an older binary that pre-dates spec 044, or the
+/// agent has not been running long enough for the boot snapshot to
+/// land. Refusing to fabricate fields here is deliberate — the
+/// downgrade engine reads the same JSON and a stale or fabricated
+/// view here would mask divergence from what the agent actually sees.
+pub(crate) fn cmd_posture(cli: &Cli, data_dir: &Path) -> Result<()> {
+    let effective_dir = resolve_data_dir(cli, data_dir);
+    let path = effective_dir.join("posture.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("InnerWarden - host posture\n");
+            println!("  No snapshot at {}.", path.display());
+            println!();
+            println!("  Causes:");
+            println!("    - agent has not booted since spec 044 deploy");
+            println!("    - agent is on an older binary (pre-2026-05-09)");
+            println!();
+            println!("  The agent writes this file at boot and refreshes every 10 min.");
+            return Ok(());
+        }
+        Err(e) => {
+            anyhow::bail!("cannot read {}: {e}", path.display());
+        }
+    };
+
+    let snap: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("malformed JSON at {}", path.display()))?;
+
+    let captured_at = snap["captured_at"].as_str().unwrap_or("?");
+    println!("InnerWarden - host posture\n");
+    println!("  Snapshot taken: {captured_at}");
+    println!();
+
+    // SSHD ─────────────────────────────────────────────────────────────────
+    let sshd = &snap["sshd"];
+    let sshd_state = sshd["probe_state"].as_str().unwrap_or("?");
+    println!("SSHD ({sshd_state}):");
+    if sshd_state == "ok" {
+        let pa = sshd["password_authentication"].as_str().unwrap_or("?");
+        let kbd = sshd["kbd_interactive_authentication"]
+            .as_str()
+            .unwrap_or("?");
+        let prl = sshd["permit_root_login"].as_str().unwrap_or("?");
+        let pk = sshd["pubkey_authentication"].as_str().unwrap_or("?");
+        let mat = sshd["max_auth_tries"].as_u64();
+        println!("  PasswordAuthentication        : {pa}");
+        println!("  KbdInteractiveAuthentication  : {kbd}");
+        println!("  PermitRootLogin               : {prl}");
+        println!("  PubkeyAuthentication          : {pk}");
+        if let Some(n) = mat {
+            println!("  MaxAuthTries                  : {n}");
+        }
+        if let Some(ports) = sshd["ports"].as_array() {
+            let list: Vec<String> = ports
+                .iter()
+                .filter_map(|p| p.as_u64().map(|n| n.to_string()))
+                .collect();
+            if !list.is_empty() {
+                println!("  Listen ports                  : {}", list.join(", "));
+            }
+        }
+    } else if let Some(err) = sshd["error"].as_str() {
+        println!("  error: {err}");
+    }
+    println!();
+
+    // Listening services ───────────────────────────────────────────────────
+    let services = &snap["services"];
+    let svc_state = services["probe_state"].as_str().unwrap_or("?");
+    println!("Listening services ({svc_state}):");
+    if svc_state == "ok" {
+        if let Some(listeners) = services["listeners"].as_array() {
+            if listeners.is_empty() {
+                println!("  (no listeners)");
+            } else {
+                for l in listeners {
+                    let proto = l["proto"].as_str().unwrap_or("?");
+                    let port = l["port"].as_u64().unwrap_or(0);
+                    let addr = l["addr"].as_str().unwrap_or("?");
+                    let comm = l["comm"].as_str().unwrap_or("?");
+                    println!("  {proto:<3} {addr}:{port}  {comm}");
+                }
+            }
+        }
+    } else if let Some(err) = services["error"].as_str() {
+        println!("  error: {err}");
+    }
+    println!();
+
+    // Sudo ─────────────────────────────────────────────────────────────────
+    let sudo = &snap["sudo"];
+    let sudo_state = sudo["probe_state"].as_str().unwrap_or("?");
+    println!("Sudo ({sudo_state}):");
+    if sudo_state == "ok" {
+        for (key, label) in [
+            ("sudo_group_members", "group sudo "),
+            ("wheel_group_members", "group wheel"),
+            ("admin_group_members", "group admin"),
+        ] {
+            if let Some(arr) = sudo[key].as_array() {
+                let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                if !names.is_empty() {
+                    println!("  {label}: {}", names.join(", "));
+                }
+            }
+        }
+        if let Some(arr) = sudo["sudoers_d_filenames"].as_array() {
+            let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            if !names.is_empty() {
+                println!("  /etc/sudoers.d/: {}", names.join(", "));
+            }
+        }
+    } else if let Some(err) = sudo["error"].as_str() {
+        println!("  error: {err}");
+    }
+    println!();
+
+    // Firewall ─────────────────────────────────────────────────────────────
+    let fw = &snap["firewall"];
+    let fw_state = fw["probe_state"].as_str().unwrap_or("?");
+    println!("Firewall ({fw_state}):");
+    if fw_state == "ok" {
+        if let Some(arr) = fw["active_backends"].as_array() {
+            let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            if !names.is_empty() {
+                println!("  Active backends   : {}", names.join(", "));
+            }
+        }
+        let policy = fw["default_policy"].as_str().unwrap_or("?");
+        println!("  Default INPUT     : {policy}");
+        if let Some(ports) = fw["allowed_tcp_ports"].as_array() {
+            let list: Vec<String> = ports
+                .iter()
+                .filter_map(|p| p.as_u64().map(|n| n.to_string()))
+                .collect();
+            if !list.is_empty() {
+                println!("  Allowed TCP ports : {}", list.join(", "));
+            }
+        }
+    } else if let Some(err) = fw["error"].as_str() {
+        println!("  error: {err}");
+    }
+    println!();
+
     Ok(())
 }

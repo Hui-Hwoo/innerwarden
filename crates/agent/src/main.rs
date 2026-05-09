@@ -146,6 +146,7 @@ mod notification_pipeline;
 mod observation_verify;
 mod orphan_recovery;
 mod pcap_capture;
+mod posture;
 mod process;
 mod process_health;
 #[allow(dead_code)]
@@ -481,6 +482,17 @@ struct AgentState {
     environment_profile: environment_profile::EnvironmentProfile,
     /// Last time the periodic env census ran. Spec 005 Phase 6.
     last_env_census_at: Option<std::time::Instant>,
+    /// Host posture snapshot — sshd / sudo / firewall / listeners. Read by
+    /// the severity downgrade engine (spec 044 Phase 3, not yet wired).
+    /// Refreshed on a 10 min slow-loop tick (Phase 2.2). Best-effort:
+    /// when probes fail the snapshot is "permissive" and the downgrade
+    /// engine keeps alerts at their original severity.
+    #[allow(dead_code)] // Read by Phase 3 downgrade engine (not yet wired).
+    host_posture: posture::HostPosture,
+    /// Last time the host posture was refreshed. Drives the slow-loop
+    /// 10 min cadence (read in `loops/boot.rs` posture refresh block)
+    /// and the dashboard "stale snapshot" warning (Phase 2.3).
+    last_host_posture_at: Option<std::time::Instant>,
     /// Neural autoencoder anomaly engine — learns "normal" and flags novel patterns.
     anomaly_engine: neural_lifecycle::AnomalyEngine,
     /// Neural incidents pending processing — buffered here because the agent

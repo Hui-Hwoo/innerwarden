@@ -4336,6 +4336,54 @@ mod tests {
         assert!(JS_RESPONSES.contains("Resolved as"));
     }
 
+    /// Spec 044 / 2026-05-09 prod report anchor: operator hit "Error: HTTP
+    /// 403" on the AI Intelligence Briefing Regenerate button. Root cause:
+    /// `home.js` POST to `/api/briefing/generate` did NOT send the
+    /// `x-requested-with: XMLHttpRequest` header that `csrf_protection`
+    /// middleware demands. Same bug existed in `actions.js`,
+    /// `compliance.js`, and `honeypot.js` — all silent because the
+    /// operator had not exercised those flows recently.
+    ///
+    /// This anchor sweeps every embedded JS asset that contains
+    /// `method: 'POST'` and asserts the file also contains the CSRF
+    /// header string (case-insensitive). A future fetch added without
+    /// the header trips this in CI before the operator hits 403.
+    #[test]
+    fn embedded_js_assets_with_post_fetch_carry_csrf_header() {
+        let assets: &[(&str, &str)] = &[
+            ("home.js", JS_HOME),
+            ("threats.js", JS_THREATS),
+            ("journey.js", JS_JOURNEY),
+            ("sensors.js", JS_SENSORS),
+            ("reports.js", JS_REPORTS),
+            ("status.js", JS_STATUS),
+            ("compliance.js", JS_COMPLIANCE),
+            ("honeypot.js", JS_HONEYPOT),
+            ("intel.js", JS_INTEL),
+            ("monthly.js", JS_MONTHLY),
+            ("responses.js", JS_RESPONSES),
+            ("actions.js", JS_ACTIONS),
+        ];
+        for (name, src) in assets {
+            // Look for POST method declarations (whitespace-tolerant).
+            // If the file has any POST fetch, the file must also contain
+            // the CSRF header string. Single mention covers all POSTs in
+            // that file — the anchor is "did the author know about CSRF?",
+            // not "is every individual POST audited".
+            let has_post = src.contains("method: 'POST'") || src.contains("method:'POST'");
+            if has_post {
+                let has_csrf = src.to_ascii_lowercase().contains("x-requested-with");
+                assert!(
+                    has_csrf,
+                    "{name}: file has a POST fetch but no x-requested-with header — \
+                     CSRF middleware will reject it with HTTP 403. See \
+                     dashboard/mod.rs::csrf_protection. Add \
+                     `'x-requested-with': 'XMLHttpRequest'` to the headers map."
+                );
+            }
+        }
+    }
+
     // ─── PR #425 Wave 4d — banner reads gauges, not lifetime counters ───
 
     #[test]

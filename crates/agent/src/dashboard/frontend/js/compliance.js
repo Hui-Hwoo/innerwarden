@@ -460,8 +460,13 @@ async function submitOverride(decisionId) {
   try {
     const r = await fetch('/api/action/decision/override', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      // x-requested-with required by CSRF middleware (audit I-14).
+      headers: {
+        'content-type': 'application/json',
+        'x-requested-with': 'XMLHttpRequest',
+      },
       body: JSON.stringify({ decision_id: decisionId, new_action: newAction, reason }),
+      credentials: 'include',
     });
     const data = await r.json();
     if (data.success) {
@@ -496,8 +501,13 @@ async function labelDecision(decisionId, label) {
   try {
     const r = await fetch('/api/action/decision/label', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      // x-requested-with required by CSRF middleware (audit I-14).
+      headers: {
+        'content-type': 'application/json',
+        'x-requested-with': 'XMLHttpRequest',
+      },
       body: JSON.stringify({ decision_id: decisionId, label, reason: '' }),
+      credentials: 'include',
     });
     const data = await r.json();
     // Inline visual confirmation. The compliance status pill (top

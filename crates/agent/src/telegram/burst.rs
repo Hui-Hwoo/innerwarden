@@ -13,22 +13,10 @@ pub fn format_daily_digest(
     is_simple: bool,
 ) -> String {
     if is_simple {
-        let raw_score = 100i32
-            .saturating_sub(critical_count as i32 * 20)
-            .saturating_sub(high_count as i32 * 5);
-        let score = raw_score.clamp(0, 100) as u32;
-        let health_emoji = if score >= 80 {
-            "\u{1f7e2}" // 🟢
-        } else if score >= 50 {
-            "\u{1f7e1}" // 🟡
-        } else {
-            "\u{1f534}" // 🔴
-        };
-
-        // Bug 5 (2026-05-06): the simple-mode digest hardcoded
-        // "All clear. Nothing needs you." even with non-zero
-        // critical/high counts, contradicting the lines above. Mirror
-        // the gate from the enriched variant.
+        // Spec 044 Phase 1 (2026-05-09): the legacy `100 − critical*20 − high*5` "Health" score
+        // clamped to 0 whenever the day saw more than ~5 high-severity incidents — even when
+        // every one of those was auto-resolved silently. The score lied about effective host
+        // health, so it is removed. Posture-aware severity (Phase 3) replaces the intent.
         let footer = if critical_count == 0 && high_count == 0 {
             "All clear. Nothing needs you."
         } else {
@@ -40,7 +28,6 @@ pub fn format_daily_digest(
              \n\
              \u{00a0}\u{00a0}{blocks_today} attacks blocked\n\
              \u{00a0}\u{00a0}{critical_count} critical threats\n\
-             \u{00a0}\u{00a0}Health: {score}/100 {health_emoji}\n\
              \n\
              {footer}"
         )
@@ -77,23 +64,16 @@ pub fn format_daily_digest_enriched(
     is_simple: bool,
     pipeline: &PipelineDigestStats,
 ) -> String {
-    let raw_score = 100i32
-        .saturating_sub(critical_count as i32 * 20)
-        .saturating_sub(high_count as i32 * 5);
-    let score = raw_score.clamp(0, 100) as u32;
-    let health_emoji = if score >= 80 {
-        "\u{1f7e2}" // 🟢
-    } else if score >= 50 {
-        "\u{1f7e1}" // 🟡
-    } else {
-        "\u{1f534}" // 🔴
-    };
-
+    // Spec 044 Phase 1 (2026-05-09): "Server health: X/100" line removed. The formula
+    // (100 − critical*20 − high*5, clamp 0..100) clamped to 0 whenever the day saw more than
+    // ~5 high-severity incidents, even when every one was auto-resolved silently — the same
+    // briefing that read "🔴 0/100" listed "✅ 160 threat groups auto-resolved" two lines
+    // below it. The score did not credit auto-resolution, did not subtract for hardening
+    // posture, and so was anti-informative. Phase 3 of spec 044 introduces posture-aware
+    // severity to fix the underlying signal-vs-noise problem; this phase just stops lying.
     if is_simple {
         let mut msg = format!(
             "\u{1f6e1}\u{fe0f} <b>Daily Security Briefing</b>\n\
-             \n\
-             {health_emoji} Server health: <b>{score}/100</b>\n\
              \n\
              While you were away, InnerWarden:\n\
              \u{00a0}\u{00a0}\u{2022} Blocked <b>{blocks_today}</b> attacks\n\
@@ -142,7 +122,6 @@ pub fn format_daily_digest_enriched(
         let mut msg = format!(
             "\u{1f4ca} <b>Daily Digest</b> ({date})\n\
              \n\
-             Health: {score}/100 {health_emoji}\n\
              Incidents: {incidents_today} | Blocks: {blocks_today}\n\
              Critical: {critical_count} | High: {high_count}\n\
              Top: {top_detector} ({top_count})",
@@ -224,25 +203,42 @@ mod tests {
         assert!(msg.contains("Good morning"));
         assert!(msg.contains("0 attacks blocked"));
         assert!(msg.contains("0 critical threats"));
-        assert!(msg.contains("Health: 100/100"));
         assert!(msg.contains("All clear"));
     }
 
+    /// Spec 044 Phase 1 anchor (2026-05-09): the legacy `Health: X/100` line was
+    /// removed because the underlying formula (`100 − critical*20 − high*5`, clamped)
+    /// reported `🔴 0/100` whenever the day saw more than ~5 high-severity incidents,
+    /// even when every one was auto-resolved silently. Pin the absence so a future
+    /// "let's add a score back" change forces an explicit conversation rather than
+    /// regressing the briefing copy.
     #[test]
-    fn format_daily_digest_simple_with_threats_lowers_score() {
-        // 2 critical (-40) + 4 high (-20) -> score 40, yellow then red threshold
-        let msg = format_daily_digest(10, 5, 2, 4, "rule_A", 7, true);
-        assert!(msg.contains("5 attacks blocked"));
-        assert!(msg.contains("2 critical threats"));
-        // 100 - 2*20 - 4*5 = 40, falls below the yellow >=50 threshold -> red emoji.
-        assert!(msg.contains("Health: 40/100"));
-    }
-
-    #[test]
-    fn format_daily_digest_simple_floors_score_at_zero() {
-        // 100 critical * 20 = -1900 raw; clamp to 0.
-        let msg = format_daily_digest(0, 0, 100, 0, "n/a", 0, true);
-        assert!(msg.contains("Health: 0/100"));
+    fn format_daily_digest_omits_health_score() {
+        let cases = [
+            // Zero state.
+            format_daily_digest(0, 0, 0, 0, "n/a", 0, true),
+            format_daily_digest(0, 0, 0, 0, "n/a", 0, false),
+            // The exact production shape the operator hit on 2026-05-09 (1 critical + 61 high
+            // → legacy formula clamps to 0).
+            format_daily_digest(316, 47, 1, 61, "proto_anomaly", 169, true),
+            format_daily_digest(316, 47, 1, 61, "proto_anomaly", 169, false),
+        ];
+        for msg in &cases {
+            assert!(!msg.contains("Health:"), "found Health: in: {msg}");
+            assert!(!msg.contains("/100"), "found /100 in: {msg}");
+            assert!(
+                !msg.contains("\u{1f7e2}"),
+                "found 🟢 (health emoji) in: {msg}"
+            );
+            assert!(
+                !msg.contains("\u{1f7e1}"),
+                "found 🟡 (health emoji) in: {msg}"
+            );
+            assert!(
+                !msg.contains("\u{1f534}"),
+                "found 🔴 (health emoji) in: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -399,6 +395,63 @@ mod tests {
         let msg = format_daily_digest_enriched(0, 0, 0, 0, "n/a", 0, true, &pipeline);
         assert!(msg.contains("All clear. Nothing needs you."));
         assert!(!msg.contains("Auto-handled"));
+    }
+
+    /// Spec 044 Phase 1 anchor (2026-05-09 prod observation): operator received
+    /// `🔴 Server health: 0/100` while the same briefing reported `✅ 160 threat
+    /// groups auto-resolved` immediately below — the score did not credit
+    /// auto-resolution. This test reproduces the exact production input shape
+    /// (1 critical + 61 high) plus a couple of representative cases and pins
+    /// that the enriched briefing no longer contains the score line.
+    #[test]
+    fn format_daily_digest_enriched_omits_health_score() {
+        let big_pipeline = PipelineDigestStats {
+            suppressed_count: 30,
+            auto_resolved_groups: 160,
+            needs_review_groups: 30,
+            deferred: vec![
+                ("proto_anomaly".to_string(), 169),
+                ("crontab_persistence".to_string(), 2),
+            ],
+        };
+        let cases = [
+            // Zero state, simple + technical.
+            format_daily_digest_enriched(0, 0, 0, 0, "n/a", 0, true, &empty_pipeline()),
+            format_daily_digest_enriched(0, 0, 0, 0, "n/a", 0, false, &empty_pipeline()),
+            // The exact prod observation: 316 events, 47 blocks, 1 critical, 61 high — legacy
+            // formula clamped to 0/100 with the 🔴 emoji.
+            format_daily_digest_enriched(316, 47, 1, 61, "proto_anomaly", 169, true, &big_pipeline),
+            format_daily_digest_enriched(
+                316,
+                47,
+                1,
+                61,
+                "proto_anomaly",
+                169,
+                false,
+                &big_pipeline,
+            ),
+        ];
+        for msg in &cases {
+            assert!(
+                !msg.contains("Server health"),
+                "found 'Server health' in: {msg}"
+            );
+            assert!(!msg.contains("Health:"), "found 'Health:' in: {msg}");
+            assert!(!msg.contains("/100"), "found '/100' in: {msg}");
+            assert!(
+                !msg.contains("\u{1f7e2}"),
+                "found 🟢 (health emoji) in: {msg}"
+            );
+            assert!(
+                !msg.contains("\u{1f7e1}"),
+                "found 🟡 (health emoji) in: {msg}"
+            );
+            assert!(
+                !msg.contains("\u{1f534}"),
+                "found 🔴 (health emoji) in: {msg}"
+            );
+        }
     }
 
     #[test]
