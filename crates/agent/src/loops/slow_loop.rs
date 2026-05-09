@@ -1170,6 +1170,25 @@ pub(crate) async fn process_narrative_tick(
             &kc_incidents,
             &self_traffic_list,
         );
+        // 2026-05-09 fast-path block for deterministic kill_chain
+        // patterns (reverse_shell, bind_shell, code_inject,
+        // inject_shell). MUST run AFTER the dismiss helpers above so
+        // operator-session / self-traffic FPs are filtered first; the
+        // function re-checks the per-incident decisions table to defer
+        // to any earlier dismiss decision, never overrides one. The
+        // block call inherits circuit breaker + rate limit + safelist
+        // + cloud-provider gate from the canonical executor.
+        // Latency cut: removes the AI router call (~100ms Local Warden,
+        // ~1-3s cloud LLM) from the dispatch path. Tick cadence
+        // unchanged. For sub-second response see future bpf_send_signal
+        // spec.
+        crate::killchain_inline::fast_path_block_strong_patterns(
+            &kc_incidents,
+            data_dir,
+            cfg,
+            state,
+        )
+        .await;
         let gate_counter = state.telemetry.gate_suppressed_counter();
         killchain_inline::notify_telegram(
             &state.telegram_client,

@@ -178,6 +178,84 @@ fn is_strong_killchain_pattern(pattern: &str) -> bool {
         .any(|p| pattern.eq_ignore_ascii_case(p))
 }
 
+/// 2026-05-09: subset of STRONG_KILLCHAIN_PATTERNS where the AI
+/// verdict is deterministic (always block) AND the false-positive
+/// rate is ~0 because the kernel evidence is precise. For these
+/// patterns we shortcut the AI router and write the block decision +
+/// execute the block immediately in the slow_loop tick. This cuts the
+/// response time by the AI call latency (~100 ms Local Warden, ~1-3 s
+/// cloud LLM) and adds resilience: if the AI provider is down, strong
+/// patterns still get blocked.
+///
+/// Deliberately EXCLUDES `data_exfil` and `exploit_c2` even though
+/// both are in STRONG_KILLCHAIN_PATTERNS: those have a real FP rate
+/// (the codex/openclaw class — npm exec → Cloudflare with
+/// socket+sensitive_read), and the AI dismiss path is the right
+/// place to filter them. The fast-path is for patterns where the AI
+/// has zero useful input.
+///
+/// The `operator-session` and `self-traffic-comm` dismiss helpers
+/// run BEFORE this in the slow_loop; their dismiss decisions block
+/// the fast-path via the per-incident decision check below. So the
+/// fast-path NEVER overrides an operator-session or self-traffic
+/// FP filter.
+const FAST_PATH_KILLCHAIN_PATTERNS: &[&str] = &[
+    // Emitted by `innerwarden-killchain` crate (the bitmask matcher
+    // wired into killchain_inline::process_events). These are the
+    // labels seen in prod incidents.
+    "reverse_shell",
+    "bind_shell",
+    "code_inject",
+    "inject_shell",
+    // Emitted by the userspace sensor detector
+    // (crates/sensor/src/detectors/reverse_shell.rs). Same kernel
+    // evidence shape (connect+dup2 / bind+listen+dup2), different
+    // emitter — sensor-side aggregator with the `ebpf_` prefix.
+    // Both detection paths converge on the fast-path so a single
+    // implementation change can not silently break it.
+    "ebpf_reverse_shell",
+    "ebpf_bind_shell",
+];
+
+pub(crate) fn is_fast_path_killchain_pattern(pattern: &str) -> bool {
+    FAST_PATH_KILLCHAIN_PATTERNS
+        .iter()
+        .any(|p| pattern.eq_ignore_ascii_case(p))
+}
+
+/// Pure predicate: does this incident qualify for the fast-path block?
+/// Returns `Some((pattern, c2_ip, incident_id))` when yes.
+///
+/// Caller is responsible for the per-incident decision-existence check
+/// (so fast-path does not override an earlier dismiss). Pulled out as
+/// a pure function so the rule itself is unit-testable without a
+/// live AgentState.
+pub(crate) fn fast_path_extract_block_target(
+    inc_json: &serde_json::Value,
+) -> Option<(String, String, String)> {
+    let ev = inc_json
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())?;
+    let pattern = ev.get("pattern").and_then(|v| v.as_str())?;
+    if !is_fast_path_killchain_pattern(pattern) {
+        return None;
+    }
+    let c2_ip = ev.get("c2_ip").and_then(|v| v.as_str())?;
+    if c2_ip.is_empty() {
+        return None;
+    }
+    let incident_id = inc_json.get("incident_id").and_then(|v| v.as_str())?;
+    if incident_id.is_empty() {
+        return None;
+    }
+    Some((
+        pattern.to_string(),
+        c2_ip.to_string(),
+        incident_id.to_string(),
+    ))
+}
+
 /// Phase 7B (audit RC-2 — Slice C): for each kill chain incident
 /// whose target IP belongs to an active operator SSH session, write a
 /// `dismiss` decision through the standard hash-chained audit path.
@@ -556,6 +634,118 @@ pub(crate) fn dismiss_self_traffic_incidents(
                 "killchain: failed to write self-traffic-fp dismiss decision"
             );
         }
+    }
+}
+
+/// 2026-05-09: shortcut the AI router for kill_chain patterns where
+/// the AI verdict is deterministic (always block) AND the FP rate is
+/// ~0. Runs in the slow_loop tick AFTER `dismiss_operator_session_incidents`
+/// and `dismiss_self_traffic_incidents` so any earlier dismiss decision
+/// short-circuits the fast-path block (we re-check the SQLite decisions
+/// table before blocking).
+///
+/// Latency win on prod: removes the AI call from the dispatch path
+/// (~100 ms Local Warden, ~1-3 s cloud LLM). The slow_loop tick
+/// cadence (`incident_poll_secs = 2` default) is unchanged — this is
+/// not a kernel-time response. For sub-second response see the
+/// future `bpf_send_signal()` spec.
+///
+/// Resilience win: if the AI provider is down or rate-limited, strong
+/// patterns still get blocked at this layer.
+///
+/// Cost win: zero LLM call cost for fast-path patterns.
+///
+/// Determinism win: the verdict is the rule, not a model output.
+/// A future Local Warden retrain that drifts on these patterns does
+/// not change behaviour.
+pub(crate) async fn fast_path_block_strong_patterns(
+    incidents: &[serde_json::Value],
+    data_dir: &std::path::Path,
+    cfg: &crate::config::AgentConfig,
+    state: &mut crate::AgentState,
+) {
+    if incidents.is_empty() {
+        return;
+    }
+    // Skill picker: same convention as local_classifier::decide and
+    // correlation_response. `format!("block-ip-{}", block_backend)` —
+    // operator's configured firewall backend wins.
+    let block_skill_id = format!("block-ip-{}", cfg.responder.block_backend);
+
+    for inc_json in incidents {
+        let Some((pattern, c2_ip, incident_id)) = fast_path_extract_block_target(inc_json) else {
+            continue;
+        };
+
+        // Per-incident decision-existence check. The dismiss helpers
+        // (operator-session, self-traffic-comm, cloud-destination not
+        // landed) write their dismiss decisions BEFORE this function
+        // runs in the slow_loop. If any decision is already on file
+        // for this incident, the fast-path defers — never overrides
+        // an earlier verdict.
+        if let Some(store) = state.sqlite_store.as_ref() {
+            if store
+                .decisions_for_incident(&incident_id)
+                .map(|d| !d.is_empty())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+
+        // Parse the killchain JSON into a structured Incident. If the
+        // schema does not match (e.g. older killchain emitter), skip
+        // — the AI router path will pick it up later.
+        let incident: innerwarden_core::incident::Incident =
+            match serde_json::from_value(inc_json.clone()) {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!(
+                        incident_id = %incident_id,
+                        error = %e,
+                        "killchain fast-path: incident JSON did not parse, deferring to AI router"
+                    );
+                    continue;
+                }
+            };
+
+        // Synthetic AiDecision tagged with `ai_provider="fast-path-strong-pattern"`
+        // so the audit trail is unambiguous: this block was not the AI's
+        // verdict, it was the rule.
+        let decision = crate::ai::AiDecision {
+            action: crate::ai::AiAction::BlockIp {
+                ip: c2_ip.clone(),
+                skill_id: block_skill_id.clone(),
+            },
+            confidence: 1.0,
+            auto_execute: true,
+            reason: format!(
+                "Fast-path: kill chain pattern `{pattern}` is in the deterministic-block \
+                 set (reverse_shell / bind_shell / code_inject / inject_shell). The AI \
+                 verdict for these is always `block_ip`; we shortcut the AI call to cut \
+                 response time and stay resilient when the AI provider is degraded. \
+                 Existing safeguards still apply: circuit breaker, rate limit, safelist, \
+                 cloud-provider check, untouchable gate."
+            ),
+            alternatives: vec![],
+            estimated_threat: "critical".to_string(),
+        };
+
+        // Delegate to the canonical block executor. This inherits all
+        // existing safeguards: circuit breaker (max blocks/hour),
+        // per-minute rate limit, eligibility check (operator session,
+        // safelist, cloud-provider gate), and writes the audit decision
+        // through the standard hash-chained path.
+        let _ = crate::decision_block_ip::execute_block_ip_decision(
+            &c2_ip,
+            &block_skill_id,
+            &decision,
+            &incident,
+            data_dir,
+            cfg,
+            state,
+        )
+        .await;
     }
 }
 
@@ -965,6 +1155,229 @@ mod tests {
             &test_self_traffic_list(),
         );
         assert_eq!(store.decisions_count().unwrap(), 0);
+    }
+
+    // ── 2026-05-09: fast-path block anchors ───────────────────────────
+    //
+    // The fast-path shortcuts the AI router for kill_chain patterns
+    // where the AI verdict is deterministic (always block). The
+    // anchors below pin the FP boundary: the fast-path must trigger
+    // ONLY for the explicit pattern set, must defer when an earlier
+    // dismiss decision exists, must reject malformed input. The user
+    // explicitly named "ancoras pra nao estragar nada" as a release
+    // requirement — every entry below is a regression guard.
+
+    /// Headline positive anchor: an `ebpf_reverse_shell` incident with
+    /// a non-empty c2_ip MUST qualify for the fast-path block. This
+    /// is the prod-shape repro: if the eBPF detector fires reverse
+    /// shell, fast-path takes it.
+    #[test]
+    fn fast_path_extracts_block_target_for_reverse_shell() {
+        let inc = serde_json::json!({
+            "incident_id": "reverse_shell:ebpf_reverse_shell:9000:2026-05-09T22:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "ebpf_reverse_shell",
+                "c2_ip": "203.0.113.45",
+                "c2_port": 4444,
+                "pid": 9000,
+                "comm": "bash",
+            }]
+        });
+        // killchain crate emits the bare `reverse_shell` label.
+        let inc_canonical = serde_json::json!({
+            "incident_id": "reverse_shell:9000:2026-05-09T22:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "reverse_shell",
+                "c2_ip": "203.0.113.45",
+                "c2_port": 4444,
+                "pid": 9000,
+                "comm": "bash",
+            }]
+        });
+        let extracted = fast_path_extract_block_target(&inc_canonical);
+        assert!(extracted.is_some(), "reverse_shell + c2_ip must qualify");
+        let (pattern, c2_ip, incident_id) = extracted.unwrap();
+        assert_eq!(pattern, "reverse_shell");
+        assert_eq!(c2_ip, "203.0.113.45");
+        assert!(incident_id.contains("9000"));
+        // Sensor reverse_shell detector emits `ebpf_reverse_shell` —
+        // both labels qualify so a single detection layer change
+        // cannot silently bypass the fast-path. Anchor pins the
+        // dual-label coverage.
+        let extracted_ebpf = fast_path_extract_block_target(&inc);
+        assert!(
+            extracted_ebpf.is_some(),
+            "ebpf_reverse_shell from the sensor detector must also qualify; \
+             both detection layers (killchain crate + sensor reverse_shell) \
+             must converge on the fast-path"
+        );
+    }
+
+    /// I1 (spec 045 invariant): `data_exfil` is in STRONG_KILLCHAIN_PATTERNS
+    /// but MUST NOT be in the fast-path. The codex/openclaw FP class hits
+    /// data_exfil; the AI dismiss path is the right place to filter it.
+    /// Removing data_exfil from this exclusion would re-introduce the
+    /// 2026-05-09 codex prod incident.
+    #[test]
+    fn fast_path_skips_data_exfil_pattern() {
+        assert!(
+            !is_fast_path_killchain_pattern("data_exfil"),
+            "data_exfil must NEVER be fast-path-blocked — codex/openclaw \
+             class of FP relies on the AI dismiss path"
+        );
+        let inc = serde_json::json!({
+            "incident_id": "kill_chain:data_exfil:3452:2026-05-09T20:34Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "data_exfil",
+                "c2_ip": "104.16.5.34",
+                "comm": "npm exec codex-",
+            }]
+        });
+        assert!(fast_path_extract_block_target(&inc).is_none());
+    }
+
+    /// Same guard for `exploit_c2` — the codex prod incident actually
+    /// classified as EXPLOIT_C2 (2/3 bits FULL_EXPLOIT). Must stay
+    /// in the AI path so the dismiss can land.
+    #[test]
+    fn fast_path_skips_exploit_c2_pattern() {
+        assert!(
+            !is_fast_path_killchain_pattern("exploit_c2"),
+            "exploit_c2 must NEVER be fast-path-blocked — the prod \
+             codex incident hit this pattern; AI dismiss must run"
+        );
+        let inc = serde_json::json!({
+            "incident_id": "kill_chain:exploit_c2:3452:2026-05-09T20:34Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "exploit_c2",
+                "c2_ip": "104.16.5.34",
+                "comm": "npm exec codex-",
+            }]
+        });
+        assert!(fast_path_extract_block_target(&inc).is_none());
+    }
+
+    /// Defensive: `exploit_shell` and `full_exploit` are in
+    /// STRONG_KILLCHAIN_PATTERNS but NOT in the fast-path list. They
+    /// have a non-zero historical FP rate, so the AI router stays
+    /// in the loop. Pin the exclusion.
+    #[test]
+    fn fast_path_skips_exploit_shell_and_full_exploit() {
+        assert!(!is_fast_path_killchain_pattern("exploit_shell"));
+        assert!(!is_fast_path_killchain_pattern("full_exploit"));
+    }
+
+    /// The fast-path set: kernel-evidence patterns from the killchain
+    /// crate AND their `ebpf_` aliases from the sensor reverse_shell
+    /// detector. If a future PR adds an entry, this test forces the
+    /// author to update the assertion AND justify the addition in
+    /// the commit message.
+    #[test]
+    fn fast_path_pattern_list_is_exactly_the_documented_six() {
+        let recognised = [
+            "reverse_shell",
+            "bind_shell",
+            "code_inject",
+            "inject_shell",
+            "ebpf_reverse_shell",
+            "ebpf_bind_shell",
+        ];
+        for p in recognised {
+            assert!(
+                is_fast_path_killchain_pattern(p),
+                "{p} must be in the fast-path list"
+            );
+        }
+        // Case insensitivity (defensive — sensor sometimes upper-cases).
+        assert!(is_fast_path_killchain_pattern("REVERSE_SHELL"));
+        assert!(is_fast_path_killchain_pattern("Bind_Shell"));
+        // Anything outside the documented set must NOT qualify.
+        for forbidden in [
+            "data_exfil",
+            "exploit_c2",
+            "exploit_shell",
+            "full_exploit",
+            "DATA_EXFIL",
+            "ssh_bruteforce",
+            "proto_anomaly",
+            "killchain.unknown",
+            "",
+        ] {
+            assert!(
+                !is_fast_path_killchain_pattern(forbidden),
+                "{forbidden} must NOT be in the fast-path list (would create FP risk)"
+            );
+        }
+    }
+
+    /// Empty c2_ip → no block target. The fast-path needs an IP to
+    /// pass to the block executor; without one we defer to AI router
+    /// (which can still produce a non-block verdict like Monitor).
+    #[test]
+    fn fast_path_skips_when_c2_ip_is_empty() {
+        let inc = serde_json::json!({
+            "incident_id": "reverse_shell:9000:2026-05-09T22:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "reverse_shell",
+                "c2_ip": "",
+                "pid": 9000,
+            }]
+        });
+        assert!(fast_path_extract_block_target(&inc).is_none());
+    }
+
+    /// Missing c2_ip field (older killchain schema) → no block target.
+    /// Forward-compat with future schema changes.
+    #[test]
+    fn fast_path_skips_when_c2_ip_field_absent() {
+        let inc = serde_json::json!({
+            "incident_id": "reverse_shell:9000:2026-05-09T22:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "reverse_shell",
+                // No c2_ip field at all.
+                "pid": 9000,
+            }]
+        });
+        assert!(fast_path_extract_block_target(&inc).is_none());
+    }
+
+    /// Missing incident_id → no block target. Without incident_id we
+    /// cannot dedupe against existing decisions, so we defer.
+    #[test]
+    fn fast_path_skips_when_incident_id_absent() {
+        let inc = serde_json::json!({
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "reverse_shell",
+                "c2_ip": "203.0.113.45",
+            }]
+        });
+        assert!(fast_path_extract_block_target(&inc).is_none());
+    }
+
+    /// Empty evidence array → no block target.
+    #[test]
+    fn fast_path_skips_when_evidence_empty() {
+        let inc = serde_json::json!({
+            "incident_id": "x",
+            "evidence": []
+        });
+        assert!(fast_path_extract_block_target(&inc).is_none());
+    }
+
+    /// Missing evidence field → no block target.
+    #[test]
+    fn fast_path_skips_when_evidence_absent() {
+        let inc = serde_json::json!({
+            "incident_id": "x"
+        });
+        assert!(fast_path_extract_block_target(&inc).is_none());
     }
 
     // event_to_tracker_json preserves key fields
