@@ -1,10 +1,113 @@
 // Auto-extracted from mod.rs — dashboard compliance handlers
 
+use axum::extract::Query;
+use serde::Deserialize;
+
 use super::*;
 
+/// Spec 046 Phase A — honeypot sessions API contract.
+///
+/// All query parameters are optional and defaults are designed so a
+/// no-arg `GET /api/honeypot/sessions` returns the engaged-only first
+/// page (the operator-facing "wow" surface). The toggle for showing
+/// unengaged sessions is opt-in via `engaged_only=false`.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct HoneypotSessionsQuery {
+    /// 0-indexed page number. Default 0.
+    #[serde(default)]
+    page: Option<usize>,
+    /// Page size. Default 20. Clamped to `[1, MAX_HONEYPOT_PAGE_SIZE]`.
+    #[serde(default)]
+    size: Option<usize>,
+    /// When true (default), filter to sessions with at least one auth
+    /// attempt or one shell command. When false, return everything.
+    #[serde(default)]
+    engaged_only: Option<bool>,
+}
+
+/// Spec 046 Inv. 6 — pagination size cap. Prevents an operator (or a
+/// dashboard bug) from asking for the entire 244+ session list in one
+/// shot, which would defeat the point of pagination and hammer the
+/// `read_dir` traversal.
+const MAX_HONEYPOT_PAGE_SIZE: usize = 100;
+
+/// Default page size when the query string omits `size`.
+const DEFAULT_HONEYPOT_PAGE_SIZE: usize = 20;
+
+/// Spec 046 Inv. 7 — engagement predicate. Mirrors the JS-side
+/// `_honeypotIsEngaged` so the backend filter and the frontend label
+/// can never drift. A session is "engaged" if the attacker tried to
+/// authenticate at least once OR typed at least one shell command.
+/// Pure connect-and-disconnect probes (port scans, banner grabs)
+/// are unengaged — they confirm the listener is alive but they are
+/// not the operator's "wow" moment.
+fn session_is_engaged(s: &serde_json::Value) -> bool {
+    let cmd = s
+        .get("commands_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let auth = s.get("auth_attempts").and_then(|v| v.as_u64()).unwrap_or(0);
+    cmd > 0 || auth > 0
+}
+
+/// Apply the spec-046 query contract to the full session list:
+///   1. Compute the total + engaged + unengaged splits up-front.
+///   2. Filter by `engaged_only` (default true).
+///   3. Paginate by `page` × `size`.
+///
+/// Pure function — all I/O is upstream in the handler. Anchor tests
+/// pin the contract directly without spinning up the axum harness.
+fn paginate_honeypot_sessions(
+    sessions: Vec<serde_json::Value>,
+    query: &HoneypotSessionsQuery,
+) -> serde_json::Value {
+    let total = sessions.len();
+    let total_engaged = sessions.iter().filter(|s| session_is_engaged(s)).count();
+    let total_unengaged = total - total_engaged;
+
+    let engaged_only = query.engaged_only.unwrap_or(true);
+    let filtered: Vec<serde_json::Value> = if engaged_only {
+        sessions.into_iter().filter(session_is_engaged).collect()
+    } else {
+        sessions
+    };
+
+    let filtered_total = filtered.len();
+    let size = query
+        .size
+        .unwrap_or(DEFAULT_HONEYPOT_PAGE_SIZE)
+        .clamp(1, MAX_HONEYPOT_PAGE_SIZE);
+    let page = query.page.unwrap_or(0);
+    let start = page.saturating_mul(size);
+    let end = start.saturating_add(size).min(filtered_total);
+    let page_slice: Vec<serde_json::Value> = if start >= filtered_total {
+        Vec::new()
+    } else {
+        filtered[start..end].to_vec()
+    };
+    let has_more = end < filtered_total;
+
+    serde_json::json!({
+        "sessions": page_slice,
+        "page": page,
+        "size": size,
+        "total": total,
+        "total_engaged": total_engaged,
+        "total_unengaged": total_unengaged,
+        "filtered_total": filtered_total,
+        "has_more": has_more,
+        "engaged_only": engaged_only,
+    })
+}
+
 /// GET /api/honeypot/sessions - list honeypot sessions from the honeypot/ subdirectory.
+///
+/// Spec 046 Phase A: paginated, engaged-only by default. See
+/// `HoneypotSessionsQuery` and `paginate_honeypot_sessions` for the
+/// contract.
 pub(super) async fn api_honeypot_sessions(
     State(state): State<DashboardState>,
+    Query(query): Query<HoneypotSessionsQuery>,
 ) -> Json<serde_json::Value> {
     let honeypot_dir = state.data_dir.join("honeypot");
 
@@ -42,7 +145,7 @@ pub(super) async fn api_honeypot_sessions(
     let mut sessions: Vec<serde_json::Value> = Vec::new();
 
     let Ok(mut dir) = tokio::fs::read_dir(&honeypot_dir).await else {
-        return Json(serde_json::json!({ "sessions": [] }));
+        return Json(paginate_honeypot_sessions(Vec::new(), &query));
     };
 
     // Collect all file names first so we can detect .jsonl-only sessions
@@ -191,7 +294,7 @@ pub(super) async fn api_honeypot_sessions(
         tb.cmp(ta)
     });
 
-    Json(serde_json::json!({ "sessions": sessions }))
+    Json(paginate_honeypot_sessions(sessions, &query))
 }
 /// GET /api/admin-actions - recent admin action entries for compliance view.
 pub(super) async fn api_admin_actions(
@@ -806,7 +909,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Don't create the honeypot/ subdir → handler short-circuits.
         let state = crate::dashboard::state::test_dashboard_state(dir.path());
-        let Json(payload) = api_honeypot_sessions(State(state)).await;
+        let Json(payload) =
+            api_honeypot_sessions(State(state), Query(HoneypotSessionsQuery::default())).await;
         let sessions = payload["sessions"].as_array().expect("sessions array");
         assert!(sessions.is_empty(), "no honeypot dir → empty sessions");
     }
@@ -820,9 +924,177 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("honeypot")).unwrap();
         let state = crate::dashboard::state::test_dashboard_state(dir.path());
-        let Json(payload) = api_honeypot_sessions(State(state)).await;
+        let Json(payload) =
+            api_honeypot_sessions(State(state), Query(HoneypotSessionsQuery::default())).await;
         let sessions = payload["sessions"].as_array().expect("sessions array");
         // No session JSON files → no entries.
         assert!(sessions.is_empty());
+    }
+
+    // ── Spec 046 Phase A — pagination contract anchors ──────────────
+    //
+    // These pin the pure pagination helper directly so the contract
+    // is anchor-tested without spinning up axum or the filesystem.
+
+    fn fake_session(ip: &str, auth_attempts: u64, commands_count: u64) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": format!("s-{ip}-{auth_attempts}-{commands_count}"),
+            "target_ip": ip,
+            "started_at": "2026-05-10T00:00:00Z",
+            "duration_secs": 0,
+            "auth_attempts": auth_attempts,
+            "commands_count": commands_count,
+            "commands": [],
+            "iocs": [],
+            "blocked": false,
+            "mode": "always_on",
+        })
+    }
+
+    /// Spec 046 anchor #10 — Inv. 6 (pagination round-trip). A
+    /// request with no params returns the engaged-only first page
+    /// of size DEFAULT_HONEYPOT_PAGE_SIZE.
+    #[test]
+    fn api_honeypot_sessions_paginates_with_default_size() {
+        // 50 sessions: 30 engaged (mix of auth/commands), 20
+        // unengaged (zero of both). Engaged-only default → 20 in
+        // first page, 10 spilled to next.
+        let mut all = Vec::new();
+        for i in 0..30 {
+            all.push(fake_session(&format!("10.0.0.{i}"), 1, 0));
+        }
+        for i in 0..20 {
+            all.push(fake_session(&format!("192.0.2.{i}"), 0, 0));
+        }
+        let q = HoneypotSessionsQuery::default();
+        let resp = paginate_honeypot_sessions(all, &q);
+        let sessions = resp["sessions"].as_array().unwrap();
+        assert_eq!(
+            sessions.len(),
+            DEFAULT_HONEYPOT_PAGE_SIZE,
+            "first page must hold DEFAULT_HONEYPOT_PAGE_SIZE engaged sessions"
+        );
+        assert_eq!(resp["page"].as_u64(), Some(0));
+        assert_eq!(
+            resp["size"].as_u64(),
+            Some(DEFAULT_HONEYPOT_PAGE_SIZE as u64)
+        );
+        assert_eq!(resp["has_more"].as_bool(), Some(true));
+    }
+
+    /// Spec 046 anchor #11 — Inv. 7 (engaged-only is the default).
+    /// Empty query string → engaged_only=true → unengaged sessions
+    /// are excluded from the returned page.
+    #[test]
+    fn api_honeypot_sessions_returns_engaged_only_by_default() {
+        let all = vec![
+            fake_session("203.0.113.1", 0, 0), // unengaged
+            fake_session("203.0.113.2", 1, 0), // engaged (auth)
+            fake_session("203.0.113.3", 0, 5), // engaged (commands)
+            fake_session("203.0.113.4", 0, 0), // unengaged
+        ];
+        let q = HoneypotSessionsQuery::default();
+        let resp = paginate_honeypot_sessions(all, &q);
+        assert_eq!(resp["engaged_only"].as_bool(), Some(true));
+        assert_eq!(resp["sessions"].as_array().unwrap().len(), 2);
+        for s in resp["sessions"].as_array().unwrap() {
+            let auth = s["auth_attempts"].as_u64().unwrap_or(0);
+            let cmd = s["commands_count"].as_u64().unwrap_or(0);
+            assert!(
+                auth > 0 || cmd > 0,
+                "default page must contain only engaged sessions"
+            );
+        }
+    }
+
+    /// Spec 046 anchor #12 — Inv. 6 (response shape). The metadata
+    /// fields the frontend depends on for the engagement banner and
+    /// pagination controls MUST always be present, even when the
+    /// page itself is empty.
+    #[test]
+    fn api_honeypot_sessions_returns_total_split_metadata() {
+        let all = vec![
+            fake_session("203.0.113.1", 0, 0),
+            fake_session("203.0.113.2", 0, 0),
+            fake_session("203.0.113.3", 1, 0),
+        ];
+        let q = HoneypotSessionsQuery::default();
+        let resp = paginate_honeypot_sessions(all, &q);
+
+        for key in [
+            "total",
+            "total_engaged",
+            "total_unengaged",
+            "filtered_total",
+            "has_more",
+            "page",
+            "size",
+            "engaged_only",
+            "sessions",
+        ] {
+            assert!(
+                resp.get(key).is_some(),
+                "response must always carry {key} for the frontend contract"
+            );
+        }
+        assert_eq!(resp["total"].as_u64(), Some(3));
+        assert_eq!(resp["total_engaged"].as_u64(), Some(1));
+        assert_eq!(resp["total_unengaged"].as_u64(), Some(2));
+    }
+
+    /// Spec 046 — explicit opt-in to all sessions returns engaged
+    /// + unengaged interleaved (the operator's "show me everything"
+    /// toggle).
+    #[test]
+    fn api_honeypot_sessions_show_all_returns_engaged_plus_unengaged() {
+        let all = vec![
+            fake_session("203.0.113.1", 0, 0),
+            fake_session("203.0.113.2", 1, 0),
+        ];
+        let q = HoneypotSessionsQuery {
+            engaged_only: Some(false),
+            ..Default::default()
+        };
+        let resp = paginate_honeypot_sessions(all, &q);
+        assert_eq!(resp["engaged_only"].as_bool(), Some(false));
+        assert_eq!(resp["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(resp["filtered_total"].as_u64(), Some(2));
+    }
+
+    /// Spec 046 — page beyond the last one returns an empty array
+    /// with `has_more = false`. Frontend uses this to disable Next.
+    #[test]
+    fn api_honeypot_sessions_page_beyond_last_returns_empty_no_more() {
+        let mut all = Vec::new();
+        for i in 0..3 {
+            all.push(fake_session(&format!("10.0.0.{i}"), 1, 0));
+        }
+        let q = HoneypotSessionsQuery {
+            page: Some(99),
+            size: Some(5),
+            ..Default::default()
+        };
+        let resp = paginate_honeypot_sessions(all, &q);
+        assert_eq!(resp["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(resp["has_more"].as_bool(), Some(false));
+        assert_eq!(resp["page"].as_u64(), Some(99));
+    }
+
+    /// Spec 046 — page-size clamp. A pathological request with
+    /// `size=99999` MUST be clamped to `MAX_HONEYPOT_PAGE_SIZE` so
+    /// the dashboard cannot DoS the listing endpoint.
+    #[test]
+    fn api_honeypot_sessions_page_size_clamped_to_max() {
+        let mut all = Vec::new();
+        for i in 0..200 {
+            all.push(fake_session(&format!("10.0.0.{}", i % 254), 1, 0));
+        }
+        let q = HoneypotSessionsQuery {
+            size: Some(99999),
+            ..Default::default()
+        };
+        let resp = paginate_honeypot_sessions(all, &q);
+        assert_eq!(resp["size"].as_u64(), Some(MAX_HONEYPOT_PAGE_SIZE as u64));
+        assert!(resp["sessions"].as_array().unwrap().len() <= MAX_HONEYPOT_PAGE_SIZE);
     }
 }

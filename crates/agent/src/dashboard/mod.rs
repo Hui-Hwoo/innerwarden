@@ -4041,6 +4041,68 @@ mod tests {
         assert!(JS_HONEYPOT.contains("Unengaged ="));
     }
 
+    /// Spec 046 anchor #13 — Inv. 6 (frontend pinned). The
+    /// pagination controls (Prev / Next + page-size + 'has_more'
+    /// consumption) MUST stay in the bundle so a future refactor
+    /// cannot silently revert to "fetch all 244+ sessions".
+    #[test]
+    fn honeypot_js_renders_pagination_controls() {
+        assert!(
+            JS_HONEYPOT.contains("function honeypotPrevPage"),
+            "Prev page handler missing — pagination broken"
+        );
+        assert!(
+            JS_HONEYPOT.contains("function honeypotNextPage"),
+            "Next page handler missing — pagination broken"
+        );
+        assert!(
+            JS_HONEYPOT.contains("_honeypotPaginationBar"),
+            "pagination render helper missing"
+        );
+        // The query string the frontend sends MUST carry the three
+        // backend-honored params; a refactor that drops one breaks
+        // the contract with `paginate_honeypot_sessions`.
+        for key in ["page", "size", "engaged_only"] {
+            assert!(
+                JS_HONEYPOT.contains(key),
+                "pagination param '{key}' missing from frontend query"
+            );
+        }
+        // Default state MUST be engaged-only (Spec 046 Inv. 7).
+        // Anchor against accidental `_honeypotShowEngagedOnly = false`.
+        assert!(
+            JS_HONEYPOT.contains("_honeypotShowEngagedOnly = true"),
+            "engaged-only default flipped — Spec 046 Inv. 7 regressed"
+        );
+    }
+
+    /// Spec 046 anchor #14 — Inv. 8 (three empty states). A
+    /// refactor that collapses the three empty-state branches into
+    /// one generic "no sessions" wall reverts the operator-visible
+    /// honesty surface.
+    #[test]
+    fn honeypot_js_handles_three_empty_states() {
+        assert!(
+            JS_HONEYPOT.contains("function _honeypotEmptyState"),
+            "empty-state helper missing — three-branch contract regressed"
+        );
+        // Case (a) — listener has no data at all.
+        assert!(
+            JS_HONEYPOT.contains("Honeypot listener active — no probes yet"),
+            "case (a) copy missing"
+        );
+        // Case (b) — data exists, zero engaged.
+        assert!(
+            JS_HONEYPOT.contains("no shell engagements yet"),
+            "case (b) copy missing"
+        );
+        // Case (c) — current page empty under filter.
+        assert!(
+            JS_HONEYPOT.contains("is empty under the current filter"),
+            "case (c) copy missing"
+        );
+    }
+
     #[test]
     fn home_activity_strip_carries_unit_and_timezone_labels() {
         // Audit 3.7 partial: the "29K -> 6 -> 5 -> 1" funnel had no

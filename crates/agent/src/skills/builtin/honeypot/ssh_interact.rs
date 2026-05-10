@@ -7,6 +7,7 @@
 //! - `RejectAll` - the classic medium mode: captures creds, rejects auth, no shell.
 //! - `LlmShell` - accepts password auth and serves an AI-backed interactive shell.
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,9 +15,97 @@ use bytes::Bytes;
 use chrono::Utc;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Config, Handler, Session};
-use russh::ChannelId;
+use russh::{ChannelId, SshId};
 use serde::Serialize;
-use tracing::debug;
+use tracing::{debug, info};
+
+// Spec 046 Phase A — honeypot effectiveness contract.
+//
+// `MIN_ATTEMPTS_BEFORE_ACCEPT` rejects the first N password attempts in
+// LlmShell mode unconditionally. Single-shot credential scanners
+// disconnect after the first reject; multi-attempt droppers iterate
+// through their list and reach the threshold. Kept as a `const` so
+// anchor tests can quote it without copy-pasting a literal.
+const MIN_ATTEMPTS_BEFORE_ACCEPT: usize = 2;
+
+// `AUTH_REJECT_DELAY_MS` simulates real OpenSSH's slow rejection so
+// timing-based scanners can't flag us as "accepts at line rate, must
+// be a honeypot". 80 ms is below the 200 ms ssh_interact connection
+// budget but above the floor that line-rate scanners measure.
+const AUTH_REJECT_DELAY_MS: u64 = 80;
+
+/// Curated list of well-known weak SSH credentials that real Mirai-class
+/// droppers expect to succeed on a compromised IoT/server target. The
+/// honeypot only accepts a credential when (a) the connection has tried
+/// at least `MIN_ATTEMPTS_BEFORE_ACCEPT` times AND (b) the current
+/// `(user, password)` pair is on this list.
+///
+/// Strategic rationale (spec 046): when a scanner's credential database
+/// later resells "user/pw works on host X", every entry on this list
+/// becomes globally untrustworthy because half the matches came from
+/// honeypots. Each IW install that runs this code adds noise to the
+/// resale market.
+///
+/// Sources: Mirai source (default device passwords), Cowrie's
+/// `userdb.txt` historical defaults, common SSH brute-force wordlists.
+/// Order is best-known-first to keep the linear scan cheap.
+const KNOWN_WEAK_CREDENTIALS: &[(&str, &str)] = &[
+    // Classic root defaults
+    ("root", "root"),
+    ("root", "toor"),
+    ("root", "admin"),
+    ("root", "password"),
+    ("root", "123456"),
+    ("root", "12345"),
+    ("root", "1234"),
+    ("root", "default"),
+    ("root", "qwerty"),
+    ("root", "888888"),
+    ("root", "666666"),
+    ("root", ""),
+    // Mirai-source defaults (DLink, Xerox, Dahua DVRs, Hikvision, etc.)
+    ("root", "vizxv"),
+    ("root", "xc3511"),
+    ("root", "xmhdipc"),
+    ("root", "anko"),
+    ("root", "juantech"),
+    ("root", "pass"),
+    ("root", "klv1234"),
+    ("root", "Zte521"),
+    ("admin", "admin"),
+    ("admin", "password"),
+    ("admin", "1234"),
+    ("admin", "12345"),
+    ("admin", "123456"),
+    ("admin", "admin1"),
+    ("admin", "default"),
+    ("admin", ""),
+    // Common SSH service / appliance defaults
+    ("ubnt", "ubnt"),
+    ("pi", "raspberry"),
+    ("oracle", "oracle"),
+    ("postgres", "postgres"),
+    ("mysql", "mysql"),
+    ("test", "test"),
+    ("guest", "guest"),
+    ("user", "user"),
+    ("ftp", "ftp"),
+    ("nagios", "nagios"),
+    ("support", "support"),
+];
+
+/// Returns `true` when `(user, password)` is on the well-known weak
+/// credential list. Spec 046 Phase A — used as the second predicate in
+/// the tiered acceptance flow alongside `MIN_ATTEMPTS_BEFORE_ACCEPT`.
+///
+/// Pure function — no I/O, no allocation beyond the list scan. Anchor
+/// tests live in the `tests` module below; do NOT inline-replicate the
+/// list in callers.
+pub(crate) fn is_known_weak_credential(user: &str, password: &str) -> bool {
+    KNOWN_WEAK_CREDENTIALS
+        .iter()
+        .any(|(u, p)| *u == user && *p == password)
+}
 
 // ---------------------------------------------------------------------------
 // Evidence types
@@ -154,6 +243,11 @@ impl Handler for HoneypotSshHandler {
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         debug!(user, "honeypot SSH auth_password");
+        // Spec 046 Inv. 1: credential capture is unconditional. Every
+        // attempt MUST be appended to evidence BEFORE any
+        // accept/reject decision, so a future regression in the
+        // tiered logic can never silently drop a credential from the
+        // operator's log.
         self.record("password", user, Some(password.to_string()), None);
         match &mut self.mode {
             HandlerMode::LlmShell {
@@ -162,9 +256,57 @@ impl Handler for HoneypotSshHandler {
                 ..
             } => {
                 *auth_attempt_count += 1;
-                // Accept on first password attempt - most real attackers try
-                // one password per connection and reconnect for the next.
-                // Rejecting would just make them disconnect without entering the shell.
+                let attempt_n = *auth_attempt_count;
+
+                // Spec 046 Phase A — tiered acceptance. The shell
+                // door only opens when the connection profile matches
+                // a real Mirai-class dropper:
+                //   1. attempt_n must be ≥ MIN_ATTEMPTS_BEFORE_ACCEPT
+                //      (filters single-shot credentialers that
+                //      disconnect after one try regardless of
+                //      accept/reject).
+                //   2. The current (user, password) pair must be on
+                //      the curated KNOWN_WEAK_CREDENTIALS list
+                //      (filters random-string brute force; ensures
+                //      the credential we accept is one already
+                //      circulating in scanner databases, so accepting
+                //      it adds market-distortion poison rather than
+                //      novel data).
+                //
+                // When either guard fires, we sleep
+                // AUTH_REJECT_DELAY_MS before replying so timing
+                // analysis can't flag us as "rejects at line rate".
+                // The contract is "reject the first MIN_ATTEMPTS_BEFORE_ACCEPT
+                // attempts UNCONDITIONALLY". With MIN=2, that means attempts
+                // #1 AND #2 must both reject regardless of credential
+                // weakness. The first push of this PR shipped `<` instead
+                // of `<=`, which let attempt #2 with `admin/admin` slip
+                // through to the weak-credential branch and accept on
+                // the second try — a one-attempt fingerprint window for
+                // scanners and a violation of Spec 046 Inv. 2. Caught by
+                // CodeRabbit on PR #508 review. The
+                // `weak_credential_on_second_attempt_still_rejects` anchor
+                // below pins the corrected semantics.
+                if attempt_n <= MIN_ATTEMPTS_BEFORE_ACCEPT {
+                    debug!(user, attempt_n, "honeypot: rejected under threshold");
+                    tokio::time::sleep(Duration::from_millis(AUTH_REJECT_DELAY_MS)).await;
+                    return Ok(Auth::Reject {
+                        proceed_with_methods: None,
+                        partial_success: false,
+                    });
+                }
+                if !is_known_weak_credential(user, password) {
+                    debug!(user, "honeypot: rejected non-weak credential");
+                    tokio::time::sleep(Duration::from_millis(AUTH_REJECT_DELAY_MS)).await;
+                    return Ok(Auth::Reject {
+                        proceed_with_methods: None,
+                        partial_success: false,
+                    });
+                }
+                info!(
+                    user,
+                    attempt_n, "honeypot: accepted dropper-style auth (shell open)"
+                );
                 *accepted_user = Some(user.to_string());
                 Ok(Auth::Accept)
             }
@@ -527,14 +669,41 @@ fn build_shell_system_prompt(user: &str, hostname: &str, history: &[(String, Str
 // Public entry points
 // ---------------------------------------------------------------------------
 
+/// SSH banner advertised to clients. Spec 046 Inv. 4: russh's default
+/// (`SSH-2.0-russh_0.60.1`) is a one-byte honeypot fingerprint —
+/// `ssh-audit` and any half-decent scanner flag the server as a
+/// non-OpenSSH implementation in zero queries. We replace it with a
+/// realistic recent-Ubuntu-LTS OpenSSH banner so scanners proceed
+/// to the auth phase. Pinned to a stable Ubuntu 22.04 LTS release;
+/// rotation per-install is a Phase B follow-up.
+const HONEYPOT_SSH_BANNER: &str = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6";
+
+/// Spec 046 Phase A — minimum SSH `max_auth_attempts` floor. The
+/// tiered acceptance flow needs at least `MIN_ATTEMPTS_BEFORE_ACCEPT + 1`
+/// attempts before the shell can ever open. If a caller (operator
+/// config, test fixture, future refactor) passes `1` or `2`, russh
+/// closes the connection BEFORE the dropper reaches a known-weak
+/// credential and the honeypot becomes unreachable — silently
+/// regressing back to "0 commands captured". CodeRabbit caught this
+/// on PR #508 review; the floor enforcement closes the gap.
+fn floor_max_auth_attempts(requested: usize) -> usize {
+    requested.max(MIN_ATTEMPTS_BEFORE_ACCEPT + 1)
+}
+
 /// Build an ephemeral russh server config with an Ed25519 key.
 pub(crate) fn build_ssh_config(max_auth_attempts: usize) -> Arc<Config> {
     // ssh_key::PrivateKey::random requires CryptoRng from rand_core 0.10 (via russh 0.60).
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
         .expect("Ed25519 key generation should not fail");
     Arc::new(Config {
+        // Spec 046 Inv. 4 — masquerade as OpenSSH instead of russh.
+        server_id: SshId::Standard(Cow::Borrowed(HONEYPOT_SSH_BANNER)),
         keys: vec![key],
-        max_auth_attempts,
+        max_auth_attempts: floor_max_auth_attempts(max_auth_attempts),
+        // Reject latency comes from per-attempt `tokio::time::sleep`
+        // inside `auth_password` rather than russh's built-in timer
+        // because we want different timings per branch (under-threshold
+        // vs non-weak-credential) and the russh timer is global.
         auth_rejection_time: Duration::ZERO,
         auth_rejection_time_initial: Some(Duration::ZERO),
         inactivity_timeout: Some(Duration::from_secs(30)),
@@ -677,14 +846,27 @@ mod tests {
         let _ = bucket; // used for compilation check
     }
 
-    // --- LlmShell mode tests (no real AI needed for unit tests) ---
+    // ── Spec 046 Phase A — tiered acceptance + banner anchors ────
+    //
+    // The pre-spec-046 contract was "LlmShell mode accepts on the
+    // first password attempt regardless of credential". Prod evidence
+    // (2026-05-10, 244 sessions across 30 days, 0 commands) showed
+    // that contract was the bug, not the design. The new contract:
+    //
+    //   1. Every attempt is recorded (Inv. 1).
+    //   2. Reject the first MIN_ATTEMPTS_BEFORE_ACCEPT attempts
+    //      regardless of credential (Inv. 2 — filters single-shot
+    //      credential scanners).
+    //   3. After threshold, accept ONLY if the credential is on the
+    //      KNOWN_WEAK_CREDENTIALS list (Inv. 3 — filters random
+    //      brute-force; ensures we accept a credential already
+    //      circulating in scanner DBs so accepting it adds market-
+    //      distortion poison).
+    //   4. RejectAll mode is unchanged (Inv. 5).
+    //   5. SSH banner masquerades as OpenSSH, never russh (Inv. 4).
 
-    #[tokio::test]
-    async fn llm_shell_mode_accepts_password_auth() {
-        // We use a minimal mock that is never called in these unit tests
-        // (the auth flow itself does not invoke the AI).
+    fn make_llm_shell_handler(bucket: &EvidenceBucket) -> HoneypotSshHandler {
         struct NoopAi;
-
         #[async_trait::async_trait]
         impl crate::ai::AiProvider for NoopAi {
             fn name(&self) -> &'static str {
@@ -701,13 +883,11 @@ mod tests {
                 _system_prompt: &str,
                 _user_message: &str,
             ) -> anyhow::Result<String> {
-                Ok("fake output".to_string())
+                Ok(String::new())
             }
         }
-
-        let bucket = empty_bucket();
-        let mut h = HoneypotSshHandler {
-            evidence: Arc::clone(&bucket),
+        HoneypotSshHandler {
+            evidence: Arc::clone(bucket),
             mode: HandlerMode::LlmShell {
                 ai: Arc::new(NoopAi),
                 hostname: "srv-prod-01".to_string(),
@@ -716,17 +896,250 @@ mod tests {
                 input_buf: Vec::new(),
                 history: Vec::new(),
             },
-        };
-        // Accept first password attempt - attackers try one password per connection
-        let result = h.auth_password("attacker", "hunter2").await.unwrap();
+        }
+    }
+
+    /// Spec 046 anchor #1 — Inv. 1 (cred capture is unconditional)
+    /// for the under-threshold reject branch. Operator log must NEVER
+    /// be missing a credential because the tiered logic rejected the
+    /// attempt — the credential is the WHOLE POINT of the listener.
+    #[tokio::test]
+    async fn auth_password_records_attempt_even_when_rejected_under_threshold() {
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+        let res = h.auth_password("admin", "admin").await.unwrap();
         assert!(
-            matches!(result, Auth::Accept),
-            "must accept first password to lure attacker into shell"
+            matches!(res, Auth::Reject { .. }),
+            "first attempt must reject regardless of credential weakness"
         );
         let ev = bucket.lock().unwrap();
-        assert_eq!(ev.auth_attempts.len(), 1);
-        assert_eq!(ev.auth_attempts[0].method, "password");
-        assert_eq!(ev.auth_attempts[0].username, "attacker");
+        assert_eq!(ev.auth_attempts.len(), 1, "credential must be recorded");
+        assert_eq!(ev.auth_attempts[0].username, "admin");
+        assert_eq!(ev.auth_attempts[0].password.as_deref(), Some("admin"));
+    }
+
+    /// Spec 046 anchor #2 — Inv. 1 for the not-weak reject branch.
+    #[tokio::test]
+    async fn auth_password_records_attempt_even_when_credential_not_weak() {
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+        // Bypass under-threshold guard: pump attempts up first.
+        for _ in 0..MIN_ATTEMPTS_BEFORE_ACCEPT {
+            let _ = h.auth_password("nobody", "ignore").await.unwrap();
+        }
+        let res = h
+            .auth_password("nobody", "ZkX9Q1mP4uV7sT2nR6bL")
+            .await
+            .unwrap();
+        assert!(
+            matches!(res, Auth::Reject { .. }),
+            "non-weak credential must reject even after threshold"
+        );
+        let ev = bucket.lock().unwrap();
+        assert!(
+            ev.auth_attempts
+                .iter()
+                .any(|a| a.password.as_deref() == Some("ZkX9Q1mP4uV7sT2nR6bL")),
+            "the rejected credential must be appended to evidence"
+        );
+    }
+
+    /// Spec 046 anchor #3 — Inv. 2 (single-shot scanners get reject).
+    /// This is THE fingerprint guard: a credentialer connecting once
+    /// and trying `admin/admin` MUST see a reject so it cannot use
+    /// our zero-effort accept as a cheap "honeypot detector".
+    #[tokio::test]
+    async fn single_shot_attempt_is_rejected_in_llm_shell_mode() {
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+        // `admin/admin` is on the KNOWN_WEAK list — but attempt #1
+        // must still reject because of the threshold guard.
+        let res = h.auth_password("admin", "admin").await.unwrap();
+        assert!(
+            matches!(res, Auth::Reject { .. }),
+            "first attempt must always reject — even on a weak credential — \
+             so single-shot scanners cannot fingerprint us as accept-on-1"
+        );
+    }
+
+    /// Spec 046 anchor #3b — Inv. 2 (regression: off-by-one fix).
+    /// CodeRabbit caught on PR #508 that the first push used
+    /// `attempt_n < MIN_ATTEMPTS_BEFORE_ACCEPT`, so attempt #2 with a
+    /// weak credential leaked through to the accept branch — only
+    /// attempt #1 was unconditionally rejected, contradicting the
+    /// "reject the first 2 attempts unconditionally" contract. This
+    /// anchor pins the corrected semantics so the bug cannot return.
+    /// Removing this test would re-open the one-attempt fingerprint
+    /// window scanners can use to cheap-detect IW honeypots.
+    #[tokio::test]
+    async fn weak_credential_on_second_attempt_still_rejects() {
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+        // Attempt #1 — under-threshold reject regardless of cred.
+        let r1 = h.auth_password("admin", "admin").await.unwrap();
+        assert!(matches!(r1, Auth::Reject { .. }));
+        // Attempt #2 — STILL under threshold; even though
+        // `admin/admin` is a known-weak credential, the contract
+        // says "first MIN_ATTEMPTS_BEFORE_ACCEPT attempts always
+        // reject" so the dropper has to demonstrate persistence.
+        let r2 = h.auth_password("admin", "admin").await.unwrap();
+        assert!(
+            matches!(r2, Auth::Reject { .. }),
+            "attempt #2 with a known-weak credential MUST still reject — \
+             the threshold is `<= MIN_ATTEMPTS_BEFORE_ACCEPT`, not `<`. \
+             A regression here re-opens the off-by-one fingerprint window."
+        );
+        // Attempt #3 — past threshold + weak cred → finally accepts.
+        let r3 = h.auth_password("admin", "admin").await.unwrap();
+        assert!(
+            matches!(r3, Auth::Accept),
+            "attempt #3 with a known-weak credential MUST accept — \
+             the threshold is exclusive of MIN_ATTEMPTS_BEFORE_ACCEPT."
+        );
+    }
+
+    /// Spec 046 anchor #4 — Inv. 3 (tiered accept happy path).
+    /// Both guards satisfied: attempt count ≥ threshold AND the
+    /// credential is on the curated weak list. This is the only
+    /// branch that opens the shell.
+    #[tokio::test]
+    async fn accept_only_when_attempt_n_threshold_and_known_weak() {
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+        // First MIN_ATTEMPTS_BEFORE_ACCEPT attempts are placeholders.
+        for _ in 0..MIN_ATTEMPTS_BEFORE_ACCEPT {
+            let res = h.auth_password("root", "irrelevant").await.unwrap();
+            assert!(matches!(res, Auth::Reject { .. }));
+        }
+        // Now a known-weak credential should accept.
+        let res = h.auth_password("root", "123456").await.unwrap();
+        assert!(
+            matches!(res, Auth::Accept),
+            "after threshold and known-weak credential, must accept"
+        );
+        // accepted_user must be set so the prompt builder picks it up.
+        if let HandlerMode::LlmShell { accepted_user, .. } = &h.mode {
+            assert_eq!(accepted_user.as_deref(), Some("root"));
+        } else {
+            panic!("mode must remain LlmShell after accept");
+        }
+    }
+
+    /// Spec 046 anchor #5 — Inv. 3 (no count-only acceptance).
+    /// Even after many attempts, a non-weak credential MUST stay
+    /// rejected. Removing this guard would let an attacker bypass
+    /// the list by hammering the same random string.
+    #[tokio::test]
+    async fn random_password_after_threshold_still_rejected() {
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+        for _ in 0..(MIN_ATTEMPTS_BEFORE_ACCEPT + 5) {
+            let res = h.auth_password("nobody", "qP9wKzLm8ntx").await.unwrap();
+            assert!(
+                matches!(res, Auth::Reject { .. }),
+                "random non-weak credential must reject regardless of attempt count"
+            );
+        }
+    }
+
+    /// Spec 046 anchor #6 — list correctness. The Mirai canonical
+    /// defaults are part of the design contract. Removing them would
+    /// silently regress the bot-class we're built to trap.
+    #[test]
+    fn known_weak_credential_list_includes_canonical_mirai_defaults() {
+        // Each pair below has shipped on real Mirai source and is
+        // tried by every Mirai-derivative we've seen in prod logs.
+        let must_have: &[(&str, &str)] = &[
+            ("root", "root"),
+            ("root", "123456"),
+            ("root", "vizxv"),
+            ("root", "xc3511"),
+            ("admin", "admin"),
+            ("ubnt", "ubnt"),
+            ("pi", "raspberry"),
+        ];
+        for (u, p) in must_have {
+            assert!(
+                is_known_weak_credential(u, p),
+                "known-weak list must include canonical Mirai default {u}/{p}"
+            );
+        }
+        // Sanity: random strings must NOT match.
+        assert!(!is_known_weak_credential("root", "qP9wKzLm8ntx"));
+        assert!(!is_known_weak_credential("noopuser", "noopuser"));
+    }
+
+    /// Spec 046 anchor #7 — Inv. 4 (banner). The russh default
+    /// banner is `SSH-2.0-russh_*` which is a one-token honeypot
+    /// fingerprint. Banner MUST NOT contain that substring, ever.
+    #[test]
+    fn build_ssh_config_banner_does_not_contain_russh() {
+        let cfg = build_ssh_config(6);
+        let banner = format!("{:?}", cfg.server_id);
+        assert!(
+            !banner.to_lowercase().contains("russh"),
+            "banner must not leak the russh implementation name: got {banner}"
+        );
+    }
+
+    /// Spec 046 anchor #8 — Inv. 4 (banner shape). The banner MUST
+    /// look like a recent OpenSSH so scanners proceed past the
+    /// banner-grab phase.
+    #[test]
+    fn build_ssh_config_banner_matches_openssh_shape() {
+        let cfg = build_ssh_config(6);
+        let banner_dbg = format!("{:?}", cfg.server_id);
+        assert!(
+            banner_dbg.contains("SSH-2.0-OpenSSH"),
+            "banner must advertise OpenSSH: got {banner_dbg}"
+        );
+    }
+
+    /// Spec 046 anchor #8b — `max_auth_attempts` floor enforcement.
+    /// CodeRabbit caught on PR #508 that the function blindly trusted
+    /// the caller's value. With the tiered flow rejecting the first 2
+    /// attempts unconditionally, a caller passing `max_auth_attempts =
+    /// 1` or `2` makes the shell unreachable even on perfect Mirai
+    /// matches — the dropper hits russh's session close before our
+    /// accept branch runs. The floor pulls any value below
+    /// `MIN_ATTEMPTS_BEFORE_ACCEPT + 1` up to that minimum.
+    #[test]
+    fn build_ssh_config_floors_max_auth_attempts_below_threshold() {
+        for too_low in [0usize, 1, 2] {
+            let cfg = build_ssh_config(too_low);
+            assert!(
+                cfg.max_auth_attempts >= MIN_ATTEMPTS_BEFORE_ACCEPT + 1,
+                "floor breached: requested={too_low}, got={}, min={}",
+                cfg.max_auth_attempts,
+                MIN_ATTEMPTS_BEFORE_ACCEPT + 1
+            );
+        }
+        // Sane operator values are NOT touched.
+        assert_eq!(build_ssh_config(6).max_auth_attempts, 6);
+        assert_eq!(build_ssh_config(10).max_auth_attempts, 10);
+    }
+
+    /// Spec 046 anchor #9 — Inv. 5 (RejectAll preserved at high
+    /// attempt counts). Accidentally letting the tiered logic leak
+    /// into the RejectAll branch would defeat the medium-interaction
+    /// listener entirely.
+    #[tokio::test]
+    async fn reject_all_mode_rejects_at_high_attempt_counts() {
+        let bucket = empty_bucket();
+        let mut h = HoneypotSshHandler {
+            evidence: Arc::clone(&bucket),
+            mode: HandlerMode::RejectAll,
+        };
+        // Bombard with weak credentials AND high attempt counts —
+        // RejectAll must still reject every single one.
+        for i in 0..6u32 {
+            let res = h.auth_password("root", "root").await.unwrap();
+            assert!(
+                matches!(res, Auth::Reject { .. }),
+                "RejectAll mode must reject attempt {i} of root/root"
+            );
+        }
+        assert_eq!(bucket.lock().unwrap().auth_attempts.len(), 6);
     }
 
     #[tokio::test]
