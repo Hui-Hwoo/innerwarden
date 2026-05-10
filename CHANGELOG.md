@@ -9,6 +9,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-05-10
+
+Hotfix release for the silent Local Warden Model regression that affected every GHA-released binary in the v0.13.x line. Anyone installing via the `curl | sudo bash` script or `innerwarden upgrade` for v0.13.0–v0.13.2 was getting an agent that logged the on-device classifier as missing and silently fell back to whatever cloud provider was configured. v0.13.3 is the first release where the binary on the GitHub release page actually has the Local Warden classifier linked in.
+
 ### Fixed
 
 - **GHA-released agent now ships with Local Warden Model linked in.** Pre-fix the release workflow built the agent with `cargo zigbuild --release -p innerwarden-agent` without `--features local-classifier`, which meant every binary downloaded from the GitHub release page (including via the `curl | sudo bash` install script and `innerwarden upgrade`) had the on-device ONNX classifier missing — at startup the agent logged `local_warden provider requires building innerwarden-agent with --features local-classifier` and silently fell back to whatever cloud provider was configured. Operators using `scripts/deploy-prod.sh` were unaffected because that script always passed the feature explicitly. The condition has existed at least since v0.13.0 and went undetected because the prior asset manifest checked filenames, not binary content. Fix: pass `--features local-classifier` on both x86_64 and aarch64 build steps in `release.yml`. The binary feature-parity guard from PR #520 verifies the `local_classifier` symbol is present and now hard-fails the release if it is not — so the regression cannot recur.
