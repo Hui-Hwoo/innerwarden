@@ -1089,6 +1089,21 @@ pub struct ShadowConfig {
     /// `/var/lib/innerwarden/shadow-decisions.jsonl`.
     #[serde(default = "default_shadow_log_path")]
     pub log_path: String,
+
+    /// Fraction of `Decide` calls that run the shadow comparison.
+    /// Default `1.0` (every call) preserves the original behaviour from
+    /// the initial 028-b validation window.
+    ///
+    /// After RESULTS_V3 (2026-05-11) the spec 028-b validation window
+    /// is satisfied with 22 days of data — operators can drop this to
+    /// `0.1` to keep a 10% drift-detection sample at one-tenth the
+    /// Azure latency + API spend per incident, then return to `1.0`
+    /// temporarily when investigating a suspected model regression.
+    ///
+    /// Range `[0.0, 1.0]`. Values outside the range fail config
+    /// validation rather than silently clamping.
+    #[serde(default = "default_shadow_sample_rate")]
+    pub sample_rate: f32,
 }
 
 impl Default for ShadowConfig {
@@ -1101,6 +1116,7 @@ impl Default for ShadowConfig {
             base_url: String::new(),
             api_version: String::new(),
             log_path: default_shadow_log_path(),
+            sample_rate: default_shadow_sample_rate(),
         }
     }
 }
@@ -1109,7 +1125,28 @@ fn default_shadow_log_path() -> String {
     "/var/lib/innerwarden/shadow-decisions.jsonl".to_string()
 }
 
+fn default_shadow_sample_rate() -> f32 {
+    1.0
+}
+
 impl ShadowConfig {
+    /// Validate the shadow config. Called from the agent boot path so
+    /// a malformed `[ai.shadow]` block fails fast at startup rather
+    /// than silently clamping a bad `sample_rate` to a confusing
+    /// runtime behaviour.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !(0.0..=1.0).contains(&self.sample_rate) || self.sample_rate.is_nan() {
+            anyhow::bail!(
+                "[ai.shadow].sample_rate must be in [0.0, 1.0], got {}",
+                self.sample_rate
+            );
+        }
+        Ok(())
+    }
+
     /// Resolve API key: config field first, then provider-specific env var.
     pub fn resolved_api_key(&self) -> String {
         if !self.api_key.is_empty() {
@@ -3837,6 +3874,47 @@ approval_ttl_secs = 300
         assert!(s.base_url.is_empty());
         assert!(s.api_version.is_empty());
         assert_eq!(s.log_path, "/var/lib/innerwarden/shadow-decisions.jsonl");
+        assert_eq!(
+            s.sample_rate, 1.0,
+            "default must preserve legacy 100% shadow behaviour"
+        );
+    }
+
+    #[test]
+    fn shadow_config_validate_rejects_out_of_range_sample_rate() {
+        // Operator typo guard. After RESULTS_V3 lowered shadow sampling
+        // to 0.1 in prod, a bad edit (e.g. `1.1` or negative) must fail
+        // at startup rather than silently clamp.
+        let mut s = ShadowConfig::default();
+        s.enabled = true;
+        s.provider = "azure_openai".to_string();
+
+        s.sample_rate = 1.5;
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("sample_rate"),
+            "validate must mention sample_rate, got: {err}"
+        );
+
+        s.sample_rate = -0.1;
+        assert!(s.validate().is_err());
+
+        s.sample_rate = f32::NAN;
+        assert!(s.validate().is_err());
+
+        // Disabled config skips the check.
+        s.enabled = false;
+        s.sample_rate = f32::INFINITY;
+        assert!(s.validate().is_ok(), "disabled shadow skips validation");
+
+        // Boundary values pass.
+        s.enabled = true;
+        s.sample_rate = 0.0;
+        assert!(s.validate().is_ok());
+        s.sample_rate = 1.0;
+        assert!(s.validate().is_ok());
+        s.sample_rate = 0.1;
+        assert!(s.validate().is_ok());
     }
 
     #[test]

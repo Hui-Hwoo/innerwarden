@@ -31,6 +31,14 @@ pub struct ShadowProvider {
     log_path: PathBuf,
     /// Serializes writes to the JSONL file across concurrent decisions.
     write_lock: Arc<Mutex<()>>,
+    /// Fraction of `decide()` calls that exercise the shadow path.
+    /// `1.0` means every call (legacy behaviour from the initial 028-b
+    /// validation window); `0.1` runs the shadow ~10% of the time and
+    /// skips both the shadow request and the JSONL append for the
+    /// other 90% — keeps a drift-detection sample at a fraction of
+    /// the Azure latency + API spend per incident.
+    /// Validated by `ShadowConfig::validate` to be in `[0.0, 1.0]`.
+    sample_rate: f32,
 }
 
 #[derive(Serialize)]
@@ -50,17 +58,45 @@ struct ShadowLogEntry<'a> {
 }
 
 impl ShadowProvider {
-    pub fn new(
+    /// Construct a shadow-mode wrapper. `sample_rate=1.0` preserves
+    /// the legacy "run shadow on every decide()" behaviour from the
+    /// initial 028-b validation window; `sample_rate=0.1` is the
+    /// post-validation drift-detection setting (see RESULTS_V3
+    /// 2026-05-11). Range is `[0.0, 1.0]`; values outside that clamp
+    /// defensively — the canonical gate is `ShadowConfig::validate`
+    /// at startup.
+    pub fn with_sample_rate(
         primary: Box<dyn AiProvider>,
         shadow: Box<dyn AiProvider>,
         log_path: impl AsRef<Path>,
+        sample_rate: f32,
     ) -> Self {
+        // Caller is expected to validate via `ShadowConfig::validate`
+        // before reaching here; clamp defensively as a belt-and-suspenders
+        // in case a future caller forgets, so a misconfig can never cause
+        // shadow to run never (when intended) or always (when not).
+        let sample_rate = sample_rate.clamp(0.0, 1.0);
         Self {
             primary,
             shadow,
             log_path: log_path.as_ref().to_path_buf(),
             write_lock: Arc::new(Mutex::new(())),
+            sample_rate,
         }
+    }
+
+    /// Returns true when this `decide()` call should exercise the shadow.
+    /// `1.0` always runs, `0.0` never runs, anything in between is a
+    /// per-call uniform random draw. Extracted so tests can pin the
+    /// boundary behaviour without seeding the global RNG.
+    fn should_sample(sample_rate: f32) -> bool {
+        if sample_rate >= 1.0 {
+            return true;
+        }
+        if sample_rate <= 0.0 {
+            return false;
+        }
+        rand::random::<f32>() < sample_rate
     }
 
     async fn append_log(&self, entry: &ShadowLogEntry<'_>) {
@@ -114,6 +150,18 @@ impl AiProvider for ShadowProvider {
 
     async fn decide(&self, ctx: &DecisionContext<'_>) -> Result<AiDecision> {
         let incident_id = ctx.incident.incident_id.clone();
+
+        // Probabilistic sampling (2026-05-11 RESULTS_V3): when
+        // `sample_rate < 1.0`, skip the shadow path entirely on the
+        // non-sampled fraction. The skipped calls don't touch the
+        // shadow provider, don't append to the JSONL log, and don't
+        // emit the per-decision info log line. Net effect: at
+        // `sample_rate = 0.1` the shadow infra runs 10% as often,
+        // preserving drift-detection signal at 1/10 the Azure latency
+        // + API spend.
+        if !Self::should_sample(self.sample_rate) {
+            return self.primary.decide(ctx).await;
+        }
 
         // Run both concurrently and time each provider independently so
         // shadow_latency_ms reflects the shadow's own inference time, not the
@@ -262,7 +310,7 @@ mod tests {
             action: AiAction::Ignore { reason: "s".into() },
             calls: Arc::clone(&shadow_calls),
         });
-        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
 
         let inc = dummy_incident();
         let ctx = DecisionContext {
@@ -305,7 +353,7 @@ mod tests {
             },
             calls: Arc::new(AtomicUsize::new(0)),
         });
-        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
 
         let inc = dummy_incident();
         let ctx = DecisionContext {
@@ -349,7 +397,7 @@ mod tests {
             action: AiAction::Ignore { reason: "x".into() },
             calls: Arc::new(AtomicUsize::new(0)),
         });
-        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
         let inc = dummy_incident();
         let ctx = DecisionContext {
             incident: &inc,
@@ -373,7 +421,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let shadow = Box::new(Erroring);
-        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
         let d = sp.decide(&ctx).await.unwrap();
         assert!(matches!(d.action, AiAction::Ignore { .. }));
         let logged = std::fs::read_to_string(tmp.path()).unwrap();
@@ -396,7 +444,7 @@ mod tests {
             calls: Arc::clone(&shadow_calls),
         });
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
 
         let reply = sp.chat("system", "user").await.unwrap();
         assert_eq!(reply, "prim chat");
@@ -445,7 +493,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
 
         let caps = sp.capabilities();
         assert!(caps.has(Capability::Decide));
@@ -468,7 +516,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
         assert_eq!(sp.name(), "primary-name");
     }
 
@@ -514,7 +562,7 @@ mod tests {
             name: "slow-shadow",
             delay_ms: 80,
         });
-        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
 
         let inc = dummy_incident();
         let ctx = DecisionContext {
@@ -561,7 +609,8 @@ mod tests {
             action: AiAction::Ignore { reason: "s".into() },
             calls: Arc::new(AtomicUsize::new(0)),
         });
-        let sp = ShadowProvider::new(primary, shadow, "/nonexistent/dir/shadow.jsonl");
+        let sp =
+            ShadowProvider::with_sample_rate(primary, shadow, "/nonexistent/dir/shadow.jsonl", 1.0);
 
         let inc = dummy_incident();
         let ctx = DecisionContext {
@@ -577,5 +626,198 @@ mod tests {
         };
         let d = sp.decide(&ctx).await.unwrap();
         assert!(matches!(d.action, AiAction::Ignore { .. }));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Sample-rate behaviour (RESULTS_V3, 2026-05-11). The boundary
+    // cases (0.0 / 1.0) are deterministic; the intermediate cases use
+    // the static helper which does call the global RNG. Tests pin
+    // boundaries to avoid flakiness from random draws.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn should_sample_one_point_oh_always_runs() {
+        // sample_rate=1.0 is the legacy behaviour and the default. Every
+        // call must run the shadow path so the JSONL log keeps growing
+        // at the existing rate for existing deployments.
+        for _ in 0..100 {
+            assert!(ShadowProvider::should_sample(1.0));
+        }
+    }
+
+    #[test]
+    fn should_sample_zero_never_runs() {
+        // sample_rate=0.0 is the operator's "shadow off but stay
+        // wrapped" mode (useful when toggling at runtime via config
+        // reload without restarting). The shadow path must skip
+        // unconditionally so no Azure calls fire and the JSONL log
+        // stays unchanged.
+        for _ in 0..100 {
+            assert!(!ShadowProvider::should_sample(0.0));
+        }
+    }
+
+    #[test]
+    fn should_sample_intermediate_does_not_panic() {
+        // Probabilistic; we don't assert on the boolean outcome (it's
+        // random) but we DO assert that calling it many times never
+        // panics — the rand::random::<f32>() path is well-formed.
+        let mut hits = 0;
+        let mut total = 0;
+        for _ in 0..2000 {
+            total += 1;
+            if ShadowProvider::should_sample(0.1) {
+                hits += 1;
+            }
+        }
+        // 0.1 over 2000 draws: expected ~200, allow generous 50..400
+        // band so the test stays green across the rand crate's internal
+        // PRNG variations and CI noise. Tighter would flake.
+        assert!(
+            (50..=400).contains(&hits),
+            "expected ~200 sampled out of 2000 at rate 0.1, got {hits} / {total}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_skips_shadow_when_sample_rate_zero() {
+        // Hard zero: shadow provider must NEVER be called, JSONL log
+        // must stay empty. This is the operator's "keep wrapping for
+        // hot-reload to flip later, but no live shadow traffic" mode.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let shadow_calls = Arc::new(AtomicUsize::new(0));
+        let primary = Box::new(FakeProvider {
+            name: "prim",
+            action: AiAction::Ignore { reason: "p".into() },
+            calls: primary_calls.clone(),
+        });
+        let shadow = Box::new(FakeProvider {
+            name: "shad",
+            action: AiAction::Ignore { reason: "s".into() },
+            calls: shadow_calls.clone(),
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 0.0);
+
+        let inc = dummy_incident();
+        let ctx = DecisionContext {
+            incident: &inc,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked: vec![],
+            available_skills: vec![],
+            ip_reputation: None,
+            ip_geo: None,
+            graph_context: None,
+            graph_subgraph: None,
+        };
+
+        // 5 calls is plenty to make any deterministic-bug stand out.
+        for _ in 0..5 {
+            let _ = sp.decide(&ctx).await.unwrap();
+        }
+
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            5,
+            "primary must always run"
+        );
+        assert_eq!(
+            shadow_calls.load(Ordering::SeqCst),
+            0,
+            "shadow must never run at rate 0"
+        );
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(
+            log.is_empty(),
+            "JSONL log must stay empty when shadow is skipped: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_always_runs_shadow_when_sample_rate_one() {
+        // Sanity check the legacy behaviour wasn't broken by the
+        // refactor. With rate=1.0 the shadow must run on every call
+        // and the JSONL log must grow by one line per call.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let shadow_calls = Arc::new(AtomicUsize::new(0));
+        let primary = Box::new(FakeProvider {
+            name: "prim",
+            action: AiAction::Ignore { reason: "p".into() },
+            calls: primary_calls.clone(),
+        });
+        let shadow = Box::new(FakeProvider {
+            name: "shad",
+            action: AiAction::Ignore { reason: "s".into() },
+            calls: shadow_calls.clone(),
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sp = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), 1.0);
+
+        let inc = dummy_incident();
+        let ctx = DecisionContext {
+            incident: &inc,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked: vec![],
+            available_skills: vec![],
+            ip_reputation: None,
+            ip_geo: None,
+            graph_context: None,
+            graph_subgraph: None,
+        };
+        for _ in 0..3 {
+            let _ = sp.decide(&ctx).await.unwrap();
+        }
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            shadow_calls.load(Ordering::SeqCst),
+            3,
+            "shadow must run on every call at rate 1.0"
+        );
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert_eq!(log.lines().count(), 3, "one JSONL line per call");
+    }
+
+    #[test]
+    fn with_sample_rate_clamps_out_of_range_values() {
+        // Defensive belt-and-suspenders: ShadowConfig::validate is
+        // the canonical gate at startup, but if a future caller
+        // forgets to validate the constructor must not panic or
+        // produce a degenerate state. Negative clamps to 0
+        // (effectively "never sample"), > 1 clamps to 1 ("always").
+        // This pins the contract so refactors of `clamp` cannot
+        // silently regress to a behaviour where, say, a typo'd
+        // `-0.1` would loop forever on `rand::random::<f32>() < -0.1`.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let shadow_calls = Arc::new(AtomicUsize::new(0));
+        let primary = Box::new(FakeProvider {
+            name: "prim",
+            action: AiAction::Ignore { reason: "p".into() },
+            calls: primary_calls.clone(),
+        });
+        let shadow = Box::new(FakeProvider {
+            name: "shad",
+            action: AiAction::Ignore { reason: "s".into() },
+            calls: shadow_calls.clone(),
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sp_neg = ShadowProvider::with_sample_rate(primary, shadow, tmp.path(), -0.5);
+        assert_eq!(sp_neg.sample_rate, 0.0);
+
+        let primary2 = Box::new(FakeProvider {
+            name: "prim",
+            action: AiAction::Ignore { reason: "p".into() },
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let shadow2 = Box::new(FakeProvider {
+            name: "shad",
+            action: AiAction::Ignore { reason: "s".into() },
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let tmp2 = tempfile::NamedTempFile::new().unwrap();
+        let sp_high = ShadowProvider::with_sample_rate(primary2, shadow2, tmp2.path(), 2.5);
+        assert_eq!(sp_high.sample_rate, 1.0);
     }
 }

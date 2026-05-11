@@ -485,10 +485,17 @@ pub fn build_shadow_observer(
 /// Decide auditing. Returns the primary unchanged when shadow is
 /// `None`. Keeps the shadow path a one-liner at call sites so the
 /// router stays easy to read.
+///
+/// `sample_rate` in `[0.0, 1.0]` controls the fraction of `decide()`
+/// calls that exercise the shadow path. `1.0` (legacy default) means
+/// every call. `0.1` runs the shadow on ~10% of calls — preserves a
+/// drift-detection sample after the initial validation window is
+/// satisfied. See `ShadowConfig::sample_rate`.
 pub fn wrap_with_shadow(
     primary: Box<dyn AiProvider>,
     shadow: Option<Box<dyn AiProvider>>,
     log_path: &str,
+    sample_rate: f32,
 ) -> Box<dyn AiProvider> {
     match shadow {
         Some(shadow) => {
@@ -496,9 +503,15 @@ pub fn wrap_with_shadow(
                 primary = %primary.name(),
                 shadow = %shadow.name(),
                 log_path = %log_path,
+                sample_rate,
                 "shadow mode enabled"
             );
-            Box::new(shadow::ShadowProvider::new(primary, shadow, log_path))
+            Box::new(shadow::ShadowProvider::with_sample_rate(
+                primary,
+                shadow,
+                log_path,
+                sample_rate,
+            ))
         }
         None => primary,
     }
@@ -1030,7 +1043,7 @@ mod tests {
             "ufw",
         )
         .expect("stub builds");
-        let wrapped = wrap_with_shadow(primary, None, "/tmp/unused.jsonl");
+        let wrapped = wrap_with_shadow(primary, None, "/tmp/unused.jsonl", 1.0);
         assert_eq!(wrapped.name(), "stub");
     }
 

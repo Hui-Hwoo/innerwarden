@@ -325,9 +325,12 @@ fn resolve_slot(
                         confidence_threshold,
                         block_backend,
                     ) {
-                        Ok(shadow_opt) => {
-                            crate::ai::wrap_with_shadow(primary_box, shadow_opt, &scfg.log_path)
-                        }
+                        Ok(shadow_opt) => crate::ai::wrap_with_shadow(
+                            primary_box,
+                            shadow_opt,
+                            &scfg.log_path,
+                            scfg.sample_rate,
+                        ),
                         Err(e) => {
                             on_fallback(slot_name, &scfg.provider, &e);
                             primary_box

@@ -326,6 +326,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     // Validate Telegram config early to fail fast on misconfiguration
     cfg.telegram.validate()?;
+    // Validate [ai.shadow] (sample_rate range etc.) — same fail-fast
+    // philosophy. After RESULTS_V3 (2026-05-11) operators may set
+    // `sample_rate = 0.1` to keep a drift sample at 1/10 cost; a
+    // typo'd `1.1` or `-0.5` must error at startup, not silently clamp.
+    cfg.ai.shadow.validate()?;
 
     // Initialize cloud provider IP safelist (Google, AWS, Azure, Cloudflare, etc.)
     cloud_safelist::init();
