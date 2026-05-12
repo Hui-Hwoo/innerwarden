@@ -17,6 +17,16 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/consistency_block_counts.rs::blocks_today_agrees_across_all_graph_derived_surfaces` — "Blocks today" agrees across dashboard live feed, top bar, site live feed, and the shared graph helper. Pinned the 2026-04-11 / 2026-04-22 dashboard-vs-site count drift.
 
+- `crates/agent/src/dashboard/consistency_case_metrics.rs::overview_counts_new_fields_reconcile_with_leaf_buckets` — spec 049 math contract: `flagged_by_system = contained + observing + filtered_out + needs_review`, `warden_decisions = contained + observing + filtered_out`, `needs_review = flagged - warden_decisions`. Fires if any leaf-bucket refactor forgets to recompute the derived totals.
+
+- `crates/agent/src/dashboard/consistency_case_metrics.rs::dismissed_cases_are_counted_not_silently_dropped` — spec 049 Q1+Q7 regression guard: 10 dismissed cases produce `filtered_out=10` / `flagged=10` / `warden_decisions=10`. Pre-spec-049 the `KpiBucket::None` arm was `=> {}` and the count was silently zero.
+
+- `crates/agent/src/dashboard/consistency_case_metrics.rs::tally_cases_to_overview_counts_round_trip_pins_prod_screenshot_shape` — the operator's prod input that motivated spec 049 (4 block + 3 observing + 45 dismiss + 1 no-decision) MUST round-trip through `tally_cases` to `flagged=53`, `warden_decisions=52`, `needs_review=1`.
+
+- `crates/agent/src/dashboard/case_metrics.rs::tests::dismissed_kpi_bucket_maps_to_filtered_out_not_dropped` — `KpiBucket::None` maps to `CaseOutcome::FilteredOut`. Pre-spec-049 was silently uncounted; future revert lights this up.
+
+- `crates/agent/src/dashboard/case_metrics.rs::tests::kpi_bucket_mapping_is_total_and_canonical` — every `KpiBucket` variant has exactly one `CaseOutcome` mapping. A new variant landing without a mapping fails the test.
+
 - `crates/agent/src/response_lifecycle.rs::tests::current_orphan_count_returns_zero_on_clean_system` — `current_orphan_count()` returns the number of real orphan entries on disk, never the lifetime counter. Pinned the 2026-05-03 banner gaslighting bug ("17 orphaned" persisting after PR #408 GC pruned the entries).
 
 - `crates/agent/src/response_lifecycle.rs::tests::to_json_exposes_gauges_shape_distinct_from_totals` — JSON output keeps `gauges.*` (current state) separate from `totals.*` (lifetime counters). Anti-regression for collapsing them back into one field.

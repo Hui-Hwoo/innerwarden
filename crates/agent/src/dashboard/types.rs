@@ -367,6 +367,20 @@ pub(crate) struct OverviewResponse {
     /// was `request_confirmation`. Drives the Threats-tab "Needs
     /// attention" KPI.
     pub(super) attention_count: usize,
+    /// Spec 049 — distinct attacker IPs whose decision was `dismiss`
+    /// / `ignore` ("filtered out as noise"). Pre-spec-049 these were
+    /// silently uncounted (`KpiBucket::None`). Drives the new "Filtered
+    /// out" sub-breakdown on the Home strip and the matching pivot
+    /// in Cases. See `case_metrics.rs` for the math contract.
+    pub(super) filtered_out_count: usize,
+    /// Spec 049 — `Flagged by system = blocked + observing + filtered_out + attention`.
+    /// MSSP volume number, computed by the backend so every consumer
+    /// (Home strip, Briefings, exports) reads the same reconciliation.
+    pub(super) flagged_by_system_count: usize,
+    /// Spec 049 — `Warden decisions = blocked + observing + filtered_out`.
+    /// "Operator did not have to act" number. Dismiss counts as a
+    /// decision, not a no-op (spec 049 Q1+Q7).
+    pub(super) warden_decisions_count: usize,
     /// Breakdown by severity level: {"critical": N, "high": N, ...}
     pub(super) severity_breakdown: std::collections::HashMap<String, usize>,
     /// Incidents from allowlisted IPs/users (can be hidden in dashboard).

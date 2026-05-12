@@ -14,6 +14,7 @@ use types::*;
 mod actions;
 mod agent_api;
 mod auth;
+mod case_metrics;
 mod compliance;
 mod data_api;
 mod fleet;
@@ -28,6 +29,9 @@ mod threat_contract;
 
 #[cfg(test)]
 mod consistency_block_counts;
+
+#[cfg(test)]
+mod consistency_case_metrics;
 
 #[cfg(test)]
 mod consistency_incidents_today;
@@ -2627,6 +2631,11 @@ mod tests {
                 blocked_count: 0,
                 observing_count: 0,
                 attention_count: 0,
+                // Spec 049: math contract still holds at zero
+                // (0 = 0 + 0 + 0 + 0).
+                filtered_out_count: 0,
+                flagged_by_system_count: 0,
+                warden_decisions_count: 0,
                 severity_breakdown: std::collections::HashMap::new(),
                 allowlisted_count: 0,
                 top_detectors: vec![],

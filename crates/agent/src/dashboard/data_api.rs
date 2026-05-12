@@ -133,6 +133,23 @@ pub(super) struct OverviewCounts {
     pub blocked_count: usize,
     pub observing_count: usize,
     pub attention_count: usize,
+    /// Spec 049 — "Filtered out": cases dismissed by Warden as
+    /// noise/low-risk. Pre-spec-049 this was silently uncounted
+    /// (`KpiBucket::None` was dropped). Spec 049 Q1+Q7 made dismiss
+    /// a first-class Warden decision; this counter surfaces it on
+    /// the Home strip. See `case_metrics.rs` for the math contract.
+    pub filtered_out_count: usize,
+    /// Spec 049 — `Flagged by system = Contained + Observing +
+    /// FilteredOut + NeedsReview`. The MSSP volume number ("essa
+    /// noite processamos 53 tentativas"). Emitted from the backend
+    /// (not derived in the frontend) so every consumer sees the same
+    /// reconciliation. See `case_metrics::CaseMetrics::flagged_by_system`.
+    pub flagged_by_system_count: usize,
+    /// Spec 049 — `Warden decisions = Contained + Observing +
+    /// FilteredOut`. The "operator did not have to act" number;
+    /// dismiss counts as a decision, not a no-op. See
+    /// `case_metrics::CaseMetrics::warden_decisions`.
+    pub warden_decisions_count: usize,
     pub allowlisted_count: usize,
     pub severity_breakdown: std::collections::HashMap<String, usize>,
     pub by_detector: BTreeMap<String, usize>,
@@ -371,7 +388,12 @@ pub(super) fn compute_overview_counts_from_sqlite(
             super::threat_contract::KpiBucket::Blocked => counts.blocked_count += 1,
             super::threat_contract::KpiBucket::Observing => counts.observing_count += 1,
             super::threat_contract::KpiBucket::Attention => counts.attention_count += 1,
-            super::threat_contract::KpiBucket::None => {}
+            // Spec 049: dismiss IS a Warden decision. Even though
+            // Phase 10 below overwrites these per-incident counts
+            // with per-attacker aggregates from `buckets.*`, keeping
+            // the four arms symmetric documents intent and survives
+            // any future refactor that bypasses Phase 10.
+            super::threat_contract::KpiBucket::None => counts.filtered_out_count += 1,
         }
 
         // Bucket-level severity histogram + unique attacker set.
@@ -526,6 +548,21 @@ pub(super) fn compute_overview_counts_from_sqlite(
     counts.blocked_count = buckets.blocked.unique_attackers + buckets.honeypot.unique_attackers;
     counts.observing_count = buckets.observing.unique_attackers;
     counts.attention_count = buckets.attention.unique_attackers;
+    // Spec 049 — surface `Filtered out` on the Home strip and compute
+    // the two derived totals (`Flagged by system`, `Warden decisions`)
+    // in the backend so every consumer reads the same reconciliation.
+    // `dismissed.unique_attackers` was already tracked here but never
+    // surfaced as a flat counter pre-spec-049. Math contract pinned
+    // by `case_metrics.rs` + `consistency_case_metrics.rs`.
+    counts.filtered_out_count = buckets.dismissed.unique_attackers;
+    let case_metrics = super::case_metrics::CaseMetrics {
+        contained: counts.blocked_count,
+        observing: counts.observing_count,
+        filtered_out: counts.filtered_out_count,
+        needs_review: counts.attention_count,
+    };
+    counts.flagged_by_system_count = case_metrics.flagged_by_system();
+    counts.warden_decisions_count = case_metrics.warden_decisions();
 
     // Drop the old per-incident attacker sets; they're shadowed by
     // the aggregate computation above. Keeping the variable names
@@ -800,6 +837,11 @@ pub(super) async fn api_overview(
             blocked_count: 0,
             observing_count: 0,
             attention_count: 0,
+            // Spec 049 — sleeping default: zero everywhere (math
+            // contract still holds: 0 = 0 + 0 + 0 + 0).
+            filtered_out_count: 0,
+            flagged_by_system_count: 0,
+            warden_decisions_count: 0,
             severity_breakdown: std::collections::HashMap::new(),
             allowlisted_count: 0,
             top_detectors: vec![],
@@ -904,6 +946,9 @@ pub(super) async fn api_overview(
             blocked_count: c.blocked_count,
             observing_count: c.observing_count,
             attention_count: c.attention_count,
+            filtered_out_count: c.filtered_out_count,
+            flagged_by_system_count: c.flagged_by_system_count,
+            warden_decisions_count: c.warden_decisions_count,
             severity_breakdown: c.severity_breakdown,
             // Phase 7: now populated from the persisted is_allowlisted
             // column. Pre-Phase-7 returned 0 because the flag only
@@ -940,6 +985,10 @@ pub(super) async fn api_overview(
     let mut blocked_count = 0usize;
     let mut observing_count = 0usize;
     let mut attention_count = 0usize;
+    // Spec 049 — `Filtered out` (dismissed/ignored cases). Pre-spec-049
+    // these were silently dropped by `KpiBucket::None`; now they are
+    // a first-class Warden decision and surface on the Home strip.
+    let mut filtered_out_count = 0usize;
 
     // Operator filter passed via query string. Applied AFTER the canonical
     // internal/research filter so the operator filter narrows what's
@@ -1038,7 +1087,9 @@ pub(super) async fn api_overview(
                 super::threat_contract::KpiBucket::Blocked => blocked_count += 1,
                 super::threat_contract::KpiBucket::Observing => observing_count += 1,
                 super::threat_contract::KpiBucket::Attention => attention_count += 1,
-                super::threat_contract::KpiBucket::None => {}
+                // Spec 049: dismiss IS a Warden decision; count it
+                // instead of dropping it on the floor.
+                super::threat_contract::KpiBucket::None => filtered_out_count += 1,
             }
             if let Some(dec) = decision {
                 decisions_count += 1;
@@ -1083,6 +1134,17 @@ pub(super) async fn api_overview(
 
     let telemetry = crate::telemetry::read_latest_snapshot(&state.data_dir, &date);
     let handled_ips_today = handled_ips.len();
+    // Spec 049 — math contract for the new operator-visible counters.
+    // Building `CaseMetrics` from the four leaf buckets is the ONE
+    // place where the derived totals are computed, so a future
+    // refactor that miscounts any leaf bucket also miscounts the
+    // derived totals consistently (instead of two-place drift).
+    let case_metrics = super::case_metrics::CaseMetrics {
+        contained: blocked_count,
+        observing: observing_count,
+        filtered_out: filtered_out_count,
+        needs_review: attention_count,
+    };
     Json(OverviewResponse {
         date,
         events_count: metrics.edge_count, // edges ≈ events (each event creates edges)
@@ -1097,6 +1159,9 @@ pub(super) async fn api_overview(
         blocked_count,
         observing_count,
         attention_count,
+        filtered_out_count: case_metrics.filtered_out,
+        flagged_by_system_count: case_metrics.flagged_by_system(),
+        warden_decisions_count: case_metrics.warden_decisions(),
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -1781,6 +1846,9 @@ pub(super) fn compute_overview_from_graph(
     let mut blocked_count = 0usize;
     let mut observing_count = 0usize;
     let mut attention_count = 0usize;
+    // Spec 049 — count dismissed cases as `Filtered out` (Warden
+    // decision). Pre-spec-049 `KpiBucket::None` was silently dropped.
+    let mut filtered_out_count = 0usize;
 
     for &id in &incident_nodes {
         if let Some(Node::Incident {
@@ -1833,7 +1901,8 @@ pub(super) fn compute_overview_from_graph(
                 super::threat_contract::KpiBucket::Blocked => blocked_count += 1,
                 super::threat_contract::KpiBucket::Observing => observing_count += 1,
                 super::threat_contract::KpiBucket::Attention => attention_count += 1,
-                super::threat_contract::KpiBucket::None => {}
+                // Spec 049: dismiss IS a Warden decision; count it.
+                super::threat_contract::KpiBucket::None => filtered_out_count += 1,
             }
             if let Some(dec) = decision {
                 decisions_count += 1;
@@ -1876,6 +1945,13 @@ pub(super) fn compute_overview_from_graph(
     top_detectors.truncate(6);
 
     let handled_ips_today = handled_ips.len();
+    // Spec 049 — math contract derived from the four leaf buckets.
+    let case_metrics = super::case_metrics::CaseMetrics {
+        contained: blocked_count,
+        observing: observing_count,
+        filtered_out: filtered_out_count,
+        needs_review: attention_count,
+    };
     OverviewResponse {
         date: date.to_string(),
         events_count: metrics.edge_count,
@@ -1890,6 +1966,9 @@ pub(super) fn compute_overview_from_graph(
         blocked_count,
         observing_count,
         attention_count,
+        filtered_out_count: case_metrics.filtered_out,
+        flagged_by_system_count: case_metrics.flagged_by_system(),
+        warden_decisions_count: case_metrics.warden_decisions(),
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -1954,19 +2033,29 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
     let mut blocked_count = 0usize;
     let mut observing_count = 0usize;
     let mut attention_count = 0usize;
+    // Spec 049 — Filtered out (dismissed) is now a counted Warden
+    // decision, not a silent drop. Mirrors the production paths.
+    let mut filtered_out_count = 0usize;
     for d in &decisions {
         let outcome = super::threat_contract::classify_decision(Some(&d.action_type), None);
         match super::threat_contract::kpi_bucket(outcome) {
             super::threat_contract::KpiBucket::Blocked => blocked_count += 1,
             super::threat_contract::KpiBucket::Observing => observing_count += 1,
             super::threat_contract::KpiBucket::Attention => attention_count += 1,
-            super::threat_contract::KpiBucket::None => {}
+            super::threat_contract::KpiBucket::None => filtered_out_count += 1,
         }
     }
     // Incidents without a matching decision: count as needing attention.
     if incidents.len() > decisions.len() {
         attention_count += incidents.len() - decisions.len();
     }
+    // Spec 049 — math contract derived from the four leaf buckets.
+    let case_metrics = super::case_metrics::CaseMetrics {
+        contained: blocked_count,
+        observing: observing_count,
+        filtered_out: filtered_out_count,
+        needs_review: attention_count,
+    };
 
     OverviewResponse {
         date: date.to_string(),
@@ -1982,6 +2071,9 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
         blocked_count,
         observing_count,
         attention_count,
+        filtered_out_count: case_metrics.filtered_out,
+        flagged_by_system_count: case_metrics.flagged_by_system(),
+        warden_decisions_count: case_metrics.warden_decisions(),
         severity_breakdown: std::collections::HashMap::new(),
         allowlisted_count: 0,
         top_detectors,
