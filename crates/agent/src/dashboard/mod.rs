@@ -2884,6 +2884,8 @@ mod tests {
                 filtered_out_count: 0,
                 flagged_by_system_count: 0,
                 warden_decisions_count: 0,
+                // Spec 049 PR4: TZ label.
+                timezone: "UTC".to_string(),
                 severity_breakdown: std::collections::HashMap::new(),
                 allowlisted_count: 0,
                 top_detectors: vec![],

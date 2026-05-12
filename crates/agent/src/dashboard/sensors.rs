@@ -44,6 +44,9 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
             &today,
             0,
             None,
+            // Spec 049 PR4: Sensors HUD does NOT carry a scope picker
+            // — it always renders today's full-day window.
+            None,
             now_dt,
             &degraded,
             &state.data_dir,

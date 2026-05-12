@@ -172,6 +172,66 @@ struct OverviewRow {
     external_ips: std::collections::BTreeSet<String>,
 }
 
+/// Spec 049 PR4 — validate an `(hour_from, hour_to)` pair from a
+/// `ListQuery`. Returns `Some((lo, hi))` only when BOTH are present,
+/// BOTH are in `0..=23`, AND `lo <= hi`. Any other shape returns
+/// `None`, meaning "no hour filter applied" — the safest default
+/// when the operator (or a misbehaving client) passes malformed
+/// values. Cross-midnight ranges (lo > hi) are intentionally NOT
+/// supported in PR4 — operator picks two adjacent dates instead.
+pub(super) fn parse_hour_filter(
+    hour_from: Option<u32>,
+    hour_to: Option<u32>,
+) -> Option<(u32, u32)> {
+    match (hour_from, hour_to) {
+        (Some(lo), Some(hi)) if lo <= 23 && hi <= 23 && lo <= hi => Some((lo, hi)),
+        _ => None,
+    }
+}
+
+/// Spec 049 PR4 — is `ts_ms` inside the inclusive hour-of-day filter?
+/// `hour_filter == None` means "no filter, always include". Hours
+/// are extracted in UTC (matches the storage semantics of `ts_ms`);
+/// see the PR4 note in `OverviewResponse::timezone` about the TZ
+/// labelling story for the frontend.
+pub(super) fn ts_passes_hour_filter(ts_ms: i64, hour_filter: Option<(u32, u32)>) -> bool {
+    let Some((lo, hi)) = hour_filter else {
+        return true;
+    };
+    let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts_ms) else {
+        // Invalid timestamp is operator-visible noise — surface it
+        // by including the row so the operator can investigate.
+        // Filtering it out would silently mask the data bug.
+        return true;
+    };
+    use chrono::Timelike;
+    let hour = dt.hour();
+    hour >= lo && hour <= hi
+}
+
+/// Spec 049 PR4 — operator timezone label exposed on
+/// `OverviewResponse::timezone` so the frontend scope picker can
+/// render "Today (America/Sao_Paulo)" without browser-derived TZ
+/// (which drifts across operator/analyst/client). Resolution order:
+/// 1. `TZ` env var (operator can override via systemd unit).
+/// 2. `/etc/timezone` first line (Linux convention).
+/// 3. `"UTC"` fallback.
+pub(super) fn operator_timezone() -> String {
+    if let Ok(tz) = std::env::var("TZ") {
+        let trimmed = tz.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string("/etc/timezone") {
+        let first_line = content.lines().next().unwrap_or("").trim();
+        if !first_line.is_empty() {
+            return first_line.to_string();
+        }
+    }
+    "UTC".to_string()
+}
+
 /// Read all of `date`'s incidents from SQLite (the durable source of
 /// truth, unaffected by KG TTL eviction), join with each one's latest
 /// decision, and produce both the legacy flat counters and the
@@ -180,11 +240,17 @@ struct OverviewRow {
 /// Returns `None` when the SQLite store is unreachable. Callers fall
 /// back to the in-memory KG iteration in that case so test fixtures
 /// without a Store keep working.
+#[allow(clippy::too_many_arguments)]
+// Spec 049 PR4: bundling these 8 args into a struct is a bigger
+// refactor than this PR warrants — the function is internal to the
+// dashboard module and every caller is a one-line call site. If the
+// arg list grows again, switch to a builder/struct then.
 pub(super) fn compute_overview_counts_from_sqlite(
     store: &innerwarden_store::Store,
     date: &str,
     sev_min_rank: u8,
     detector_substring: Option<&str>,
+    hour_filter: Option<(u32, u32)>,
     now: chrono::DateTime<chrono::Utc>,
     degraded: &DegradedSignals,
     data_dir: &std::path::Path,
@@ -356,6 +422,12 @@ pub(super) fn compute_overview_counts_from_sqlite(
     let stuck_threshold_ms = 60 * 60 * 1000; // 1 hour
 
     for row in &decoded {
+        // Spec 049 PR4: hour-of-day filter (inclusive, UTC).
+        // Applied BEFORE incidents_count so the count agrees with
+        // the filtered list the operator sees in the Cases tab.
+        if !ts_passes_hour_filter(row.ts_ms, hour_filter) {
+            continue;
+        }
         counts.incidents_count += 1;
         *counts.by_detector.entry(row.detector.clone()).or_insert(0) += 1;
         *counts
@@ -842,6 +914,10 @@ pub(super) async fn api_overview(
             filtered_out_count: 0,
             flagged_by_system_count: 0,
             warden_decisions_count: 0,
+            // Spec 049 PR4 — operator TZ is a static label, surface
+            // it even in sleeping mode so the picker has a useful
+            // initial render before the first non-sleeping refresh.
+            timezone: operator_timezone(),
             severity_breakdown: std::collections::HashMap::new(),
             allowlisted_count: 0,
             top_detectors: vec![],
@@ -886,6 +962,11 @@ pub(super) async fn api_overview(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_ascii_lowercase());
+    // Spec 049 PR4: validate `hour_from` / `hour_to` once at the
+    // handler so the SQLite + KG-fallback paths both see the same
+    // resolved filter (no chance of divergent interpretation across
+    // paths — same recurring-bug class as "Dashboard count != Site count").
+    let hour_filter = parse_hour_filter(query.hour_from, query.hour_to);
     let now = chrono::Utc::now();
     let degraded = read_degraded_signals(&state);
     let sqlite_counts = state.sqlite_store.as_ref().and_then(|store| {
@@ -894,6 +975,7 @@ pub(super) async fn api_overview(
             &date,
             sev_min_rank_filter,
             detector_substring_filter.as_deref(),
+            hour_filter,
             now,
             &degraded,
             &state.data_dir,
@@ -949,6 +1031,7 @@ pub(super) async fn api_overview(
             filtered_out_count: c.filtered_out_count,
             flagged_by_system_count: c.flagged_by_system_count,
             warden_decisions_count: c.warden_decisions_count,
+            timezone: operator_timezone(),
             severity_breakdown: c.severity_breakdown,
             // Phase 7: now populated from the persisted is_allowlisted
             // column. Pre-Phase-7 returned 0 because the flag only
@@ -1024,6 +1107,12 @@ pub(super) async fn api_overview(
                 if ts.naive_utc().date() != target {
                     continue;
                 }
+            }
+            // Spec 049 PR4: hour-of-day filter. Applied AFTER the
+            // date filter so the SQLite path and the KG fallback
+            // path agree row-for-row (recurring-bug class).
+            if !ts_passes_hour_filter(ts.timestamp_millis(), hour_filter) {
+                continue;
             }
             // Spec 015 follow-up: skip research-only incidents.
             if *research_only {
@@ -1162,6 +1251,7 @@ pub(super) async fn api_overview(
         filtered_out_count: case_metrics.filtered_out,
         flagged_by_system_count: case_metrics.flagged_by_system(),
         warden_decisions_count: case_metrics.warden_decisions(),
+        timezone: operator_timezone(),
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -1372,6 +1462,7 @@ pub(super) async fn api_report(
                 &today,
                 0,
                 None,
+                None,
                 now,
                 &degraded,
                 &state.data_dir,
@@ -1488,8 +1579,17 @@ pub(super) async fn api_briefing_generate(
         let today = resolve_date(None);
         let now = chrono::Utc::now();
         let degraded = read_degraded_signals(&state);
-        compute_overview_counts_from_sqlite(store, &today, 0, None, now, &degraded, &state.data_dir)
-            .and_then(|counts| counts.snapshot)
+        compute_overview_counts_from_sqlite(
+            store,
+            &today,
+            0,
+            None,
+            None,
+            now,
+            &degraded,
+            &state.data_dir,
+        )
+        .and_then(|counts| counts.snapshot)
     });
     let context =
         crate::briefing::build_briefing_context(&state.knowledge_graph, snapshot.as_ref());
@@ -1969,6 +2069,7 @@ pub(super) fn compute_overview_from_graph(
         filtered_out_count: case_metrics.filtered_out,
         flagged_by_system_count: case_metrics.flagged_by_system(),
         warden_decisions_count: case_metrics.warden_decisions(),
+        timezone: operator_timezone(),
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -2074,6 +2175,7 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
         filtered_out_count: case_metrics.filtered_out,
         flagged_by_system_count: case_metrics.flagged_by_system(),
         warden_decisions_count: case_metrics.warden_decisions(),
+        timezone: operator_timezone(),
         severity_breakdown: std::collections::HashMap::new(),
         allowlisted_count: 0,
         top_detectors,
@@ -2112,6 +2214,131 @@ pub(super) fn effective_severity(outcome: &str, severity: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    // ── Spec 049 PR4 unit tests ────────────────────────────────────
+    // Hour-of-day filter + operator-TZ resolver. Helpers are pure
+    // functions; their behaviour is the contract every compute path
+    // depends on.
+
+    #[test]
+    fn parse_hour_filter_accepts_in_range_pair() {
+        assert_eq!(parse_hour_filter(Some(0), Some(0)), Some((0, 0)));
+        assert_eq!(parse_hour_filter(Some(0), Some(23)), Some((0, 23)));
+        assert_eq!(parse_hour_filter(Some(14), Some(16)), Some((14, 16)));
+        assert_eq!(parse_hour_filter(Some(23), Some(23)), Some((23, 23)));
+    }
+
+    #[test]
+    fn parse_hour_filter_rejects_missing_either_bound() {
+        assert_eq!(parse_hour_filter(None, None), None);
+        assert_eq!(parse_hour_filter(Some(10), None), None);
+        assert_eq!(parse_hour_filter(None, Some(10)), None);
+    }
+
+    #[test]
+    fn parse_hour_filter_rejects_out_of_range() {
+        // 24 is NOT a valid hour-of-day. Frontend pickers should
+        // never emit this, but a malformed client must not crash
+        // the backend or produce inflated counts.
+        assert_eq!(parse_hour_filter(Some(24), Some(23)), None);
+        assert_eq!(parse_hour_filter(Some(0), Some(24)), None);
+        assert_eq!(parse_hour_filter(Some(100), Some(200)), None);
+    }
+
+    #[test]
+    fn parse_hour_filter_rejects_cross_midnight_range() {
+        // Spec 049 PR4 deliberately does NOT support `lo > hi`
+        // (cross-midnight). Operator picks two adjacent dates
+        // instead. Anti-regression for a future "implement wrap"
+        // shortcut that would diverge from the documented contract.
+        assert_eq!(parse_hour_filter(Some(22), Some(2)), None);
+        assert_eq!(parse_hour_filter(Some(23), Some(0)), None);
+        assert_eq!(parse_hour_filter(Some(1), Some(0)), None);
+    }
+
+    #[test]
+    fn ts_passes_hour_filter_returns_true_when_no_filter() {
+        // No filter = include everything. Operator opens Cases tab
+        // without picker = sees all today's incidents.
+        assert!(ts_passes_hour_filter(0, None));
+        assert!(ts_passes_hour_filter(i64::MAX / 2, None));
+        assert!(ts_passes_hour_filter(-1, None));
+    }
+
+    #[test]
+    fn ts_passes_hour_filter_includes_in_range_ts() {
+        // 2026-05-11 14:30:00 UTC → hour 14
+        let ts_ms = chrono::DateTime::parse_from_rfc3339("2026-05-11T14:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert!(ts_passes_hour_filter(ts_ms, Some((14, 16))));
+        assert!(ts_passes_hour_filter(ts_ms, Some((14, 14))));
+        assert!(ts_passes_hour_filter(ts_ms, Some((0, 23))));
+    }
+
+    #[test]
+    fn ts_passes_hour_filter_excludes_out_of_range_ts() {
+        // 2026-05-11 14:30:00 UTC → hour 14
+        let ts_ms = chrono::DateTime::parse_from_rfc3339("2026-05-11T14:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert!(!ts_passes_hour_filter(ts_ms, Some((15, 16))));
+        assert!(!ts_passes_hour_filter(ts_ms, Some((0, 13))));
+        assert!(!ts_passes_hour_filter(ts_ms, Some((23, 23))));
+    }
+
+    #[test]
+    fn ts_passes_hour_filter_includes_boundary_hours() {
+        // Inclusive on BOTH ends — 14:00 must pass (14, 16) and
+        // 16:59:59 must pass (14, 16).
+        let ts_14 = chrono::DateTime::parse_from_rfc3339("2026-05-11T14:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let ts_16_end = chrono::DateTime::parse_from_rfc3339("2026-05-11T16:59:59Z")
+            .unwrap()
+            .timestamp_millis();
+        assert!(ts_passes_hour_filter(ts_14, Some((14, 16))));
+        assert!(ts_passes_hour_filter(ts_16_end, Some((14, 16))));
+    }
+
+    #[test]
+    fn ts_passes_hour_filter_surfaces_invalid_ts_to_operator() {
+        // Spec 049 PR4: invalid timestamp returns true (include)
+        // so a data bug is operator-visible rather than silently
+        // filtered out. i64::MAX is way past chrono's representable
+        // range and produces None from `from_timestamp_millis`.
+        assert!(ts_passes_hour_filter(i64::MAX, Some((14, 16))));
+    }
+
+    #[test]
+    fn operator_timezone_prefers_env_var() {
+        // SAFETY: temp env var override scoped to this test. Cleared
+        // at the end to avoid cross-test contamination.
+        let original = std::env::var("TZ").ok();
+        // SAFETY: tests run single-threaded inside the test mod (no
+        // cross-thread env mutation).
+        unsafe { std::env::set_var("TZ", "America/Sao_Paulo") };
+        let resolved = operator_timezone();
+        assert_eq!(resolved, "America/Sao_Paulo");
+        match original {
+            Some(prev) => unsafe { std::env::set_var("TZ", prev) },
+            None => unsafe { std::env::remove_var("TZ") },
+        }
+    }
+
+    #[test]
+    fn operator_timezone_trims_whitespace_in_env_var() {
+        let original = std::env::var("TZ").ok();
+        unsafe { std::env::set_var("TZ", "  UTC  ") };
+        assert_eq!(operator_timezone(), "UTC");
+        // Whitespace-only TZ falls through to next resolver. We can
+        // not deterministically assert what comes from `/etc/timezone`
+        // on every CI runner, so only assert the trim path.
+        match original {
+            Some(prev) => unsafe { std::env::set_var("TZ", prev) },
+            None => unsafe { std::env::remove_var("TZ") },
+        }
+    }
 
     #[test]
     fn briefing_system_prompt_falls_back_when_personality_blank() {
@@ -2606,6 +2833,8 @@ mod tests {
             date: None,
             severity_min: None,
             detector: None,
+            hour_from: None,
+            hour_to: None,
         };
         let Json(out) = api_overview(State(state), Query(q)).await;
         // handled_ips_today must be present even if 0.
@@ -2773,6 +3002,7 @@ mod tests {
             date,
             0,
             None,
+            None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
             std::path::Path::new("/nonexistent-test-data-dir"),
@@ -2820,6 +3050,7 @@ mod tests {
             date,
             0,
             None,
+            None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
             std::path::Path::new("/nonexistent-test-data-dir"),
@@ -2858,6 +3089,7 @@ mod tests {
             &store,
             date,
             high_only,
+            None,
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
@@ -2924,6 +3156,7 @@ mod tests {
             &store,
             date,
             0,
+            None,
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
@@ -3023,6 +3256,7 @@ mod tests {
             date,
             0,
             None,
+            None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
             std::path::Path::new("/nonexistent-test-data-dir"),
@@ -3093,6 +3327,7 @@ mod tests {
             &store,
             date,
             0,
+            None,
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
@@ -3175,6 +3410,7 @@ mod tests {
             &store,
             &date,
             0,
+            None,
             None,
             now,
             &super::data_api::DegradedSignals::default(),
@@ -3264,6 +3500,7 @@ mod tests {
             &date,
             0,
             None,
+            None,
             now,
             &super::data_api::DegradedSignals::default(),
             std::path::Path::new("/nonexistent-test-data-dir"),
@@ -3297,6 +3534,7 @@ mod tests {
             &store,
             date,
             0,
+            None,
             None,
             chrono::Utc::now(),
             &super::data_api::DegradedSignals::default(),
@@ -3351,6 +3589,8 @@ mod tests {
             date: None,
             severity_min: None,
             detector: None,
+            hour_from: None,
+            hour_to: None,
         };
         let Json(out) = api_overview(State(state), Query(q)).await;
         assert_eq!(out.incidents_count, 1, "SQLite count must surface");
@@ -3374,6 +3614,8 @@ mod tests {
             date: None,
             severity_min: None,
             detector: None,
+            hour_from: None,
+            hour_to: None,
         };
         let Json(out) = api_overview(State(state), Query(q)).await;
         assert_eq!(out.handled_ips_today, 0);
@@ -3763,6 +4005,7 @@ mod tests {
             &date,
             0,
             None,
+            None,
             chrono::Utc::now(),
             &super::DegradedSignals::default(),
             dir.path(),
@@ -3793,6 +4036,7 @@ mod tests {
             &store,
             date,
             0,
+            None,
             None,
             chrono::Utc::now(),
             &super::DegradedSignals::default(),
@@ -3897,6 +4141,8 @@ mod tests {
             date: None,
             severity_min: None,
             detector: None,
+            hour_from: None,
+            hour_to: None,
         };
         let Json(out) = api_incidents(State(state), Query(q)).await;
         // Research-only filtered out → 2 items.
@@ -3931,6 +4177,8 @@ mod tests {
             date: None,
             severity_min: None,
             detector: None,
+            hour_from: None,
+            hour_to: None,
         };
         let Json(out) = api_incidents(State(state), Query(q)).await;
         assert_eq!(out.total, 2, "total counts pre-truncation");
@@ -3953,6 +4201,8 @@ mod tests {
             date: Some("2020-01-01".to_string()),
             severity_min: None,
             detector: None,
+            hour_from: None,
+            hour_to: None,
         };
         let Json(out) = api_incidents(State(state), Query(q)).await;
         assert_eq!(out.total, 0);
@@ -3975,6 +4225,8 @@ mod tests {
             date: None,
             severity_min: None,
             detector: None,
+            hour_from: None,
+            hour_to: None,
         };
         let Json(out) = api_decisions(State(state), Query(q)).await;
         // research_only has no decision so it's already excluded by
@@ -4034,6 +4286,8 @@ mod tests {
             date: None,
             severity_min: None,
             detector: None,
+            hour_from: None,
+            hour_to: None,
         };
         let Json(out) = api_decisions(State(state), Query(q)).await;
         assert_eq!(out.items.len(), 1);

@@ -114,6 +114,18 @@ pub(crate) struct ListQuery {
     pub(super) date: Option<String>,
     pub(super) severity_min: Option<String>,
     pub(super) detector: Option<String>,
+    /// Spec 049 PR4 — hour-of-day filter on the selected date.
+    /// Inclusive lower bound, 0-23 (UTC, matches the date semantics).
+    /// Filter only applies when BOTH `hour_from` AND `hour_to` are
+    /// present AND `hour_from <= hour_to` AND both <= 23. Any other
+    /// combination = no hour filter (the handler treats malformed
+    /// pairs as absent). Cross-midnight ranges (22:00..02:00) are
+    /// NOT supported in PR4 — operator picks two adjacent dates if
+    /// they need to span a midnight boundary.
+    pub(super) hour_from: Option<u32>,
+    /// Spec 049 PR4 — inclusive upper bound, 0-23 (UTC). See
+    /// `hour_from` for the validation contract.
+    pub(super) hour_to: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,6 +393,16 @@ pub(crate) struct OverviewResponse {
     /// "Operator did not have to act" number. Dismiss counts as a
     /// decision, not a no-op (spec 049 Q1+Q7).
     pub(super) warden_decisions_count: usize,
+    /// Spec 049 PR4 — operator timezone label (IANA name like
+    /// `"America/Sao_Paulo"`, or `"UTC"` fallback). Emitted by the
+    /// backend so the scope picker can render "Today (TZ)" without
+    /// relying on browser-derived TZ (which drifts across analysts
+    /// and the MSSP's clients). Resolution order: env `TZ`,
+    /// `/etc/timezone`, then `"UTC"`. The current PR's hour filter
+    /// (`hour_from` / `hour_to`) still interprets hours in UTC; a
+    /// follow-up PR may add operator-TZ conversion at the picker
+    /// layer.
+    pub(super) timezone: String,
     /// Breakdown by severity level: {"critical": N, "high": N, ...}
     pub(super) severity_breakdown: std::collections::HashMap<String, usize>,
     /// Incidents from allowlisted IPs/users (can be hidden in dashboard).

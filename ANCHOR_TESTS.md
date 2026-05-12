@@ -418,6 +418,18 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::cases_panel_header_reads_unresolved_cases_not_threats` — spec 049 PR3 panel-header rename. The Cases hud-panel headline reads `Unresolved Cases`; `Unresolved Threats` must stay gone (operator-facing UI is fully renamed).
 
+- `crates/agent/src/dashboard/data_api.rs::tests::parse_hour_filter_accepts_in_range_pair` — spec 049 PR4 hour-filter validation: `parse_hour_filter` returns `Some((lo, hi))` only when both bounds present, both <= 23, and `lo <= hi`. Inclusive on both ends.
+
+- `crates/agent/src/dashboard/data_api.rs::tests::parse_hour_filter_rejects_cross_midnight_range` — spec 049 PR4 deliberately does NOT support cross-midnight `lo > hi`. Operator picks two adjacent dates to span midnight. Anti-regression for a future "implement wrap" shortcut that would diverge from the documented contract.
+
+- `crates/agent/src/dashboard/data_api.rs::tests::parse_hour_filter_rejects_out_of_range` — hour values >= 24 yield `None` (no filter). Malformed frontend client must not crash the backend or inflate counts.
+
+- `crates/agent/src/dashboard/data_api.rs::tests::ts_passes_hour_filter_includes_boundary_hours` — inclusive on both ends: `14:00` passes `(14, 16)` and `16:59:59` passes `(14, 16)`. Pins the inclusive semantics so a future refactor can't silently switch to exclusive bounds.
+
+- `crates/agent/src/dashboard/data_api.rs::tests::ts_passes_hour_filter_surfaces_invalid_ts_to_operator` — spec 049 PR4 honesty rule: an invalid `ts_ms` (out of chrono's representable range) returns `true` (include) so a data bug is operator-visible rather than silently filtered out.
+
+- `crates/agent/src/dashboard/data_api.rs::tests::operator_timezone_prefers_env_var` — `TZ` env var wins over `/etc/timezone`. Spec 049 PR4 contract: operator-config TZ flows through to the picker label, never browser-derived.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).
