@@ -261,9 +261,17 @@ function renderReviewBanner(overview) {
 }
 
 // ── Activity strip ──────────────────────────────────────────────────
-// 4 numbers in one row: events watched / flagged / stopped / awaiting.
-// Replaces both the 7-row "summary pyramid" and the standalone "Now"
-// section — same data, single line, scannable in 2 seconds.
+// 4 numbers in one row: events watched / flagged by system / Warden
+// decisions / needs review. Plus a sub-breakdown row underneath:
+// Contained · Observing · Filtered out.
+//
+// Spec 049 PR2: all four leaf counters + two derived totals come
+// from the BACKEND (`overview.flagged_by_system_count`,
+// `overview.warden_decisions_count`, etc.). Pre-spec-049 the
+// frontend summed `snap.buckets.X.unique_attackers` itself — which
+// drifted from the backend on every refactor and silently dropped
+// `dismissed` (KpiBucket::None) entirely. Backend now owns the math
+// contract (case_metrics.rs); frontend just renders.
 function renderActivityStrip(overview, totalEventsScanned) {
   var snap = overview && overview.snapshot;
 
@@ -273,43 +281,31 @@ function renderActivityStrip(overview, totalEventsScanned) {
     : (totalEventsScanned || overview.events_count || 0);
   setText('homeActWatched', formatBigNumber(watched));
 
-  // Flagged = total unique attackers across all buckets (matches the
-  // unified attacker-count contract from Phase 10).
-  var flagged = 0;
-  if (snap) {
-    flagged =
-      (snap.buckets.blocked.unique_attackers || 0) +
-      (snap.buckets.observing.unique_attackers || 0) +
-      (snap.buckets.honeypot.unique_attackers || 0) +
-      (snap.buckets.attention.unique_attackers || 0) +
-      (snap.buckets.allowlisted.unique_attackers || 0);
-  } else {
-    flagged = overview.handled_ips_today || 0;
-  }
-  setText('homeActFlagged', flagged);
+  // Flagged by system = backend-computed sum of all four outcomes
+  // (Contained + Observing + Filtered out + Needs review). Replaces
+  // the pre-spec-049 frontend bucket sum that excluded dismissed.
+  setText('homeActFlagged', overview.flagged_by_system_count || 0);
 
-  // Stopped automatically = blocked + observing + honeypot.
-  var stopped = 0;
-  if (snap) {
-    stopped =
-      (snap.buckets.blocked.unique_attackers || 0) +
-      (snap.buckets.observing.unique_attackers || 0) +
-      (snap.buckets.honeypot.unique_attackers || 0);
-  } else {
-    stopped = overview.handled_ips_today || 0;
-  }
-  setText('homeActStopped', stopped);
+  // Warden decisions = backend-computed (Contained + Observing +
+  // Filtered out). Includes dismiss because dismiss is a decision,
+  // not a no-op (spec 049 Q1+Q7).
+  setText('homeActStopped', overview.warden_decisions_count || 0);
 
-  // Awaiting review = attention bucket. Cell gets a warning tint
-  // when > 0 so it stands out without being a separate banner copy.
-  var awaiting = snap
-    ? (snap.buckets.attention.unique_attackers || 0)
-    : (overview.attention_count || 0);
-  setText('homeActAwaiting', awaiting);
+  // Needs review = attention bucket. Cell gets a warning tint when
+  // > 0 so it stands out without being a separate banner copy.
+  var needsReview = overview.attention_count || 0;
+  setText('homeActAwaiting', needsReview);
   var awaitingCell = document.querySelector('.activity-cell-attention');
   if (awaitingCell) {
-    awaitingCell.classList.toggle('activity-cell-attention-active', awaiting > 0);
+    awaitingCell.classList.toggle('activity-cell-attention-active', needsReview > 0);
   }
+
+  // Sub-breakdown row: Contained · Observing · Filtered out. Sum
+  // matches `homeActStopped`. Filtered out was invisible pre-spec-
+  // 049 (the silent-drop bug RECURRING_BUGS.md anchored).
+  setText('homeActContained', overview.blocked_count || 0);
+  setText('homeActObserving', overview.observing_count || 0);
+  setText('homeActFilteredOut', overview.filtered_out_count || 0);
 
   // Window label: "since midnight UTC · last Nh".
   var elapsed = computeElapsedHoursUtc();

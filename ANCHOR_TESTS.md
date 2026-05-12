@@ -406,7 +406,23 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 ### Number-consistency labels (Wave 10 - AUDIT-WAVE10-LABEL-HONESTY anchor)
 
-- `crates/agent/src/dashboard/mod.rs::tests::wave10_home_activity_strip_reads_handled_not_stopped` - the home activity strip cell that aggregates blocked + observing + honeypot reads "handled automatically", NOT "stopped automatically". The pre-Wave-10 copy lied for the observing bucket (observing means we are watching, not stopping). Anti-regression: the old "stopped automatically" string must NOT come back.
+- `crates/agent/src/dashboard/mod.rs::tests::wave10_home_activity_strip_reads_handled_not_stopped` - the home activity strip cell that aggregates Contained + Observing + Filtered out reads `Warden decisions` (spec 049 PR2, supersedes the Wave-10 interim `handled automatically`). Anti-regression: both `stopped automatically` (pre-Wave-10) and `handled automatically` (Wave-10 interim) must stay gone.
+
+- `crates/agent/src/dashboard/mod.rs::tests::home_strip_uses_spec_049_metric_names_and_warden_branding` — spec 049 PR2 label contract. Home strip labels read `flagged by system` / `Warden decisions` / `needs review` / `Contained` / `Observing` / `Filtered out`. Pre-spec-049 labels (`flagged as suspicious`, `handled automatically`, `awaiting review`) must stay gone.
+
+- `crates/agent/src/dashboard/mod.rs::tests::nav_tab_label_reads_cases_not_threats` — spec 049 PR3 top-nav rename. Main-nav button MUST render `Cases` (visible) + `Cases — audit ledger` (aria-label). Legacy strings (`>Threats</button>`, `Threat investigation`) must stay gone.
+
+- `crates/agent/src/dashboard/mod.rs::tests::nav_more_menu_reads_briefings_not_report` — spec 049 PR3 More-menu rename. `Briefings` is the MSSP entregable per spec 049 §8.4; the legacy `Report` string must stay gone.
+
+- `crates/agent/src/dashboard/mod.rs::tests::rename_keeps_internal_route_slugs_unchanged` — spec 049 PR3 backwards-compat guard. Internal slugs (`id="navInvestigate"`, `showView('investigate')`, `id="navReport"`, `showView('report')`) MUST survive the rename so bookmarked URLs, JS state, and deep links keep working. A future PR that renames the slugs MUST ship a redirect for the old paths in the same change.
+
+- `crates/agent/src/dashboard/mod.rs::tests::cases_panel_header_reads_unresolved_cases_not_threats` — spec 049 PR3 panel-header rename. The Cases hud-panel headline reads `Unresolved Cases`; `Unresolved Threats` must stay gone (operator-facing UI is fully renamed).
+
+- `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
+
+- `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).
+
+- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_home_activity_breakdown_styles` — `.home-activity-breakdown` + chip / num / label / sep selectors must exist. Without them the chips render as inline plain text.
 - `crates/agent/src/dashboard/mod.rs::tests::threats_kpi_tile_label_is_blocks_not_blocked` (extended in Wave 10) - the Threats KPI tile reads "Block actions" / "today" (aggregate, decisions) and the sidebar group reads "Currently blocked attackers" (snapshot, unique IPs). Pre-Wave-10 the labels read "Blocks · Today" and "Blocked attackers" — same page, different answers, no copy disclosing the snapshot-vs-aggregate axis. Operator's hard rule (2026-05-05): every label must explicitly disclose window + scope + cardinality unit. The test name predates Wave 10 (kept for git-blame continuity); the docstring has been updated to reflect the new disambiguation pair.
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_live_feed_clips_to_rolling_24h_matching_site_label` - the public live-feed builder (`build_live_feed_response`) clips `real_incidents` to `now - 24h` so the site's hardcoded "(24h)" labels (`Live.tsx:415,422,429`) match the underlying data. Source-grep anchor: pins `cutoff_24h = now - chrono::Duration::hours(24)` AND `i.ts >= cutoff_24h` filter in active code. A future "remove the cutoff for performance" PR fails CI loudly.
 

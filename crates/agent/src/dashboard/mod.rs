@@ -1265,6 +1265,11 @@ mod tests {
             "homeActFlagged",
             "homeActStopped",
             "homeActAwaiting",
+            // Spec 049 PR2 sub-breakdown row (Contained · Observing · Filtered out).
+            "homeActBreakdown",
+            "homeActContained",
+            "homeActObserving",
+            "homeActFilteredOut",
             "briefingSection",
             "briefingContent",
             "briefingBtn",
@@ -1331,6 +1336,241 @@ mod tests {
             !body.contains("section.style.display = 'none';"),
             "loadBriefing must NOT hide section on error (always-visible contract)"
         );
+    }
+
+    // ── Spec 049 PR3 anchors ────────────────────────────────────────
+    // Tab renames: `Threats` → `Cases` (audit weight in the noun) and
+    // `Report` → `Briefings` (the MSSP entregable, not an internal
+    // doc). Internal route slugs (`investigate`, `report`) keep their
+    // old names so deep links and state survive the rename — this is
+    // deliberate and pinned by `*_keeps_internal_route_slugs_unchanged`.
+
+    #[test]
+    fn nav_tab_label_reads_cases_not_threats() {
+        // Top-nav button visible text MUST read `Cases`. Aria-label
+        // MUST also use the new vocabulary so screen readers stay in
+        // sync. Internal id + onclick route stay on `investigate`.
+        assert!(
+            INDEX_HTML.contains(">Cases</button>"),
+            "main nav button MUST render `Cases` text (spec 049 PR3)"
+        );
+        assert!(
+            INDEX_HTML.contains("aria-label=\"Cases — audit ledger\""),
+            "main nav button MUST carry the new aria-label (spec 049 PR3)"
+        );
+        // Legacy strings must stay gone.
+        assert!(
+            !INDEX_HTML.contains(">Threats</button>"),
+            "main nav button MUST NOT revert to `Threats` text (spec 049 PR3)"
+        );
+        assert!(
+            !INDEX_HTML.contains("aria-label=\"Threat investigation\""),
+            "aria-label MUST NOT revert to `Threat investigation` (spec 049 PR3)"
+        );
+    }
+
+    #[test]
+    fn nav_more_menu_reads_briefings_not_report() {
+        // The More-menu item that opens the retrospective report
+        // surface MUST read `Briefings`. Spec 049 §8.4: the artefact
+        // is what the MSSP delivers to the client, not an internal
+        // report. Internal `id="navReport"` + `showView('report')`
+        // stay so existing JS state / URLs work.
+        assert!(
+            INDEX_HTML.contains(">Briefings</button>"),
+            "More-menu item MUST render `Briefings` text (spec 049 PR3)"
+        );
+        assert!(
+            !INDEX_HTML.contains("\">Report</button>"),
+            "More-menu item MUST NOT revert to `Report` (spec 049 PR3)"
+        );
+    }
+
+    #[test]
+    fn rename_keeps_internal_route_slugs_unchanged() {
+        // The rename is purely operator-facing. Internal route slugs
+        // (`showView('investigate')`, `showView('report')`, the `id`
+        // attributes `navInvestigate` + `navReport`) MUST survive so
+        // bookmarked URLs, JS state, and deep links from external
+        // tools keep working. Renaming the slugs is OUT of scope for
+        // PR3; if a future PR wants to rename the slugs, it must
+        // ship a redirect for the old paths AND update all callers in
+        // the same change.
+        assert!(
+            INDEX_HTML.contains("id=\"navInvestigate\""),
+            "internal id `navInvestigate` MUST survive PR3 rename"
+        );
+        assert!(
+            INDEX_HTML.contains("showView('investigate')"),
+            "internal route `investigate` MUST survive PR3 rename"
+        );
+        assert!(
+            INDEX_HTML.contains("id=\"navReport\""),
+            "internal id `navReport` MUST survive PR3 rename"
+        );
+        assert!(
+            INDEX_HTML.contains("showView('report')"),
+            "internal route `report` MUST survive PR3 rename"
+        );
+    }
+
+    #[test]
+    fn cases_panel_header_reads_unresolved_cases_not_threats() {
+        // The Cases hud-panel header (the `Unresolved …` headline
+        // above the gauge) tracks the tab rename — operator should
+        // never read `Threats` anywhere in the operator-facing UI.
+        assert!(
+            INDEX_HTML.contains("Unresolved Cases"),
+            "Cases panel header MUST read `Unresolved Cases` (spec 049 PR3)"
+        );
+        assert!(
+            !INDEX_HTML.contains("Unresolved Threats"),
+            "Cases panel header MUST NOT revert to `Unresolved Threats`"
+        );
+    }
+
+    // ── Spec 049 PR2 anchors ────────────────────────────────────────
+    // Home strip migrated from frontend bucket-sum math to backend-
+    // emitted counters (`flagged_by_system_count`, `warden_decisions_count`,
+    // etc.). Labels migrated to spec 049 vocabulary. Filtered out
+    // (silently uncounted pre-spec-049) now visible as a sub-breakdown
+    // chip. These anchors pin the contract so a future refactor
+    // cannot silently revert.
+
+    #[test]
+    fn home_strip_uses_spec_049_metric_names_and_warden_branding() {
+        // The four operator-facing strings live in the HTML labels.
+        // If a future change reverts to legacy copy, the operator
+        // reads back the old (pre-spec-049, inconsistent) names.
+        assert!(
+            INDEX_HTML.contains("flagged by system"),
+            "home strip must label the second cell `flagged by system` (spec 049)"
+        );
+        assert!(
+            INDEX_HTML.contains(">Warden decisions<"),
+            "home strip must label the third cell `Warden decisions` (spec 049 Q2 + brand equity)"
+        );
+        assert!(
+            INDEX_HTML.contains("needs review"),
+            "home strip must label the fourth cell `needs review` (spec 049 — replaces `awaiting review`)"
+        );
+        assert!(
+            INDEX_HTML.contains(">Filtered out<"),
+            "home strip sub-breakdown must include `Filtered out` chip (spec 049 Q1+Q7 — dismiss is a Warden decision, not a trash bin)"
+        );
+        assert!(
+            INDEX_HTML.contains(">Contained<"),
+            "home strip sub-breakdown must include `Contained` chip (= blocked + honeypot)"
+        );
+        assert!(
+            INDEX_HTML.contains(">Observing<"),
+            "home strip sub-breakdown must include `Observing` chip"
+        );
+        // Pre-spec-049 legacy labels MUST be gone.
+        assert!(
+            !INDEX_HTML.contains("flagged as suspicious"),
+            "home strip dropped legacy `flagged as suspicious` label — operator now reads `flagged by system`"
+        );
+        assert!(
+            !INDEX_HTML.contains("handled automatically"),
+            "home strip dropped legacy `handled automatically` label — operator now reads `Warden decisions`"
+        );
+        assert!(
+            !INDEX_HTML.contains("awaiting review"),
+            "home strip dropped legacy `awaiting review` label — operator now reads `needs review`"
+        );
+    }
+
+    #[test]
+    fn home_strip_reads_backend_counters_not_frontend_bucket_sum() {
+        // Spec 049 PR1 moved the math contract to the backend. Frontend
+        // must read `overview.flagged_by_system_count` etc. directly —
+        // NOT sum `snap.buckets.X.unique_attackers` itself (which drifted
+        // historically and silently dropped dismissed). If a future
+        // refactor re-introduces the frontend sum, the operator sees
+        // numbers that disagree with `/api/overview` JSON. Anchor pins
+        // the read path.
+        let strip_start = JS_HOME
+            .find("function renderActivityStrip(")
+            .expect("renderActivityStrip defined");
+        let strip_end = JS_HOME[strip_start..]
+            .find("\nfunction ")
+            .expect("end of renderActivityStrip")
+            + strip_start;
+        let body = &JS_HOME[strip_start..strip_end];
+        assert!(
+            body.contains("overview.flagged_by_system_count"),
+            "renderActivityStrip must read backend `flagged_by_system_count`"
+        );
+        assert!(
+            body.contains("overview.warden_decisions_count"),
+            "renderActivityStrip must read backend `warden_decisions_count`"
+        );
+        assert!(
+            body.contains("overview.filtered_out_count"),
+            "renderActivityStrip must read backend `filtered_out_count` (the spec 049 dismiss-is-decision counter)"
+        );
+        // Anti-regression: the pre-spec-049 frontend bucket-sum must
+        // not return. These exact substrings would only appear if
+        // someone reintroduced the manual aggregation.
+        assert!(
+            !body.contains("snap.buckets.blocked.unique_attackers"),
+            "renderActivityStrip must NOT sum buckets on the frontend — backend owns the math contract (spec 049 PR1)"
+        );
+        assert!(
+            !body.contains("snap.buckets.honeypot.unique_attackers"),
+            "renderActivityStrip must NOT sum honeypot bucket on the frontend"
+        );
+    }
+
+    #[test]
+    fn home_strip_breakdown_chips_render_leaf_outcome_counters() {
+        // The three sub-breakdown chips MUST read the leaf-bucket
+        // counters whose sum equals `warden_decisions_count` by
+        // backend construction (case_metrics.rs math contract).
+        // Anchor pins the read sites so a refactor cannot rewire them
+        // to a different field and silently break the visible
+        // reconciliation (chip total != Warden decisions number above).
+        let strip_start = JS_HOME
+            .find("function renderActivityStrip(")
+            .expect("renderActivityStrip defined");
+        let strip_end = JS_HOME[strip_start..]
+            .find("\nfunction ")
+            .expect("end of renderActivityStrip")
+            + strip_start;
+        let body = &JS_HOME[strip_start..strip_end];
+        assert!(
+            body.contains("homeActContained") && body.contains("overview.blocked_count"),
+            "Contained chip must read `overview.blocked_count` (= Contained in spec 049)"
+        );
+        assert!(
+            body.contains("homeActObserving") && body.contains("overview.observing_count"),
+            "Observing chip must read `overview.observing_count`"
+        );
+        assert!(
+            body.contains("homeActFilteredOut") && body.contains("overview.filtered_out_count"),
+            "Filtered out chip must read `overview.filtered_out_count`"
+        );
+    }
+
+    #[test]
+    fn app_css_defines_home_activity_breakdown_styles() {
+        // The sub-breakdown row depends on these classes. Without
+        // them the chips render as inline plain text (no padding,
+        // no hover affordance). Anchor pins the contract so a CSS
+        // refactor cannot silently drop the styling.
+        for selector in [
+            ".home-activity-breakdown",
+            ".home-activity-breakdown .breakdown-chip",
+            ".home-activity-breakdown .breakdown-num",
+            ".home-activity-breakdown .breakdown-label",
+            ".home-activity-breakdown .breakdown-sep",
+        ] {
+            assert!(
+                APP_CSS.contains(selector),
+                "app.css must define {selector} (spec 049 PR2 sub-breakdown styling)"
+            );
+        }
     }
 
     #[test]
@@ -1759,20 +1999,28 @@ mod tests {
 
     #[test]
     fn wave10_home_activity_strip_reads_handled_not_stopped() {
-        // Wave 10 (label honesty, 2026-05-05): the home activity strip
-        // cell that aggregates blocked + observing + honeypot used to
-        // read "stopped automatically". That mis-described the
-        // observing bucket (we did NOT stop the attacker — we are
-        // watching). Operator's hard rule: every label discloses the
-        // actual operation. "Handled automatically" is honest about all
-        // three outcomes.
+        // Wave 10 (label honesty, 2026-05-05) renamed "stopped
+        // automatically" -> "handled automatically" because "stopped"
+        // lied for the observing bucket. Spec 049 PR2 (2026-05-12)
+        // superseded that with the operator-facing brand vocabulary
+        // — `Warden decisions` — which folds in Filtered out as well
+        // (spec 049 Q1+Q7: dismiss is a decision, not a no-op). Both
+        // the Wave-10 lesson (no "stopped" verb on observing/dismiss)
+        // and the spec-049 contract (operator reads `Warden decisions`)
+        // are pinned here.
         assert!(
-            INDEX_HTML.contains("<div class=\"activity-label\">handled automatically</div>"),
-            "home activity strip must read 'handled automatically' (Wave 10) — the cell sums blocked + observing + honeypot, and 'stopped' lied for the observing bucket"
+            INDEX_HTML.contains("<div class=\"activity-label\">Warden decisions</div>"),
+            "home activity strip must read 'Warden decisions' (spec 049 PR2) — the cell sums Contained + Observing + Filtered out, and the brand owns the noun"
         );
+        // Pre-Wave-10 string must stay gone.
         assert!(
             !INDEX_HTML.contains("<div class=\"activity-label\">stopped automatically</div>"),
             "home activity strip must NOT revert to 'stopped automatically' (pre-Wave-10) — observing is not stopping"
+        );
+        // Wave-10 interim string must also stay gone (superseded by spec 049).
+        assert!(
+            !INDEX_HTML.contains("<div class=\"activity-label\">handled automatically</div>"),
+            "home activity strip must NOT revert to 'handled automatically' (Wave 10 interim) — spec 049 PR2 renamed it to 'Warden decisions'"
         );
     }
 
@@ -4123,20 +4371,23 @@ mod tests {
         // renamed "stopped automatically" -> "handled automatically".
         // It sums blocked + observing + honeypot, and "stopped" lied
         // for the observing bucket — observing means we are watching,
-        // not stopping. The Wave-10 anchor
-        // `wave10_home_activity_strip_reads_handled_not_stopped`
-        // asserts the new copy AND the absence of the old; this audit
-        // 3.7 check is updated to consume the new label so the two
-        // anchors agree.
+        // not stopping.
+        //
+        // Spec 049 PR2 (2026-05-12): labels migrated to the operator-
+        // facing vocabulary the spec commits to — "flagged by system"
+        // / "Warden decisions" / "needs review". Filtered out
+        // (dismissed) becomes visible as a sub-breakdown chip after
+        // years of being silently uncounted. The labels asserted here
+        // MUST agree with `home_strip_uses_spec_049_metric_names_and_warden_branding`.
         for label in [
             "events watched",
-            "flagged as suspicious",
-            "handled automatically",
-            "awaiting review",
+            "flagged by system",
+            "Warden decisions",
+            "needs review",
         ] {
             assert!(
                 INDEX_HTML.contains(label),
-                "activity strip label '{label}' missing — audit 3.7 unit hint regression"
+                "activity strip label '{label}' missing — audit 3.7 unit hint + spec 049 vocabulary regression"
             );
         }
         // The timezone marker must remain on the activity-strip

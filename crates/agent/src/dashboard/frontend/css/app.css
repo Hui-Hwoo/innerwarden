@@ -1531,6 +1531,45 @@
       .activity-strip .activity-cell { flex-basis: calc(50% - 5px); }
     }
 
+    /* Spec 049 sub-breakdown row under the activity strip.
+       Three small chips (Contained · Observing · Filtered out) that
+       sum to homeActStopped. Same data path, finer grain — the
+       operator clicks the chip whose outcome they want to audit. */
+    .home-activity-breakdown {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      padding: 0 4px;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .home-activity-breakdown .breakdown-chip {
+      cursor: pointer;
+      padding: 3px 8px;
+      border-radius: 8px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .home-activity-breakdown .breakdown-chip:hover {
+      background: var(--card-hov);
+      color: var(--text);
+    }
+    .home-activity-breakdown .breakdown-chip:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .home-activity-breakdown .breakdown-num {
+      font-weight: 700;
+      color: var(--text);
+    }
+    .home-activity-breakdown .breakdown-label {
+      margin-left: 4px;
+    }
+    .home-activity-breakdown .breakdown-sep {
+      color: var(--dim);
+    }
+
     /* System health line: 1 row when good, expands when bad. */
     .home-health-line {
       display: flex;
