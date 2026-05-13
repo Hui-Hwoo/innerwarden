@@ -268,10 +268,14 @@ function outcomeOf(item) {
 }
 
 function buildGroupedList(items) {
-  // Filter out trusted/private IPs if toggle is on
-  if (state.hideAllowlisted) {
-    items = items.filter(function(item) { return !isIpTrusted(item.value) && !isPrivateIp(item.value); });
-  }
+  // Spec 049 PR22 — frontend filtering REMOVED. Pre-PR22 this body
+  // applied an extra `isIpTrusted + isPrivateIp` filter on top of
+  // whatever the backend returned. Backend already drops self-traffic
+  // (Cloudflare + RFC1918) consistently via `is_self_traffic_or_internal`
+  // in `data_api.rs`. The double-filter is what caused the
+  // strip-vs-panel mismatch operator-reported on 2026-05-13 ("40
+  // Currently blocked" vs "7 attackers" in the list). Backend is the
+  // single source of truth; frontend renders what it receives.
   // Filter by outcome if set (e.g. from Home CTA click).
   //
   // Spec 049 PR14 expanded the bucket vocabulary:

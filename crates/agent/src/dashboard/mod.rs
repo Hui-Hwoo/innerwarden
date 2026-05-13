@@ -16,6 +16,7 @@ mod agent_api;
 mod audit_export_csv;
 mod audit_export_signing;
 mod auth;
+mod canonical_counts;
 mod case_metrics;
 mod case_recurrence;
 mod cases_from_sqlite;
@@ -7026,6 +7027,83 @@ mod tests {
             "PR20 — build_attackers_from_sqlite must call \
              `cloud_safelist::is_self_traffic_ip` so the panel \
              agrees with the strip on which IPs count."
+        );
+    }
+
+    // ── Spec 049 PR22 — canonical counts + cross-endpoint anchors ───
+    //
+    // Operator-driven 2026-05-13 after the 18-PR whack-a-mole: the
+    // dashboard had at least six independent count-producing functions,
+    // each with subtly different filters, scopes, and units. PR22
+    // introduces a single `canonical_counts::compute` and pins the
+    // contracts that prevent the next divergence by construction.
+
+    #[test]
+    fn pr22_overview_events_count_reads_canonical_counter_not_edge_count() {
+        // The biggest operator-visible gap: /api/overview said 130k
+        // events while /api/sensors said 3.7k. Same KG, different
+        // proxies. PR22 collapses both onto `graph.total_events_ingested`.
+        // Anti-regression: no surface may go back to `metrics.edge_count`
+        // as a proxy for events.
+        const DATA_API_SRC: &str = include_str!("data_api.rs");
+        assert!(
+            !DATA_API_SRC.contains("events_count: metrics.edge_count"),
+            "PR22 — `events_count: metrics.edge_count` is the legacy \
+             ~30× inflation proxy. Read `graph.total_events_ingested` \
+             so every events surface (Home, Cases strip, Sensors HUD) \
+             agrees."
+        );
+        assert!(
+            DATA_API_SRC.contains("events_count: graph.total_events_ingested"),
+            "PR22 — at least one `events_count` field must read from \
+             `graph.total_events_ingested` (the canonical counter the \
+             sensor increments)."
+        );
+    }
+
+    #[test]
+    fn pr22_canonical_counts_module_exists_and_is_wired() {
+        // The new `canonical_counts` module is the single source of
+        // truth for dashboard counters. PR22 introduces it; future PRs
+        // migrate the remaining endpoints to consume from it. Pin the
+        // existence so a future "let's just delete this" refactor
+        // has to justify reverting the canonical design.
+        const CANONICAL: &str = include_str!("canonical_counts.rs");
+        assert!(
+            CANONICAL.contains("pub(super) struct CanonicalCounts"),
+            "PR22 — canonical_counts.rs must define `CanonicalCounts` \
+             as the single counter struct every endpoint reads from."
+        );
+        assert!(
+            CANONICAL.contains("pub(super) fn compute("),
+            "PR22 — canonical_counts.rs must expose `compute()` as \
+             the canonical entry point."
+        );
+        assert!(
+            CANONICAL.contains("graph.total_events_ingested"),
+            "PR22 — the canonical events counter must come from \
+             `graph.total_events_ingested`, NOT from `metrics.edge_count` \
+             or `count_file_lines` (the dead events-*.jsonl path)."
+        );
+    }
+
+    #[test]
+    fn pr22_frontend_no_longer_double_filters_trusted_ips() {
+        // PR21 unchecked the hidden checkbox; PR22 removes the JS
+        // filter body entirely so a future config-driven re-default
+        // cannot resurrect the silent double-filter. Backend is the
+        // single source of truth for which IPs reach the panel.
+        assert!(
+            !JS_THREATS.contains("if (state.hideAllowlisted) {\n    items = items.filter"),
+            "PR22 — the JS frontend must not filter by `state.hideAllowlisted`. \
+             Backend already drops self-traffic in \
+             `is_self_traffic_or_internal`; the JS layer doing it again \
+             caused the 2026-05-13 strip-vs-panel mismatch."
+        );
+        assert!(
+            JS_THREATS.contains("// Spec 049 PR22 — frontend filtering REMOVED"),
+            "PR22 — the removal must be documented in-line so a future \
+             contributor sees the intent before re-adding."
         );
     }
 }

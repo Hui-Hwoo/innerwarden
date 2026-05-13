@@ -952,7 +952,10 @@ pub(super) async fn api_overview(
         crate::dashboard::investigation::explicit_date_filter(query.date.as_deref());
     let arc_graph = crate::dashboard::investigation::graph_for_date(&state, explicit_date);
     let graph = arc_graph.read().unwrap();
-    let metrics = graph.metrics();
+    // PR22: dropped `let metrics = graph.metrics();` — only consumer
+    // was the legacy edge-count proxy for events; we now read the
+    // canonical sensor ingestion counter directly so this surface
+    // agrees with `/api/sensors`.
     let date_filter: Option<chrono::NaiveDate> =
         explicit_date.and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
@@ -1062,7 +1065,10 @@ pub(super) async fn api_overview(
         });
         return Json(OverviewResponse {
             date,
-            events_count: metrics.edge_count, // legacy field — kept for backwards-compat
+            // PR22: replaced legacy `metrics.edge_count` proxy with the
+            // canonical event counter so this surface agrees with
+            // /api/sensors.total_events (same KG source).
+            events_count: graph.total_events_ingested,
             incidents_count: c.incidents_count,
             decisions_count: c.decisions_count,
             ai_confirmed: c.ai_confirmed,
@@ -1283,7 +1289,11 @@ pub(super) async fn api_overview(
     };
     Json(OverviewResponse {
         date,
-        events_count: metrics.edge_count, // edges ≈ events (each event creates edges)
+        // PR22: edges are NOT events — each event creates multiple
+        // edges (incident → ip, incident → process, etc) so the proxy
+        // inflated this surface ~30×. Read the canonical counter so
+        // /api/overview agrees with /api/sensors.total_events.
+        events_count: graph.total_events_ingested,
         incidents_count: incident_nodes.len(),
         decisions_count,
         ai_confirmed,
@@ -1932,7 +1942,8 @@ pub(super) fn compute_overview_from_graph(
 ) -> OverviewResponse {
     use crate::knowledge_graph::types::{Node, NodeType, Relation};
 
-    let metrics = graph.metrics();
+    // PR22: dropped `let metrics = graph.metrics();` — same reason
+    // as the api_overview path above.
     let incident_nodes = graph.nodes_of_type(NodeType::Incident);
 
     let mut by_detector: BTreeMap<String, usize> = BTreeMap::new();
@@ -2058,7 +2069,10 @@ pub(super) fn compute_overview_from_graph(
     };
     OverviewResponse {
         date: date.to_string(),
-        events_count: metrics.edge_count,
+        // PR22: edge_count proxy was inflating events_count by ~30×.
+        // Source of truth: graph.total_events_ingested, matching the
+        // /api/sensors path.
+        events_count: graph.total_events_ingested,
         incidents_count: incident_nodes.len(),
         decisions_count,
         ai_confirmed,

@@ -634,6 +634,20 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/sensors.rs::tests::api_status_files_no_longer_advertises_dead_jsonl_streams` — same contract, struct-level. Replaces the legacy `test_sensors_system_status_mapping` test which pinned the OPPOSITE direction (asserting the dead probes existed).
 
+- `crates/agent/src/dashboard/mod.rs::tests::pr22_overview_events_count_reads_canonical_counter_not_edge_count` — spec 049 PR22 anti-regression: `/api/overview.events_count` must NOT use `metrics.edge_count` (the ~30× inflation proxy from the pre-PR22 era). Source: `graph.total_events_ingested`, matching `/api/sensors.total_events`. Operator-reported 2026-05-13: 130k vs 3.7k for the same KG.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr22_canonical_counts_module_exists_and_is_wired` — source-grep on `canonical_counts.rs` asserting `CanonicalCounts` struct + `compute()` entry point + canonical events counter. Removing the module fails this anchor.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr22_frontend_no_longer_double_filters_trusted_ips` — frontend `state.hideAllowlisted` JS filter body is gone. Backend is the single source of truth; the JS layer doing it again caused the 2026-05-13 strip-vs-panel mismatch.
+
+- `crates/agent/src/dashboard/canonical_counts.rs::tests::canonical_counts_returns_zero_for_clean_store` — empty-store no-panic anchor. Boot path on a clean install must not crash.
+
+- `crates/agent/src/dashboard/canonical_counts.rs::tests::canonical_counts_aggregates_one_blocked_incident` — single incident + block_ip decision must land 1 in each: incidents_today, blocked_attackers, unique_attackers_today, flagged_by_system, warden_decisions.
+
+- `crates/agent/src/dashboard/canonical_counts.rs::tests::canonical_counts_excludes_self_traffic_ips` — Cloudflare-edge IPs and RFC1918 must not inflate any counter (PR20+PR21 contract end-to-end).
+
+- `crates/agent/src/dashboard/canonical_counts.rs::tests::canonical_counts_reads_events_today_from_kg_ingest_counter` — events_today must come from `graph.total_events_ingested`, NOT from `metrics.edge_count` or `count_file_lines` proxies.
+
 - `crates/agent/src/dashboard/mod.rs::tests::threats_kpi_tile_label_is_blocks_not_blocked` (extended in Wave 10) - the Threats KPI tile reads "Block actions" / "today" (aggregate, decisions) and the sidebar group reads "Currently blocked attackers" (snapshot, unique IPs). Pre-Wave-10 the labels read "Blocks · Today" and "Blocked attackers" — same page, different answers, no copy disclosing the snapshot-vs-aggregate axis. Operator's hard rule (2026-05-05): every label must explicitly disclose window + scope + cardinality unit. The test name predates Wave 10 (kept for git-blame continuity); the docstring has been updated to reflect the new disambiguation pair.
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_live_feed_clips_to_rolling_24h_matching_site_label` - the public live-feed builder (`build_live_feed_response`) clips `real_incidents` to `now - 24h` so the site's hardcoded "(24h)" labels (`Live.tsx:415,422,429`) match the underlying data. Source-grep anchor: pins `cutoff_24h = now - chrono::Duration::hours(24)` AND `i.ts >= cutoff_24h` filter in active code. A future "remove the cutoff for performance" PR fails CI loudly.
 
