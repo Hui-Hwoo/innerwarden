@@ -40,90 +40,7 @@ impl SlackClient {
         incident: &Incident,
         dashboard_url: Option<&str>,
     ) -> Result<()> {
-        let severity_str = format!("{:?}", incident.severity);
-        let emoji = severity_emoji(&severity_str);
-        let color = severity_color(&severity_str);
-
-        // Extract primary IP or user entity for display
-        let entity_line = {
-            let ip = incident
-                .entities
-                .iter()
-                .find(|e| e.r#type == EntityType::Ip)
-                .map(|e| format!("IP: `{}`", e.value));
-            let user = incident
-                .entities
-                .iter()
-                .find(|e| e.r#type == EntityType::User)
-                .map(|e| format!("User: `{}`", e.value));
-            [ip, user]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("  |  ")
-        };
-
-        // Dashboard deep-link button (optional)
-        let actions_block = if let Some(url) = dashboard_url {
-            // Build a URL that deep-links to the first IP entity if available
-            let link_url = incident
-                .entities
-                .iter()
-                .find(|e| e.r#type == EntityType::Ip)
-                .map(|e| format!("{}/?entity={}", url, e.value))
-                .unwrap_or_else(|| url.to_string());
-
-            Some(json!({
-                "type": "actions",
-                "elements": [{
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": "Investigate →", "emoji": true },
-                    "url": link_url,
-                    "style": "danger"
-                }]
-            }))
-        } else {
-            None
-        };
-
-        let mut blocks = vec![
-            json!({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": format!("{emoji} *{severity_str} - {title}*\n{summary}",
-                        emoji = emoji,
-                        severity_str = severity_str.to_uppercase(),
-                        title = &incident.title,
-                        summary = &incident.summary,
-                    )
-                }
-            }),
-            json!({
-                "type": "context",
-                "elements": [{
-                    "type": "mrkdwn",
-                    "text": format!("🖥 `{host}`  {entity_part}  🕐 {time}",
-                        host = &incident.host,
-                        entity_part = if entity_line.is_empty() { String::new() } else { format!(" |  {entity_line}") },
-                        time = incident.ts.format("%H:%M UTC"),
-                    )
-                }]
-            }),
-        ];
-
-        if let Some(ab) = actions_block {
-            blocks.push(ab);
-        }
-
-        // Slack's `attachments` API supports a sidebar colour line.
-        let payload = json!({
-            "attachments": [{
-                "color": color,
-                "blocks": blocks,
-                "fallback": format!("[InnerWarden] {}: {}", severity_str, incident.title),
-            }]
-        });
+        let payload = incident_alert_payload(incident, dashboard_url);
 
         let resp = self
             .client
@@ -151,52 +68,7 @@ impl SlackClient {
         &self,
         alert: &crate::dashboard::AgentGuardAlert,
     ) -> Result<()> {
-        let color = match alert.severity.as_str() {
-            "high" => "#f43f5e",
-            "medium" => "#f97316",
-            _ => "#eab308",
-        };
-        let sev_emoji = match alert.severity.as_str() {
-            "high" => "🔴",
-            "medium" => "🟠",
-            _ => "🟡",
-        };
-        let cmd_preview = if alert.command.len() > 120 {
-            format!("{}…", &alert.command[..120])
-        } else {
-            alert.command.clone()
-        };
-        let signals_str = alert.signals.join(", ");
-        let atr_line = if alert.atr_rule_ids.is_empty() {
-            String::new()
-        } else {
-            format!("  |  ATR: {}", alert.atr_rule_ids.join(", "))
-        };
-
-        let payload = json!({
-            "attachments": [{
-                "color": color,
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": format!(
-                                "🤖 *Agent Guard Alert*\n{sev_emoji} {} — {}\n\n*Agent:* {}\n*Command:* `{}`\n*Risk:* {}/100\n*Signals:* {}{}",
-                                alert.severity.to_uppercase(),
-                                alert.recommendation.to_uppercase(),
-                                alert.agent_name,
-                                cmd_preview,
-                                alert.risk_score,
-                                signals_str,
-                                atr_line,
-                            )
-                        }
-                    }
-                ],
-                "fallback": format!("[InnerWarden] Agent Guard: {} attempted {}", alert.agent_name, cmd_preview)
-            }]
-        });
+        let payload = agent_guard_alert_payload(alert);
 
         let resp = self
             .client
@@ -217,6 +89,136 @@ impl SlackClient {
         }
         Ok(())
     }
+}
+
+fn incident_alert_payload(incident: &Incident, dashboard_url: Option<&str>) -> serde_json::Value {
+    let severity_str = format!("{:?}", incident.severity);
+    let emoji = severity_emoji(&severity_str);
+    let color = severity_color(&severity_str);
+
+    let entity_line = {
+        let ip = incident
+            .entities
+            .iter()
+            .find(|e| e.r#type == EntityType::Ip)
+            .map(|e| format!("IP: `{}`", e.value));
+        let user = incident
+            .entities
+            .iter()
+            .find(|e| e.r#type == EntityType::User)
+            .map(|e| format!("User: `{}`", e.value));
+        [ip, user]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("  |  ")
+    };
+
+    let actions_block = dashboard_url.map(|url| {
+        let link_url = incident
+            .entities
+            .iter()
+            .find(|e| e.r#type == EntityType::Ip)
+            .map(|e| format!("{}/?entity={}", url, e.value))
+            .unwrap_or_else(|| url.to_string());
+
+        json!({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": { "type": "plain_text", "text": "Investigate →", "emoji": true },
+                "url": link_url,
+                "style": "danger"
+            }]
+        })
+    });
+
+    let mut blocks = vec![
+        json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!("{emoji} *{severity_str} - {title}*\n{summary}",
+                    emoji = emoji,
+                    severity_str = severity_str.to_uppercase(),
+                    title = &incident.title,
+                    summary = &incident.summary,
+                )
+            }
+        }),
+        json!({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": format!("🖥 `{host}`  {entity_part}  🕐 {time}",
+                    host = &incident.host,
+                    entity_part = if entity_line.is_empty() { String::new() } else { format!(" |  {entity_line}") },
+                    time = incident.ts.format("%H:%M UTC"),
+                )
+            }]
+        }),
+    ];
+
+    if let Some(block) = actions_block {
+        blocks.push(block);
+    }
+
+    json!({
+        "attachments": [{
+            "color": color,
+            "blocks": blocks,
+            "fallback": format!("[InnerWarden] {}: {}", severity_str, incident.title),
+        }]
+    })
+}
+
+fn agent_guard_alert_payload(alert: &crate::dashboard::AgentGuardAlert) -> serde_json::Value {
+    let color = match alert.severity.as_str() {
+        "high" => "#f43f5e",
+        "medium" => "#f97316",
+        _ => "#eab308",
+    };
+    let sev_emoji = match alert.severity.as_str() {
+        "high" => "🔴",
+        "medium" => "🟠",
+        _ => "🟡",
+    };
+    let cmd_preview = if alert.command.len() > 120 {
+        format!("{}…", &alert.command[..120])
+    } else {
+        alert.command.clone()
+    };
+    let signals_str = alert.signals.join(", ");
+    let atr_line = if alert.atr_rule_ids.is_empty() {
+        String::new()
+    } else {
+        format!("  |  ATR: {}", alert.atr_rule_ids.join(", "))
+    };
+
+    json!({
+        "attachments": [{
+            "color": color,
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": format!(
+                            "🤖 *Agent Guard Alert*\n{sev_emoji} {} — {}\n\n*Agent:* {}\n*Command:* `{}`\n*Risk:* {}/100\n*Signals:* {}{}",
+                            alert.severity.to_uppercase(),
+                            alert.recommendation.to_uppercase(),
+                            alert.agent_name,
+                            cmd_preview,
+                            alert.risk_score,
+                            signals_str,
+                            atr_line,
+                        )
+                    }
+                }
+            ],
+            "fallback": format!("[InnerWarden] Agent Guard: {} attempted {}", alert.agent_name, cmd_preview)
+        }]
+    })
 }
 
 fn severity_emoji(severity: &str) -> &'static str {
@@ -296,5 +298,89 @@ mod tests {
         // neutral styling, documenting current behavior explicitly.
         assert_eq!(severity_emoji("critical"), "ℹ️");
         assert_eq!(severity_color("critical"), "#6b7280");
+    }
+
+    fn test_incident() -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "edge-1".to_string(),
+            incident_id: "inc-1".to_string(),
+            severity: innerwarden_core::event::Severity::Critical,
+            title: "Credential stuffing".to_string(),
+            summary: "Burst from one actor".to_string(),
+            evidence: serde_json::Value::Null,
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![
+                innerwarden_core::entities::EntityRef::ip("1.2.3.4"),
+                innerwarden_core::entities::EntityRef::user("root"),
+            ],
+        }
+    }
+
+    fn test_guard_alert(command: String, severity: &str) -> crate::dashboard::AgentGuardAlert {
+        crate::dashboard::AgentGuardAlert {
+            ts: chrono::Utc::now(),
+            agent_name: "codex".to_string(),
+            command,
+            risk_score: 91,
+            severity: severity.to_string(),
+            recommendation: "block".to_string(),
+            signals: vec!["shell".to_string(), "credential".to_string()],
+            atr_rule_ids: vec!["ATR-7".to_string()],
+            explanation: "dangerous".to_string(),
+        }
+    }
+
+    #[test]
+    fn incident_payload_includes_entity_context_and_dashboard_deeplink() {
+        let payload = incident_alert_payload(&test_incident(), Some("https://dash.local"));
+        assert_eq!(payload["attachments"][0]["color"], "#9b1c1c");
+        let blocks = payload["attachments"][0]["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            blocks[2]["elements"][0]["url"],
+            "https://dash.local/?entity=1.2.3.4"
+        );
+        let context = blocks[1]["elements"][0]["text"].as_str().unwrap();
+        assert!(context.contains("IP: `1.2.3.4`"));
+        assert!(context.contains("User: `root`"));
+    }
+
+    #[test]
+    fn incident_payload_omits_actions_without_dashboard_url() {
+        let mut incident = test_incident();
+        incident.entities.clear();
+        let payload = incident_alert_payload(&incident, None);
+        let blocks = payload["attachments"][0]["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[1]["elements"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("edge-1"));
+    }
+
+    #[test]
+    fn agent_guard_payload_truncates_long_commands_and_renders_atr_context() {
+        let payload = agent_guard_alert_payload(&test_guard_alert("x".repeat(140), "high"));
+        assert_eq!(payload["attachments"][0]["color"], "#f43f5e");
+        let text = payload["attachments"][0]["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("ATR: ATR-7"));
+        assert!(text.contains('…'));
+    }
+
+    #[test]
+    fn agent_guard_payload_uses_medium_palette_and_handles_empty_atr_ids() {
+        let mut alert = test_guard_alert("echo ok".to_string(), "medium");
+        alert.atr_rule_ids.clear();
+        let payload = agent_guard_alert_payload(&alert);
+        assert_eq!(payload["attachments"][0]["color"], "#f97316");
+        let text = payload["attachments"][0]["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("MEDIUM"));
+        assert!(!text.contains("ATR:"));
     }
 }

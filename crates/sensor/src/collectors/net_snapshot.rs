@@ -153,6 +153,79 @@ fn build_inode_pid_map() -> HashMap<u64, (u32, String)> {
     map
 }
 
+fn attach_pid_ownership(entries: &mut [SocketEntry], inode_map: &HashMap<u64, (u32, String)>) {
+    for entry in entries {
+        if let Some((pid, comm)) = inode_map.get(&entry.inode) {
+            entry.pid = Some(*pid);
+            entry.comm = Some(comm.clone());
+        }
+    }
+}
+
+fn is_interesting_socket(entry: &SocketEntry) -> bool {
+    (entry.state == "ESTABLISHED" || entry.state == "LISTEN" || entry.state == "SYN_SENT")
+        && (entry.remote_addr != "0.0.0.0" || entry.state == "LISTEN")
+        && (!entry.local_addr.starts_with("127.") || entry.state == "LISTEN")
+}
+
+fn build_snapshot_event(
+    host_id: &str,
+    now: chrono::DateTime<Utc>,
+    entries: &[SocketEntry],
+) -> Event {
+    let interesting: Vec<&SocketEntry> = entries
+        .iter()
+        .filter(|entry| is_interesting_socket(entry))
+        .collect();
+
+    let established: Vec<serde_json::Value> = interesting
+        .iter()
+        .filter(|entry| entry.state == "ESTABLISHED")
+        .map(|entry| {
+            serde_json::json!({
+                "pid": entry.pid,
+                "comm": entry.comm,
+                "local": format!("{}:{}", entry.local_addr, entry.local_port),
+                "remote": format!("{}:{}", entry.remote_addr, entry.remote_port),
+                "state": entry.state,
+            })
+        })
+        .collect();
+
+    let listening: Vec<serde_json::Value> = interesting
+        .iter()
+        .filter(|entry| entry.state == "LISTEN")
+        .map(|entry| {
+            serde_json::json!({
+                "pid": entry.pid,
+                "comm": entry.comm,
+                "addr": format!("{}:{}", entry.local_addr, entry.local_port),
+            })
+        })
+        .collect();
+
+    Event {
+        ts: now,
+        host: host_id.to_string(),
+        source: "net_snapshot".into(),
+        kind: "network.snapshot".into(),
+        severity: Severity::Debug,
+        summary: format!(
+            "Network snapshot: {} established, {} listening",
+            established.len(),
+            listening.len()
+        ),
+        details: serde_json::json!({
+            "established": established,
+            "listening": listening,
+            "established_count": established.len(),
+            "listening_count": listening.len(),
+        }),
+        tags: vec!["snapshot".into(), "network".into()],
+        entities: Vec::new(),
+    }
+}
+
 /// Run the network snapshot collector.
 pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
     info!("net_snapshot: starting (interval: {interval_secs}s)");
@@ -180,67 +253,8 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
 
         // Resolve PID ownership
         let inode_map = build_inode_pid_map();
-        for entry in &mut entries {
-            if let Some((pid, comm)) = inode_map.get(&entry.inode) {
-                entry.pid = Some(*pid);
-                entry.comm = Some(comm.clone());
-            }
-        }
-
-        // Filter to interesting connections (skip loopback, TIME_WAIT)
-        let interesting: Vec<&SocketEntry> = entries
-            .iter()
-            .filter(|e| e.state == "ESTABLISHED" || e.state == "LISTEN" || e.state == "SYN_SENT")
-            .filter(|e| e.remote_addr != "0.0.0.0" || e.state == "LISTEN")
-            .filter(|e| !e.local_addr.starts_with("127.") || e.state == "LISTEN")
-            .collect();
-
-        let established: Vec<serde_json::Value> = interesting
-            .iter()
-            .filter(|e| e.state == "ESTABLISHED")
-            .map(|e| {
-                serde_json::json!({
-                    "pid": e.pid,
-                    "comm": e.comm,
-                    "local": format!("{}:{}", e.local_addr, e.local_port),
-                    "remote": format!("{}:{}", e.remote_addr, e.remote_port),
-                    "state": e.state,
-                })
-            })
-            .collect();
-
-        let listening: Vec<serde_json::Value> = interesting
-            .iter()
-            .filter(|e| e.state == "LISTEN")
-            .map(|e| {
-                serde_json::json!({
-                    "pid": e.pid,
-                    "comm": e.comm,
-                    "addr": format!("{}:{}", e.local_addr, e.local_port),
-                })
-            })
-            .collect();
-
-        let event = Event {
-            ts: now,
-            host: host_id.clone(),
-            source: "net_snapshot".into(),
-            kind: "network.snapshot".into(),
-            severity: Severity::Debug,
-            summary: format!(
-                "Network snapshot: {} established, {} listening",
-                established.len(),
-                listening.len()
-            ),
-            details: serde_json::json!({
-                "established": established,
-                "listening": listening,
-                "established_count": established.len(),
-                "listening_count": listening.len(),
-            }),
-            tags: vec!["snapshot".into(), "network".into()],
-            entities: Vec::new(),
-        };
+        attach_pid_ownership(&mut entries, &inode_map);
+        let event = build_snapshot_event(&host_id, now, &entries);
 
         let _ = tx.send(event).await;
     }
@@ -315,5 +329,77 @@ mod tests {
         let (addr, port) = parse_hex_addr("00000000000000000000000000000001:0050");
         assert_eq!(addr, "ipv6:00000000000000000000000000000001");
         assert_eq!(port, 80);
+    }
+
+    fn socket(local_addr: &str, remote_addr: &str, state: &'static str, inode: u64) -> SocketEntry {
+        SocketEntry {
+            local_addr: local_addr.to_string(),
+            local_port: 8080,
+            remote_addr: remote_addr.to_string(),
+            remote_port: 443,
+            state,
+            inode,
+            pid: None,
+            comm: None,
+        }
+    }
+
+    #[test]
+    fn interesting_socket_filter_keeps_exposed_connections_only() {
+        assert!(is_interesting_socket(&socket(
+            "10.0.0.5",
+            "8.8.8.8",
+            "ESTABLISHED",
+            1
+        )));
+        assert!(is_interesting_socket(&socket(
+            "127.0.0.1",
+            "0.0.0.0",
+            "LISTEN",
+            2
+        )));
+        assert!(!is_interesting_socket(&socket(
+            "127.0.0.1",
+            "8.8.8.8",
+            "ESTABLISHED",
+            3
+        )));
+        assert!(!is_interesting_socket(&socket(
+            "10.0.0.5",
+            "0.0.0.0",
+            "TIME_WAIT",
+            4
+        )));
+    }
+
+    #[test]
+    fn attach_pid_ownership_populates_matching_inodes_only() {
+        let mut entries = vec![
+            socket("10.0.0.5", "8.8.8.8", "ESTABLISHED", 77),
+            socket("10.0.0.6", "1.1.1.1", "SYN_SENT", 88),
+        ];
+        let owners = HashMap::from([(77, (4242, "curl".to_string()))]);
+        attach_pid_ownership(&mut entries, &owners);
+
+        assert_eq!(entries[0].pid, Some(4242));
+        assert_eq!(entries[0].comm.as_deref(), Some("curl"));
+        assert_eq!(entries[1].pid, None);
+        assert_eq!(entries[1].comm, None);
+    }
+
+    #[test]
+    fn snapshot_event_counts_established_and_listening_connections() {
+        let mut owned = socket("10.0.0.5", "8.8.8.8", "ESTABLISHED", 77);
+        owned.pid = Some(42);
+        owned.comm = Some("curl".to_string());
+        let listen = socket("0.0.0.0", "0.0.0.0", "LISTEN", 88);
+        let hidden = socket("127.0.0.1", "8.8.8.8", "ESTABLISHED", 99);
+
+        let ev = build_snapshot_event("sensor-a", Utc::now(), &[owned, listen, hidden]);
+        assert_eq!(ev.kind, "network.snapshot");
+        assert_eq!(ev.details["established_count"], 1);
+        assert_eq!(ev.details["listening_count"], 1);
+        assert_eq!(ev.details["established"][0]["pid"], 42);
+        assert!(ev.summary.contains("1 established, 1 listening"));
     }
 }

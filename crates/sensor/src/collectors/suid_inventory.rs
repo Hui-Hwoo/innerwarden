@@ -70,35 +70,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
                 continue;
             }
 
-            let in_danger_path = is_in_danger_path(&bin.path);
-            let severity = classify_suid_change_severity(is_new, in_danger_path);
-            let action = suid_action_label(is_new);
-
-            let event = Event {
-                ts: now,
-                host: host_id.clone(),
-                source: "suid_inventory".into(),
-                kind: format!("file.{action}"),
-                severity,
-                summary: format!(
-                    "SUID binary {}: {} (mode: {:o}, sha256: {})",
-                    action,
-                    bin.path,
-                    bin.mode,
-                    &bin.sha256[..16]
-                ),
-                details: serde_json::json!({
-                    "action": action,
-                    "path": bin.path,
-                    "mode": format!("{:o}", bin.mode),
-                    "uid": bin.uid,
-                    "size": bin.size,
-                    "sha256": bin.sha256,
-                    "in_danger_path": in_danger_path,
-                }),
-                tags: vec!["suid".into(), "inventory".into()],
-                entities: vec![EntityRef::path(bin.path.clone())],
-            };
+            let event = build_suid_change_event(&host_id, now, bin, is_new);
 
             let _ = tx.send(event).await;
             baseline.insert(bin.path.clone(), bin.clone());
@@ -164,6 +136,43 @@ fn scan_dir_recursive(dir: &Path, results: &mut Vec<SuidBinary>, depth: u32) {
             size: meta.len(),
             sha256,
         });
+    }
+}
+
+fn build_suid_change_event(
+    host_id: &str,
+    now: chrono::DateTime<Utc>,
+    bin: &SuidBinary,
+    is_new: bool,
+) -> Event {
+    let in_danger_path = is_in_danger_path(&bin.path);
+    let severity = classify_suid_change_severity(is_new, in_danger_path);
+    let action = suid_action_label(is_new);
+
+    Event {
+        ts: now,
+        host: host_id.to_string(),
+        source: "suid_inventory".into(),
+        kind: format!("file.{action}"),
+        severity,
+        summary: format!(
+            "SUID binary {}: {} (mode: {:o}, sha256: {})",
+            action,
+            bin.path,
+            bin.mode,
+            &bin.sha256[..16]
+        ),
+        details: serde_json::json!({
+            "action": action,
+            "path": bin.path,
+            "mode": format!("{:o}", bin.mode),
+            "uid": bin.uid,
+            "size": bin.size,
+            "sha256": bin.sha256,
+            "in_danger_path": in_danger_path,
+        }),
+        tags: vec!["suid".into(), "inventory".into()],
+        entities: vec![EntityRef::path(bin.path.clone())],
     }
 }
 
@@ -253,5 +262,72 @@ mod tests {
         // Confirms event kind labels remain stable for downstream routing and analytics.
         assert_eq!(suid_action_label(true), "new_suid");
         assert_eq!(suid_action_label(false), "suid_modified");
+    }
+
+    #[test]
+    fn compute_sha256_hashes_small_files_and_ignores_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("payload.bin");
+        std::fs::write(&file, b"innerwarden").unwrap();
+
+        let digest = compute_sha256(&file).unwrap();
+        assert_eq!(
+            digest,
+            "de10c070ac7779a62bda785e6cf5708cfc82f0c131d093a47f963cc1443c1d6f"
+        );
+        assert!(compute_sha256(&dir.path().join("missing.bin")).is_none());
+    }
+
+    #[test]
+    fn scan_dir_recursive_collects_suid_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular");
+        let suid = dir.path().join("helper");
+        std::fs::write(&regular, b"regular").unwrap();
+        std::fs::write(&suid, b"suid").unwrap();
+
+        let mut perms = std::fs::metadata(&suid).unwrap().permissions();
+        perms.set_mode(0o4755);
+        std::fs::set_permissions(&suid, perms).unwrap();
+
+        let mut results = Vec::new();
+        scan_dir_recursive(dir.path(), &mut results, 2);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, suid.to_string_lossy());
+        assert_eq!(results[0].sha256.len(), 64);
+    }
+
+    #[test]
+    fn suid_change_event_marks_dangerous_new_binaries_as_critical() {
+        let bin = SuidBinary {
+            path: "/tmp/dropper".to_string(),
+            mode: 0o4755,
+            uid: 0,
+            size: 12,
+            sha256: "0123456789abcdef0123456789abcdef".to_string(),
+        };
+
+        let ev = build_suid_change_event("sensor-a", Utc::now(), &bin, true);
+        assert_eq!(ev.kind, "file.new_suid");
+        assert_eq!(ev.severity, Severity::Critical);
+        assert_eq!(ev.details["in_danger_path"], true);
+        assert_eq!(ev.entities[0].value, "/tmp/dropper");
+    }
+
+    #[test]
+    fn suid_change_event_marks_non_dangerous_modifications_as_medium() {
+        let bin = SuidBinary {
+            path: "/usr/bin/tool".to_string(),
+            mode: 0o2755,
+            uid: 0,
+            size: 24,
+            sha256: "fedcba9876543210fedcba9876543210".to_string(),
+        };
+
+        let ev = build_suid_change_event("sensor-b", Utc::now(), &bin, false);
+        assert_eq!(ev.kind, "file.suid_modified");
+        assert_eq!(ev.severity, Severity::Medium);
+        assert_eq!(ev.details["action"], "suid_modified");
     }
 }

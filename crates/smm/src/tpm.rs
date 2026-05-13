@@ -82,8 +82,10 @@ fn is_zero_pcr(hex_val: &str) -> bool {
 
 /// Check if TPM is present and accessible.
 pub fn check_tpm_present() -> CheckResult {
-    let info = TpmInfo::read();
+    check_tpm_present_from_info(TpmInfo::read())
+}
 
+fn check_tpm_present_from_info(info: TpmInfo) -> CheckResult {
     if !info.present {
         return CheckResult {
             id: "TPM-001",
@@ -115,8 +117,10 @@ pub fn check_tpm_present() -> CheckResult {
 
 /// Check PCR values for firmware integrity (PCR 0-7 = firmware boot stages).
 pub fn check_pcr_values() -> CheckResult {
-    let info = TpmInfo::read();
+    check_pcr_values_from_info(TpmInfo::read())
+}
 
+fn check_pcr_values_from_info(info: TpmInfo) -> CheckResult {
     if !info.present {
         return CheckResult {
             id: "TPM-002",
@@ -217,5 +221,101 @@ mod tests {
     fn check_tpm_runs() {
         let result = check_tpm_present();
         assert!(!result.id.is_empty());
+    }
+
+    #[test]
+    fn present_check_reports_warning_when_tpm_is_missing() {
+        let result = check_tpm_present_from_info(TpmInfo {
+            present: false,
+            version: String::new(),
+            pcrs: BTreeMap::new(),
+        });
+        assert_eq!(result.id, "TPM-001");
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert!(result.detail.contains("no TPM detected"));
+    }
+
+    #[test]
+    fn present_check_reports_secure_with_bank_count_and_version() {
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert("sha256".to_string(), BTreeMap::new());
+
+        let result = check_tpm_present_from_info(TpmInfo {
+            present: true,
+            version: "2".to_string(),
+            pcrs,
+        });
+        assert_eq!(result.status, CheckStatus::Secure);
+        assert!(result.detail.contains("TPM 2 detected"));
+        assert!(result.detail.contains("1 PCR bank"));
+    }
+
+    #[test]
+    fn pcr_check_reports_unavailable_without_tpm_or_banks() {
+        let missing = check_pcr_values_from_info(TpmInfo {
+            present: false,
+            version: String::new(),
+            pcrs: BTreeMap::new(),
+        });
+        assert_eq!(missing.status, CheckStatus::Unavailable);
+
+        let no_banks = check_pcr_values_from_info(TpmInfo {
+            present: true,
+            version: "2".to_string(),
+            pcrs: BTreeMap::new(),
+        });
+        assert_eq!(no_banks.status, CheckStatus::Unavailable);
+        assert!(no_banks.detail.contains("no PCR banks readable"));
+    }
+
+    #[test]
+    fn pcr_check_reports_secure_when_boot_chain_is_measured() {
+        let mut bank = BTreeMap::new();
+        for idx in 0..=7 {
+            bank.insert(idx, format!("{:064x}", idx + 1));
+        }
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert("sha256".to_string(), bank);
+
+        let result = check_pcr_values_from_info(TpmInfo {
+            present: true,
+            version: "2".to_string(),
+            pcrs,
+        });
+        assert_eq!(result.status, CheckStatus::Secure);
+        assert!(result.detail.contains("8 PCRs extended"));
+    }
+
+    #[test]
+    fn pcr_check_reports_warning_for_zeroed_boot_measurements() {
+        let mut bank = BTreeMap::new();
+        bank.insert(0, "0".repeat(64));
+        bank.insert(1, "1".repeat(64));
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert("sha1".to_string(), bank);
+
+        let result = check_pcr_values_from_info(TpmInfo {
+            present: true,
+            version: "1".to_string(),
+            pcrs,
+        });
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert!(result.detail.contains("[0]"));
+    }
+
+    #[test]
+    fn pcr_check_reports_unavailable_when_boot_indices_are_absent() {
+        let mut bank = BTreeMap::new();
+        bank.insert(9, "1".repeat(64));
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert("sha256".to_string(), bank);
+
+        let result = check_pcr_values_from_info(TpmInfo {
+            present: true,
+            version: "2".to_string(),
+            pcrs,
+        });
+        assert_eq!(result.status, CheckStatus::Unavailable);
+        assert!(result.detail.contains("no firmware PCRs"));
     }
 }

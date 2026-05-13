@@ -1321,4 +1321,263 @@ nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
         assert_eq!(default_poll_seconds(), 60);
         assert_eq!(default_journald_units(), vec!["sshd", "sudo"]);
     }
+
+    #[test]
+    fn load_minimal_config_applies_nested_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sensor.toml");
+        std::fs::write(
+            &path,
+            r#"
+[agent]
+host_id = "host-a"
+
+[output]
+data_dir = "/tmp/innerwarden"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.agent.host_id, "host-a");
+        assert_eq!(cfg.output.data_dir, "/tmp/innerwarden");
+        assert!(cfg.output.write_events);
+        assert!(cfg.collectors.auth_log.enabled);
+        assert_eq!(cfg.collectors.integrity.poll_seconds, 60);
+        assert!(cfg.detectors.ssh_bruteforce.enabled);
+        assert!(cfg.detectors.log_tampering.enabled);
+        assert!(cfg.allowlist.trusted_users.is_empty());
+    }
+
+    #[test]
+    fn load_respects_nested_overrides_and_surfaces_parse_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("sensor-valid.toml");
+        std::fs::write(
+            &valid,
+            r#"
+[agent]
+host_id = "host-b"
+
+[output]
+data_dir = "/var/lib/innerwarden"
+write_events = false
+
+[collectors.exec_audit]
+enabled = true
+path = "/tmp/exec.log"
+include_tty = true
+
+[detectors.port_scan]
+enabled = true
+threshold = 99
+window_seconds = 42
+
+[allowlist]
+trusted_users = ["alice", "bob"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = load(valid.to_str().unwrap()).unwrap();
+        assert!(!cfg.output.write_events);
+        assert!(cfg.collectors.exec_audit.enabled);
+        assert_eq!(cfg.collectors.exec_audit.path, "/tmp/exec.log");
+        assert!(cfg.collectors.exec_audit.include_tty);
+        assert!(cfg.detectors.port_scan.enabled);
+        assert_eq!(cfg.detectors.port_scan.threshold, 99);
+        assert_eq!(cfg.detectors.port_scan.window_seconds, 42);
+        assert_eq!(cfg.allowlist.trusted_users, vec!["alice", "bob"]);
+
+        let invalid = dir.path().join("sensor-invalid.toml");
+        std::fs::write(&invalid, "[agent\nhost_id = nope").unwrap();
+        assert!(load(invalid.to_str().unwrap()).is_err());
+        assert!(load(dir.path().join("missing.toml").to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn config_default_structs_preserve_runtime_security_thresholds() {
+        let exec = ExecAuditConfig::default();
+        assert!(!exec.enabled);
+        assert_eq!(exec.path, "/var/log/audit/audit.log");
+        assert!(!exec.include_tty);
+
+        let journald = JournaldConfig::default();
+        assert!(!journald.enabled);
+        assert_eq!(journald.units, vec!["sshd", "sudo"]);
+
+        let integrity = IntegrityConfig::default();
+        assert!(!integrity.enabled);
+        assert!(integrity.paths.is_empty());
+        assert_eq!(integrity.poll_seconds, 60);
+
+        let auth = AuthLogConfig::default();
+        assert!(auth.enabled);
+        assert_eq!(auth.path, "/var/log/auth.log");
+
+        let ssh = SshBruteforceConfig::default();
+        assert!(ssh.enabled);
+        assert_eq!(ssh.threshold, 8);
+        assert_eq!(ssh.window_seconds, 300);
+
+        let stuffing = CredentialStuffingConfig::default();
+        assert!(!stuffing.enabled);
+        assert_eq!(stuffing.threshold, 6);
+        assert_eq!(stuffing.window_seconds, 300);
+
+        let port_scan = PortScanConfig::default();
+        assert!(!port_scan.enabled);
+        assert_eq!(port_scan.threshold, 12);
+        assert_eq!(port_scan.window_seconds, 60);
+
+        let sudo = SudoAbuseConfig::default();
+        assert!(!sudo.enabled);
+        assert_eq!(sudo.threshold, 3);
+        assert_eq!(sudo.window_seconds, 300);
+
+        let nginx = NginxAccessConfig::default();
+        assert!(!nginx.enabled);
+        assert_eq!(nginx.path, "/var/log/nginx/access.log");
+
+        let search = SearchAbuseConfig::default();
+        assert!(!search.enabled);
+        assert_eq!(search.threshold, 30);
+        assert_eq!(search.window_seconds, 60);
+        assert_eq!(search.path_prefix, "/api/search");
+
+        let guard = ExecutionGuardConfig::default();
+        assert!(!guard.enabled);
+        assert_eq!(guard.mode, "observe");
+        assert_eq!(guard.window_seconds, 300);
+
+        let docker = DockerAnomalyConfig::default();
+        assert!(!docker.enabled);
+        assert_eq!(docker.threshold, 3);
+        assert_eq!(docker.window_seconds, 300);
+
+        let integrity_alert = IntegrityAlertConfig::default();
+        assert!(!integrity_alert.enabled);
+        assert_eq!(integrity_alert.cooldown_seconds, 3600);
+
+        let tamper = LogTamperingConfig::default();
+        assert!(tamper.enabled);
+        assert_eq!(tamper.cooldown_seconds, 600);
+
+        let dns = DnsTunnelingConfig::default();
+        assert!(dns.enabled);
+        assert_eq!(dns.entropy_threshold, 4.0);
+        assert_eq!(dns.volume_threshold, 15);
+        assert_eq!(dns.length_threshold, 100);
+        assert_eq!(dns.window_seconds, 60);
+
+        let lateral = LateralMovementConfig::default();
+        assert!(lateral.enabled);
+        assert_eq!(lateral.ssh_threshold, 3);
+        assert_eq!(lateral.scan_threshold, 5);
+        assert_eq!(lateral.window_seconds, 300);
+
+        let miner = CryptoMinerConfig::default();
+        assert!(miner.enabled);
+        assert_eq!(miner.cooldown_seconds, 300);
+
+        let outbound = OutboundAnomalyConfig::default();
+        assert!(outbound.enabled);
+        assert_eq!(outbound.connection_flood_threshold, 50);
+        assert_eq!(outbound.port_spray_threshold, 20);
+        assert_eq!(outbound.udp_flood_threshold, 100);
+        assert_eq!(outbound.fanout_threshold, 10);
+        assert_eq!(outbound.window_seconds, 60);
+        assert_eq!(outbound.cooldown_seconds, 300);
+
+        let rootkit = RootkitConfig::default();
+        assert!(rootkit.enabled);
+        assert_eq!(rootkit.check_interval_seconds, 60);
+        assert_eq!(rootkit.cooldown_seconds, 600);
+        assert!(rootkit.timing_enabled);
+        assert_eq!(rootkit.timing_min_samples, 100);
+        assert!(rootkit.timing_z_threshold >= 4.0);
+        assert_eq!(rootkit.timing_consecutive_threshold, 5);
+
+        let reverse = ReverseShellConfig::default();
+        assert!(reverse.enabled);
+        assert_eq!(reverse.cooldown_seconds, 300);
+
+        let ssh_key = SshKeyInjectionConfig::default();
+        assert!(ssh_key.enabled);
+        assert_eq!(ssh_key.cooldown_seconds, 600);
+
+        let web_shell = WebShellConfig::default();
+        assert!(web_shell.enabled);
+        assert_eq!(web_shell.cooldown_seconds, 300);
+
+        let kernel_module = KernelModuleLoadConfig::default();
+        assert!(kernel_module.enabled);
+        assert_eq!(kernel_module.cooldown_seconds, 600);
+
+        let crontab = CrontabPersistenceConfig::default();
+        assert!(crontab.enabled);
+        assert_eq!(crontab.cooldown_seconds, 300);
+
+        let exfil = DataExfiltrationConfig::default();
+        assert!(exfil.enabled);
+        assert_eq!(exfil.correlation_window_seconds, 60);
+        assert_eq!(exfil.cooldown_seconds, 300);
+
+        let inject = ProcessInjectionConfig::default();
+        assert!(inject.enabled);
+        assert_eq!(inject.cooldown_seconds, 600);
+
+        let create_user = UserCreationConfig::default();
+        assert!(create_user.enabled);
+        assert_eq!(create_user.cooldown_seconds, 600);
+
+        let systemd = SystemdPersistenceConfig::default();
+        assert!(systemd.enabled);
+        assert_eq!(systemd.cooldown_seconds, 600);
+
+        let ransomware = RansomwareConfig::default();
+        assert!(ransomware.enabled);
+        assert_eq!(ransomware.file_threshold, 50);
+        assert_eq!(ransomware.window_seconds, 30);
+        assert_eq!(ransomware.cooldown_seconds, 60);
+        assert_eq!(ransomware.entropy_threshold, 7.5);
+        assert_eq!(ransomware.entropy_count_threshold, 3);
+
+        let harvest = CredentialHarvestConfig::default();
+        assert!(harvest.enabled);
+        assert_eq!(harvest.cooldown_seconds, 600);
+
+        let flood = PacketFloodConfig::default();
+        assert!(flood.enabled);
+        assert_eq!(flood.syn_threshold, 100);
+        assert_eq!(flood.http_threshold, 200);
+        assert_eq!(flood.slowloris_threshold, 50);
+        assert_eq!(flood.udp_threshold, 50);
+        assert_eq!(flood.rate_multiplier, 10.0);
+        assert_eq!(flood.window_seconds, 30);
+        assert_eq!(flood.cooldown_seconds, 60);
+
+        let nginx_error = NginxErrorConfig::default();
+        assert!(!nginx_error.enabled);
+        assert_eq!(nginx_error.path, "/var/log/nginx/error.log");
+
+        let web_scan = WebScanConfig::default();
+        assert!(!web_scan.enabled);
+        assert_eq!(web_scan.threshold, 15);
+        assert_eq!(web_scan.window_seconds, 60);
+
+        let syslog = SyslogFirewallConfig::default();
+        assert!(!syslog.enabled);
+        assert_eq!(syslog.path, "/var/log/syslog");
+
+        let cloudtrail = CloudTrailConfig::default();
+        assert!(!cloudtrail.enabled);
+        assert_eq!(cloudtrail.dir, "/var/log/cloudtrail");
+    }
+
+    #[test]
+    fn effective_trusted_uids_auto_detect_branch_returns_human_uid_candidates_only() {
+        let detected = CalibrationConfig::default().effective_trusted_uids();
+        assert!(detected.iter().all(|uid| (1000..65534).contains(uid)));
+    }
 }

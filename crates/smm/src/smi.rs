@@ -25,14 +25,22 @@ pub struct SmiRate {
 /// Measure SMI rate over a short window.
 /// Default window is 2 seconds (enough to detect storm patterns).
 pub fn measure_smi_rate(window: Duration) -> Option<SmiRate> {
-    let start = msr::read_smi_count()?;
+    let start = msr::read_smi_count();
     let t0 = Instant::now();
 
     std::thread::sleep(window);
 
-    let end = msr::read_smi_count()?;
+    let end = msr::read_smi_count();
     let elapsed = t0.elapsed().as_secs_f64();
 
+    smi_rate_from_samples(start, end, elapsed)
+}
+
+fn smi_rate_from_samples(start: Option<u64>, end: Option<u64>, elapsed: f64) -> Option<SmiRate> {
+    Some(smi_rate_from_counts(start?, end?, elapsed))
+}
+
+fn smi_rate_from_counts(start: u64, end: u64, elapsed: f64) -> SmiRate {
     let delta = end.saturating_sub(start);
     let rate = if elapsed > 0.0 {
         (delta as f64 / elapsed) * 60.0
@@ -40,12 +48,12 @@ pub fn measure_smi_rate(window: Duration) -> Option<SmiRate> {
         0.0
     };
 
-    Some(SmiRate {
+    SmiRate {
         count_start: start,
         count_end: end,
         window_secs: elapsed,
         rate_per_min: rate,
-    })
+    }
 }
 
 // ── Thresholds ──────────────────────────────────────────────────────────
@@ -63,8 +71,10 @@ const SMI_RATE_CRITICAL: f64 = 200.0;
 
 /// Check SMI rate for anomalies (quick 2-second measurement).
 pub fn check_smi_rate() -> CheckResult {
-    let rate = measure_smi_rate(Duration::from_secs(2));
+    smi_check_from_rate(measure_smi_rate(Duration::from_secs(2)))
+}
 
+fn smi_check_from_rate(rate: Option<SmiRate>) -> CheckResult {
     let Some(rate) = rate else {
         return CheckResult {
             id: "SMI-001",
@@ -174,5 +184,56 @@ mod tests {
         // expected by report aggregation.
         let result = check_smi_rate();
         assert_eq!(result.id, "SMI-001");
+    }
+
+    #[test]
+    fn smi_rate_math_handles_growth_rollbacks_and_zero_elapsed_windows() {
+        let storm = smi_rate_from_counts(100, 110, 2.0);
+        assert_eq!(storm.rate_per_min, 300.0);
+
+        let rollback = smi_rate_from_counts(110, 100, 2.0);
+        assert_eq!(rollback.rate_per_min, 0.0);
+
+        let zero_elapsed = smi_rate_from_counts(100, 110, 0.0);
+        assert_eq!(zero_elapsed.rate_per_min, 0.0);
+    }
+
+    #[test]
+    fn smi_rate_samples_require_both_counters_and_preserve_elapsed_window() {
+        let sampled = smi_rate_from_samples(Some(100), Some(102), 2.0)
+            .expect("paired samples should produce a rate");
+        assert_eq!(sampled.window_secs, 2.0);
+        assert_eq!(sampled.rate_per_min, 60.0);
+
+        assert!(smi_rate_from_samples(None, Some(102), 2.0).is_none());
+        assert!(smi_rate_from_samples(Some(100), None, 2.0).is_none());
+    }
+
+    #[test]
+    fn smi_check_classifies_unavailable_secure_warning_and_critical_states() {
+        let unavailable = smi_check_from_rate(None);
+        assert_eq!(unavailable.status, CheckStatus::Unavailable);
+
+        let secure = smi_check_from_rate(Some(smi_rate_from_counts(10, 10, 2.0)));
+        assert_eq!(secure.status, CheckStatus::Secure);
+        assert!(secure.detail.contains("SMI rate normal"));
+
+        let warning = smi_check_from_rate(Some(SmiRate {
+            count_start: 10,
+            count_end: 12,
+            window_secs: 2.0,
+            rate_per_min: SMI_RATE_WARNING,
+        }));
+        assert_eq!(warning.status, CheckStatus::Warning);
+        assert!(warning.detail.contains("elevated SMI rate"));
+
+        let critical = smi_check_from_rate(Some(SmiRate {
+            count_start: 10,
+            count_end: 30,
+            window_secs: 2.0,
+            rate_per_min: SMI_RATE_CRITICAL,
+        }));
+        assert_eq!(critical.status, CheckStatus::Critical);
+        assert!(critical.detail.contains("SMI STORM"));
     }
 }

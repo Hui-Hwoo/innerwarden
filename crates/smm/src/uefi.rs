@@ -23,18 +23,31 @@ pub struct SecureBootState {
 impl SecureBootState {
     /// Read Secure Boot state from efivarfs.
     pub fn read() -> Option<Self> {
-        let sb = read_efi_var("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c")?;
-        // EFI var format: 4 bytes attributes + data.
-        let enabled = sb.get(4).copied() == Some(1);
+        secure_boot_state_from_reader(read_efi_var)
+    }
+}
 
-        let setup = read_efi_var("SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c");
-        let setup_mode = setup.and_then(|v| v.get(4).copied()) == Some(1);
+fn secure_boot_state_from_reader<F>(mut read_var: F) -> Option<SecureBootState>
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
+    let secure_boot = read_var("SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c")?;
+    let setup_mode = read_var("SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c");
+    Some(secure_boot_state_from_vars(
+        &secure_boot,
+        setup_mode.as_deref(),
+    ))
+}
 
-        Some(Self {
-            enabled,
-            setup_mode,
-            raw: sb.get(4).copied(),
-        })
+fn secure_boot_state_from_vars(
+    secure_boot_var: &[u8],
+    setup_mode_var: Option<&[u8]>,
+) -> SecureBootState {
+    // EFI var format: 4 bytes attributes + data.
+    SecureBootState {
+        enabled: secure_boot_var.get(4).copied() == Some(1),
+        setup_mode: setup_mode_var.and_then(|value| value.get(4).copied()) == Some(1),
+        raw: secure_boot_var.get(4).copied(),
     }
 }
 
@@ -58,12 +71,19 @@ pub struct BiosInfo {
 impl BiosInfo {
     /// Read BIOS info from sysfs DMI tables.
     pub fn read() -> Self {
-        Self {
-            vendor: read_dmi("bios_vendor"),
-            version: read_dmi("bios_version"),
-            date: read_dmi("bios_date"),
-            bios_release: read_dmi("bios_release"),
-        }
+        bios_info_from_reader(read_dmi)
+    }
+}
+
+fn bios_info_from_reader<F>(mut read_field: F) -> BiosInfo
+where
+    F: FnMut(&str) -> String,
+{
+    BiosInfo {
+        vendor: read_field("bios_vendor"),
+        version: read_field("bios_version"),
+        date: read_field("bios_date"),
+        bios_release: read_field("bios_release"),
     }
 }
 
@@ -79,8 +99,17 @@ fn read_dmi(field: &str) -> String {
 
 /// Check Secure Boot status.
 pub fn check_secure_boot() -> CheckResult {
-    // Check if EFI is available at all.
-    if !Path::new("/sys/firmware/efi").exists() {
+    secure_boot_check_from_state(
+        Path::new("/sys/firmware/efi").exists(),
+        SecureBootState::read(),
+    )
+}
+
+fn secure_boot_check_from_state(
+    efi_available: bool,
+    state: Option<SecureBootState>,
+) -> CheckResult {
+    if !efi_available {
         return CheckResult {
             id: "UEFI-001",
             name: "Secure Boot",
@@ -90,7 +119,7 @@ pub fn check_secure_boot() -> CheckResult {
         };
     }
 
-    match SecureBootState::read() {
+    match state {
         Some(state) => {
             if state.enabled && !state.setup_mode {
                 CheckResult {
@@ -135,8 +164,10 @@ pub fn check_secure_boot() -> CheckResult {
 
 /// Check BIOS vendor/version for known-good baseline.
 pub fn check_bios_info() -> CheckResult {
-    let info = BiosInfo::read();
+    bios_info_check_from_info(BiosInfo::read())
+}
 
+fn bios_info_check_from_info(info: BiosInfo) -> CheckResult {
     if info.vendor.is_empty() && info.version.is_empty() {
         return CheckResult {
             id: "UEFI-002",
@@ -174,6 +205,47 @@ mod tests {
     }
 
     #[test]
+    fn secure_boot_state_parser_handles_enabled_setup_and_short_variables() {
+        let enabled = secure_boot_state_from_vars(
+            &[0x06, 0x00, 0x00, 0x00, 0x01],
+            Some(&[0x06, 0x00, 0x00, 0x00, 0x00]),
+        );
+        assert!(enabled.enabled);
+        assert!(!enabled.setup_mode);
+        assert_eq!(enabled.raw, Some(1));
+
+        let setup = secure_boot_state_from_vars(
+            &[0x06, 0x00, 0x00, 0x00, 0x00],
+            Some(&[0x06, 0x00, 0x00, 0x00, 0x01]),
+        );
+        assert!(!setup.enabled);
+        assert!(setup.setup_mode);
+
+        let short = secure_boot_state_from_vars(&[0x06], None);
+        assert!(!short.enabled);
+        assert!(!short.setup_mode);
+        assert_eq!(short.raw, None);
+    }
+
+    #[test]
+    fn secure_boot_state_reader_handles_present_and_missing_variable_sets() {
+        let populated = secure_boot_state_from_reader(|name| match name {
+            "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" => {
+                Some(vec![0x06, 0x00, 0x00, 0x00, 0x01])
+            }
+            "SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c" => {
+                Some(vec![0x06, 0x00, 0x00, 0x00, 0x00])
+            }
+            _ => None,
+        })
+        .expect("secure boot variables should parse");
+        assert!(populated.enabled);
+        assert!(!populated.setup_mode);
+
+        assert!(secure_boot_state_from_reader(|_| None).is_none());
+    }
+
+    #[test]
     fn bios_info_handles_missing() {
         // BiosInfo::read() should not panic even if files don't exist.
         let info = BiosInfo {
@@ -186,9 +258,103 @@ mod tests {
     }
 
     #[test]
+    fn bios_info_reader_populates_all_fields_from_injected_source() {
+        let info = bios_info_from_reader(|field| match field {
+            "bios_vendor" => "InnerVendor".to_string(),
+            "bios_version" => "9.9.9".to_string(),
+            "bios_date" => "2026-05-13".to_string(),
+            "bios_release" => "42".to_string(),
+            _ => String::new(),
+        });
+
+        assert_eq!(info.vendor, "InnerVendor");
+        assert_eq!(info.version, "9.9.9");
+        assert_eq!(info.date, "2026-05-13");
+        assert_eq!(info.bios_release, "42");
+    }
+
+    #[test]
     fn check_secure_boot_runs() {
         let result = check_secure_boot();
         // On most dev machines, either Unavailable (no EFI) or some valid state.
         assert!(!result.id.is_empty());
+    }
+
+    #[test]
+    fn check_bios_info_runs() {
+        let result = check_bios_info();
+        assert_eq!(result.id, "UEFI-002");
+    }
+
+    #[test]
+    fn secure_boot_check_reports_legacy_mode_without_efi() {
+        let result = secure_boot_check_from_state(false, None);
+        assert_eq!(result.status, CheckStatus::Unavailable);
+        assert!(result.detail.contains("legacy BIOS mode"));
+    }
+
+    #[test]
+    fn secure_boot_check_reports_secure_setup_and_disabled_modes() {
+        let secure = secure_boot_check_from_state(
+            true,
+            Some(SecureBootState {
+                enabled: true,
+                setup_mode: false,
+                raw: Some(1),
+            }),
+        );
+        assert_eq!(secure.status, CheckStatus::Secure);
+
+        let setup = secure_boot_check_from_state(
+            true,
+            Some(SecureBootState {
+                enabled: false,
+                setup_mode: true,
+                raw: Some(0),
+            }),
+        );
+        assert_eq!(setup.status, CheckStatus::Warning);
+        assert!(setup.detail.contains("Setup Mode"));
+
+        let disabled = secure_boot_check_from_state(
+            true,
+            Some(SecureBootState {
+                enabled: false,
+                setup_mode: false,
+                raw: Some(7),
+            }),
+        );
+        assert_eq!(disabled.status, CheckStatus::Warning);
+        assert!(disabled.detail.contains("raw=7"));
+    }
+
+    #[test]
+    fn secure_boot_check_reports_unavailable_when_variable_is_missing() {
+        let result = secure_boot_check_from_state(true, None);
+        assert_eq!(result.status, CheckStatus::Unavailable);
+        assert!(result
+            .detail
+            .contains("cannot read SecureBoot EFI variable"));
+    }
+
+    #[test]
+    fn bios_check_reports_unavailable_or_secure_from_supplied_inventory() {
+        let missing = bios_info_check_from_info(BiosInfo {
+            vendor: String::new(),
+            version: String::new(),
+            date: String::new(),
+            bios_release: String::new(),
+        });
+        assert_eq!(missing.status, CheckStatus::Unavailable);
+
+        let populated = bios_info_check_from_info(BiosInfo {
+            vendor: "InnerVendor".to_string(),
+            version: "1.2.3".to_string(),
+            date: "2026-05-13".to_string(),
+            bios_release: "7".to_string(),
+        });
+        assert_eq!(populated.status, CheckStatus::Secure);
+        assert!(populated.detail.contains("InnerVendor 1.2.3"));
+        assert!(populated.detail.contains("release: 7"));
     }
 }

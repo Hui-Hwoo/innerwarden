@@ -80,10 +80,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
                 continue;
             };
 
-            let changed = baseline
-                .get(*key)
-                .map(|prev| prev != &current)
-                .unwrap_or(true);
+            let changed = sysctl_changed(baseline.get(*key), &current);
 
             if !changed {
                 continue;
@@ -92,28 +89,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host_id: String, interval_secs: u64) {
             let old = baseline.get(*key).cloned().unwrap_or("(not set)".into());
             baseline.insert(key.to_string(), current.clone());
 
-            // Determine severity based on which sysctl changed
-            let severity = classify_sysctl_severity(key, &current);
-
-            let event = Event {
-                ts: now,
-                host: host_id.clone(),
-                source: "sysctl_drift".into(),
-                kind: "system.sysctl_changed".into(),
-                severity,
-                summary: format!(
-                    "Sysctl changed: {} = {} (was: {}) — {}",
-                    key, current, old, desc
-                ),
-                details: serde_json::json!({
-                    "sysctl": key,
-                    "old_value": old,
-                    "new_value": current,
-                    "description": desc,
-                }),
-                tags: vec!["sysctl".into(), "drift".into(), "hardening".into()],
-                entities: vec![EntityRef::path(key.to_string())],
-            };
+            let event = build_sysctl_change_event(&host_id, now, key, desc, &old, &current);
 
             let _ = tx.send(event).await;
         }
@@ -127,6 +103,10 @@ fn read_sysctl(key: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+fn sysctl_changed(previous: Option<&String>, current: &str) -> bool {
+    previous.map(|prev| prev != current).unwrap_or(true)
+}
+
 fn classify_sysctl_severity(key: &str, current: &str) -> Severity {
     match key {
         "kernel.randomize_va_space" if current == "0" => Severity::Critical,
@@ -136,6 +116,35 @@ fn classify_sysctl_severity(key: &str, current: &str) -> Severity {
         "kernel.kexec_load_disabled" if current == "0" => Severity::High,
         "kernel.yama.ptrace_scope" if current == "0" => Severity::High,
         _ => Severity::Medium,
+    }
+}
+
+fn build_sysctl_change_event(
+    host_id: &str,
+    now: chrono::DateTime<Utc>,
+    key: &str,
+    desc: &str,
+    old: &str,
+    current: &str,
+) -> Event {
+    Event {
+        ts: now,
+        host: host_id.to_string(),
+        source: "sysctl_drift".into(),
+        kind: "system.sysctl_changed".into(),
+        severity: classify_sysctl_severity(key, current),
+        summary: format!(
+            "Sysctl changed: {} = {} (was: {}) — {}",
+            key, current, old, desc
+        ),
+        details: serde_json::json!({
+            "sysctl": key,
+            "old_value": old,
+            "new_value": current,
+            "description": desc,
+        }),
+        tags: vec!["sysctl".into(), "drift".into(), "hardening".into()],
+        entities: vec![EntityRef::path(key.to_string())],
     }
 }
 
@@ -190,5 +199,37 @@ mod tests {
             classify_sysctl_severity("fs.protected_symlinks", "0"),
             Severity::Medium
         ));
+    }
+
+    #[test]
+    fn sysctl_changed_detects_missing_and_modified_values_only() {
+        let same = "1".to_string();
+        assert!(sysctl_changed(None, "1"));
+        assert!(!sysctl_changed(Some(&same), "1"));
+        assert!(sysctl_changed(Some(&same), "0"));
+    }
+
+    #[test]
+    fn read_sysctl_returns_none_for_unknown_proc_paths() {
+        assert!(read_sysctl("innerwarden.definitely_missing").is_none());
+    }
+
+    #[test]
+    fn build_sysctl_change_event_preserves_context_and_severity() {
+        let ev = build_sysctl_change_event(
+            "sensor-a",
+            Utc::now(),
+            "kernel.randomize_va_space",
+            "ASLR",
+            "2",
+            "0",
+        );
+
+        assert_eq!(ev.host, "sensor-a");
+        assert_eq!(ev.kind, "system.sysctl_changed");
+        assert_eq!(ev.severity, Severity::Critical);
+        assert_eq!(ev.details["old_value"], "2");
+        assert_eq!(ev.details["new_value"], "0");
+        assert_eq!(ev.entities[0].value, "kernel.randomize_va_space");
     }
 }

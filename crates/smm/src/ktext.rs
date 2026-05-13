@@ -75,12 +75,8 @@ fn read_kcore_text() -> Option<(String, usize)> {
     let mut f = fs::File::open(path).ok()?;
     let mut buf = vec![0u8; 8 * 1024 * 1024];
     let n = f.read(&mut buf).ok()?;
-    if n < 4096 {
-        return None; // too small to be useful
-    }
     buf.truncate(n);
-    let hash = hex::encode(Sha256::digest(&buf));
-    Some((hash, n))
+    kcore_text_hash_from_bytes(&buf)
 }
 
 /// Lighter fallback: read just the ELF header of /proc/kcore (first 64KB).
@@ -89,17 +85,27 @@ fn read_kcore_header() -> Option<(String, usize)> {
     let mut f = fs::File::open(path).ok()?;
     let mut buf = vec![0u8; 64 * 1024];
     let n = f.read(&mut buf).ok()?;
-    if n < 52 {
-        // ELF header minimum
+    buf.truncate(n);
+    kcore_header_hash_from_bytes(&buf)
+}
+
+fn kcore_text_hash_from_bytes(bytes: &[u8]) -> Option<(String, usize)> {
+    if bytes.len() < 4096 {
+        return None; // too small to be useful
+    }
+    Some((hex::encode(Sha256::digest(bytes)), bytes.len()))
+}
+
+fn kcore_header_hash_from_bytes(bytes: &[u8]) -> Option<(String, usize)> {
+    if bytes.len() < 52 {
+        // ELF header minimum.
         return None;
     }
     // Verify ELF magic.
-    if &buf[..4] != b"\x7fELF" {
+    if &bytes[..4] != b"\x7fELF" {
         return None;
     }
-    buf.truncate(n);
-    let hash = hex::encode(Sha256::digest(&buf));
-    Some((hash, n))
+    Some((hex::encode(Sha256::digest(bytes)), bytes.len()))
 }
 
 /// Hash a file if it exists.
@@ -117,6 +123,10 @@ fn hash_kallsyms_addresses() -> (Option<String>, usize) {
         Err(_) => return (None, 0),
     };
 
+    hash_kallsyms_addresses_from_content(&content)
+}
+
+fn hash_kallsyms_addresses_from_content(content: &str) -> (Option<String>, usize) {
     let mut hasher = Sha256::new();
     let mut text_count = 0;
 
@@ -141,8 +151,10 @@ fn hash_kallsyms_addresses() -> (Option<String>, usize) {
 
 /// Verify kernel text integrity.
 pub fn check_kernel_text() -> CheckResult {
-    let state = KernelTextState::capture();
+    kernel_text_check_from_state(KernelTextState::capture())
+}
 
+fn kernel_text_check_from_state(state: KernelTextState) -> CheckResult {
     // If we got a kcore hash, that's the strongest signal.
     if let Some(ref hash) = state.text_hash {
         return CheckResult {
@@ -216,5 +228,132 @@ mod tests {
 
         let invalid = b"\x00\x00\x00\x00";
         assert_ne!(&invalid[..4], b"\x7fELF");
+    }
+
+    #[test]
+    fn fallback_hash_helpers_cover_file_and_kallsyms_paths() {
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let path = dir.path().join("btf");
+        std::fs::write(&path, b"btf").expect("fixture should be written");
+
+        let hash = hash_file_if_exists(path.to_str().expect("utf8 path"))
+            .expect("hash should be produced");
+        assert_eq!(hash, hex::encode(Sha256::digest(b"btf")));
+        assert!(hash_file_if_exists("/definitely/missing/btf").is_none());
+
+        let (kallsyms_hash, count) = hash_kallsyms_addresses_from_content(
+            "ffffffff81000000 T start_kernel\n\
+             ffffffff81000001 t helper\n\
+             ffffffff81000002 D data_symbol\n\
+             malformed\n",
+        );
+        assert!(kallsyms_hash.is_some());
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn kernel_text_check_reports_primary_fallback_and_unavailable_modes() {
+        let primary = kernel_text_check_from_state(KernelTextState {
+            text_hash: Some("a".repeat(64)),
+            method: "kcore".to_string(),
+            size: 8192,
+            btf_hash: None,
+            kallsyms_addr_hash: None,
+            text_symbol_count: 11,
+        });
+        assert_eq!(primary.status, CheckStatus::Secure);
+        assert!(primary.detail.contains("kernel text hashed via kcore"));
+
+        let fallback = kernel_text_check_from_state(KernelTextState {
+            text_hash: None,
+            method: "unavailable".to_string(),
+            size: 0,
+            btf_hash: Some("b".repeat(64)),
+            kallsyms_addr_hash: Some("c".repeat(64)),
+            text_symbol_count: 7,
+        });
+        assert_eq!(fallback.status, CheckStatus::Secure);
+        assert!(fallback.detail.contains("kernel text via fallback"));
+        assert!(fallback.detail.contains("7 text symbols"));
+
+        let unavailable = kernel_text_check_from_state(KernelTextState {
+            text_hash: None,
+            method: "unavailable".to_string(),
+            size: 0,
+            btf_hash: None,
+            kallsyms_addr_hash: None,
+            text_symbol_count: 0,
+        });
+        assert_eq!(unavailable.status, CheckStatus::Unavailable);
+    }
+
+    #[test]
+    fn kcore_hash_helpers_cover_short_invalid_and_valid_inputs() {
+        assert!(kcore_text_hash_from_bytes(&vec![0u8; 4095]).is_none());
+        let text = vec![0xAB; 4096];
+        let (text_hash, text_size) =
+            kcore_text_hash_from_bytes(&text).expect("large buffers should hash");
+        assert_eq!(text_size, 4096);
+        assert_eq!(text_hash, hex::encode(Sha256::digest(&text)));
+
+        assert!(kcore_header_hash_from_bytes(&vec![0u8; 51]).is_none());
+        assert!(kcore_header_hash_from_bytes(&vec![0u8; 64]).is_none());
+
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        let (header_hash, header_size) =
+            kcore_header_hash_from_bytes(&elf).expect("ELF headers should hash");
+        assert_eq!(header_size, 64);
+        assert_eq!(header_hash, hex::encode(Sha256::digest(&elf)));
+    }
+
+    #[test]
+    fn kernel_text_fallback_formats_btf_only_and_kallsyms_only_states() {
+        let btf_only = kernel_text_check_from_state(KernelTextState {
+            text_hash: None,
+            method: "unavailable".to_string(),
+            size: 0,
+            btf_hash: Some("d".repeat(64)),
+            kallsyms_addr_hash: None,
+            text_symbol_count: 0,
+        });
+        assert_eq!(btf_only.status, CheckStatus::Secure);
+        assert!(btf_only.detail.contains("BTF sha256:dddddddddddddddd"));
+        assert!(!btf_only.detail.contains("kallsyms-addr"));
+
+        let kallsyms_only = kernel_text_check_from_state(KernelTextState {
+            text_hash: None,
+            method: "unavailable".to_string(),
+            size: 0,
+            btf_hash: None,
+            kallsyms_addr_hash: Some("e".repeat(64)),
+            text_symbol_count: 42,
+        });
+        assert_eq!(kallsyms_only.status, CheckStatus::Secure);
+        assert!(kallsyms_only
+            .detail
+            .contains("kallsyms-addr sha256:eeeeeeeeeeeeeeee"));
+        assert!(kallsyms_only.detail.contains("42 text symbols"));
+        assert!(!kallsyms_only.detail.contains("BTF sha256"));
+    }
+
+    #[test]
+    fn hash_kallsyms_addresses_is_stable_for_address_order_and_text_symbol_counting() {
+        let content = "ffffffff81000000 T start_kernel\n\
+                       ffffffff81000001 t schedule\n\
+                       ffffffff81000002 R rodata\n";
+        let (first_hash, first_count) = hash_kallsyms_addresses_from_content(content);
+        let (second_hash, second_count) = hash_kallsyms_addresses_from_content(content);
+
+        assert_eq!(first_hash, second_hash);
+        assert_eq!(first_count, 2);
+        assert_eq!(second_count, 2);
+    }
+
+    #[test]
+    fn hash_kallsyms_addresses_handles_empty_input_without_losing_hash_contract() {
+        let (hash, count) = hash_kallsyms_addresses_from_content("");
+        assert_eq!(count, 0);
+        assert_eq!(hash, Some(hex::encode(Sha256::digest(b""))));
     }
 }

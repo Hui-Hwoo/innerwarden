@@ -63,13 +63,16 @@ pub fn is_own_listening_port(port: u16) -> bool {
 /// Discover the host's own IPv4 addresses from /proc/net/fib_trie.
 /// Same logic as agent's cloud_safelist::init_local_interface_ips.
 fn discover_own_ips() -> std::collections::HashSet<String> {
-    let mut ips = std::collections::HashSet::new();
-
     let Ok(content) = std::fs::read_to_string("/proc/net/fib_trie") else {
         // Not Linux or /proc not available (macOS, containers without /proc)
-        return ips;
+        return std::collections::HashSet::new();
     };
 
+    parse_own_ips(&content)
+}
+
+fn parse_own_ips(content: &str) -> std::collections::HashSet<String> {
+    let mut ips = std::collections::HashSet::new();
     let lines: Vec<&str> = content.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -98,24 +101,32 @@ fn discover_listening_ports() -> std::collections::HashSet<u16> {
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        for line in content.lines().skip(1) {
-            // Format: "  sl  local_address rem_address   st ..."
-            // local_address = hex_ip:hex_port
-            // st = 0A means LISTEN
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 4 {
-                continue;
-            }
-            let st = parts[3];
-            if st != "0A" {
-                continue; // Not LISTEN state
-            }
-            // Parse port from local_address (second field, after colon)
-            if let Some(port_hex) = parts[1].split(':').nth(1) {
-                if let Ok(port) = u16::from_str_radix(port_hex, 16) {
-                    if port > 0 {
-                        ports.insert(port);
-                    }
+        ports.extend(parse_listening_ports(&content));
+    }
+
+    ports
+}
+
+fn parse_listening_ports(content: &str) -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+
+    for line in content.lines().skip(1) {
+        // Format: "  sl  local_address rem_address   st ..."
+        // local_address = hex_ip:hex_port
+        // st = 0A means LISTEN
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let st = parts[3];
+        if st != "0A" {
+            continue; // Not LISTEN state
+        }
+        // Parse port from local_address (second field, after colon)
+        if let Some(port_hex) = parts[1].split(':').nth(1) {
+            if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+                if port > 0 {
+                    ports.insert(port);
                 }
             }
         }
@@ -232,3 +243,73 @@ pub mod dns_c2;
 pub mod proto_anomaly;
 pub mod sandbox_evasion;
 pub mod threat_intel;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_own_ips_keeps_local_host_entries_and_filters_special_ranges() {
+        let content = "\
+           |-- 10.0.0.15
+              /32 host LOCAL
+           |-- 127.0.0.1
+              /32 host LOCAL
+           |-- 169.254.12.7
+              /32 host LOCAL
+           |-- 192.168.1.20
+              /32 host LOCAL
+           |-- 8.8.8.8
+              /32 host REMOTE
+";
+
+        let ips = parse_own_ips(content);
+        assert!(ips.contains("10.0.0.15"));
+        assert!(ips.contains("192.168.1.20"));
+        assert!(!ips.contains("127.0.0.1"));
+        assert!(!ips.contains("169.254.12.7"));
+        assert!(!ips.contains("8.8.8.8"));
+    }
+
+    #[test]
+    fn parse_listening_ports_keeps_only_listen_rows_with_nonzero_ports() {
+        let content = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:22B8 00000000:0000 0A 00000000:00000000 00:00000000 00000000   100        0 1 1 0000000000000000 100 0 0 10 0
+   1: 00000000:0000 00000000:0000 0A 00000000:00000000 00:00000000 00000000   100        0 1 1 0000000000000000 100 0 0 10 0
+   2: 0100007F:1F90 00000000:0000 01 00000000:00000000 00:00000000 00000000   100        0 1 1 0000000000000000 100 0 0 10 0
+";
+
+        let ports = parse_listening_ports(content);
+        assert_eq!(ports.len(), 1);
+        assert!(ports.contains(&8888));
+    }
+
+    #[test]
+    fn internal_ip_classification_covers_ipv4_ipv6_and_invalid_input() {
+        assert!(is_internal_ip("10.0.0.1"));
+        assert!(is_internal_ip("127.0.0.1"));
+        assert!(is_internal_ip("::1"));
+        assert!(is_internal_ip("::"));
+        assert!(!is_internal_ip("8.8.8.8"));
+        assert!(!is_internal_ip("not-an-ip"));
+    }
+
+    #[test]
+    fn verified_infra_process_rejects_unexpected_comm_names() {
+        assert!(!is_verified_infra_process(
+            "definitely-not-nginx",
+            999_999,
+            &["nginx", "sshd"],
+        ));
+    }
+
+    #[test]
+    fn verified_infra_process_allows_matching_comm_when_process_already_exited() {
+        assert!(is_verified_infra_process(
+            "nginx-worker",
+            999_999,
+            &["nginx", "sshd"],
+        ));
+    }
+}

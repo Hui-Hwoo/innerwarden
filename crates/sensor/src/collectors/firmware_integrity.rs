@@ -41,6 +41,8 @@ const WATCHED_EFIVARS: &[&str] = &[
     "KEK-8be4df61-93ca-11d2-aa0d-00e098032b8c",
 ];
 
+const ACPI_TABLE_NAMES: &[&str] = &["DSDT", "SSDT", "FACP", "APIC", "MCFG", "HPET"];
+
 pub async fn run(tx: mpsc::Sender<Event>, host: String) {
     // Only run on systems with EFI or /boot
     if !Path::new("/sys/firmware").exists() && !Path::new("/boot").exists() {
@@ -77,30 +79,12 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
             match esp_hashes.get(path) {
                 None => {
                     // New file appeared - possible bootkit installation
-                    let ev = make_event(
-                        &host,
-                        Severity::Critical,
-                        &format!("New EFI binary detected: {path}"),
-                        "firmware.esp_new_binary",
-                        &[("path", path.as_str()), ("hash", hash.as_str())],
-                        &["firmware", "bootkit", "esp"],
-                    );
+                    let ev = esp_new_binary_event(&host, path, hash);
                     let _ = tx.send(ev).await;
                 }
                 Some(old_hash) if old_hash != hash => {
                     // File modified - possible bootkit or unauthorized update
-                    let ev = make_event(
-                        &host,
-                        Severity::Critical,
-                        &format!("EFI binary modified: {path}"),
-                        "firmware.esp_modified",
-                        &[
-                            ("path", path.as_str()),
-                            ("old_hash", old_hash.as_str()),
-                            ("new_hash", hash.as_str()),
-                        ],
-                        &["firmware", "bootkit", "esp"],
-                    );
+                    let ev = esp_modified_event(&host, path, old_hash, hash);
                     let _ = tx.send(ev).await;
                 }
                 _ => {} // unchanged
@@ -109,14 +93,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         // Detect deleted EFI files (bootkit cleaning up)
         for path in esp_hashes.keys() {
             if !new_esp.contains_key(path) {
-                let ev = make_event(
-                    &host,
-                    Severity::High,
-                    &format!("EFI binary removed: {path}"),
-                    "firmware.esp_removed",
-                    &[("path", path.as_str())],
-                    &["firmware", "esp"],
-                );
+                let ev = esp_removed_event(&host, path);
                 let _ = tx.send(ev).await;
             }
         }
@@ -127,19 +104,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         for (name, hash) in &new_efivars {
             if let Some(old_hash) = efivar_hashes.get(name) {
                 if old_hash != hash {
-                    let severity = classify_efivar_change(name);
-                    let ev = make_event(
-                        &host,
-                        severity,
-                        &format!("UEFI variable changed: {name}"),
-                        "firmware.efivar_changed",
-                        &[
-                            ("variable", name.as_str()),
-                            ("old_hash", old_hash.as_str()),
-                            ("new_hash", hash.as_str()),
-                        ],
-                        &["firmware", "uefi", "bootkit"],
-                    );
+                    let ev = efivar_changed_event(&host, name, old_hash, hash);
                     let _ = tx.send(ev).await;
                 }
             }
@@ -151,14 +116,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         for (table, hash) in &new_acpi {
             if let Some(old_hash) = acpi_hashes.get(table) {
                 if old_hash != hash {
-                    let ev = make_event(
-                        &host,
-                        Severity::Critical,
-                        &format!("ACPI table modified at runtime: {table}"),
-                        "firmware.acpi_modified",
-                        &[("table", table.as_str())],
-                        &["firmware", "acpi", "rootkit"],
-                    );
+                    let ev = acpi_modified_event(&host, table);
                     let _ = tx.send(ev).await;
                 }
             }
@@ -168,14 +126,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         // 4. Firmware version - detect BIOS downgrade/replacement
         let new_dmi = read_dmi_info();
         if !dmi_baseline.is_empty() && new_dmi != dmi_baseline {
-            let ev = make_event(
-                &host,
-                Severity::Critical,
-                "DMI/SMBIOS firmware info changed at runtime",
-                "firmware.dmi_changed",
-                &[("old", &dmi_baseline), ("new", &new_dmi)],
-                &["firmware", "bios"],
-            );
+            let ev = dmi_changed_event(&host, &dmi_baseline, &new_dmi);
             let _ = tx.send(ev).await;
             dmi_baseline = new_dmi;
         }
@@ -184,22 +135,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         let new_tainted = read_tainted();
         if new_tainted != kernel_tainted_baseline && new_tainted > kernel_tainted_baseline {
             let added = new_tainted & !kernel_tainted_baseline;
-            let reasons = kernel_taint_reasons(added);
-            let severity = classify_kernel_taint_severity(added);
-            let ev = make_event(
-                &host,
-                severity,
-                &format!(
-                    "Kernel tainted flag changed: +{added} ({})",
-                    reasons.join(", ")
-                ),
-                "firmware.kernel_tainted",
-                &[
-                    ("flags_added", &added.to_string()),
-                    ("total", &new_tainted.to_string()),
-                ],
-                &["kernel", "tainted", "firmware"],
-            );
+            let ev = kernel_tainted_event(&host, added, new_tainted);
             let _ = tx.send(ev).await;
             kernel_tainted_baseline = new_tainted;
         }
@@ -238,44 +174,46 @@ fn scan_esp_hashes() -> HashMap<String, String> {
 }
 
 fn scan_efivar_hashes() -> HashMap<String, String> {
-    let mut hashes = HashMap::new();
-    let efivars_dir = Path::new("/sys/firmware/efi/efivars");
-    if !efivars_dir.exists() {
-        return hashes;
-    }
-    for name in WATCHED_EFIVARS {
-        let path = efivars_dir.join(name);
-        if let Some(hash) = sha256_file(&path) {
-            hashes.insert(name.to_string(), hash);
-        }
-    }
-    hashes
+    scan_named_hashes(Path::new("/sys/firmware/efi/efivars"), WATCHED_EFIVARS)
 }
 
 fn scan_acpi_hashes() -> HashMap<String, String> {
+    scan_named_hashes(Path::new("/sys/firmware/acpi/tables"), ACPI_TABLE_NAMES)
+}
+
+fn scan_named_hashes(dir: &Path, names: &[&str]) -> HashMap<String, String> {
     let mut hashes = HashMap::new();
-    let acpi_dir = Path::new("/sys/firmware/acpi/tables");
-    if !acpi_dir.exists() {
+    if !dir.exists() {
         return hashes;
     }
-    for table_name in ["DSDT", "SSDT", "FACP", "APIC", "MCFG", "HPET"] {
-        let path = acpi_dir.join(table_name);
+    for name in names {
+        let path = dir.join(name);
         if let Some(hash) = sha256_file(&path) {
-            hashes.insert(table_name.to_string(), hash);
+            hashes.insert((*name).to_string(), hash);
         }
     }
     hashes
 }
 
 fn read_dmi_info() -> String {
+    dmi_info_from_reader(
+        &[
+            "/sys/firmware/dmi/tables/smbios_entry_point",
+            "/sys/class/dmi/id/bios_vendor",
+            "/sys/class/dmi/id/bios_version",
+            "/sys/class/dmi/id/bios_date",
+        ],
+        |file| fs::read_to_string(file).ok(),
+    )
+}
+
+fn dmi_info_from_reader<F>(files: &[&str], mut read_to_string: F) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let mut info = String::new();
-    for file in [
-        "/sys/firmware/dmi/tables/smbios_entry_point",
-        "/sys/class/dmi/id/bios_vendor",
-        "/sys/class/dmi/id/bios_version",
-        "/sys/class/dmi/id/bios_date",
-    ] {
-        if let Ok(content) = fs::read_to_string(file) {
+    for file in files {
+        if let Some(content) = read_to_string(file) {
             info.push_str(&content.trim().replace('\n', " "));
             info.push('|');
         }
@@ -284,9 +222,13 @@ fn read_dmi_info() -> String {
 }
 
 fn read_tainted() -> u64 {
-    fs::read_to_string("/proc/sys/kernel/tainted")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+    let content = fs::read_to_string("/proc/sys/kernel/tainted").ok();
+    tainted_value_from_content(content.as_deref())
+}
+
+fn tainted_value_from_content(content: Option<&str>) -> u64 {
+    content
+        .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0)
 }
 
@@ -313,6 +255,100 @@ fn make_event(
         tags: tags.iter().map(|t| t.to_string()).collect(),
         entities: vec![],
     }
+}
+
+fn esp_new_binary_event(host: &str, path: &str, hash: &str) -> Event {
+    make_event(
+        host,
+        Severity::Critical,
+        &format!("New EFI binary detected: {path}"),
+        "firmware.esp_new_binary",
+        &[("path", path), ("hash", hash)],
+        &["firmware", "bootkit", "esp"],
+    )
+}
+
+fn esp_modified_event(host: &str, path: &str, old_hash: &str, new_hash: &str) -> Event {
+    make_event(
+        host,
+        Severity::Critical,
+        &format!("EFI binary modified: {path}"),
+        "firmware.esp_modified",
+        &[
+            ("path", path),
+            ("old_hash", old_hash),
+            ("new_hash", new_hash),
+        ],
+        &["firmware", "bootkit", "esp"],
+    )
+}
+
+fn esp_removed_event(host: &str, path: &str) -> Event {
+    make_event(
+        host,
+        Severity::High,
+        &format!("EFI binary removed: {path}"),
+        "firmware.esp_removed",
+        &[("path", path)],
+        &["firmware", "esp"],
+    )
+}
+
+fn efivar_changed_event(host: &str, name: &str, old_hash: &str, new_hash: &str) -> Event {
+    make_event(
+        host,
+        classify_efivar_change(name),
+        &format!("UEFI variable changed: {name}"),
+        "firmware.efivar_changed",
+        &[
+            ("variable", name),
+            ("old_hash", old_hash),
+            ("new_hash", new_hash),
+        ],
+        &["firmware", "uefi", "bootkit"],
+    )
+}
+
+fn acpi_modified_event(host: &str, table: &str) -> Event {
+    make_event(
+        host,
+        Severity::Critical,
+        &format!("ACPI table modified at runtime: {table}"),
+        "firmware.acpi_modified",
+        &[("table", table)],
+        &["firmware", "acpi", "rootkit"],
+    )
+}
+
+fn dmi_changed_event(host: &str, old: &str, new: &str) -> Event {
+    make_event(
+        host,
+        Severity::Critical,
+        "DMI/SMBIOS firmware info changed at runtime",
+        "firmware.dmi_changed",
+        &[("old", old), ("new", new)],
+        &["firmware", "bios"],
+    )
+}
+
+fn kernel_tainted_event(host: &str, added: u64, total: u64) -> Event {
+    let added_string = added.to_string();
+    let total_string = total.to_string();
+    let reasons = kernel_taint_reasons(added);
+    make_event(
+        host,
+        classify_kernel_taint_severity(added),
+        &format!(
+            "Kernel tainted flag changed: +{added} ({})",
+            reasons.join(", ")
+        ),
+        "firmware.kernel_tainted",
+        &[
+            ("flags_added", added_string.as_str()),
+            ("total", total_string.as_str()),
+        ],
+        &["kernel", "tainted", "firmware"],
+    )
 }
 
 fn should_hash_esp_entry(path: &Path) -> bool {
@@ -460,5 +496,94 @@ mod tests {
         assert_eq!(ev.details["key"].as_str().unwrap(), "value");
         assert_eq!(ev.tags.len(), 1);
         assert_eq!(ev.tags[0], "tag1");
+    }
+
+    #[test]
+    fn sha256_file_hashes_existing_paths_and_skips_missing_files() {
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let path = dir.path().join("bootx64.efi");
+        std::fs::write(&path, b"firmware").expect("fixture should be written");
+
+        let hash = sha256_file(&path).expect("digest should be computed");
+        assert_eq!(hash, format!("{:x}", Sha256::digest(b"firmware")));
+        assert!(sha256_file(&dir.path().join("missing.efi")).is_none());
+    }
+
+    #[test]
+    fn esp_and_efivar_event_builders_preserve_detection_context() {
+        let created = esp_new_binary_event("sensor-a", "/boot/EFI/new.efi", "abc");
+        assert_eq!(created.kind, "firmware.esp_new_binary");
+        assert_eq!(created.severity, Severity::Critical);
+        assert_eq!(created.details["hash"], "abc");
+
+        let modified = esp_modified_event("sensor-b", "/boot/EFI/shim.efi", "old", "new");
+        assert_eq!(modified.kind, "firmware.esp_modified");
+        assert_eq!(modified.details["old_hash"], "old");
+        assert_eq!(modified.details["new_hash"], "new");
+
+        let removed = esp_removed_event("sensor-c", "/boot/EFI/removed.efi");
+        assert_eq!(removed.severity, Severity::High);
+        assert_eq!(removed.details["path"], "/boot/EFI/removed.efi");
+
+        let changed = efivar_changed_event(
+            "sensor-d",
+            "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+            "before",
+            "after",
+        );
+        assert_eq!(changed.kind, "firmware.efivar_changed");
+        assert_eq!(changed.severity, Severity::Critical);
+        assert_eq!(
+            changed.details["variable"],
+            "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+        );
+    }
+
+    #[test]
+    fn runtime_event_builders_render_firmware_and_taint_changes() {
+        let acpi = acpi_modified_event("sensor-a", "DSDT");
+        assert_eq!(acpi.kind, "firmware.acpi_modified");
+        assert_eq!(acpi.details["table"], "DSDT");
+
+        let dmi = dmi_changed_event("sensor-b", "old-info", "new-info");
+        assert_eq!(dmi.kind, "firmware.dmi_changed");
+        assert_eq!(dmi.details["old"], "old-info");
+        assert_eq!(dmi.details["new"], "new-info");
+
+        let tainted = kernel_tainted_event("sensor-c", 8192 | 256, 8448);
+        assert_eq!(tainted.kind, "firmware.kernel_tainted");
+        assert_eq!(tainted.severity, Severity::Critical);
+        assert_eq!(tainted.details["flags_added"], "8448");
+        assert!(tainted.summary.contains("unsigned module"));
+        assert!(tainted.summary.contains("ACPI table overridden"));
+    }
+
+    #[test]
+    fn named_hash_scans_and_tainted_parsing_cover_present_missing_and_invalid_data() {
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        std::fs::write(dir.path().join("DSDT"), b"table").expect("table fixture should be written");
+
+        let hashes = scan_named_hashes(dir.path(), &["DSDT", "missing"]);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(
+            hashes.get("DSDT"),
+            Some(&format!("{:x}", Sha256::digest(b"table")))
+        );
+        assert!(scan_named_hashes(&dir.path().join("absent"), &["DSDT"]).is_empty());
+
+        assert_eq!(tainted_value_from_content(Some("8192\n")), 8192);
+        assert_eq!(tainted_value_from_content(Some("invalid")), 0);
+        assert_eq!(tainted_value_from_content(None), 0);
+    }
+
+    #[test]
+    fn dmi_info_composition_normalizes_multiline_fields_and_skips_missing_entries() {
+        let info = dmi_info_from_reader(&["vendor", "version", "missing"], |field| match field {
+            "vendor" => Some("Inner\nVendor\n".to_string()),
+            "version" => Some(" 1.2.3 ".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(info, "Inner Vendor|1.2.3|");
     }
 }

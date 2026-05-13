@@ -37,6 +37,80 @@ struct CgroupState {
     last_alert: Option<DateTime<Utc>>,
 }
 
+fn alert_cooldown_elapsed(
+    last_alert: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    cooldown: Duration,
+) -> bool {
+    last_alert.map(|t| now - t > cooldown).unwrap_or(true)
+}
+
+fn cpu_rate_per_second(cpu_delta: u64, elapsed_us: u64) -> u64 {
+    cpu_delta.saturating_mul(1_000_000) / elapsed_us.max(1)
+}
+
+fn build_cpu_abuse_event(
+    host: &str,
+    now: DateTime<Utc>,
+    cgroup_name: &str,
+    cpu_rate: u64,
+    high_cpu_count: usize,
+) -> Event {
+    Event {
+        ts: now,
+        host: host.to_string(),
+        source: "cgroup".to_string(),
+        kind: "cgroup.cpu_abuse".to_string(),
+        severity: Severity::High,
+        summary: format!(
+            "Sustained high CPU in cgroup {}: {:.1}% for {} readings",
+            cgroup_name,
+            cpu_rate as f64 / 10_000.0,
+            high_cpu_count
+        ),
+        details: serde_json::json!({
+            "cgroup": cgroup_name,
+            "cpu_rate_percent": cpu_rate as f64 / 10_000.0,
+            "consecutive_readings": high_cpu_count,
+            "threshold_percent": CPU_ABUSE_THRESHOLD_US as f64 / 10_000.0,
+        }),
+        tags: vec![
+            "cgroup".to_string(),
+            "cryptominer".to_string(),
+            "resource_abuse".to_string(),
+        ],
+        entities: vec![EntityRef::container(cgroup_name)],
+    }
+}
+
+fn build_memory_spike_event(
+    host: &str,
+    now: DateTime<Utc>,
+    cgroup_name: &str,
+    mem_bytes: u64,
+) -> Event {
+    Event {
+        ts: now,
+        host: host.to_string(),
+        source: "cgroup".to_string(),
+        kind: "cgroup.memory_spike".to_string(),
+        severity: Severity::Medium,
+        summary: format!(
+            "High memory usage in cgroup {}: {} MB",
+            cgroup_name,
+            mem_bytes / (1024 * 1024)
+        ),
+        details: serde_json::json!({
+            "cgroup": cgroup_name,
+            "memory_bytes": mem_bytes,
+            "memory_mb": mem_bytes / (1024 * 1024),
+            "threshold_mb": MEMORY_SPIKE_THRESHOLD / (1024 * 1024),
+        }),
+        tags: vec!["cgroup".to_string(), "resource_abuse".to_string()],
+        entities: vec![EntityRef::container(cgroup_name)],
+    }
+}
+
 /// Run the cgroup abuse detector as a periodic scanner.
 pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
     let cgroup_base = Path::new("/sys/fs/cgroup");
@@ -79,7 +153,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
                     .unwrap_or(1)
                     .max(1) as u64;
                 let cpu_delta = cpu_us.saturating_sub(state.last_cpu_usage_us);
-                let cpu_rate = cpu_delta * 1_000_000 / elapsed_us;
+                let cpu_rate = cpu_rate_per_second(cpu_delta, elapsed_us);
 
                 state.last_cpu_usage_us = cpu_us;
                 state.last_read_at = now;
@@ -92,35 +166,17 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
 
                 // Alert after sustained high CPU
                 if state.high_cpu_count >= CPU_MIN_READINGS {
-                    let should_alert = state.last_alert.map(|t| now - t > cooldown).unwrap_or(true);
+                    let should_alert = alert_cooldown_elapsed(state.last_alert, now, cooldown);
 
                     if should_alert {
                         state.last_alert = Some(now);
-                        let ev = Event {
-                            ts: now,
-                            host: host.clone(),
-                            source: "cgroup".to_string(),
-                            kind: "cgroup.cpu_abuse".to_string(),
-                            severity: Severity::High,
-                            summary: format!(
-                                "Sustained high CPU in cgroup {}: {:.1}% for {} readings",
-                                cgroup_name,
-                                cpu_rate as f64 / 10_000.0,
-                                state.high_cpu_count
-                            ),
-                            details: serde_json::json!({
-                                "cgroup": cgroup_name,
-                                "cpu_rate_percent": cpu_rate as f64 / 10_000.0,
-                                "consecutive_readings": state.high_cpu_count,
-                                "threshold_percent": CPU_ABUSE_THRESHOLD_US as f64 / 10_000.0,
-                            }),
-                            tags: vec![
-                                "cgroup".to_string(),
-                                "cryptominer".to_string(),
-                                "resource_abuse".to_string(),
-                            ],
-                            entities: vec![EntityRef::container(&cgroup_name)],
-                        };
+                        let ev = build_cpu_abuse_event(
+                            &host,
+                            now,
+                            &cgroup_name,
+                            cpu_rate,
+                            state.high_cpu_count,
+                        );
                         if tx.send(ev).await.is_err() {
                             return;
                         }
@@ -138,30 +194,11 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
                         last_alert: None,
                     });
 
-                    let should_alert = state.last_alert.map(|t| now - t > cooldown).unwrap_or(true);
+                    let should_alert = alert_cooldown_elapsed(state.last_alert, now, cooldown);
 
                     if should_alert {
                         state.last_alert = Some(now);
-                        let ev = Event {
-                            ts: now,
-                            host: host.clone(),
-                            source: "cgroup".to_string(),
-                            kind: "cgroup.memory_spike".to_string(),
-                            severity: Severity::Medium,
-                            summary: format!(
-                                "High memory usage in cgroup {}: {} MB",
-                                cgroup_name,
-                                mem_bytes / (1024 * 1024)
-                            ),
-                            details: serde_json::json!({
-                                "cgroup": cgroup_name,
-                                "memory_bytes": mem_bytes,
-                                "memory_mb": mem_bytes / (1024 * 1024),
-                                "threshold_mb": MEMORY_SPIKE_THRESHOLD / (1024 * 1024),
-                            }),
-                            tags: vec!["cgroup".to_string(), "resource_abuse".to_string()],
-                            entities: vec![EntityRef::container(&cgroup_name)],
-                        };
+                        let ev = build_memory_spike_event(&host, now, &cgroup_name, mem_bytes);
                         if tx.send(ev).await.is_err() {
                             return;
                         }
@@ -282,5 +319,79 @@ mod tests {
         std::fs::write(dir.path().join("memory.current"), "536870912\n").unwrap();
         let mem = read_memory_current(dir.path()).unwrap();
         assert_eq!(mem, 536870912); // 512 MB
+    }
+
+    #[test]
+    fn cpu_stat_without_usage_or_with_invalid_usage_returns_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("cpu.stat"), "user_usec 9\nsystem_usec 3\n").unwrap();
+        assert!(read_cpu_usage(dir.path()).is_none());
+
+        std::fs::write(dir.path().join("cpu.stat"), "usage_usec nope\n").unwrap();
+        assert!(read_cpu_usage(dir.path()).is_none());
+    }
+
+    #[test]
+    fn memory_current_rejects_non_numeric_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("memory.current"), "not-a-number\n").unwrap();
+        assert!(read_memory_current(dir.path()).is_none());
+    }
+
+    #[test]
+    fn discover_cgroups_finds_top_level_and_nested_resource_groups() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let top = dir.path().join("pod-a");
+        let nested_parent = dir.path().join("docker");
+        let nested = nested_parent.join("container-a");
+        std::fs::create_dir_all(&top).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(top.join("cpu.stat"), "usage_usec 1\n").unwrap();
+        std::fs::write(nested.join("memory.current"), "42\n").unwrap();
+
+        let found = discover_cgroups(dir.path()).unwrap();
+        assert!(found.contains(&top));
+        assert!(found.contains(&nested));
+    }
+
+    #[test]
+    fn cpu_rate_and_cooldown_helpers_cover_threshold_math() {
+        assert_eq!(cpu_rate_per_second(950_000, 1_000_000), 950_000);
+        assert_eq!(cpu_rate_per_second(42, 0), 42_000_000);
+
+        let now = Utc::now();
+        assert!(alert_cooldown_elapsed(None, now, Duration::seconds(300)));
+        assert!(!alert_cooldown_elapsed(
+            Some(now - Duration::seconds(60)),
+            now,
+            Duration::seconds(300),
+        ));
+        assert!(alert_cooldown_elapsed(
+            Some(now - Duration::seconds(301)),
+            now,
+            Duration::seconds(300),
+        ));
+    }
+
+    #[test]
+    fn cpu_abuse_event_carries_rate_context_and_container_entity() {
+        let now = Utc::now();
+        let ev = build_cpu_abuse_event("sensor-a", now, "/docker/app", 1_250_000, 4);
+        assert_eq!(ev.host, "sensor-a");
+        assert_eq!(ev.kind, "cgroup.cpu_abuse");
+        assert_eq!(ev.severity, Severity::High);
+        assert_eq!(ev.details["consecutive_readings"], 4);
+        assert_eq!(ev.entities[0].value, "/docker/app");
+        assert!(ev.summary.contains("125.0%"));
+    }
+
+    #[test]
+    fn memory_spike_event_reports_megabytes_and_medium_severity() {
+        let now = Utc::now();
+        let ev = build_memory_spike_event("sensor-b", now, "/slice/db", 512 * 1024 * 1024);
+        assert_eq!(ev.kind, "cgroup.memory_spike");
+        assert_eq!(ev.severity, Severity::Medium);
+        assert_eq!(ev.details["memory_mb"], 512);
+        assert!(ev.tags.iter().any(|tag| tag == "resource_abuse"));
     }
 }

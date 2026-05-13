@@ -59,6 +59,114 @@ struct WriteBurstTracker {
     last_alert: Option<DateTime<Utc>>,
 }
 
+fn track_write_burst(tracker: &mut WriteBurstTracker, now: DateTime<Utc>) {
+    tracker.writes.push(now);
+    tracker
+        .writes
+        .retain(|ts| now - *ts < Duration::seconds(RANSOMWARE_WINDOW_SECS));
+}
+
+fn should_emit_ransomware_burst(tracker: &WriteBurstTracker, now: DateTime<Utc>) -> bool {
+    tracker.writes.len() >= RANSOMWARE_WRITE_THRESHOLD
+        && tracker
+            .last_alert
+            .map(|t| now - t > Duration::seconds(60))
+            .unwrap_or(true)
+}
+
+fn file_change_base_severity(path_str: &str) -> Severity {
+    if path_str.contains("/etc/shadow")
+        || path_str.contains("/etc/sudoers")
+        || path_str.contains("/boot/")
+        || path_str.contains("sshd_config")
+    {
+        Severity::Critical
+    } else {
+        Severity::High
+    }
+}
+
+fn build_file_change_event(
+    host: &str,
+    now: DateTime<Utc>,
+    path_str: &str,
+    current: &FileState,
+    previous: Option<&FileState>,
+    entropy: Option<f64>,
+) -> Event {
+    let encrypted = entropy
+        .map(|value| value >= ENCRYPTION_ENTROPY_THRESHOLD)
+        .unwrap_or(false);
+    let severity = if encrypted {
+        Severity::Critical
+    } else {
+        file_change_base_severity(path_str)
+    };
+    let prev_hash = previous.map(|state| state.hash.clone()).unwrap_or_default();
+    let prev_modified = previous
+        .map(|state| state.last_modified.to_rfc3339())
+        .unwrap_or_default();
+
+    Event {
+        ts: now,
+        host: host.to_string(),
+        source: "fanotify".to_string(),
+        kind: if encrypted {
+            "file.encrypted_write".to_string()
+        } else {
+            "file.realtime_modified".to_string()
+        },
+        severity,
+        summary: format!(
+            "File modified: {} (hash changed{})",
+            path_str,
+            if encrypted {
+                ", HIGH ENTROPY - possible encryption"
+            } else {
+                ""
+            }
+        ),
+        details: serde_json::json!({
+            "path": path_str,
+            "new_hash": current.hash,
+            "old_hash": prev_hash,
+            "previous_check": prev_modified,
+            "new_size": current.size,
+            "entropy": entropy,
+            "encrypted": encrypted,
+        }),
+        tags: vec!["filesystem".to_string(), "integrity".to_string()],
+        entities: vec![EntityRef::path(path_str)],
+    }
+}
+
+fn build_ransomware_burst_event(
+    host: &str,
+    now: DateTime<Utc>,
+    tracker: &WriteBurstTracker,
+    latest_file: &str,
+) -> Event {
+    Event {
+        ts: now,
+        host: host.to_string(),
+        source: "fanotify".to_string(),
+        kind: "file.ransomware_burst".to_string(),
+        severity: Severity::Critical,
+        summary: format!(
+            "Ransomware-like behavior: {} file modifications in {}s",
+            tracker.writes.len(),
+            RANSOMWARE_WINDOW_SECS
+        ),
+        details: serde_json::json!({
+            "writes_in_window": tracker.writes.len(),
+            "window_seconds": RANSOMWARE_WINDOW_SECS,
+            "latest_file": latest_file,
+        }),
+        tags: vec!["ransomware".to_string(), "filesystem".to_string()],
+        entities: vec![],
+    }
+}
+
 /// Run the fanotify/polling filesystem monitor.
 ///
 /// On Linux with appropriate permissions, uses inotify (via polling with
@@ -119,110 +227,31 @@ pub async fn run(
 
             if changed {
                 // Track write burst
-                burst_tracker.writes.push(now);
-                burst_tracker
-                    .writes
-                    .retain(|ts| now - *ts < Duration::seconds(RANSOMWARE_WINDOW_SECS));
+                track_write_burst(&mut burst_tracker, now);
 
                 let path_str = path.to_string_lossy().to_string();
 
-                // Emit file modification event
-                let severity = if path_str.contains("/etc/shadow")
-                    || path_str.contains("/etc/sudoers")
-                    || path_str.contains("/boot/")
-                    || path_str.contains("sshd_config")
-                {
-                    Severity::Critical
-                } else {
-                    Severity::High
-                };
-
                 // Check entropy for encryption indicator
                 let entropy = compute_file_entropy(path);
-                let encrypted = entropy
-                    .map(|e| e >= ENCRYPTION_ENTROPY_THRESHOLD)
-                    .unwrap_or(false);
-
-                let prev_hash = file_states
-                    .get(path)
-                    .map(|s| s.hash.clone())
-                    .unwrap_or_default();
-                let prev_modified = file_states
-                    .get(path)
-                    .map(|s| s.last_modified.to_rfc3339())
-                    .unwrap_or_default();
-
-                let ev = Event {
-                    ts: now,
-                    host: host.clone(),
-                    source: "fanotify".to_string(),
-                    kind: if encrypted {
-                        "file.encrypted_write".to_string()
-                    } else {
-                        "file.realtime_modified".to_string()
-                    },
-                    severity: if encrypted {
-                        Severity::Critical
-                    } else {
-                        severity
-                    },
-                    summary: format!(
-                        "File modified: {} (hash changed{})",
-                        path_str,
-                        if encrypted {
-                            ", HIGH ENTROPY - possible encryption"
-                        } else {
-                            ""
-                        }
-                    ),
-                    details: serde_json::json!({
-                        "path": path_str,
-                        "new_hash": current.hash,
-                        "old_hash": prev_hash,
-                        "previous_check": prev_modified,
-                        "new_size": current.size,
-                        "entropy": entropy,
-                        "encrypted": encrypted,
-                    }),
-                    tags: vec!["filesystem".to_string(), "integrity".to_string()],
-                    entities: vec![EntityRef::path(&path_str)],
-                };
+                let ev = build_file_change_event(
+                    &host,
+                    now,
+                    &path_str,
+                    &current,
+                    file_states.get(path),
+                    entropy,
+                );
 
                 if tx.send(ev).await.is_err() {
                     return;
                 }
 
                 // Ransomware burst detection
-                if burst_tracker.writes.len() >= RANSOMWARE_WRITE_THRESHOLD {
-                    let should_alert = burst_tracker
-                        .last_alert
-                        .map(|t| now - t > Duration::seconds(60))
-                        .unwrap_or(true);
-
-                    if should_alert {
-                        burst_tracker.last_alert = Some(now);
-                        let ev = Event {
-                            ts: now,
-                            host: host.clone(),
-                            source: "fanotify".to_string(),
-                            kind: "file.ransomware_burst".to_string(),
-                            severity: Severity::Critical,
-                            summary: format!(
-                                "Ransomware-like behavior: {} file modifications in {}s",
-                                burst_tracker.writes.len(),
-                                RANSOMWARE_WINDOW_SECS
-                            ),
-                            details: serde_json::json!({
-                                "writes_in_window": burst_tracker.writes.len(),
-                                "window_seconds": RANSOMWARE_WINDOW_SECS,
-                                "latest_file": path_str,
-                            }),
-                            tags: vec!["ransomware".to_string(), "filesystem".to_string()],
-                            entities: vec![],
-                        };
-                        if tx.send(ev).await.is_err() {
-                            return;
-                        }
+                if should_emit_ransomware_burst(&burst_tracker, now) {
+                    burst_tracker.last_alert = Some(now);
+                    let ev = build_ransomware_burst_event(&host, now, &burst_tracker, &path_str);
+                    if tx.send(ev).await.is_err() {
+                        return;
                     }
                 }
 
@@ -387,5 +416,99 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temporary directory should be created");
         let path = dir.path().join("missing.txt");
         assert!(compute_file_state(&path).is_none());
+    }
+
+    #[test]
+    fn file_change_event_marks_encrypted_and_sensitive_paths_correctly() {
+        let previous = FileState {
+            hash: "old".to_string(),
+            last_modified: Utc::now() - Duration::seconds(5),
+            size: 3,
+        };
+        let current = FileState {
+            hash: "new".to_string(),
+            last_modified: Utc::now(),
+            size: 99,
+        };
+
+        let encrypted = build_file_change_event(
+            "sensor-a",
+            Utc::now(),
+            "/tmp/blob.bin",
+            &current,
+            Some(&previous),
+            Some(7.9),
+        );
+        assert_eq!(encrypted.kind, "file.encrypted_write");
+        assert_eq!(encrypted.severity, Severity::Critical);
+        assert_eq!(encrypted.details["old_hash"], "old");
+        assert_eq!(encrypted.details["encrypted"], true);
+
+        let sensitive = build_file_change_event(
+            "sensor-b",
+            Utc::now(),
+            "/etc/shadow",
+            &current,
+            None,
+            Some(3.2),
+        );
+        assert_eq!(sensitive.kind, "file.realtime_modified");
+        assert_eq!(sensitive.severity, Severity::Critical);
+        assert_eq!(sensitive.details["old_hash"], "");
+    }
+
+    #[test]
+    fn write_burst_tracking_prunes_old_entries_and_respects_cooldown() {
+        let now = Utc::now();
+        let mut tracker = WriteBurstTracker {
+            writes: vec![now - Duration::seconds(RANSOMWARE_WINDOW_SECS + 1)],
+            last_alert: None,
+        };
+        for _ in 0..RANSOMWARE_WRITE_THRESHOLD {
+            track_write_burst(&mut tracker, now);
+        }
+        assert_eq!(tracker.writes.len(), RANSOMWARE_WRITE_THRESHOLD);
+        assert!(should_emit_ransomware_burst(&tracker, now));
+
+        tracker.last_alert = Some(now - Duration::seconds(30));
+        assert!(!should_emit_ransomware_burst(&tracker, now));
+        tracker.last_alert = Some(now - Duration::seconds(61));
+        assert!(should_emit_ransomware_burst(&tracker, now));
+    }
+
+    #[test]
+    fn ransomware_burst_event_carries_window_and_latest_file_context() {
+        let now = Utc::now();
+        let tracker = WriteBurstTracker {
+            writes: vec![now; RANSOMWARE_WRITE_THRESHOLD],
+            last_alert: None,
+        };
+        let ev = build_ransomware_burst_event("sensor-c", now, &tracker, "/srv/app.db");
+        assert_eq!(ev.kind, "file.ransomware_burst");
+        assert_eq!(ev.severity, Severity::Critical);
+        assert_eq!(ev.details["writes_in_window"], RANSOMWARE_WRITE_THRESHOLD);
+        assert_eq!(ev.details["latest_file"], "/srv/app.db");
+    }
+
+    #[test]
+    fn non_sensitive_plaintext_file_changes_remain_high_severity() {
+        let current = FileState {
+            hash: "new".to_string(),
+            last_modified: Utc::now(),
+            size: 4,
+        };
+        let ev = build_file_change_event(
+            "sensor-d",
+            Utc::now(),
+            "/var/tmp/config.txt",
+            &current,
+            None,
+            None,
+        );
+        assert_eq!(
+            file_change_base_severity("/var/tmp/config.txt"),
+            Severity::High
+        );
+        assert_eq!(ev.severity, Severity::High);
     }
 }

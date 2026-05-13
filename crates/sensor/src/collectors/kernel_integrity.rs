@@ -89,36 +89,18 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
             if let Some(current_addr) = current_syscalls.get(name) {
                 if current_addr != baseline_addr {
                     let key = format!("syscall:{name}");
-                    let should_alert = last_alert
-                        .get(&key)
-                        .map(|t| now - *t > cooldown)
-                        .unwrap_or(true);
+                    let should_alert = should_emit_alert(last_alert.get(&key), now, cooldown);
 
                     if should_alert {
                         last_alert.insert(key, now);
-                        let ev = Event {
-                            ts: now,
-                            host: host.clone(),
-                            source: "kernel_integrity".to_string(),
-                            kind: "kernel.syscall_table_modified".to_string(),
-                            severity: Severity::Critical,
-                            summary: format!(
-                                "CRITICAL: Syscall table modified — {} changed from {} to {} (rootkit indicator)",
-                                name, baseline_addr, current_addr
-                            ),
-                            details: serde_json::json!({
-                                "syscall": name,
-                                "baseline_address": baseline_addr,
-                                "current_address": current_addr,
-                                "baseline_time": baseline.established_at.to_rfc3339(),
-                            }),
-                            tags: vec![
-                                "kernel_integrity".to_string(),
-                                "rootkit".to_string(),
-                                "syscall_hook".to_string(),
-                            ],
-                            entities: vec![],
-                        };
+                        let ev = syscall_table_modified_event(
+                            &host,
+                            now,
+                            name,
+                            baseline_addr,
+                            current_addr,
+                            &baseline.established_at,
+                        );
                         if tx.send(ev).await.is_err() {
                             return;
                         }
@@ -132,47 +114,23 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
         for id in &current_bpf {
             if !baseline.known_bpf_ids.contains(id) {
                 let key = format!("bpf:{id}");
-                let should_alert = last_alert
-                    .get(&key)
-                    .map(|t| now - *t > cooldown)
-                    .unwrap_or(true);
+                let should_alert = should_emit_alert(last_alert.get(&key), now, cooldown);
 
                 if should_alert {
                     let prog_info = read_bpf_program_info(*id);
-                    let is_innerwarden = prog_info
-                        .as_ref()
-                        .map(|name| {
-                            INNERWARDEN_BPF_PREFIXES
-                                .iter()
-                                .any(|prefix| name.starts_with(prefix))
-                        })
-                        .unwrap_or(false);
+                    let is_innerwarden = is_innerwarden_bpf_program(prog_info.as_deref());
 
                     if !is_innerwarden {
                         last_alert.insert(key, now);
                         let prog_name = prog_info.unwrap_or_else(|| "unknown".to_string());
-                        let ev = Event {
-                            ts: now,
-                            host: host.clone(),
-                            source: "kernel_integrity".to_string(),
-                            kind: "kernel.bpf_program_loaded".to_string(),
-                            severity: Severity::High,
-                            summary: format!(
-                                "New eBPF program loaded after boot: id={id} name='{prog_name}'"
-                            ),
-                            details: serde_json::json!({
-                                "bpf_id": id,
-                                "bpf_name": prog_name,
-                                "baseline_programs": baseline.known_bpf_ids.len(),
-                                "current_programs": current_bpf.len(),
-                            }),
-                            tags: vec![
-                                "kernel_integrity".to_string(),
-                                "ebpf".to_string(),
-                                "weaponization".to_string(),
-                            ],
-                            entities: vec![],
-                        };
+                        let ev = bpf_program_loaded_event(
+                            &host,
+                            now,
+                            *id,
+                            &prog_name,
+                            baseline.known_bpf_ids.len(),
+                            current_bpf.len(),
+                        );
                         if tx.send(ev).await.is_err() {
                             return;
                         }
@@ -186,28 +144,17 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
         for module in &current_modules {
             if !baseline.known_modules.contains(module) {
                 let key = format!("module:{module}");
-                let should_alert = last_alert
-                    .get(&key)
-                    .map(|t| now - *t > cooldown)
-                    .unwrap_or(true);
+                let should_alert = should_emit_alert(last_alert.get(&key), now, cooldown);
 
                 if should_alert {
                     last_alert.insert(key, now);
-                    let ev = Event {
-                        ts: now,
-                        host: host.clone(),
-                        source: "kernel_integrity".to_string(),
-                        kind: "kernel.new_module_post_boot".to_string(),
-                        severity: Severity::High,
-                        summary: format!("Kernel module loaded after boot: {module}"),
-                        details: serde_json::json!({
-                            "module": module,
-                            "baseline_modules": baseline.known_modules.len(),
-                            "current_modules": current_modules.len(),
-                        }),
-                        tags: vec!["kernel_integrity".to_string(), "module".to_string()],
-                        entities: vec![EntityRef::service(module)],
-                    };
+                    let ev = new_module_post_boot_event(
+                        &host,
+                        now,
+                        module,
+                        baseline.known_modules.len(),
+                        current_modules.len(),
+                    );
                     if tx.send(ev).await.is_err() {
                         return;
                     }
@@ -216,10 +163,124 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String, poll_seconds: u64) {
         }
 
         // Prune old alerts
-        if last_alert.len() > 1000 {
-            let cutoff = now - cooldown;
-            last_alert.retain(|_, t| *t > cutoff);
-        }
+        prune_stale_alerts(&mut last_alert, now, cooldown);
+    }
+}
+
+fn should_emit_alert(
+    last_alert: Option<&DateTime<Utc>>,
+    now: DateTime<Utc>,
+    cooldown: Duration,
+) -> bool {
+    last_alert
+        .map(|timestamp| now - *timestamp > cooldown)
+        .unwrap_or(true)
+}
+
+fn is_innerwarden_bpf_program(name: Option<&str>) -> bool {
+    name.map(|name| {
+        INNERWARDEN_BPF_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    })
+    .unwrap_or(false)
+}
+
+fn prune_stale_alerts(
+    last_alert: &mut HashMap<String, DateTime<Utc>>,
+    now: DateTime<Utc>,
+    cooldown: Duration,
+) {
+    if last_alert.len() > 1000 {
+        let cutoff = now - cooldown;
+        last_alert.retain(|_, timestamp| *timestamp > cutoff);
+    }
+}
+
+fn syscall_table_modified_event(
+    host: &str,
+    now: DateTime<Utc>,
+    name: &str,
+    baseline_addr: &str,
+    current_addr: &str,
+    established_at: &DateTime<Utc>,
+) -> Event {
+    Event {
+        ts: now,
+        host: host.to_string(),
+        source: "kernel_integrity".to_string(),
+        kind: "kernel.syscall_table_modified".to_string(),
+        severity: Severity::Critical,
+        summary: format!(
+            "CRITICAL: Syscall table modified — {} changed from {} to {} (rootkit indicator)",
+            name, baseline_addr, current_addr
+        ),
+        details: serde_json::json!({
+            "syscall": name,
+            "baseline_address": baseline_addr,
+            "current_address": current_addr,
+            "baseline_time": established_at.to_rfc3339(),
+        }),
+        tags: vec![
+            "kernel_integrity".to_string(),
+            "rootkit".to_string(),
+            "syscall_hook".to_string(),
+        ],
+        entities: vec![],
+    }
+}
+
+fn bpf_program_loaded_event(
+    host: &str,
+    now: DateTime<Utc>,
+    id: u32,
+    prog_name: &str,
+    baseline_programs: usize,
+    current_programs: usize,
+) -> Event {
+    Event {
+        ts: now,
+        host: host.to_string(),
+        source: "kernel_integrity".to_string(),
+        kind: "kernel.bpf_program_loaded".to_string(),
+        severity: Severity::High,
+        summary: format!("New eBPF program loaded after boot: id={id} name='{prog_name}'"),
+        details: serde_json::json!({
+            "bpf_id": id,
+            "bpf_name": prog_name,
+            "baseline_programs": baseline_programs,
+            "current_programs": current_programs,
+        }),
+        tags: vec![
+            "kernel_integrity".to_string(),
+            "ebpf".to_string(),
+            "weaponization".to_string(),
+        ],
+        entities: vec![],
+    }
+}
+
+fn new_module_post_boot_event(
+    host: &str,
+    now: DateTime<Utc>,
+    module: &str,
+    baseline_modules: usize,
+    current_modules: usize,
+) -> Event {
+    Event {
+        ts: now,
+        host: host.to_string(),
+        source: "kernel_integrity".to_string(),
+        kind: "kernel.new_module_post_boot".to_string(),
+        severity: Severity::High,
+        summary: format!("Kernel module loaded after boot: {module}"),
+        details: serde_json::json!({
+            "module": module,
+            "baseline_modules": baseline_modules,
+            "current_modules": current_modules,
+        }),
+        tags: vec!["kernel_integrity".to_string(), "module".to_string()],
+        entities: vec![EntityRef::service(module)],
     }
 }
 
@@ -429,5 +490,74 @@ ffffffff81abcdef T __x64_sys_openat";
         assert_eq!(parsed.len(), 2);
         assert!(parsed.contains("veth"));
         assert!(parsed.contains("intel_rapl_msr"));
+    }
+
+    #[test]
+    fn alert_cooldown_and_bpf_prefix_helpers_cover_suppression_paths() {
+        let now = Utc::now();
+        assert!(should_emit_alert(None, now, Duration::seconds(600)));
+        assert!(!should_emit_alert(
+            Some(&(now - Duration::seconds(60))),
+            now,
+            Duration::seconds(600)
+        ));
+        assert!(should_emit_alert(
+            Some(&(now - Duration::seconds(601))),
+            now,
+            Duration::seconds(600)
+        ));
+
+        assert!(is_innerwarden_bpf_program(Some("innerwarden_trace")));
+        assert!(is_innerwarden_bpf_program(Some("xdp__guard")));
+        assert!(!is_innerwarden_bpf_program(Some("custom_probe")));
+        assert!(!is_innerwarden_bpf_program(None));
+    }
+
+    #[test]
+    fn kernel_event_builders_keep_rootkit_bpf_and_module_context() {
+        let now = Utc::now();
+        let established = now - Duration::seconds(30);
+
+        let syscall = syscall_table_modified_event(
+            "sensor-a",
+            now,
+            "__x64_sys_execve",
+            "0x1",
+            "0x2",
+            &established,
+        );
+        assert_eq!(syscall.kind, "kernel.syscall_table_modified");
+        assert_eq!(syscall.severity, Severity::Critical);
+        assert_eq!(syscall.details["syscall"], "__x64_sys_execve");
+        assert_eq!(syscall.details["current_address"], "0x2");
+
+        let bpf = bpf_program_loaded_event("sensor-b", now, 77, "unknown", 3, 4);
+        assert_eq!(bpf.kind, "kernel.bpf_program_loaded");
+        assert_eq!(bpf.details["bpf_id"], 77);
+        assert_eq!(bpf.details["baseline_programs"], 3);
+
+        let module = new_module_post_boot_event("sensor-c", now, "evil_mod", 8, 9);
+        assert_eq!(module.kind, "kernel.new_module_post_boot");
+        assert_eq!(module.details["module"], "evil_mod");
+        assert_eq!(module.entities.len(), 1);
+    }
+
+    #[test]
+    fn stale_alert_pruning_only_runs_after_capacity_threshold() {
+        let now = Utc::now();
+        let cooldown = Duration::seconds(600);
+        let mut under_limit = HashMap::from([("old".to_string(), now - Duration::seconds(900))]);
+        prune_stale_alerts(&mut under_limit, now, cooldown);
+        assert!(under_limit.contains_key("old"));
+
+        let mut crowded = HashMap::new();
+        for idx in 0..1000 {
+            crowded.insert(format!("recent-{idx}"), now - Duration::seconds(30));
+        }
+        crowded.insert("expired".to_string(), now - Duration::seconds(900));
+
+        prune_stale_alerts(&mut crowded, now, cooldown);
+        assert_eq!(crowded.len(), 1000);
+        assert!(!crowded.contains_key("expired"));
     }
 }

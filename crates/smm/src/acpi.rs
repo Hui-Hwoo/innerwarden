@@ -20,7 +20,10 @@ pub struct AcpiTableHash {
 
 /// Read and hash all ACPI tables.
 pub fn hash_tables() -> Vec<AcpiTableHash> {
-    let dir = Path::new(ACPI_TABLES_DIR);
+    hash_tables_in_dir(Path::new(ACPI_TABLES_DIR))
+}
+
+fn hash_tables_in_dir(dir: &Path) -> Vec<AcpiTableHash> {
     if !dir.exists() {
         return Vec::new();
     }
@@ -55,8 +58,10 @@ pub fn hash_tables() -> Vec<AcpiTableHash> {
 
 /// Hash ACPI tables for baseline / drift detection.
 pub fn check_table_integrity() -> CheckResult {
-    let tables = hash_tables();
+    table_integrity_from_tables(hash_tables())
+}
 
+fn table_integrity_from_tables(tables: Vec<AcpiTableHash>) -> CheckResult {
     if tables.is_empty() {
         return CheckResult {
             id: "ACPI-001",
@@ -109,5 +114,85 @@ mod tests {
     fn check_tables_runs() {
         let result = check_table_integrity();
         assert!(!result.id.is_empty());
+    }
+
+    #[test]
+    fn hash_tables_in_dir_collects_files_sorts_names_and_skips_directories() {
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        std::fs::write(dir.path().join("SSDT2"), b"second").expect("fixture should be written");
+        std::fs::write(dir.path().join("DSDT"), b"primary").expect("fixture should be written");
+        std::fs::create_dir(dir.path().join("nested")).expect("nested directory should exist");
+
+        let tables = hash_tables_in_dir(dir.path());
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].name, "DSDT");
+        assert_eq!(tables[1].name, "SSDT2");
+        assert_eq!(tables[0].size, 7);
+        assert_eq!(tables[0].sha256, hex::encode(Sha256::digest(b"primary")));
+    }
+
+    #[test]
+    fn hash_tables_in_dir_returns_empty_for_missing_or_non_directory_paths() {
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let file_path = dir.path().join("not-a-dir");
+        std::fs::write(&file_path, b"plain file").expect("fixture should be written");
+
+        assert!(hash_tables_in_dir(&dir.path().join("missing")).is_empty());
+        assert!(hash_tables_in_dir(&file_path).is_empty());
+    }
+
+    #[test]
+    fn table_integrity_summary_handles_empty_dsdt_and_ssdt_variants() {
+        let unavailable = table_integrity_from_tables(Vec::new());
+        assert_eq!(unavailable.status, CheckStatus::Unavailable);
+
+        let with_dsdt = table_integrity_from_tables(vec![
+            AcpiTableHash {
+                name: "SSDT1".to_string(),
+                size: 12,
+                sha256: "a".repeat(64),
+            },
+            AcpiTableHash {
+                name: "DSDT".to_string(),
+                size: 99,
+                sha256: "b".repeat(64),
+            },
+        ]);
+        assert_eq!(with_dsdt.status, CheckStatus::Secure);
+        assert!(with_dsdt.detail.contains("2 tables hashed (1 SSDTs)"));
+        assert!(with_dsdt.detail.contains("DSDT: 99 bytes"));
+
+        let without_dsdt = table_integrity_from_tables(vec![AcpiTableHash {
+            name: "FACP".to_string(),
+            size: 7,
+            sha256: "c".repeat(64),
+        }]);
+        assert!(without_dsdt.detail.contains("no SSDTs"));
+        assert!(without_dsdt.detail.contains("DSDT: not found"));
+    }
+
+    #[test]
+    fn table_integrity_summary_counts_multiple_ssdts_and_preserves_hash_prefix() {
+        let result = table_integrity_from_tables(vec![
+            AcpiTableHash {
+                name: "DSDT".to_string(),
+                size: 128,
+                sha256: "0123456789abcdef".repeat(4),
+            },
+            AcpiTableHash {
+                name: "SSDT1".to_string(),
+                size: 32,
+                sha256: "a".repeat(64),
+            },
+            AcpiTableHash {
+                name: "SSDT2".to_string(),
+                size: 48,
+                sha256: "b".repeat(64),
+            },
+        ]);
+
+        assert_eq!(result.status, CheckStatus::Secure);
+        assert!(result.detail.contains("3 tables hashed (2 SSDTs)"));
+        assert!(result.detail.contains("sha256:0123456789abcdef"));
     }
 }
