@@ -1495,7 +1495,17 @@ pub(super) fn build_attackers_from_sqlite(
                             return None;
                         }
                         let value = e.get("value").and_then(|v| v.as_str())?;
-                        if value.is_empty() || crate::incident_auto_rules::is_internal_ip_pub(value)
+                        // PR20 follow-up: filter must match
+                        // `compute_overview_counts_from_sqlite` so the
+                        // attacker list and the strip agree on
+                        // "blocked / observing" counts. Without
+                        // is_self_traffic_ip here, the strip showed N+k
+                        // while the list showed N (the k = Cloudflare/
+                        // self-traffic IPs the strip counted but the
+                        // list silently dropped).
+                        if value.is_empty()
+                            || crate::incident_auto_rules::is_internal_ip_pub(value)
+                            || crate::cloud_safelist::is_self_traffic_ip(value)
                         {
                             return None;
                         }

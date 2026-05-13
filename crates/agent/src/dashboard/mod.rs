@@ -6980,4 +6980,52 @@ mod tests {
             "PR20 — /api/status.files must keep the live `telemetry` probe"
         );
     }
+
+    #[test]
+    fn pr20_hide_allowlisted_checkbox_unchecked_by_default() {
+        // Operator-reported follow-up on 2026-05-13: strip shows "40
+        // Currently blocked" but the panel shows "7 attackers · 20
+        // cases" because a hidden checkbox `hideAllowlisted` was
+        // `checked` by default AND `display:none` — the operator
+        // could never turn it off, and the frontend silently
+        // double-filtered (backend already drops self-traffic via
+        // `is_self_traffic_or_internal`). PR20 unchecks the box so
+        // `state.hideAllowlisted` defaults to false and the frontend
+        // filter never fires; backend is the single source of truth.
+        //
+        // "nao pode essas inconsistencia" — the operator's literal
+        // call. Anchored here so a future re-check would fail CI
+        // before reaching prod.
+        assert!(
+            !INDEX_HTML.contains("<input type=\"checkbox\" id=\"hideAllowlisted\" checked"),
+            "PR20 — the hidden hideAllowlisted checkbox MUST NOT \
+             default to `checked`. The default-on hidden filter \
+             caused the strip-vs-panel count gap operator-reported \
+             on 2026-05-13. If you re-enable it, also make it \
+             visible so the operator can toggle."
+        );
+        assert!(
+            INDEX_HTML.contains("id=\"hideAllowlisted\""),
+            "PR20 — keep the element so existing JS references \
+             (`toggleAllowlistFilter`, `state.hideAllowlisted`) do \
+             not throw. Just default it to unchecked."
+        );
+    }
+
+    #[test]
+    fn pr20_attackers_sqlite_filter_matches_overview_filter() {
+        // Strip + panel count parity. `build_attackers_from_sqlite`
+        // must apply the SAME self-traffic + RFC1918 filter that
+        // `compute_overview_counts_from_sqlite` does. Without this
+        // the strip counted Cloudflare in the blocked tile while
+        // the panel quietly dropped those rows — operator could
+        // never reconcile.
+        const INV_SRC: &str = include_str!("investigation.rs");
+        assert!(
+            INV_SRC.contains("crate::cloud_safelist::is_self_traffic_ip(value)"),
+            "PR20 — build_attackers_from_sqlite must call \
+             `cloud_safelist::is_self_traffic_ip` so the panel \
+             agrees with the strip on which IPs count."
+        );
+    }
 }

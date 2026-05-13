@@ -42,9 +42,17 @@
       <span class="status-badge status-badge-read" id="modeBadge">READ-ONLY</span>
       <span class="status-badge status-badge-ai-off" id="aiBadge">AI: off</span>
       <span class="status-badge" id="versionBadge" style="background:rgba(120,229,255,0.08);color:var(--accent);font-size:0.58rem"></span>
-      <!-- Toggle removed: research_only server-side filter handles self-traffic.
-           The checkbox element is kept hidden so JS references don't break. -->
-      <input type="checkbox" id="hideAllowlisted" checked style="display:none">
+      <!-- Spec 049 PR20 follow-up: backend filters Cloudflare /
+           RFC1918 self-traffic in `is_self_traffic_or_internal`. The
+           frontend filter is now redundant — keeping it ON
+           double-filtered (backend hid self-traffic, frontend then
+           hid "trusted" public IPs from the config allowlist) and
+           shrank the list to 7-of-40 vs the strip's 40. Operator's
+           "nao pode essas inconsistencia" call. Checkbox stays hidden
+           but UNchecked so `state.hideAllowlisted` defaults to false
+           and the frontend filter never fires. Backend is the single
+           source of truth for what's shown. -->
+      <input type="checkbox" id="hideAllowlisted" style="display:none">
     </div>
     <span id="refreshStatus"></span>
     <!-- Audit 4.6 + spec 049 PR3: Responses promoted to top-level
