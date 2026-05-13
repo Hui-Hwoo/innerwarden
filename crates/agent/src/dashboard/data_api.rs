@@ -1402,6 +1402,11 @@ fn compute_incidents_blocking(state: &DashboardState, query: ListQuery) -> Incid
                     action_taken: decision.clone(),
                     confidence: *confidence,
                     is_allowlisted: *is_allowlisted,
+                    // PR15 — populated in a single batch after the
+                    // initial filter_map walk so we pay one
+                    // xdp_block_times lookup per unique IP, not per
+                    // row.
+                    still_active_now: None,
                 })
             } else {
                 None
@@ -1411,7 +1416,31 @@ fn compute_incidents_blocking(state: &DashboardState, query: ListQuery) -> Incid
 
     incident_views.sort_by(|a, b| b.ts.cmp(&a.ts));
     let total = incident_views.len();
-    let items: Vec<IncidentView> = incident_views.into_iter().take(limit).collect();
+    let mut items: Vec<IncidentView> = incident_views.into_iter().take(limit).collect();
+
+    // PR15 — decorate rows with `still_active_now` when the operator
+    // is auditing a past date. We skip the lookup entirely for
+    // today-scope because the `Contained` outcome already implies
+    // "live now" for today's view; doing it anyway would cost an
+    // sqlite roundtrip per unique IP without changing any pixel.
+    let now = chrono::Utc::now();
+    let today = super::still_active_now::today_str(now);
+    if super::still_active_now::scope_is_past(&date, &today) {
+        let unique_ips: Vec<&str> = items
+            .iter()
+            .flat_map(|i| i.entities.iter())
+            .filter_map(|e| super::still_active_now::extract_ip(e))
+            .collect();
+        let still_active_map = super::still_active_now::build_still_active_map(
+            state.sqlite_store.as_ref(),
+            unique_ips,
+            now,
+        );
+        for item in items.iter_mut() {
+            item.still_active_now =
+                super::still_active_now::row_still_active(&item.entities, &still_active_map);
+        }
+    }
 
     IncidentListResponse { date, total, items }
 }

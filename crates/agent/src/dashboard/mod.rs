@@ -29,6 +29,7 @@ mod live_feed;
 mod push;
 mod sensors;
 mod sse;
+mod still_active_now;
 mod threat_contract;
 
 #[cfg(test)]
@@ -6319,6 +6320,125 @@ mod tests {
         assert!(
             err_str.contains("failed to load TLS cert") || err_str.contains("does-not-exist"),
             "error must reference the bad path, got: {err_str}"
+        );
+    }
+
+    // ── Spec 049 PR15 — "Still active now" badge anchors ────────────
+    //
+    // The badge answers a question operators kept asking out loud
+    // ("contained ontem — e hoje?") that the older `KERNEL · 48h`
+    // pill technically also answers but in language no operator
+    // ever pattern-matches on under pressure. These anchors pin:
+    //
+    //   * the literal label string the operator reads,
+    //   * the scope-gating logic (today-scope must NOT render the
+    //     pill — the outcome badge already conveys "live now"),
+    //   * the back-end field name and skip-on-none serialization
+    //     contract on IncidentView,
+    //   * the CSS class so the pill keeps its saturated green look
+    //     and does not collapse back into the cryptic-kernel pill.
+    //
+    // If any of these drift the operator goes back to wondering
+    // whether yesterday's containment is real today — exactly the
+    // failure mode PR15 fixed.
+
+    #[test]
+    fn pr15_threats_js_renders_still_active_now_pill_for_past_scope() {
+        assert!(
+            JS_THREATS.contains("Still active now"),
+            "PR15 — the literal pill label must live in threats.js; \
+             do not rename without updating operator-facing copy and \
+             this anchor in lockstep"
+        );
+        assert!(
+            JS_THREATS.contains("badge-still-active"),
+            "PR15 — the pill must carry the dedicated CSS class so it \
+             keeps its saturated-green look (instead of collapsing into \
+             badge-kernel-active)"
+        );
+    }
+
+    #[test]
+    fn pr15_still_active_now_pill_is_gated_on_past_scope_and_blocked_now() {
+        // Today-scope must NOT paint the pill — the outcome badge
+        // ("Contained") already conveys "live now" for today's
+        // view; an extra pill there is redundant and confuses the
+        // operator into thinking it might mean something else.
+        let gate = "casesScopeFromDate(state.filters && state.filters.date) === 'past'";
+        assert!(
+            JS_THREATS.contains(gate),
+            "PR15 — the pill must be gated on past-scope. The gate \
+             string `{gate}` is the contract; if you refactor it, \
+             update this anchor so the next reviewer can find the gate \
+             without re-reading the whole renderCard."
+        );
+        assert!(
+            JS_THREATS.contains("item.block_state.kind === 'blocked_now'"),
+            "PR15 — the pill must only paint when the kernel is \
+             currently enforcing (blocked_now). blocked_historical \
+             means the block has expired and the EXPIRED pill from \
+             blockStateBadgeHtml() handles that case"
+        );
+    }
+
+    #[test]
+    fn pr15_incident_view_exposes_still_active_now_field() {
+        // The IncidentView struct is the public contract for
+        // `/api/incidents`. PR15 added the optional field; an
+        // external auditor querying past dates relies on it to
+        // tell "yesterday's block is still live today" without
+        // doing a second roundtrip through `xdp_block_times`.
+        const TYPES: &str = include_str!("types.rs");
+        assert!(
+            TYPES.contains("still_active_now: Option<bool>"),
+            "PR15 — IncidentView must expose still_active_now as \
+             Option<bool> so today-scope responses (and past rows \
+             whose blocks have already expired) serialize as a clean \
+             absence rather than `false`"
+        );
+        assert!(
+            TYPES.contains("skip_serializing_if = \"Option::is_none\""),
+            "PR15 — the field must be skipped when None; without this \
+             the response inflates by one JSON pair per row on \
+             today-scope requests for zero operator benefit"
+        );
+    }
+
+    #[test]
+    fn pr15_data_api_decorates_past_scope_responses() {
+        // The decoration is gated server-side on past-scope so
+        // today-scope requests never pay for an xdp_block_times
+        // walk. This anchor pins the gate so a future "always
+        // decorate" refactor cannot silently regress latency or
+        // bloat today-scope JSON.
+        const DATA_API: &str = include_str!("data_api.rs");
+        assert!(
+            DATA_API.contains("super::still_active_now::scope_is_past(&date, &today)"),
+            "PR15 — compute_incidents_blocking must gate the \
+             decoration on scope_is_past so today-scope skips the \
+             sqlite walk"
+        );
+        assert!(
+            DATA_API.contains("super::still_active_now::build_still_active_map"),
+            "PR15 — decoration must use the batched map builder so \
+             repeated IPs across rows do not cost N xdp_block_times \
+             roundtrips"
+        );
+        assert!(
+            DATA_API.contains("super::still_active_now::row_still_active"),
+            "PR15 — per-row Option<bool> resolution must go through \
+             the shared helper so the row → flag rule stays unit-tested"
+        );
+    }
+
+    #[test]
+    fn pr15_app_css_defines_still_active_badge() {
+        assert!(
+            APP_CSS.contains(".badge-still-active"),
+            "PR15 — app.css must define .badge-still-active so the \
+             pill never falls back to default-styling. Without this \
+             rule the pill renders unstyled and the operator misses \
+             the affordance"
         );
     }
 }

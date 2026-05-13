@@ -1304,6 +1304,11 @@
        "kernel block has expired" (badge-kernel-expired). */
     .badge-kernel-active  { background: rgba(58,194,126,0.20);  color: var(--ok);     border: 1px solid rgba(58,194,126,0.40); }
     .badge-kernel-expired { background: rgba(255,193,7,0.10);   color: #f4d35e;       border: 1px solid rgba(255,193,7,0.25); }
+    /* Spec 049 PR15 — "Still active now" pill. Brighter and more
+       saturated than badge-kernel-active so the operator's eye snaps
+       to it when auditing a past date and the question "is this
+       block still live today?" is the one that matters. */
+    .badge-still-active   { background: rgba(58,194,126,0.32);  color: var(--ok);     border: 1px solid rgba(58,194,126,0.55); font-weight: 800; }
 
     /* Phase 7 (audit RC-2 / 2026-04-29): paired-unit KPI tile and
        pending breakdown panel. The kpi-pair-line sits between the

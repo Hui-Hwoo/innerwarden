@@ -561,6 +561,17 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).
 
 - `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_home_activity_breakdown_styles` — `.home-activity-breakdown` + chip / num / label / sep selectors must exist. Without them the chips render as inline plain text.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr15_threats_js_renders_still_active_now_pill_for_past_scope` — spec 049 PR15. The literal "Still active now" pill string + `badge-still-active` CSS class live in `threats.js`. Closes the operator gap "contained ontem — e hoje?" with plain-English copy.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr15_still_active_now_pill_is_gated_on_past_scope_and_blocked_now` — pill paints only when `casesScopeFromDate(state.filters.date) === 'past'` AND `block_state.kind === 'blocked_now'`. Today-scope keeps the existing outcome badge (no duplicate signal); `blocked_historical` keeps the existing EXPIRED pill.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr15_incident_view_exposes_still_active_now_field` — `IncidentView.still_active_now: Option<bool>` with `skip_serializing_if = Option::is_none`. External `/api/incidents` auditors get a single boolean answering "is yesterday's block still live today" without a second `xdp_block_times` roundtrip; today-scope and expired-block past rows omit the field entirely so the JSON payload stays small.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr15_data_api_decorates_past_scope_responses` — `compute_incidents_blocking` gates the decoration on `scope_is_past`, uses `build_still_active_map` (batched, deduped per request) and `row_still_active` (per-row Option contract). Pin guards latency and JSON-shape contract simultaneously.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr15_app_css_defines_still_active_badge` — `.badge-still-active` rule exists in `app.css`. Without it the pill renders unstyled and the operator loses the affordance.
+
 - `crates/agent/src/dashboard/mod.rs::tests::threats_kpi_tile_label_is_blocks_not_blocked` (extended in Wave 10) - the Threats KPI tile reads "Block actions" / "today" (aggregate, decisions) and the sidebar group reads "Currently blocked attackers" (snapshot, unique IPs). Pre-Wave-10 the labels read "Blocks · Today" and "Blocked attackers" — same page, different answers, no copy disclosing the snapshot-vs-aggregate axis. Operator's hard rule (2026-05-05): every label must explicitly disclose window + scope + cardinality unit. The test name predates Wave 10 (kept for git-blame continuity); the docstring has been updated to reflect the new disambiguation pair.
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_live_feed_clips_to_rolling_24h_matching_site_label` - the public live-feed builder (`build_live_feed_response`) clips `real_incidents` to `now - 24h` so the site's hardcoded "(24h)" labels (`Live.tsx:415,422,429`) match the underlying data. Source-grep anchor: pins `cutoff_24h = now - chrono::Duration::hours(24)` AND `i.ts >= cutoff_24h` filter in active code. A future "remove the cutoff for performance" PR fails CI loudly.
 

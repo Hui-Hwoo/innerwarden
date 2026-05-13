@@ -492,6 +492,13 @@ pub(crate) struct IncidentView {
     pub(super) confidence: Option<f32>,
     /// True if the source entity is in the allowlist.
     pub(super) is_allowlisted: bool,
+    /// Spec 049 PR15 — set to `Some(true)` only when the request
+    /// scope is a past date AND at least one IP entity on this row
+    /// is currently `BlockState::BlockedNow` (kernel-enforced).
+    /// Today-scope responses and past rows with expired blocks omit
+    /// the field entirely so the JSON payload stays small.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) still_active_now: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

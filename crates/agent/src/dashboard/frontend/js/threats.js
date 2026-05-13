@@ -501,6 +501,19 @@ function renderCard(item) {
   // the kernel is still enforcing, and "Blocked (AI) · Expired"
   // when the TTL elapsed but no fresh block has been re-issued.
   badges += blockStateBadgeHtml(item.block_state);
+  // Spec 049 PR15 — when the operator is auditing a past date and
+  // the kernel is STILL enforcing this attacker's block today, paint
+  // an unambiguous "Still active now" pill. Closes the gap operators
+  // kept asking about: "ontem foi contained — e hoje?". The cryptic
+  // `KERNEL · 48h` pill from `blockStateBadgeHtml` keeps the granular
+  // timing view; this pill is a plain-English answer to a plain
+  // English question. Today-scope skips the pill entirely because
+  // the outcome badge ("Contained") already conveys "live now".
+  if (casesScopeFromDate(state.filters && state.filters.date) === 'past'
+      && item.block_state && item.block_state.kind === 'blocked_now') {
+    badges += '<span class="card-badge badge-still-active" title="This attacker was contained on the selected past date and the kernel is still enforcing the block today.">' +
+              lucideIcon('shield-check',{size:12}) + ' Still active now</span>';
+  }
 
   const ago = (ts) => {
     if (!ts) return '';
