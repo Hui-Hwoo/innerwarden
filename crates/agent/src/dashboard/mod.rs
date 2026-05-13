@@ -6431,6 +6431,54 @@ mod tests {
         );
     }
 
+    // ── Spec 049 PR16 — algorithm-gate provider strings ────────────
+    //
+    // Triggered by an operator-reported gap on 2026-05-13: the Cases
+    // drill-down showed "Decision provenance: Unknown (provider:
+    // obvious-gate)" for a real block. PR9's heuristic recognised
+    // every other gate writer (honeypot:, observation-verify,
+    // auto-rule:) but missed the two `*-gate` providers in
+    // `incident_obvious.rs` and `incident_autodismiss.rs`. PR16 wires
+    // both, and this anchor pins the source-of-truth strings so a
+    // future rename to either side breaks the build until the
+    // classifier is updated in lockstep.
+
+    #[test]
+    fn pr16_algorithm_gate_provider_strings_stay_in_sync_with_prod_writers() {
+        // The classifier reads the strings the writers actually emit.
+        // If `incident_obvious.rs` ever renames `"obvious-gate"`, this
+        // grep-anchor fails and forces the rename to land in
+        // decision_provenance.rs at the same time.
+        const OBVIOUS_SRC: &str = include_str!("../incident_obvious.rs");
+        const AUTODISMISS_SRC: &str = include_str!("../incident_autodismiss.rs");
+        const PROV_SRC: &str = include_str!("decision_provenance.rs");
+
+        assert!(
+            OBVIOUS_SRC.contains("\"obvious-gate\""),
+            "PR16 — incident_obvious.rs is the canonical writer of the \
+             `obvious-gate` provider string. Renaming it without \
+             updating decision_provenance.rs's classifier will silently \
+             demote the row's provenance to Unknown — exactly the bug \
+             PR16 fixed."
+        );
+        assert!(
+            AUTODISMISS_SRC.contains("\"noise-gate\""),
+            "PR16 — incident_autodismiss.rs is the canonical writer of \
+             the `noise-gate` provider string. Rename in lockstep with \
+             the classifier."
+        );
+        assert!(
+            PROV_SRC.contains("provider_lower == \"obvious-gate\""),
+            "PR16 — the classifier branch for obvious-gate must exist \
+             so the operator-facing drill-down does not regress to \
+             Unknown on every prod block from this gate"
+        );
+        assert!(
+            PROV_SRC.contains("provider_lower == \"noise-gate\""),
+            "PR16 — same as above for noise-gate"
+        );
+    }
+
     #[test]
     fn pr15_app_css_defines_still_active_badge() {
         assert!(

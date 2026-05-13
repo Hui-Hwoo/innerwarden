@@ -125,6 +125,28 @@ pub(super) fn classify_decision_layer_from_fields(
             detail: format!("auto-rule · detector: {detector}"),
         };
     }
+    // Spec 049 PR16 — production algorithm-gate fast paths. These
+    // bypass the AI router entirely: `obvious-gate` (incident_obvious.rs)
+    // promotes high-confidence threat-intel matches to block_ip without
+    // LLM consultation; `noise-gate` (incident_autodismiss.rs) suppresses
+    // Low-severity detector noise the same way. Both write a real
+    // decision with a provider string of their own — drop them in
+    // here so the operator sees "Algorithm gate" instead of "Unknown"
+    // on the Cases drill-down. Operator-driven (2026-05-13): "esse
+    // foi bloqueado porque e por quem?" — answered by the gate name
+    // surfaced in the detail.
+    if provider_lower == "obvious-gate" {
+        return DecisionProvenance {
+            layer: DecisionLayer::AlgorithmGate,
+            detail: "obvious-threat fast path (threat_intel match)".to_string(),
+        };
+    }
+    if provider_lower == "noise-gate" {
+        return DecisionProvenance {
+            layer: DecisionLayer::AlgorithmGate,
+            detail: "noise filter (low-severity auto-dismiss)".to_string(),
+        };
+    }
 
     // 2. Local Warden vs LLM. The provider name is set by the AI
     //    router; `local_classifier` / `local_warden` are the two
@@ -258,6 +280,53 @@ mod tests {
         assert!(
             p.detail.contains("ssh_bruteforce"),
             "detail must surface the detector name from the provider prefix"
+        );
+    }
+
+    // ── Spec 049 PR16 — algorithm-gate fast paths ──────────────────
+    //
+    // Production drives these strings from `incident_obvious.rs` and
+    // `incident_autodismiss.rs`. The operator-visible payoff: the
+    // Cases drill-down "Decision provenance" panel reads "Algorithm
+    // gate · obvious-threat fast path (threat_intel match)" instead
+    // of "Unknown (provider: obvious-gate)" — the question "esse foi
+    // bloqueado por quem?" is now answerable from the UI alone.
+
+    #[test]
+    fn obvious_gate_provider_classifies_as_algorithm_gate() {
+        // Real prod payload (2026-05-13, IP 41.242.115.84):
+        //   provider = "obvious-gate"
+        //   reason   = "Shut the door on 41.242.115.84. threat_intel caught on first try."
+        //   confidence = 0.95
+        let p = classify_decision_layer_from_fields(
+            "obvious-gate",
+            "Shut the door on 41.242.115.84. threat_intel caught on first try. Compromise averted.",
+            Some(0.95),
+        );
+        assert_eq!(p.layer, DecisionLayer::AlgorithmGate);
+        assert!(
+            p.detail.contains("obvious-threat fast path"),
+            "PR16 — detail must name the gate so the operator can grep \
+             the source. Got: {}",
+            p.detail
+        );
+    }
+
+    #[test]
+    fn noise_gate_provider_classifies_as_algorithm_gate() {
+        // Real prod payload: provider = "noise-gate", reason =
+        // "Low-priority proto_anomaly (Low). Filed, not firing."
+        let p = classify_decision_layer_from_fields(
+            "noise-gate",
+            "Low-priority proto_anomaly (Low). Filed, not firing.",
+            Some(1.0),
+        );
+        assert_eq!(p.layer, DecisionLayer::AlgorithmGate);
+        assert!(
+            p.detail.contains("noise filter"),
+            "PR16 — detail must name the gate so the operator can grep \
+             the source. Got: {}",
+            p.detail
         );
     }
 
