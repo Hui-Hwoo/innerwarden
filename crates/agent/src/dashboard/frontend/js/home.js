@@ -1123,6 +1123,31 @@ function viewActivity() {
   showView('investigate');
 }
 
+// Spec 049 PR14 — scoped handoff from Home strip cards + sub-breakdown
+// chips into the Cases tab with the matching outcome filter
+// pre-applied. Resolves the operator's "cade os 170" reconciliation
+// gap: clicking the big number on Home now opens Cases scoped to the
+// exact set that number counts.
+//
+// Buckets accepted (snake-case wire keys, kept stable for anchor tests):
+//   - 'all_flagged'        — every outcome (1:1 reconciliation with Home's "Flagged by system")
+//   - 'warden_decisions'   — Contained + Observing + Filtered out (excludes Needs review)
+//   - 'needs_review'       — only the Needs your attention group
+//   - 'contained'          — blocked + honeypot
+//   - 'observing'          — monitoring
+//   - 'filtered_out'       — dismissed (legacy backend wire name; UI label says Filtered out)
+//
+// Sets `state.filterOutcome` rather than `state.filters.status` because
+// the dropdown filter UI binds to `status` directly — overriding it
+// would surprise the operator with a sticky dropdown selection after
+// the click. `filterOutcome` is a per-handoff scope; threats.js
+// applies it once then UI controls take over normally.
+function viewActivityScoped(bucket) {
+  state.autoSelectOnThreatsOpen = null;
+  state.filterOutcome = bucket || 'all_flagged';
+  showView('investigate');
+}
+
 function viewSystemHealth() {
   showView('status');
 }

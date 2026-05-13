@@ -546,6 +546,16 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::threats_js_group_header_uses_scope_aware_label_in_render` — render loop reads group label via `groupLabelForScope(o, scope)` rather than hard-coding `meta.label`. Anti-regression for a simplification that reverts to always-now labels even when scope = past.
 
+- `crates/agent/src/dashboard/mod.rs::tests::home_js_defines_view_activity_scoped_handoff` — spec 049 PR14 Home strip click handoff. `viewActivityScoped(bucket)` is defined and sets `state.filterOutcome` to the requested bucket (default `'all_flagged'`).
+
+- `crates/agent/src/dashboard/mod.rs::tests::home_strip_cards_route_to_scoped_buckets` — the 4 Home strip cards wire to `viewActivityScoped` with specific buckets: `all_flagged` / `warden_decisions` / `needs_review`. Events Watched stays on Sensors tab. Operator clicks the big number on Home and Cases opens already scoped.
+
+- `crates/agent/src/dashboard/mod.rs::tests::home_subbreakdown_chips_route_to_scoped_buckets` — the 3 sub-breakdown chips (Contained / Observing / Filtered out) wire to their respective buckets via `viewActivityScoped('<bucket>')`. Closes the spec 049 §6.2 reconciliation contract end to end.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_filter_branches_handle_all_pr14_buckets` — `buildGroupedList` filter handles all 4 new buckets (`warden_decisions`, `needs_review`, `observing`, `filtered_out`). Without the branches, the operator clicks "Warden decisions" and sees the full unfiltered list.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_scoped_title_has_clear_link_per_bucket` — each scoped Cases title carries the `✕ show all` clear-link so the operator escapes the filter with one click, and renders the operator-readable title per bucket (`Contained threats` / `Warden decisions` / `Needs review` / `Flagged by system`).
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).

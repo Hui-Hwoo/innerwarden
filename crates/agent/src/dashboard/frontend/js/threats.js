@@ -272,7 +272,39 @@ function buildGroupedList(items) {
   if (state.hideAllowlisted) {
     items = items.filter(function(item) { return !isIpTrusted(item.value) && !isPrivateIp(item.value); });
   }
-  // Filter by outcome if set (e.g. from Home CTA click)
+  // Filter by outcome if set (e.g. from Home CTA click).
+  //
+  // Spec 049 PR14 expanded the bucket vocabulary:
+  //   - 'all_flagged'      \u2192 no filtering (every outcome visible)
+  //   - 'warden_decisions' \u2192 keep blocked / honeypot / monitoring / dismissed (the four Warden-decided buckets)
+  //   - 'needs_review'     \u2192 only needs_attention
+  //   - 'contained'        \u2192 blocked + honeypot (legacy bucket, kept)
+  //   - 'observing'        \u2192 monitoring
+  //   - 'filtered_out'     \u2192 dismissed (wire key); UI label "Filtered out"
+  var fOutcome = (state.filterOutcome || '').toLowerCase();
+  if (fOutcome === 'warden_decisions') {
+    items = items.filter(function(item) {
+      var o = (item.outcome || '').toLowerCase();
+      return o === 'blocked' || o === 'honeypot' || o === 'monitoring' || o === 'dismissed';
+    });
+  } else if (fOutcome === 'needs_review') {
+    items = items.filter(function(item) {
+      var o = (item.outcome || '').toLowerCase();
+      return o === 'needs_attention';
+    });
+  } else if (fOutcome === 'observing') {
+    items = items.filter(function(item) {
+      var o = (item.outcome || '').toLowerCase();
+      return o === 'monitoring';
+    });
+  } else if (fOutcome === 'filtered_out') {
+    items = items.filter(function(item) {
+      var o = (item.outcome || '').toLowerCase();
+      return o === 'dismissed';
+    });
+  }
+  // Note: `'contained'` is handled by the legacy branch below; `'all_flagged'` is a no-op.
+
   var titleEl = document.getElementById('entityTitle');
   // Spec 049 PR13 \u2014 unit-disambiguation subtitle.
   //
@@ -288,14 +320,34 @@ function buildGroupedList(items) {
     ? ' <span style="font-size:0.62rem;color:var(--muted);font-weight:500;letter-spacing:0.04em;margin-left:8px">' +
       '\u00b7 ' + esc(totalDisambig.label) + '</span>'
     : '';
+  // Spec 049 PR14 \u2014 operator-readable scoped titles. Each bucket
+  // gets its own header copy so the operator never wonders "why am
+  // I seeing fewer items than expected?" (the filter IS the
+  // reason). The `\u2715 show all` clear-link is the same across all
+  // scoped views so the operator can bail out with one click.
+  var clearLink = ' <span style="font-size:0.6rem;color:var(--muted);cursor:pointer;margin-left:6px" onclick="state.filterOutcome=null;refreshLeft(false)">\u2715 show all</span>';
+  var scopedTitle = null;
+  switch (fOutcome) {
+    case 'contained':        scopedTitle = 'Contained threats'; break;
+    case 'observing':        scopedTitle = 'Observing'; break;
+    case 'filtered_out':     scopedTitle = 'Filtered out'; break;
+    case 'warden_decisions': scopedTitle = 'Warden decisions'; break;
+    case 'needs_review':     scopedTitle = 'Needs review'; break;
+    case 'all_flagged':      scopedTitle = 'Flagged by system'; break;
+    default: break;
+  }
   if (state.filterOutcome === 'contained') {
     items = items.filter(function(item) {
       var o = (item.outcome || '').toLowerCase();
       return o === 'blocked' || o === 'honeypot';
     });
-    if (titleEl) titleEl.innerHTML = 'Blocked threats <span style="font-size:0.6rem;color:var(--muted);cursor:pointer;margin-left:6px" onclick="state.filterOutcome=null;refreshLeft(false)">\u2715 show all</span>';
-  } else {
-    if (titleEl) titleEl.innerHTML = 'AI Defense Log' + subtitleHtml;
+  }
+  if (titleEl) {
+    if (scopedTitle) {
+      titleEl.innerHTML = esc(scopedTitle) + clearLink + subtitleHtml;
+    } else {
+      titleEl.innerHTML = 'AI Defense Log' + subtitleHtml;
+    }
   }
   // Audit 2.6 partial: status dropdown filter. Restricts the
   // grouped list to a single outcome bucket. Country / campaign /

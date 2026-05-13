@@ -1437,6 +1437,107 @@ mod tests {
         );
     }
 
+    // ── Spec 049 PR14 anchors ───────────────────────────────────────
+    // Home strip → Cases scoped handoff. Operator clicks `170
+    // Flagged by system` on Home → Cases opens with outcome filter
+    // pre-applied and an operator-readable title. Closes the
+    // remaining "cade os 170 em threats?" reconciliation gap from
+    // operator review on 2026-05-13.
+
+    #[test]
+    fn home_js_defines_view_activity_scoped_handoff() {
+        assert!(
+            JS_HOME.contains("function viewActivityScoped("),
+            "home.js must define viewActivityScoped handoff (spec 049 PR14)"
+        );
+        assert!(
+            JS_HOME.contains("state.filterOutcome = bucket || 'all_flagged'"),
+            "viewActivityScoped must set state.filterOutcome to the requested bucket (default all_flagged)"
+        );
+    }
+
+    #[test]
+    fn home_strip_cards_route_to_scoped_buckets() {
+        // Each of the 4 strip cards (Events watched, Flagged by
+        // system, Warden decisions, Needs review) wires to a
+        // specific bucket. Events watched stays on `showView('sensors')`
+        // because the Cases tab has no per-event surface.
+        assert!(
+            INDEX_HTML.contains("onclick=\"viewActivityScoped('all_flagged')\""),
+            "Flagged by system card must route to all_flagged (operator reads 170 on Home, sees all 170 in Cases)"
+        );
+        assert!(
+            INDEX_HTML.contains("onclick=\"viewActivityScoped('warden_decisions')\""),
+            "Warden decisions card must route to warden_decisions bucket"
+        );
+        assert!(
+            INDEX_HTML.contains("onclick=\"viewActivityScoped('needs_review')\""),
+            "Needs review card must route to needs_review bucket"
+        );
+        assert!(
+            INDEX_HTML.contains("onclick=\"showView('sensors')\""),
+            "Events watched card stays routed to Sensors tab"
+        );
+    }
+
+    #[test]
+    fn home_subbreakdown_chips_route_to_scoped_buckets() {
+        for (chip, bucket) in [
+            ("contained", "viewActivityScoped('contained')"),
+            ("observing", "viewActivityScoped('observing')"),
+            ("filtered_out", "viewActivityScoped('filtered_out')"),
+        ] {
+            assert!(
+                INDEX_HTML.contains(bucket),
+                "{chip} chip must route to {bucket}"
+            );
+        }
+    }
+
+    #[test]
+    fn threats_js_filter_branches_handle_all_pr14_buckets() {
+        // The buildGroupedList filter logic must apply each bucket
+        // correctly. Without the branch the operator clicks
+        // "Warden decisions" and sees the full unfiltered list.
+        for needle in [
+            "fOutcome === 'warden_decisions'",
+            "fOutcome === 'needs_review'",
+            "fOutcome === 'observing'",
+            "fOutcome === 'filtered_out'",
+        ] {
+            assert!(
+                JS_THREATS.contains(needle),
+                "threats.js filter must branch on {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn threats_js_scoped_title_has_clear_link_per_bucket() {
+        // Each scoped title carries the `✕ show all` clear-link
+        // so the operator escapes the filter with one click.
+        // Anti-regression for a future "title-only no-clear" tweak.
+        assert!(
+            JS_THREATS.contains("var clearLink ="),
+            "threats.js must define the clearLink HTML once + reuse across buckets"
+        );
+        assert!(
+            JS_THREATS.contains("state.filterOutcome=null;refreshLeft(false)"),
+            "clear-link onclick must reset state.filterOutcome and re-render"
+        );
+        for title in [
+            "'Contained threats'",
+            "'Warden decisions'",
+            "'Needs review'",
+            "'Flagged by system'",
+        ] {
+            assert!(
+                JS_THREATS.contains(title),
+                "threats.js must emit scoped title {title}"
+            );
+        }
+    }
+
     // ── Spec 049 PR13 anchors ───────────────────────────────────────
     // Unit disambiguation + scope-aware AI Defense Log labels.
     // Resolves operator-reported gap (2026-05-13): Home strip showed

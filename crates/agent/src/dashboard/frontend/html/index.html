@@ -138,23 +138,26 @@
         Today
         <span class="home-section-sub" id="homeActivityWindow">since midnight UTC</span>
       </div>
+      <!-- Spec 049 PR14 — strip cards clickable to land in Cases
+           with the matching outcome filter pre-applied. Resolves
+           the "cade os 170 em threats?" reconciliation gap. -->
       <div class="activity-strip">
         <div class="activity-cell" onclick="showView('sensors')" role="button" tabindex="0" title="Total events recorded by all sensors today.">
           <div class="activity-num" id="homeActWatched">0</div>
           <div class="activity-label">events watched</div>
         </div>
         <span class="activity-sep" aria-hidden="true">&rarr;</span>
-        <div class="activity-cell" onclick="viewActivity()" role="button" tabindex="0" title="Total attackers the system classified today (Contained + Observing + Filtered out + Needs review). Spec 049 math contract.">
+        <div class="activity-cell" onclick="viewActivityScoped('all_flagged')" role="button" tabindex="0" title="Total attackers the system classified today (Contained + Observing + Filtered out + Needs review). Click to see all of them in Cases.">
           <div class="activity-num" id="homeActFlagged">0</div>
           <div class="activity-label">flagged by system</div>
         </div>
         <span class="activity-sep" aria-hidden="true">&rarr;</span>
-        <div class="activity-cell" onclick="viewActivity()" role="button" tabindex="0" title="Attackers Warden decided about without operator action: Contained (blocked / honeypot), Observing (monitor), or Filtered out (dismiss-as-noise). Dismiss is a decision, not a no-op.">
+        <div class="activity-cell" onclick="viewActivityScoped('warden_decisions')" role="button" tabindex="0" title="Attackers Warden decided about without operator action: Contained (blocked / honeypot), Observing (monitor), or Filtered out (dismiss-as-noise). Click to see them in Cases.">
           <div class="activity-num activity-num-ok" id="homeActStopped">0</div>
           <div class="activity-label">Warden decisions</div>
         </div>
         <span class="activity-sep" aria-hidden="true">&rarr;</span>
-        <div class="activity-cell activity-cell-attention" onclick="viewActivity()" role="button" tabindex="0" title="Attackers Warden could not resolve alone — your decision is needed.">
+        <div class="activity-cell activity-cell-attention" onclick="viewActivityScoped('needs_review')" role="button" tabindex="0" title="Attackers Warden could not resolve alone — your decision is needed.">
           <div class="activity-num" id="homeActAwaiting">0</div>
           <div class="activity-label">needs review</div>
         </div>
@@ -165,17 +168,17 @@
            Warden decision per Q1+Q7. Each chip's sum must equal
            homeActStopped (anchored by consistency_case_metrics.rs). -->
       <div class="home-activity-breakdown" id="homeActBreakdown">
-        <span class="breakdown-chip" data-outcome="contained" onclick="viewActivity()" role="button" tabindex="0" title="Block or honeypot redirect — defensive action taken.">
+        <span class="breakdown-chip" data-outcome="contained" onclick="viewActivityScoped('contained')" role="button" tabindex="0" title="Block or honeypot redirect — defensive action taken. Click to filter Cases to this bucket.">
           <span class="breakdown-num" id="homeActContained">0</span>
           <span class="breakdown-label">Contained</span>
         </span>
         <span class="breakdown-sep" aria-hidden="true">·</span>
-        <span class="breakdown-chip" data-outcome="observing" onclick="viewActivity()" role="button" tabindex="0" title="Warden is watching but did not act yet.">
+        <span class="breakdown-chip" data-outcome="observing" onclick="viewActivityScoped('observing')" role="button" tabindex="0" title="Warden is watching but did not act yet. Click to filter Cases to this bucket.">
           <span class="breakdown-num" id="homeActObserving">0</span>
           <span class="breakdown-label">Observing</span>
         </span>
         <span class="breakdown-sep" aria-hidden="true">·</span>
-        <span class="breakdown-chip" data-outcome="filtered_out" onclick="viewActivity()" role="button" tabindex="0" title="Analyzed and closed as low-risk noise — Warden decision, not a trash bin.">
+        <span class="breakdown-chip" data-outcome="filtered_out" onclick="viewActivityScoped('filtered_out')" role="button" tabindex="0" title="Analyzed and closed as low-risk noise — Warden decision, not a trash bin. Click to filter Cases to this bucket.">
           <span class="breakdown-num" id="homeActFilteredOut">0</span>
           <span class="breakdown-label">Filtered out</span>
         </span>
