@@ -56,6 +56,7 @@ pub(crate) fn try_autodismiss_noise(
         estimated_threat: "none".to_string(),
         execution_result: "dismissed".to_string(),
         prev_hash: None,
+        decision_layer: Some("algorithm_gate".to_string()),
     };
     if let Some(writer) = &mut state.decision_writer {
         if let Err(e) = writer.write(&entry) {
@@ -369,6 +370,7 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
         estimated_threat: "none".to_string(),
         execution_result: "dismissed".to_string(),
         prev_hash: None,
+        decision_layer: Some("algorithm_gate".to_string()),
     };
     if let Some(writer) = &mut state.decision_writer {
         if let Err(e) = writer.write(&entry) {
@@ -528,6 +530,7 @@ pub(crate) fn try_dismiss_cdn_noise(
         estimated_threat: "none".to_string(),
         execution_result: "dismissed".to_string(),
         prev_hash: None,
+        decision_layer: Some("algorithm_gate".to_string()),
     };
     if let Some(writer) = &mut state.decision_writer {
         if let Err(e) = writer.write(&entry) {
@@ -675,6 +678,7 @@ pub(crate) fn try_dismiss_honeypot_probe_proto_anomaly(
         estimated_threat: "none".to_string(),
         execution_result: "dismissed".to_string(),
         prev_hash: None,
+        decision_layer: Some("algorithm_gate".to_string()),
     };
     if let Some(writer) = &mut state.decision_writer {
         if let Err(e) = writer.write(&entry) {

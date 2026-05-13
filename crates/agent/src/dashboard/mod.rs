@@ -3271,6 +3271,7 @@ mod tests {
             estimated_threat: "high".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         std::fs::write(
             &decision_path,
@@ -3499,6 +3500,7 @@ mod tests {
             estimated_threat: "critical".to_string(),
             execution_result: "ok (dry_run)".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
 
         std::fs::write(
@@ -3589,6 +3591,7 @@ mod tests {
             estimated_threat: "critical".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
 
         std::fs::write(
@@ -3696,6 +3699,7 @@ mod tests {
             estimated_threat: "critical".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
 
         std::fs::write(
@@ -3894,6 +3898,7 @@ mod tests {
             estimated_threat: "high".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         assert_eq!(determine_outcome(&[blocked], "1.2.3.4", true), "blocked");
 
@@ -3913,6 +3918,7 @@ mod tests {
             estimated_threat: "high".to_string(),
             execution_result: "ok (dry_run)".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         assert_eq!(
             determine_outcome(&[dry_run_block], "1.2.3.4", true),
@@ -3936,6 +3942,7 @@ mod tests {
             estimated_threat: "high".to_string(),
             execution_result: "error: permission denied".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         assert_eq!(determine_outcome(&[failed], "1.2.3.4", true), "active");
 
@@ -3966,6 +3973,7 @@ mod tests {
             estimated_threat: "medium".to_string(),
             execution_result: "pending-fase4".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         assert_eq!(
             determine_outcome(&[escalated], "1.2.3.4", true),
@@ -3992,6 +4000,7 @@ mod tests {
             estimated_threat: "medium".to_string(),
             execution_result: "pending-fase4".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         let block = DecisionEntry {
             ts: Utc::now(),
@@ -4009,6 +4018,7 @@ mod tests {
             estimated_threat: "high".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         assert_eq!(
             determine_outcome(&[escalated, block], "1.2.3.4", true),
@@ -4047,6 +4057,7 @@ mod tests {
             estimated_threat: "manual".to_string(),
             execution_result: "ok (dry_run)".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
 
         append_decision_entry(dir.path(), &entry, None).unwrap();
@@ -6636,5 +6647,177 @@ mod tests {
             "PR18 — one inserted incident must land as exactly one KG \
              node, not zero (missed) and not two (double-count)"
         );
+    }
+
+    // ── Spec 049 PR17 — write-time pinning anchors ───────────────────
+    //
+    // PR16 fixed two algorithm-gate providers at READ time. PR17
+    // closes the bug class at WRITE time: every prod writer pins
+    // `decision_layer` on the `DecisionEntry`, and the read path
+    // prefers that pin over the heuristic. These anchors are
+    // cross-file source-grep tripwires — a future PR that adds a
+    // new `DecisionEntry` writer without setting `decision_layer:`
+    // fails CI loudly instead of silently regressing the
+    // operator-visible drill-down to "Unknown".
+
+    #[test]
+    fn pr17_struct_carries_decision_layer_field() {
+        // The persisted record gains the pinned field. Without it,
+        // the writer cannot declare its layer at emit time and the
+        // whole PR17 contract collapses back to the read-time
+        // heuristic.
+        const DECISIONS_SRC: &str = include_str!("../decisions.rs");
+        assert!(
+            DECISIONS_SRC.contains("pub decision_layer: Option<String>,"),
+            "PR17 — DecisionEntry must expose `decision_layer: \
+             Option<String>` so each writer can pin the spec 049 \
+             §8.2.E layer at emit time. Option<> (not String) so \
+             pre-PR17 JSONL still deserialises via serde(default)."
+        );
+        assert!(
+            DECISIONS_SRC.contains("#[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub decision_layer: Option<String>,"),
+            "PR17 — the serde attributes are load-bearing: \
+             `default` lets pre-PR17 JSONL deserialise; \
+             `skip_serializing_if` keeps fresh entries compact when \
+             no pin is set (test/synthetic paths)."
+        );
+    }
+
+    #[test]
+    fn pr17_classifier_exposes_pinned_first_entry_point() {
+        // The read path must call the new entry point that prefers
+        // pinned over heuristic. Removing this function would force
+        // callers back to the legacy `*_from_fields` path and
+        // regress the bug class PR17 closes.
+        const PROV_SRC: &str = include_str!("decision_provenance.rs");
+        assert!(
+            PROV_SRC.contains("pub(super) fn classify_decision_layer(\n    pinned: Option<&str>,"),
+            "PR17 — decision_provenance.rs must expose \
+             `classify_decision_layer` that takes the pinned field \
+             as its first argument. The legacy heuristic entry \
+             point stays as `*_from_fields` for the fallback path."
+        );
+        assert!(
+            PROV_SRC.contains("DecisionLayer::from_pinned_str(s)"),
+            "PR17 — the pinned-first entry point must parse the \
+             pinned string via `from_pinned_str` (round-trip with \
+             `as_str`) so the writer-side and read-side agree on \
+             the canonical strings."
+        );
+    }
+
+    #[test]
+    fn pr17_investigation_read_path_passes_pinned_field() {
+        // The dashboard's journey builder is THE prod caller of the
+        // classifier. PR17 wires it to extract `decision_layer` from
+        // the parsed decision JSON and pass it through. Without
+        // this, the writer's pin sits in the JSONL but the
+        // drill-down never reads it.
+        const INV_SRC: &str = include_str!("investigation.rs");
+        assert!(
+            INV_SRC.contains("v.get(\"decision_layer\").and_then(|x| x.as_str())"),
+            "PR17 — investigation.rs must extract `decision_layer` \
+             from the parsed decision JSON when building the \
+             journey row. Without this the pinned field is \
+             persisted but the read path silently ignores it."
+        );
+        assert!(
+            INV_SRC.contains("crate::dashboard::decision_provenance::classify_decision_layer("),
+            "PR17 — the prod read-path call site must use the \
+             pinned-first entry point. Routing back to \
+             `*_from_fields` would lose the pin and regress to the \
+             pre-PR17 heuristic-only behaviour."
+        );
+    }
+
+    #[test]
+    fn pr17_every_prod_writer_sets_decision_layer() {
+        // Cross-file source-grep anchor: every file that constructs
+        // a `DecisionEntry` for production (NOT inside `#[cfg(test)]`
+        // or test-helper fns) must include a `decision_layer:` line.
+        // Hand-curated list — adding a new writer means adding it
+        // here AND setting the field at the new site, in lockstep.
+        //
+        // Tests use `decision_layer: None` which still matches the
+        // grep (they all include the key), so this anchor doubles as
+        // a "did you remember to set this field anywhere" check.
+        let writer_files: &[(&str, &str)] = &[
+            ("incident_obvious", include_str!("../incident_obvious.rs")),
+            (
+                "incident_autodismiss",
+                include_str!("../incident_autodismiss.rs"),
+            ),
+            (
+                "incident_ai_failure",
+                include_str!("../incident_ai_failure.rs"),
+            ),
+            ("incident_flow", include_str!("../incident_flow.rs")),
+            (
+                "incident_auto_rules",
+                include_str!("../incident_auto_rules.rs"),
+            ),
+            ("incident_crowdsec", include_str!("../incident_crowdsec.rs")),
+            (
+                "incident_abuseipdb",
+                include_str!("../incident_abuseipdb.rs"),
+            ),
+            (
+                "incident_honeypot_router",
+                include_str!("../incident_honeypot_router.rs"),
+            ),
+            (
+                "incident_honeypot_suggestion",
+                include_str!("../incident_honeypot_suggestion.rs"),
+            ),
+            (
+                "incident_audit_write",
+                include_str!("../incident_audit_write.rs"),
+            ),
+            ("killchain_inline", include_str!("../killchain_inline.rs")),
+            (
+                "correlation_response",
+                include_str!("../correlation_response.rs"),
+            ),
+            (
+                "narrative_observation_verify",
+                include_str!("../narrative_observation_verify.rs"),
+            ),
+            (
+                "honeypot_always_on",
+                include_str!("../honeypot_always_on.rs"),
+            ),
+            (
+                "honeypot_post_session",
+                include_str!("../honeypot_post_session.rs"),
+            ),
+            ("orphan_recovery", include_str!("../orphan_recovery.rs")),
+            ("bot_actions", include_str!("../bot_actions.rs")),
+            ("bot_helpers", include_str!("../bot_helpers.rs")),
+            ("dashboard/actions", include_str!("actions.rs")),
+            ("process/incidents", include_str!("../process/incidents.rs")),
+        ];
+        for (name, src) in writer_files {
+            // Accept any of the three valid PR17 pin forms:
+            //   1. struct-literal: `decision_layer: Some("...")` /
+            //      `decision_layer: None`
+            //   2. post-construction: `entry.decision_layer = Some(...)`
+            //   3. routing through `decisions::build_entry`, which
+            //      auto-pins from the `ai_provider` name (so a writer
+            //      whose only DecisionEntry comes from that helper
+            //      is implicitly compliant).
+            let has_struct_field = src.contains("decision_layer:");
+            let has_override = src.contains(".decision_layer = ");
+            let routes_through_build_entry = src.contains("decisions::build_entry(");
+            assert!(
+                has_struct_field || has_override || routes_through_build_entry,
+                "PR17 — prod writer `{name}` must pin `decision_layer` \
+                 via one of: struct-literal field, post-construction \
+                 `.decision_layer = ` assignment, or routing through \
+                 `decisions::build_entry` (which auto-pins from the AI \
+                 provider name). Without any of these, the writer \
+                 silently emits unpinned rows and the drill-down falls \
+                 back to the heuristic for this code path."
+            );
+        }
     }
 }

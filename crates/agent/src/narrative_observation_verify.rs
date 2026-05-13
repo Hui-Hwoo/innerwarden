@@ -637,6 +637,7 @@ fn write_escalate_decision(
         estimated_threat: "medium".to_string(),
         execution_result: "pending-fase4".to_string(),
         prev_hash: None,
+        decision_layer: Some("observation_verifier".to_string()),
     };
     if let Err(e) = writer.write(&entry) {
         tracing::warn!(

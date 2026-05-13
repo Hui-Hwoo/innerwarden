@@ -167,6 +167,7 @@ pub(crate) async fn handle_telegram_action_callback(
                 estimated_threat: "manual".to_string(),
                 execution_result: exec_result.message.clone(),
                 prev_hash: None,
+                decision_layer: Some("manual_operator".to_string()),
             };
             if let Err(e) = writer.write(&entry) {
                 warn!("failed to write quick-block decision entry: {e:#}");
@@ -269,6 +270,7 @@ pub(crate) async fn handle_telegram_action_callback(
                             estimated_threat: "high".to_string(),
                             execution_result: msg.clone(),
                             prev_hash: None,
+                            decision_layer: Some("manual_operator".to_string()),
                         };
                         if let Err(e) = writer.write(&entry) {
                             warn!("failed to write honeypot decision entry: {e:#}");
@@ -361,6 +363,7 @@ pub(crate) async fn handle_telegram_action_callback(
                             estimated_threat: "high".to_string(),
                             execution_result: exec_result.message.clone(),
                             prev_hash: None,
+                            decision_layer: Some("manual_operator".to_string()),
                         };
                         if let Err(e) = writer.write(&entry) {
                             warn!("failed to write honeypot-block decision entry: {e:#}");
@@ -396,6 +399,7 @@ pub(crate) async fn handle_telegram_action_callback(
                         estimated_threat: "medium".to_string(),
                         execution_result: "monitoring: no active action taken".to_string(),
                         prev_hash: None,
+                        decision_layer: Some("manual_operator".to_string()),
                     };
                     if let Err(e) = writer.write(&entry) {
                         warn!("failed to write monitor decision entry: {e:#}");
@@ -425,6 +429,7 @@ pub(crate) async fn handle_telegram_action_callback(
                         estimated_threat: "low".to_string(),
                         execution_result: "ignored by operator".to_string(),
                         prev_hash: None,
+                        decision_layer: Some("manual_operator".to_string()),
                     };
                     if let Err(e) = writer.write(&entry) {
                         warn!("failed to write ignore decision entry: {e:#}");
@@ -513,7 +518,7 @@ pub(crate) async fn handle_pending_confirmation(
     // Audit trail with ai_provider = "telegram:<operator>"
     if let Some(writer) = &mut state.decision_writer {
         let provider = format!("telegram:{}", result.operator_name);
-        let entry = decisions::build_entry(
+        let mut entry = decisions::build_entry(
             &incident.incident_id,
             &incident.host,
             &provider,
@@ -521,6 +526,10 @@ pub(crate) async fn handle_pending_confirmation(
             cfg.responder.dry_run,
             &exec_result,
         );
+        // PR17: override the auto-derived layer — `telegram:<op>` provider
+        // does not match the AI-router pattern, but the decision is
+        // operator-driven by definition.
+        entry.decision_layer = Some("manual_operator".to_string());
         if let Err(e) = writer.write(&entry) {
             warn!("failed to write Telegram decision entry: {e:#}");
         }

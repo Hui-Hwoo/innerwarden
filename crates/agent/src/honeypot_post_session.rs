@@ -279,6 +279,7 @@ pub(crate) async fn spawn_post_session_tasks(
                             format!("failed: {}", result.message)
                         },
                         prev_hash: None,
+                        decision_layer: Some("honeypot_post_session".to_string()),
                     };
                     if let Err(e) =
                         decisions::append_chained(data_dir, &entry, sqlite_store.as_ref())

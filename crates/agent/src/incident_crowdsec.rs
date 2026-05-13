@@ -100,7 +100,7 @@ pub(crate) async fn try_handle_crowdsec_autoblock(
     }
 
     if let Some(writer) = &mut state.decision_writer {
-        let entry = decisions::build_entry(
+        let mut entry = decisions::build_entry(
             &incident.incident_id,
             &incident.host,
             "crowdsec",
@@ -108,6 +108,7 @@ pub(crate) async fn try_handle_crowdsec_autoblock(
             cfg.responder.dry_run,
             &execution_result,
         );
+        entry.decision_layer = Some("algorithm_gate".to_string());
         if let Some(profile) = state.attacker_profiles.get_mut(ip.as_str()) {
             attacker_intel::observe_decision(profile, &entry);
         }

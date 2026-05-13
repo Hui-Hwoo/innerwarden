@@ -128,6 +128,7 @@ pub(crate) fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
             estimated_threat: "none".to_string(),
             execution_result: "dismissed".to_string(),
             prev_hash: None,
+            decision_layer: Some("auto_rule".to_string()),
         };
         match crate::decisions::append_chained(data_dir, &entry, Some(store)) {
             Ok(()) => written += 1,

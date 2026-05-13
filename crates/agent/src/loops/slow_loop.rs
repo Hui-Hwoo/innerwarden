@@ -1808,6 +1808,7 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
                 estimated_threat: String::new(),
                 execution_result: "ok".into(),
                 prev_hash: None,
+                decision_layer: None,
             })
             .unwrap()
         )
@@ -1882,6 +1883,7 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             estimated_threat: "high".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
         let decisions_path = dir.path().join(format!("decisions-{today}.jsonl"));

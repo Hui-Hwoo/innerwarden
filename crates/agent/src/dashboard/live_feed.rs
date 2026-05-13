@@ -446,6 +446,7 @@ pub(super) fn build_live_feed_response(
                     },
                     estimated_threat: String::new(),
                     prev_hash: None,
+                    decision_layer: None,
                 });
             }
         }
@@ -1115,6 +1116,7 @@ mod tests {
             estimated_threat: String::new(),
             execution_result: "ok".into(),
             prev_hash: None,
+            decision_layer: None,
         }
     }
 
@@ -1446,6 +1448,7 @@ mod tests {
             execution_result: "ok".into(),
             estimated_threat: String::new(),
             prev_hash: None,
+            decision_layer: None,
         }
     }
 

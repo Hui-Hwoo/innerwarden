@@ -592,6 +592,22 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::pr18_replay_primitive_is_idempotent_on_repeat` — running the replay twice over the same data must not double-count KG nodes. Relies on `ingest_incident`'s `upsert_node` semantics on `incident_id`. Without this invariant, every boot would double the surviving overlap between snapshot and SQLite.
 
+- `crates/agent/src/dashboard/decision_provenance.rs::tests::classify_decision_layer_prefers_pinned_over_heuristic` — spec 049 PR17 contract: when a writer pins `decision_layer`, the classifier must trust it even when the heuristic would have produced a different answer. Without this, the entire write-time-pinning design is decorative.
+
+- `crates/agent/src/dashboard/decision_provenance.rs::tests::classify_decision_layer_falls_back_to_heuristic_when_no_pin` — pre-PR17 JSONL entries (no `decision_layer` field, serde defaults to `None`) must still classify correctly via the heuristic. Anti-regression for the legacy compatibility path.
+
+- `crates/agent/src/dashboard/decision_provenance.rs::tests::classify_decision_layer_falls_back_to_heuristic_on_unknown_pinned_string` — defensive: a writer that ships a typo or future-version-only layer string must not crash the drill-down. The heuristic kicks in and produces a useful answer instead of "writer typed gibberish".
+
+- `crates/agent/src/dashboard/decision_provenance.rs::tests::from_pinned_str_covers_every_layer_variant` — round-trip pin: every `DecisionLayer` variant must parse back from its `as_str()` form via `from_pinned_str`. A new variant added without updating `from_pinned_str` fails here loudly instead of silently rejecting valid pins.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr17_struct_carries_decision_layer_field` — source-grep on `decisions.rs` asserting `DecisionEntry` carries `decision_layer: Option<String>` with the `#[serde(default, skip_serializing_if = "Option::is_none")]` attributes. Pre-PR17 JSONL must still deserialise; fresh test entries must stay compact.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr17_classifier_exposes_pinned_first_entry_point` — source-grep on `decision_provenance.rs` asserting `classify_decision_layer` (the pinned-first entry point) exists and calls `from_pinned_str`. Removing the function would force callers back to the legacy `*_from_fields` path and regress the bug class PR17 closes.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr17_investigation_read_path_passes_pinned_field` — source-grep on `investigation.rs` asserting the prod read-path call site extracts `decision_layer` from the parsed decision JSON and calls `classify_decision_layer`. Without this the pinned field is persisted but the drill-down silently ignores it.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr17_every_prod_writer_sets_decision_layer` — cross-file source-grep across 20 prod writer files (incident_obvious, incident_autodismiss, killchain_inline, correlation_response, narrative_observation_verify, honeypot_always_on, honeypot_post_session, bot_actions, dashboard/actions, process/incidents, etc.). Each must pin `decision_layer` via struct-literal field, `.decision_layer = ` assignment, or routing through `decisions::build_entry` (which auto-pins from the AI provider name). A new writer landing without any of these forms fails this anchor at CI.
+
 - `crates/agent/src/dashboard/mod.rs::tests::threats_kpi_tile_label_is_blocks_not_blocked` (extended in Wave 10) - the Threats KPI tile reads "Block actions" / "today" (aggregate, decisions) and the sidebar group reads "Currently blocked attackers" (snapshot, unique IPs). Pre-Wave-10 the labels read "Blocks · Today" and "Blocked attackers" — same page, different answers, no copy disclosing the snapshot-vs-aggregate axis. Operator's hard rule (2026-05-05): every label must explicitly disclose window + scope + cardinality unit. The test name predates Wave 10 (kept for git-blame continuity); the docstring has been updated to reflect the new disambiguation pair.
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_live_feed_clips_to_rolling_24h_matching_site_label` - the public live-feed builder (`build_live_feed_response`) clips `real_incidents` to `now - 24h` so the site's hardcoded "(24h)" labels (`Live.tsx:415,422,429`) match the underlying data. Source-grep anchor: pins `cutoff_24h = now - chrono::Duration::hours(24)` AND `i.ts >= cutoff_24h` filter in active code. A future "remove the cutoff for performance" PR fails CI loudly.
 

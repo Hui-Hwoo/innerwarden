@@ -1050,6 +1050,7 @@ mod tests {
             estimated_threat: "high".into(),
             execution_result: "ok".into(),
             prev_hash: None,
+            decision_layer: None,
         };
         observe_decision(&mut p, &dec);
 

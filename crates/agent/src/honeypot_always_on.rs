@@ -397,6 +397,7 @@ async fn handle_always_on_connection(
                         format!("failed: {}", result.message)
                     },
                     prev_hash: None,
+                    decision_layer: Some("honeypot_post_session".to_string()),
                 };
                 if let Err(e) = decisions::append_chained(&data_dir, &entry, sqlite_store.as_ref())
                 {
@@ -710,6 +711,7 @@ async fn always_on_abuseipdb_block(
         estimated_threat: "known-malicious".to_string(),
         execution_result: "ok".to_string(),
         prev_hash: None,
+        decision_layer: Some("honeypot_post_session".to_string()),
     };
 
     if let Err(e) = decisions::append_chained(data_dir, &entry, sqlite_store) {

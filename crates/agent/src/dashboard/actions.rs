@@ -371,6 +371,7 @@ pub(super) async fn api_action_honeypot(
                     "incident_injected".to_string()
                 },
                 prev_hash: None,
+                decision_layer: Some("manual_operator".to_string()),
             };
             if let Err(e) =
                 append_decision_entry(&state.data_dir, &entry, state.sqlite_store.as_ref())
@@ -545,6 +546,7 @@ pub(super) async fn execute_block_ip(
         estimated_threat: "manual".to_string(),
         execution_result: result_str,
         prev_hash: None,
+        decision_layer: Some("manual_operator".to_string()),
     };
 
     append_decision_entry(data_dir, &entry, store)?;
@@ -655,6 +657,7 @@ pub(super) async fn execute_suspend_user(
         estimated_threat: "manual".to_string(),
         execution_result: result_str,
         prev_hash: None,
+        decision_layer: Some("manual_operator".to_string()),
     };
 
     append_decision_entry(data_dir, &entry, store)?;

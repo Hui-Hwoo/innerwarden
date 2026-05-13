@@ -244,6 +244,7 @@ pub(crate) fn evaluate_pre_ai_flow(
                 estimated_threat: "none".to_string(),
                 execution_result: "test-ok".to_string(),
                 prev_hash: None,
+                decision_layer: Some("algorithm_gate".to_string()),
             };
             if let Some(writer) = &mut state.decision_writer {
                 if let Err(e) = writer.write(&entry) {

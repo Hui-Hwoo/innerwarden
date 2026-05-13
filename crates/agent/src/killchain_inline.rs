@@ -350,6 +350,7 @@ pub(crate) fn dismiss_operator_session_incidents(
             estimated_threat: "none".to_string(),
             execution_result: "dismissed".to_string(),
             prev_hash: None,
+            decision_layer: Some("killchain_fast_path".to_string()),
         };
         if let Err(e) = crate::decisions::append_chained(data_dir, &entry, sqlite_store) {
             warn!(
@@ -626,6 +627,7 @@ pub(crate) fn dismiss_self_traffic_incidents(
             estimated_threat: "none".to_string(),
             execution_result: "dismissed".to_string(),
             prev_hash: None,
+            decision_layer: Some("killchain_fast_path".to_string()),
         };
         if let Err(e) = crate::decisions::append_chained(data_dir, &entry, sqlite_store) {
             warn!(

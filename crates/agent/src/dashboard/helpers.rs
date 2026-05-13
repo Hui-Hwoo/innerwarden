@@ -923,6 +923,7 @@ mod tests {
             estimated_threat: "medium".into(),
             execution_result: "pending-fase4".into(),
             prev_hash: None,
+            decision_layer: None,
         };
         let monitor = DecisionEntry {
             ts: chrono::Utc::now(),
@@ -940,6 +941,7 @@ mod tests {
             estimated_threat: "low".into(),
             execution_result: "ok".into(),
             prev_hash: None,
+            decision_layer: None,
         };
         let mut ips = BTreeSet::new();
         ips.insert("1.2.3.4".into());

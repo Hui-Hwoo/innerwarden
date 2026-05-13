@@ -212,6 +212,7 @@ async fn handle_completed_chain(
         estimated_threat: decision.estimated_threat.clone(),
         execution_result: execution_result.clone(),
         prev_hash: None,
+        decision_layer: Some("correlation_rule".to_string()),
     };
     if let Some(writer) = &mut state.decision_writer {
         if let Err(e) = writer.write(&entry) {
@@ -473,6 +474,7 @@ async fn check_repeat_offenders(
             estimated_threat: "high".to_string(),
             execution_result: execution_result.clone(),
             prev_hash: None,
+            decision_layer: Some("correlation_rule".to_string()),
         };
         if let Some(writer) = &mut state.decision_writer {
             if let Err(e) = writer.write(&entry) {
@@ -616,6 +618,7 @@ async fn check_multi_technique(data_dir: &Path, cfg: &config::AgentConfig, state
             estimated_threat: "high".to_string(),
             execution_result: execution_result.clone(),
             prev_hash: None,
+            decision_layer: Some("correlation_rule".to_string()),
         };
         if let Some(writer) = &mut state.decision_writer {
             if let Err(e) = writer.write(&entry) {

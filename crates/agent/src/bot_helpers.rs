@@ -1182,6 +1182,7 @@ pub(crate) fn write_telegram_triage_audit(
             estimated_threat: "manual".to_string(),
             execution_result,
             prev_hash: None,
+            decision_layer: Some("manual_operator".to_string()),
         };
         if let Err(e) = writer.write(&entry) {
             warn!(

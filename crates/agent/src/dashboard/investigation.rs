@@ -2116,6 +2116,13 @@ pub(super) fn build_journey_from_sqlite(
             .and_then(|v| v.get("ai_provider").and_then(|x| x.as_str()))
             .unwrap_or("")
             .to_string();
+        // Spec 049 PR17 — write-time-pinned decision layer. Optional;
+        // pre-PR17 rows do not carry the field and the classifier
+        // falls back to the legacy heuristic in that case.
+        let decision_layer_pinned = parsed_decision
+            .as_ref()
+            .and_then(|v| v.get("decision_layer").and_then(|x| x.as_str()))
+            .map(|s| s.to_string());
 
         // Decision entry (if present). Outcome is computed via the
         // canonical contract so the verdict line agrees with the
@@ -2133,18 +2140,19 @@ pub(super) fn build_journey_from_sqlite(
                     "skipped".to_string()
                 }
             });
-            // Spec 049 PR9: classify the decision provenance from the
-            // already-parsed fields and inject the operator-facing
-            // labels into the journey row. Pure read-time derivation —
-            // see `decision_provenance::classify_decision_layer_from_fields`.
+            // Spec 049 PR9 + PR17: classify the decision provenance.
+            // PR17 prefers the write-time-pinned `decision_layer`
+            // field; the legacy heuristic is the fallback for
+            // pre-PR17 JSONL entries and for any pinned string the
+            // writer side mistypes.
             let reason_str = reason.clone().unwrap_or_default();
             let confidence_f32 = confidence.map(|c| c as f32);
-            let provenance =
-                crate::dashboard::decision_provenance::classify_decision_layer_from_fields(
-                    &decision_ai_provider,
-                    &reason_str,
-                    confidence_f32,
-                );
+            let provenance = crate::dashboard::decision_provenance::classify_decision_layer(
+                decision_layer_pinned.as_deref(),
+                &decision_ai_provider,
+                &reason_str,
+                confidence_f32,
+            );
             entries.push(JourneyEntry {
                 ts,
                 kind: "decision".to_string(),
@@ -2386,22 +2394,26 @@ pub(super) fn build_journey_from_graph(
                                 "skipped".to_string()
                             }
                         });
-                // Spec 049 PR9: classify provenance. The KG Incident
-                // node does NOT carry `ai_provider`, so this path
-                // relies on the reason-string heuristics in the
-                // classifier. When the reason is generic, the layer
-                // falls through to `unknown` (honest — no provider
-                // recorded). The SQLite path (production primary)
-                // has the provider and produces precise labels.
+                // Spec 049 PR9 + PR17: classify provenance. The KG
+                // Incident node does NOT carry `ai_provider` OR
+                // `decision_layer` — the KG ingestion path only
+                // captures the action+reason+confidence triple. So
+                // this branch always misses the pinned signal and
+                // falls back to the reason-string heuristic. The
+                // SQLite path (production primary) has both the
+                // provider AND the pinned layer and produces
+                // precise labels. A future PR can teach the KG
+                // ingest to capture `decision_layer` if needed; for
+                // now the heuristic floor is honest about its limits.
                 let reason_str = decision_reason.as_deref().unwrap_or("").to_string();
                 // KG path: confidence is already `Option<f32>` on the
                 // Incident node — no cast required.
-                let provenance =
-                    crate::dashboard::decision_provenance::classify_decision_layer_from_fields(
-                        "",
-                        &reason_str,
-                        *confidence,
-                    );
+                let provenance = crate::dashboard::decision_provenance::classify_decision_layer(
+                    None,
+                    "",
+                    &reason_str,
+                    *confidence,
+                );
                 entries.push(JourneyEntry {
                     ts: *ts,
                     kind: "decision".to_string(),

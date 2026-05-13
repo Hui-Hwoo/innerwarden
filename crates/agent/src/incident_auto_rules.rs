@@ -167,6 +167,7 @@ pub(crate) async fn try_handle_auto_rule(
         estimated_threat: "high".to_string(),
         execution_result: execution_result.clone(),
         prev_hash: None,
+        decision_layer: Some("auto_rule".to_string()),
     };
     if let Some(writer) = &mut state.decision_writer {
         if let Err(e) = writer.write(&entry) {

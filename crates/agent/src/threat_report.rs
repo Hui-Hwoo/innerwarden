@@ -884,6 +884,7 @@ mod tests {
             estimated_threat: "high".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         })
         .unwrap()
     }

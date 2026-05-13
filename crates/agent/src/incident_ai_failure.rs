@@ -57,6 +57,7 @@ fn build_ai_failure_entry(
         estimated_threat: "unknown".to_string(),
         execution_result: "ai_error".to_string(),
         prev_hash: None,
+        decision_layer: Some("algorithm_gate".to_string()),
     }
 }
 

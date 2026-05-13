@@ -870,6 +870,7 @@ fn try_kg_fp_suppression(
         estimated_threat: "none".to_string(),
         execution_result: "dismissed".to_string(),
         prev_hash: None,
+        decision_layer: Some("algorithm_gate".to_string()),
     };
     if let Some(writer) = &mut state.decision_writer {
         if let Err(e) = writer.write(&entry) {

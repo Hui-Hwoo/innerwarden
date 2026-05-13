@@ -76,6 +76,28 @@ impl DecisionLayer {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Spec 049 PR17 — reverse of `as_str`. Used by the read-time
+    /// classifier to honour a writer's pinned `decision_layer` field
+    /// before falling back to the heuristic. Returns `None` for
+    /// strings the writer side does not recognise — the caller treats
+    /// that as "writer ships a bogus pin, fall back to heuristic" so
+    /// a typo can never break the drill-down hard.
+    pub(super) fn from_pinned_str(s: &str) -> Option<Self> {
+        match s {
+            "algorithm_gate" => Some(Self::AlgorithmGate),
+            "killchain_fast_path" => Some(Self::KillchainFastPath),
+            "correlation_rule" => Some(Self::CorrelationRule),
+            "ai_local_warden" => Some(Self::AiLocalWarden),
+            "ai_llm" => Some(Self::AiLlm),
+            "auto_rule" => Some(Self::AutoRule),
+            "honeypot_post_session" => Some(Self::HoneypotPostSession),
+            "observation_verifier" => Some(Self::ObservationVerifier),
+            "manual_operator" => Some(Self::ManualOperator),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 /// A `DecisionLayer` plus an operator-facing `detail` line. The
@@ -226,6 +248,56 @@ pub(super) fn classify_decision_layer_from_fields(
     }
 }
 
+/// Spec 049 PR17 — read-time classifier with **write-time pinning
+/// preferred over heuristic**.
+///
+/// PR9 derived `DecisionLayer` purely from the legacy fields
+/// (`ai_provider`, `reason`, `confidence`). The problem it created:
+/// every new writer site that emitted a provider string the
+/// classifier did not yet know about silently demoted the
+/// drill-down to "Unknown". Operator-reported on 2026-05-13 with
+/// `obvious-gate` and `noise-gate` (fixed at read time by PR16) —
+/// PR17 closes the class of bug by letting writers declare the
+/// layer at emit time.
+///
+/// Ordering:
+/// 1. If `pinned` is `Some(s)` AND `s` parses to a known layer →
+///    return that layer with a detail that names the pin.
+/// 2. Otherwise (pre-PR17 JSONL row, or pinned string the writer
+///    side does not recognise) → fall through to the heuristic.
+///
+/// The fallback path is critical: legacy entries written before
+/// PR17 must still drill-down meaningfully, and a typo on the
+/// writer side must not crash the operator-visible UI hard.
+pub(super) fn classify_decision_layer(
+    pinned: Option<&str>,
+    ai_provider: &str,
+    reason: &str,
+    confidence: Option<f32>,
+) -> DecisionProvenance {
+    if let Some(s) = pinned {
+        if let Some(layer) = DecisionLayer::from_pinned_str(s) {
+            // The detail prefers the pinned string verbatim (so the
+            // operator can confirm "we trusted the writer's claim,
+            // here is what they claimed") and falls back to the
+            // existing heuristic detail logic for known layers that
+            // benefit from extra context. For now we keep the detail
+            // string simple and self-evident.
+            let detail = if ai_provider.is_empty() {
+                format!("pinned: {}", layer.as_str())
+            } else {
+                format!("pinned: {} (provider: {ai_provider})", layer.as_str())
+            };
+            return DecisionProvenance { layer, detail };
+        }
+        // Bogus pinned string — fall through to heuristic instead of
+        // returning Unknown immediately. The heuristic may still find
+        // a correct layer from provider/reason, and the operator gets
+        // a useful answer instead of "writer typed gibberish".
+    }
+    classify_decision_layer_from_fields(ai_provider, reason, confidence)
+}
+
 /// Trim a reason to a readable single-line snippet for the
 /// drill-down `detail` field. Long stack-trace-like reasons make
 /// the row visually noisy.
@@ -243,6 +315,99 @@ fn short_reason(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Spec 049 PR17 — pinned-first classifier ─────────────────────
+    //
+    // The bug PR16 patched at read time (a writer's `obvious-gate`
+    // provider silently demoting to "Unknown" because the classifier
+    // had no branch for it) can come back as soon as a new writer
+    // lands. PR17's pinned-first design closes the class: the writer
+    // declares the layer at emit time and the read path stops
+    // guessing. These tests pin every observable axis of the new
+    // entry point so a refactor that drops the pin-first contract or
+    // breaks the heuristic fallback fails CI loudly.
+
+    #[test]
+    fn classify_decision_layer_prefers_pinned_over_heuristic() {
+        // Pinned `manual_operator` must win even when the heuristic
+        // would classify the provider as `algorithm_gate` (here: the
+        // `allowlist` reason that the heuristic hits at the end of
+        // the function). This is THE invariant — without it the
+        // pinned field is decorative.
+        let p = classify_decision_layer(
+            Some("manual_operator"),
+            "obvious-gate",
+            "allowlist matched",
+            Some(0.9),
+        );
+        assert_eq!(p.layer, DecisionLayer::ManualOperator);
+        assert!(
+            p.detail.starts_with("pinned: manual_operator"),
+            "detail must name the pin so an operator auditing the row \
+             can confirm 'we trusted the writer's claim, here is what \
+             they claimed'. Got: {}",
+            p.detail
+        );
+    }
+
+    #[test]
+    fn classify_decision_layer_falls_back_to_heuristic_when_no_pin() {
+        // Legacy JSONL entries (written before PR17) carry no
+        // `decision_layer` field and serde defaults the Option to
+        // None. They must still classify correctly via the heuristic.
+        let p = classify_decision_layer(None, "obvious-gate", "fast path block", Some(0.95));
+        // `obvious-gate` was added to the heuristic in PR16; this
+        // test pins the legacy path keeps working post-PR17.
+        assert_eq!(p.layer, DecisionLayer::AlgorithmGate);
+    }
+
+    #[test]
+    fn classify_decision_layer_falls_back_to_heuristic_on_unknown_pinned_string() {
+        // Defensive: if a writer ever ships a bogus pinned string
+        // (typo, future-version-only layer name), the classifier
+        // must not return Unknown immediately. The heuristic may
+        // still give a correct answer, and the operator gets useful
+        // drill-down instead of "writer typed gibberish".
+        let p = classify_decision_layer(
+            Some("not-a-real-layer-string"),
+            "openai",
+            "decision",
+            Some(0.8),
+        );
+        // Heuristic recognises `openai` as ai_llm.
+        assert_eq!(p.layer, DecisionLayer::AiLlm);
+    }
+
+    #[test]
+    fn from_pinned_str_covers_every_layer_variant() {
+        // The frontend keys on the snake_case strings, and the
+        // writer side serialises into those same strings. This
+        // anchor pins the round-trip so renaming a variant (or
+        // adding a new one without updating from_pinned_str) fails
+        // here loudly.
+        let all = [
+            ("algorithm_gate", DecisionLayer::AlgorithmGate),
+            ("killchain_fast_path", DecisionLayer::KillchainFastPath),
+            ("correlation_rule", DecisionLayer::CorrelationRule),
+            ("ai_local_warden", DecisionLayer::AiLocalWarden),
+            ("ai_llm", DecisionLayer::AiLlm),
+            ("auto_rule", DecisionLayer::AutoRule),
+            ("honeypot_post_session", DecisionLayer::HoneypotPostSession),
+            ("observation_verifier", DecisionLayer::ObservationVerifier),
+            ("manual_operator", DecisionLayer::ManualOperator),
+            ("unknown", DecisionLayer::Unknown),
+        ];
+        for (s, expected) in all {
+            let parsed = DecisionLayer::from_pinned_str(s)
+                .unwrap_or_else(|| panic!("from_pinned_str should recognise `{s}`"));
+            assert_eq!(
+                parsed.as_str(),
+                expected.as_str(),
+                "round-trip mismatch for `{s}`"
+            );
+        }
+        assert!(DecisionLayer::from_pinned_str("bogus").is_none());
+    }
 
     // ── Provider-prefixed paths ────────────────────────────────────
 

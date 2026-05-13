@@ -79,7 +79,7 @@ pub(crate) async fn try_handle_honeypot_routing(
     };
 
     if let Some(writer) = &mut state.decision_writer {
-        let entry = decisions::build_entry(
+        let mut entry = decisions::build_entry(
             &incident.incident_id,
             &incident.host,
             "honeypot-router",
@@ -87,6 +87,7 @@ pub(crate) async fn try_handle_honeypot_routing(
             cfg.responder.dry_run,
             &execution_result,
         );
+        entry.decision_layer = Some("honeypot_post_session".to_string());
         if let Err(e) = writer.write(&entry) {
             warn!("failed to write honeypot routing decision: {e:#}");
         }

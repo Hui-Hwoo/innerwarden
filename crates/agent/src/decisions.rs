@@ -44,6 +44,24 @@ pub struct DecisionEntry {
     /// SHA-256 hash of the previous decision entry (tamper detection chain)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_hash: Option<String>,
+
+    /// Spec 049 PR17 — write-time-pinned decision layer.
+    ///
+    /// The writer site declares which spec 049 §8.2.E layer made the
+    /// call (`algorithm_gate`, `killchain_fast_path`, `correlation_rule`,
+    /// `ai_local_warden`, `ai_llm`, `auto_rule`, `honeypot_post_session`,
+    /// `observation_verifier`, `manual_operator`). The dashboard
+    /// drill-down reads this first and only falls back to the
+    /// `decision_provenance` heuristic for legacy JSONL entries written
+    /// before PR17. Pinning closes the bug class PR16 fixed at read time
+    /// (a new gate provider silently demoting to "Unknown" because the
+    /// classifier did not yet know about it).
+    ///
+    /// `Option<String>` (not the typed enum) keeps `decisions.rs` free
+    /// of a layering dependency on `dashboard/`. The string must match
+    /// the snake_case form `DecisionLayer::as_str()` emits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_layer: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +378,34 @@ fn mirror_to_sqlite(store: &innerwarden_store::Store, entry: &DecisionEntry, lin
 // Helper: build DecisionEntry from an AiDecision
 // ---------------------------------------------------------------------------
 
+/// Spec 049 PR17 — derive the canonical `decision_layer` string from
+/// an AI provider name. The router emits these names (`local_classifier`,
+/// `local_warden`, `openai`, `anthropic`, `ollama`, `llm`) into the
+/// `ai_provider` field; this helper keeps the write-time pin in sync
+/// with the heuristic in
+/// `decision_provenance::classify_decision_layer_from_fields` so the
+/// operator-facing label is identical regardless of which path
+/// (pinned or fallback) classified the row.
+///
+/// Returns `"unknown"` for unrecognised provider strings — the caller
+/// should override `entry.decision_layer` post-construction when they
+/// have the right layer context (manual operator, observation
+/// verifier, honeypot, etc.).
+pub fn ai_provider_to_decision_layer(provider: &str) -> &'static str {
+    match provider.to_ascii_lowercase().as_str() {
+        "local_classifier" | "local_warden" => "ai_local_warden",
+        "openai" | "anthropic" | "ollama" | "llm" => "ai_llm",
+        _ => "unknown",
+    }
+}
+
+/// Build a [`DecisionEntry`] from an [`AiDecision`].
+///
+/// Spec 049 PR17 — `decision_layer` is auto-set from the
+/// `ai_provider` via [`ai_provider_to_decision_layer`]. AI-router
+/// callers get the correct pin for free; non-router callers (manual
+/// operator, observation verifier, etc.) should mutate
+/// `entry.decision_layer` after construction.
 pub fn build_entry(
     incident_id: &str,
     host: &str,
@@ -426,6 +472,7 @@ pub fn build_entry(
         estimated_threat: decision.estimated_threat.clone(),
         execution_result: execution_result.to_string(),
         prev_hash: None, // Set by DecisionWriter::write() via hash chaining
+        decision_layer: Some(ai_provider_to_decision_layer(ai_provider).to_string()),
     }
 }
 
@@ -486,6 +533,7 @@ mod tests {
             estimated_threat: "high".into(),
             execution_result: "ok".into(),
             prev_hash: None,
+            decision_layer: None,
         };
         writer.write(&entry).expect("write decision");
 
@@ -522,6 +570,7 @@ mod tests {
             estimated_threat: "low".into(),
             execution_result: "skipped".into(),
             prev_hash: None,
+            decision_layer: None,
         };
         writer.write(&entry).expect("write without store");
         let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
@@ -569,6 +618,7 @@ mod tests {
             estimated_threat: "high".into(),
             execution_result: "ok".into(),
             prev_hash: None,
+            decision_layer: None,
         }
     }
 
@@ -761,6 +811,7 @@ mod tests {
             estimated_threat: "high".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         }
     }
 

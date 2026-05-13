@@ -2353,6 +2353,7 @@ mod tests {
             estimated_threat: "low".to_string(),
             execution_result: "skipped".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         fs::write(
             &decisions_path,
@@ -2487,6 +2488,7 @@ mod tests {
                     estimated_threat: "high".to_string(),
                     execution_result: "skipped".to_string(),
                     prev_hash: None,
+                    decision_layer: None,
                 })
                 .unwrap()
             })
@@ -2578,6 +2580,7 @@ mod tests {
                     estimated_threat: "medium".to_string(),
                     execution_result: "skipped".to_string(),
                     prev_hash: None,
+                    decision_layer: None,
                 })
                 .unwrap()
             })
@@ -2672,6 +2675,7 @@ mod tests {
             estimated_threat: "high".to_string(),
             execution_result: "ok".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         fs::write(
             dir.path().join(format!("decisions-{date}.jsonl")),
@@ -3148,6 +3152,7 @@ mod tests {
                     estimated_threat: "low".to_string(),
                     execution_result: "skipped".to_string(),
                     prev_hash: None,
+                    decision_layer: None,
                 })
                 .unwrap()
             ),

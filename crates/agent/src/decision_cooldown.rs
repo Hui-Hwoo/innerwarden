@@ -534,6 +534,7 @@ mod tests {
             reason: "test".to_string(),
             estimated_threat: "high".to_string(),
             prev_hash: None,
+            decision_layer: None,
         };
         let key = decision_cooldown_key_from_entry(&entry);
         assert_eq!(key, Some("block_ip:nginx:ip:10.0.0.1".to_string()));
