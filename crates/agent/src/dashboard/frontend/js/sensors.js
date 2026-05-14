@@ -7,6 +7,69 @@ const SENSOR_COLORS = {
   macos_log: '#a78bfa',  };
 function sensorColor(name) { return SENSOR_COLORS[name] || '#78e5ff'; }
 
+// Mirror of `crates/sensor/src/collector_health.rs::COLLECTOR_MANIFEST`.
+// Frontend needs to know which collectors are alarm-style (low count
+// = healthy, silence is good) vs telemetry-style (low count = broken).
+// Cross-file anchor in `crates/agent/src/dashboard/mod.rs` asserts
+// every Rust manifest entry has a JS entry — drift fails CI.
+const COLLECTOR_CATEGORY = {
+  // Telemetry: always-on, high-volume feeds. Low count → broken.
+  auth_log: 'telemetry',
+  auditd: 'telemetry',
+  cgroup: 'telemetry',
+  cloudtrail: 'telemetry',
+  dns_capture: 'telemetry',
+  ebpf: 'telemetry',
+  ebpf_syscall: 'telemetry',
+  exec_audit: 'telemetry',
+  file_extract: 'telemetry',
+  http_capture: 'telemetry',
+  journald: 'telemetry',
+  kernel_integrity: 'telemetry',
+  macos_log: 'telemetry',
+  net_snapshot: 'telemetry',
+  nginx_access: 'telemetry',
+  nginx_error: 'telemetry',
+  osquery_log: 'telemetry',
+  proc_maps: 'telemetry',
+  proto_http: 'telemetry',
+  proto_smb: 'telemetry',
+  proto_ssh: 'telemetry',
+  suricata_eve: 'telemetry',
+  syslog_firewall: 'telemetry',
+  tcp_stream: 'telemetry',
+  // Alarm: event-driven detectors. Silence is healthy.
+  docker: 'alarm',
+  fanotify_watch: 'alarm',
+  firmware_integrity: 'alarm',
+  integrity: 'alarm',
+  sysctl_drift: 'alarm',
+  tls_fingerprint: 'alarm',
+  usb_monitor: 'alarm',
+  // Snapshot: periodic point-in-time inventory.
+  suid_inventory: 'snapshot',
+  systemd_inventory: 'snapshot',
+};
+
+function collectorCategory(name) {
+  // Unknown collectors default to 'telemetry' — same fallback as the
+  // Rust `category_for()` function. Better to mis-classify as
+  // "broken if low" than to silently hide an unknown collector.
+  return COLLECTOR_CATEGORY[name] || 'telemetry';
+}
+
+function categoryBadge(cat) {
+  // Tiny pill that tells the operator at a glance whether a low
+  // count is concerning. Hover tooltip explains.
+  if (cat === 'alarm') {
+    return '<span class="cat-badge cat-alarm" title="Event-driven detector — silence means the system is healthy. Only emits when something interesting happens (malicious TLS handshake, file drift, etc).">ALARM</span>';
+  }
+  if (cat === 'snapshot') {
+    return '<span class="cat-badge cat-snapshot" title="Periodic snapshot collector — count reflects scheduled cycles, not detected items.">SNAPSHOT</span>';
+  }
+  return '<span class="cat-badge cat-telemetry" title="Always-on telemetry stream — low count signals the collector or its source is broken.">TELEMETRY</span>';
+}
+
 async function loadSensors() {
   try {
     const data = await loadJson('/api/sensors');
@@ -27,35 +90,118 @@ async function loadSensors() {
     // Per-source rows — split into active vs available
     const srcEl = document.getElementById('sensorSources');
     if (srcEl) {
+      // 2026-05-14 refactor: split source list by CATEGORY, not by
+      // count. A `tls_fingerprint` collector with count=0 was being
+      // rendered under "ready — not collecting" alongside genuinely
+      // broken collectors, when it's actually an alarm-style detector
+      // whose silence means the system is healthy. The category
+      // mapping mirrors `crates/sensor/src/collector_health.rs`.
       const allSources = data.sources || [];
-      const active = allSources.filter(s => s.count > 0);
-      const idle = allSources.filter(s => s.count === 0);
-      const totalActive = active.length;
       const totalAll = allSources.length;
 
+      // Telemetry with count > 0 = active; telemetry with count = 0
+      // is the operator-actionable case (broken / source missing).
+      const telActive = allSources.filter(
+        (s) => collectorCategory(s.name) === 'telemetry' && s.count > 0,
+      );
+      const telBroken = allSources.filter(
+        (s) => collectorCategory(s.name) === 'telemetry' && s.count === 0,
+      );
+      // Alarm collectors with count = 0 are HEALTHY (no detection
+      // events). With count > 0 they're surfacing real findings.
+      const alarmWithFindings = allSources.filter(
+        (s) => collectorCategory(s.name) === 'alarm' && s.count > 0,
+      );
+      const alarmQuiet = allSources.filter(
+        (s) => collectorCategory(s.name) === 'alarm' && s.count === 0,
+      );
+      const snapshots = allSources.filter(
+        (s) => collectorCategory(s.name) === 'snapshot',
+      );
+
+      const renderSourceRow = (s, color) => {
+        return (
+          '<div class="hud-source">' +
+          '<div class="hud-source-dot" style="background:' +
+          color +
+          ';box-shadow:0 0 6px ' +
+          color +
+          ';"></div>' +
+          '<span class="hud-source-name">' +
+          s.name +
+          '</span>' +
+          categoryBadge(collectorCategory(s.name)) +
+          '<span class="hud-source-count" style="color:' +
+          color +
+          ';">' +
+          s.count.toLocaleString() +
+          '</span></div>'
+        );
+      };
+
       let shtml = '<div style="font-size:0.72rem;font-weight:700;color:var(--ok);letter-spacing:0.05em;margin-bottom:6px">' +
-        'DATA COLLECTION &mdash; ' + totalActive + '/' + totalAll + ' active</div>';
+        'TELEMETRY STREAMS &mdash; ' +
+        telActive.length +
+        '/' +
+        (telActive.length + telBroken.length) +
+        ' active</div>';
       shtml += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
-      for (const s of active) {
-        const c = sensorColor(s.name);
-        shtml += '<div class="hud-source">' +
-          '<div class="hud-source-dot" style="background:' + c + ';box-shadow:0 0 6px ' + c + ';"></div>' +
-          '<span class="hud-source-name">' + s.name + '</span>' +
-          '<span class="hud-source-count" style="color:' + c + ';">' + s.count.toLocaleString() + '</span></div>';
+      for (const s of telActive) {
+        shtml += renderSourceRow(s, sensorColor(s.name));
       }
       shtml += '</div>';
-      if (idle.length > 0) {
-        shtml += '<div style="font-size:0.65rem;color:var(--muted);margin-top:8px;cursor:pointer" onclick="var el=document.getElementById(\'idleSources\');el.style.display=el.style.display===\'none\'?\'grid\':\'none\'">' +
-          idle.length + ' ready &mdash; not collecting &#9662;</div>' +
-          '<div id="idleSources" style="display:none;flex-wrap:wrap;gap:6px;margin-top:4px;opacity:0.5">';
-        for (const s of idle) {
-          shtml += '<div class="hud-source">' +
-            '<div class="hud-source-dot" style="background:var(--muted);"></div>' +
-            '<span class="hud-source-name">' + s.name + '</span>' +
-            '<span class="hud-source-count" style="color:var(--muted);">0</span></div>';
+      if (telBroken.length > 0) {
+        // Operator-actionable: telemetry with zero count IS broken.
+        // Surface prominently so they investigate.
+        shtml +=
+          '<div style="font-size:0.65rem;color:var(--danger);margin-top:8px;font-weight:700">' +
+          '⚠ ' +
+          telBroken.length +
+          ' telemetry streams report zero today &mdash; investigate</div>' +
+          '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;opacity:0.7">';
+        for (const s of telBroken) {
+          shtml += renderSourceRow(s, 'var(--danger)');
         }
         shtml += '</div>';
       }
+
+      if (alarmWithFindings.length > 0) {
+        shtml +=
+          '<div style="font-size:0.72rem;font-weight:700;color:var(--orange);letter-spacing:0.05em;margin-top:12px;margin-bottom:6px">' +
+          'ALARM DETECTORS &mdash; ' +
+          alarmWithFindings.length +
+          ' with findings</div>' +
+          '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+        for (const s of alarmWithFindings) {
+          shtml += renderSourceRow(s, 'var(--orange)');
+        }
+        shtml += '</div>';
+      }
+      if (alarmQuiet.length > 0) {
+        shtml +=
+          '<div style="font-size:0.65rem;color:var(--muted);margin-top:8px;cursor:pointer" onclick="var el=document.getElementById(\'alarmQuiet\');el.style.display=el.style.display===\'none\'?\'flex\':\'none\'">' +
+          alarmQuiet.length +
+          ' alarms quiet &mdash; healthy (silence is good) &#9662;</div>' +
+          '<div id="alarmQuiet" style="display:none;flex-wrap:wrap;gap:6px;margin-top:4px;opacity:0.5">';
+        for (const s of alarmQuiet) {
+          shtml += renderSourceRow(s, 'var(--muted)');
+        }
+        shtml += '</div>';
+      }
+
+      if (snapshots.length > 0) {
+        shtml +=
+          '<div style="font-size:0.65rem;color:var(--muted);margin-top:8px">' +
+          'Snapshot collectors (periodic) &mdash; ' +
+          snapshots.length +
+          '</div>' +
+          '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;opacity:0.7">';
+        for (const s of snapshots) {
+          shtml += renderSourceRow(s, 'var(--muted)');
+        }
+        shtml += '</div>';
+      }
+
       srcEl.innerHTML = shtml;
     }
 

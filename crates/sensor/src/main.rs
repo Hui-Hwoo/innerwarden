@@ -1,3 +1,4 @@
+mod collector_health;
 mod collectors;
 mod config;
 mod detectors;

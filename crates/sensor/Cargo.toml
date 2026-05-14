@@ -44,6 +44,7 @@ tempfile = "3"
 proptest = "1"
 serde_yaml = "0.9"
 glob = "0.3"
+filetime = "0.2"
 # `test-util` enables `#[tokio::test(start_paused = true)]` and
 # `tokio::time::advance` used by the nginx_access / nginx_error
 # integration tests in Wave 9f. Without this feature the macro expands

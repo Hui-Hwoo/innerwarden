@@ -7144,4 +7144,64 @@ mod tests {
              month must always regenerate."
         );
     }
+
+    #[test]
+    fn pr25_collector_category_js_map_mirrors_rust_manifest() {
+        // 2026-05-14 — the Sensors HUD now categorises collectors as
+        // telemetry / alarm / snapshot so a low-count alarm collector
+        // (tls_fingerprint, fanotify_watch, integrity, sysctl_drift)
+        // does not get mis-rendered under "ready — not collecting".
+        //
+        // The classification lives in two places: the Rust manifest
+        // (single source of truth, `crates/sensor/src/collector_health.rs`)
+        // and the JS map (`crates/agent/src/dashboard/frontend/js/sensors.js`).
+        // Drift breaks the operator-visible categorisation silently —
+        // this anchor source-greps both files and fails CI if either
+        // side adds a collector the other side does not know about.
+        const RUST_MANIFEST: &str = include_str!("../../../sensor/src/collector_health.rs");
+        const JS_SRC: &str = include_str!("frontend/js/sensors.js");
+
+        // Pull every `("name", CollectorCategory::Variant),` row from the Rust manifest.
+        let rust_entries: std::collections::HashMap<String, String> = RUST_MANIFEST
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if !l.starts_with("(\"") {
+                    return None;
+                }
+                let name_end = l[2..].find('"')?;
+                let name = &l[2..2 + name_end];
+                let rest = &l[2 + name_end..];
+                let cat = if rest.contains("CollectorCategory::Telemetry") {
+                    "telemetry"
+                } else if rest.contains("CollectorCategory::Alarm") {
+                    "alarm"
+                } else if rest.contains("CollectorCategory::Snapshot") {
+                    "snapshot"
+                } else {
+                    return None;
+                };
+                Some((name.to_string(), cat.to_string()))
+            })
+            .collect();
+
+        assert!(
+            !rust_entries.is_empty(),
+            "PR25 — failed to parse Rust manifest entries — grep regex \
+             may be stale relative to collector_health.rs structure"
+        );
+
+        for (name, expected_cat) in &rust_entries {
+            // Look for `<name>: '<cat>'` in the JS map (with single
+            // OR double quotes around the category string).
+            let pat_single = format!("{name}: '{expected_cat}'");
+            let pat_double = format!("{name}: \"{expected_cat}\"");
+            assert!(
+                JS_SRC.contains(&pat_single) || JS_SRC.contains(&pat_double),
+                "PR25 — JS COLLECTOR_CATEGORY map is missing entry \
+                 `{name}: '{expected_cat}'`. Add it (or remove the row \
+                 from the Rust manifest in lockstep)."
+            );
+        }
+    }
 }
