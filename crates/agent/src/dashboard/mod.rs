@@ -7204,4 +7204,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn pr26_report_operational_health_incidents_treated_as_sqlite() {
+        // Operator-reported 2026-05-14: Report page showed
+        // `incidents: ✗ 0B` in the Operational Health table while the
+        // top of the same page said `Incidents Today: 223`. Cause: the
+        // SQLite-aware special-case in `reports.js` only matched the
+        // `events` row, not `incidents`. Spec 016 (2026-04-12)
+        // migrated BOTH to SQLite — the JSONL files don't exist on
+        // disk anymore for either. Anchor pins the unified handling.
+        const REPORTS_JS: &str = include_str!("frontend/js/reports.js");
+        assert!(
+            REPORTS_JS.contains("(f.file === 'events' || f.file === 'incidents') && !f.exists"),
+            "PR26 — the SQLite-aware special-case in reports.js must \
+             match BOTH `events` and `incidents`. Pre-PR26 it only \
+             matched `events`, surfacing the dead `incidents.jsonl` \
+             probe as a misleading red ✗ on the Report page."
+        );
+    }
+
+    #[test]
+    fn pr26_report_top_ips_filters_self_traffic() {
+        // Operator-reported 2026-05-14: Report's Top IPs list
+        // surfaced `10.0.0.238` (the host's own internal address)
+        // and `127.0.0.1` (loopback) as the top two "attackers". The
+        // Top IPs counter populated `ip_counts` from three sites
+        // without applying the self-traffic / RFC1918 filter that
+        // overview-counts + Cases entities already use. PR26 routes
+        // all three sites through a shared `is_report_visible_ip`.
+        const REPORT_SRC: &str = include_str!("../report.rs");
+        assert!(
+            REPORT_SRC.contains("fn is_report_visible_ip(ip: &str) -> bool"),
+            "PR26 — report.rs must expose `is_report_visible_ip` as \
+             the single self-traffic + RFC1918 filter for the Top \
+             IPs counter."
+        );
+        assert!(
+            REPORT_SRC.contains("crate::cloud_safelist::is_self_traffic_ip(ip)"),
+            "PR26 — the filter must call `cloud_safelist::is_self_traffic_ip` \
+             so Cloudflare-edge IPs are also dropped, not just RFC1918."
+        );
+    }
 }

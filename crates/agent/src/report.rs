@@ -375,6 +375,16 @@ fn populate_counters_from_graph(
             for edge in graph.outgoing_edges(id) {
                 if edge.relation == Relation::TriggeredBy {
                     if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                        // 2026-05-14 — skip self-traffic / private IPs
+                        // for the operator-facing Top IPs list. Before
+                        // this filter the Report's Top IPs included
+                        // 10.0.0.238 (the host's own internal address)
+                        // and 127.0.0.1 (loopback) as the top two
+                        // "attackers". Mirrors the same filter
+                        // overview-counts + Cases entities apply.
+                        if !is_report_visible_ip(addr) {
+                            continue;
+                        }
                         *counters.ip_counts.entry(addr.clone()).or_insert(0) += 1;
                         *counters
                             .entity_counts
@@ -858,7 +868,7 @@ fn parse_events_file(path: &Path, counters: &mut Counters) -> ParseOutcome {
             let key = format!("{:?}:{}", e.r#type, e.value);
             *counters.entity_counts.entry(key).or_insert(0) += 1;
 
-            if e.r#type == EntityType::Ip {
+            if e.r#type == EntityType::Ip && is_report_visible_ip(&e.value) {
                 *counters.ip_counts.entry(e.value).or_insert(0) += 1;
             }
         }
@@ -885,11 +895,30 @@ fn parse_incidents_file(path: &Path, counters: &mut Counters) -> ParseOutcome {
             let key = format!("{:?}:{}", e.r#type, e.value);
             *counters.entity_counts.entry(key).or_insert(0) += 1;
 
-            if e.r#type == EntityType::Ip {
+            if e.r#type == EntityType::Ip && is_report_visible_ip(&e.value) {
                 *counters.ip_counts.entry(e.value).or_insert(0) += 1;
             }
         }
     })
+}
+
+/// 2026-05-14 — report-page filter for the operator-facing Top IPs
+/// list. Drops RFC1918 / loopback / link-local (own host noise) AND
+/// `cloud_safelist::is_self_traffic_ip` matches (Cloudflare edge,
+/// agent's bound interface IPs). Same filter the overview counts +
+/// Cases entities apply; the Report's Top IPs panel was the last
+/// surface that surfaced self-traffic as "attackers".
+fn is_report_visible_ip(ip: &str) -> bool {
+    if ip.is_empty() {
+        return false;
+    }
+    if crate::incident_auto_rules::is_internal_ip_pub(ip) {
+        return false;
+    }
+    if crate::cloud_safelist::is_self_traffic_ip(ip) {
+        return false;
+    }
+    true
 }
 
 fn parse_decisions_file(path: &Path, counters: &mut Counters) -> ParseOutcome {

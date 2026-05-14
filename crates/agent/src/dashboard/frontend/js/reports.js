@@ -198,11 +198,13 @@ function renderReport(r) {
     <div class="report-section-title">Operational Health</div>
     <table class="report-table"><thead><tr><th>File</th><th>Exists</th><th>Valid</th><th>Lines</th><th>Size</th></tr></thead><tbody>`;
   (oh.files || []).forEach(f => {
-    // Spec 016 migrated events to SQLite. The events.jsonl file no
-    // longer exists on disk, so its "Exists: ✗" used to look like a
-    // health failure. Show "SQLite" for the events row instead; the
-    // rest still use jsonl backing.
-    const isSqliteOnly = (f.file === 'events' && !f.exists);
+    // Spec 016 (2026-04-12) migrated BOTH events AND incidents to
+    // SQLite. The .jsonl files no longer exist on disk; their
+    // "Exists: ✗" used to look like a health failure when they're
+    // actually fine — incidents now live in `innerwarden.db`.
+    // Operator-reported 2026-05-14: Report page showed
+    // `incidents: ✗ 0B` while Summary said `Incidents Today: 223`.
+    const isSqliteOnly = (f.file === 'events' || f.file === 'incidents') && !f.exists;
     const existsCell = isSqliteOnly
       ? '<span class="health-ok" title="stored in innerwarden.db (spec 016)">SQLite</span>'
       : (f.exists ? '<span class="health-ok">' + lucideIcon('check',{size:12}) + '</span>' : '<span class="health-fail">' + lucideIcon('x',{size:12}) + '</span>');
