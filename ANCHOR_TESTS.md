@@ -430,7 +430,6 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/data_api.rs::tests::operator_timezone_prefers_env_var` — `TZ` env var wins over `/etc/timezone`. Spec 049 PR4 contract: operator-config TZ flows through to the picker label, never browser-derived.
 
-- `crates/agent/src/dashboard/mod.rs::tests::cases_tab_has_hour_scope_picker_inputs` — spec 049 PR5 UI surface. Cases tab carries `flt-hour-from`, `flt-hour-to`, `flt-tz-label` IDs above the Advanced toggle (operator's primary audit question deserves visible controls). Both hour inputs declare `type=number min=0 max=23` so browser validation matches the backend `parse_hour_filter` contract.
 
 - `crates/agent/src/dashboard/mod.rs::tests::state_js_carries_hour_filter_in_state_filters` — `state.filters` declares `hour_from: ''` and `hour_to: ''` with empty-string defaults so `buildQuery` skips them when the picker is empty (no stray `hour_from=` in the URL).
 
@@ -440,29 +439,17 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::threats_js_passes_hour_filter_on_overview_queries` — BOTH refresh paths (`refreshLeft` + `refreshLeftLive`) pass `hour_from`/`hour_to` to `/api/overview`. Counts agreed by construction; if only one path threaded them through, the operator would see live vs manual numbers diverge (the recurring "Dashboard count != Site count" pattern).
 
-- `crates/agent/src/dashboard/mod.rs::tests::threats_js_renders_tz_label_from_overview_response` — `renderTzLabel` reads `overview.timezone` (backend-emitted) and writes to `#flt-tz-label`. NEVER falls back to `Intl.DateTimeFormat()` (browser TZ drifts across analyst / client / MSSP operator).
 
-- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_hour_scope_picker_styles` — `.flt-hour-row` + chip / label / number / TZ-label selectors must exist. Without them the picker renders as inline plain text.
 
-- `crates/agent/src/dashboard/mod.rs::tests::cases_tab_renders_header_duplo_with_band_labels` — spec 049 PR6 §8.2.A header duplo. Cases tab carries both `Current state · now` and `Selected period` band labels + 3 new live IDs (`kpi-now-blocked`, `kpi-now-observing`, `kpi-now-needs-review`). Legacy IDs survive and back the Selected period band.
 
-- `crates/agent/src/dashboard/mod.rs::tests::cases_tab_current_state_band_carries_now_label_not_period_label` — anti-flip guard for the two bands' semantics. Each Current state kpi-card carries `>now<` window label; each Selected period card carries `>period<`. A future refactor that swaps the labels would invert the bands' meaning.
 
-- `crates/agent/src/dashboard/mod.rs::tests::threats_js_renders_current_state_band_from_backend` — `renderCurrentStateBand` defined + called from BOTH refresh paths + writes into the 3 Current state IDs. Reads strictly from `overview.current_state.*` (PR6 backend-emitted, ignores scope picker).
 
-- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_cases_band_label_styles` — `.cases-band-label` + `.cases-band-label.cases-band-period` selectors. Without them the bands stack with no visual caption.
 
-- `crates/agent/src/dashboard/mod.rs::tests::cases_tab_has_live_toggle_button` — spec 049 PR8 Live toggle present on the Current state band label. Default class `live-toggle-on` (matches pre-PR8 implicit always-live behaviour); operator opts OUT for audit screenshots.
 
-- `crates/agent/src/dashboard/mod.rs::tests::cases_band_label_uses_flex_layout_for_live_toggle` — `.cases-band-current` modifier on the band label so the toggle button sits flush right.
 
-- `crates/agent/src/dashboard/mod.rs::tests::threats_js_live_toggle_persists_to_localstorage` — toggle state survives reloads under stable key `iw_cases_live_toggle`. `isCasesLiveEnabled` + `toggleCasesLive` helpers pinned.
 
-- `crates/agent/src/dashboard/mod.rs::tests::threats_js_render_current_state_band_is_gated_by_live_toggle` — when toggle OFF, `renderCurrentStateBand` early-returns. Freeze contract — operator's audit screenshot stays stable.
 
-- `crates/agent/src/dashboard/mod.rs::tests::threats_js_live_toggle_renders_catchup_on_reenable` — re-enabling jumps to latest value immediately (no stale-looking gap waiting for next SSE event).
 
-- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_live_toggle_styles` — `.live-toggle` + `.live-toggle-on` + `.live-dot` + `@keyframes liveTogglePulse`. The pulsing dot is the operator's visual signal that the band is live.
 
 - `crates/agent/src/dashboard/decision_provenance.rs::tests::decision_layer_serializes_as_snake_case_strings` — spec 049 PR9 wire-format contract. All 10 `DecisionLayer` variants serialize to fixed snake_case strings that the frontend keys on (`algorithm_gate` / `killchain_fast_path` / `correlation_rule` / `ai_local_warden` / `ai_llm` / `auto_rule` / `honeypot_post_session` / `observation_verifier` / `manual_operator` / `unknown`). Changing any string is a breaking change for the drill-down UI.
 
@@ -626,9 +613,7 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::pr20_overview_counts_filter_cloudflare_self_traffic` — spec 049 PR20 fix for the operator-reported 2026-05-13 strip/panel mismatch: "1 Currently observing" with no row to drill into because the 1 IP (172.70.80.132) was Cloudflare. Overview counts must call `cloud_safelist::is_self_traffic_ip` so strip and panel agree.
 
-- `crates/agent/src/dashboard/mod.rs::tests::pr20_cases_band_labels_distinguish_live_from_period` — operator-readability: "Live state · enforced right now" vs "Decisions in selected period". Pre-PR20 labels were "Current state · now" vs "Selected period" which the operator read as duplicate when scope=today.
 
-- `crates/agent/src/dashboard/mod.rs::tests::pr20_pivot_picker_lives_inside_advanced_filters` — UX cleanup: the IP/User/Detector pivot picker moves from primary sidebar control into `#advFilters` collapsed block. 95% of operator flows are IP-centric; this reclaims sidebar real estate.
 
 - `crates/agent/src/dashboard/mod.rs::tests::pr20_sensors_status_drops_dead_jsonl_probes` — `/api/status.files` must NOT advertise the events / incidents JSONL probes that spec-016 (commit 8bd59990, 2026-04-12) removed. Probing for them surfaced a misleading "events: not found" on the Sensors HUD.
 

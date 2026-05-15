@@ -522,11 +522,6 @@ function investigateTopThreat() {
   showView('investigate');
 }
 
-function toggleAdvFilters() {
-  const el = document.getElementById('advFilters');
-  const btn = document.getElementById('flt-adv-toggle');
-  if (!el || !btn) return;
-  const open = el.style.display !== 'none';
-  el.style.display = open ? 'none' : 'block';
-  btn.textContent = open ? '▸ Advanced filters' : '▾ Advanced filters';
-}
+// 2026-05-15 slim-down: removed toggleAdvFilters — the #advFilters
+// collapsible block was deleted from the Cases sidebar along with the
+// hour/severity/detector/status/compare-date filters it contained.

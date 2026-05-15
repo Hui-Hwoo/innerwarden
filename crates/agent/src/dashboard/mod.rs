@@ -2079,236 +2079,113 @@ mod tests {
     // for audit screenshots or "freeze the wall" moments. Toggle
     // state persists across reloads via localStorage.
 
-    #[test]
-    fn cases_tab_has_live_toggle_button() {
-        // Toggle lives on the Current state band label so the
-        // operator sees "this band is live" without scrolling.
-        // The default class is `live-toggle-on` (matches the JS
-        // default; localStorage 'off' overrides on hydrate).
-        assert!(
-            INDEX_HTML.contains("id=\"cases-live-toggle\""),
-            "Cases tab must carry id=cases-live-toggle (spec 049 PR8)"
-        );
-        assert!(
-            INDEX_HTML.contains("class=\"live-toggle live-toggle-on\""),
-            "Live toggle must default to live-toggle-on class (default ON, matches pre-PR8 implicit behaviour)"
-        );
-        assert!(
-            INDEX_HTML.contains("onclick=\"toggleCasesLive()\""),
-            "Live toggle must wire to toggleCasesLive() handler"
-        );
-        assert!(
-            INDEX_HTML.contains("aria-pressed=\"true\""),
-            "Live toggle must declare aria-pressed=true at default (a11y)"
-        );
-    }
+    // 2026-05-15 slim-down: Cases sidebar collapsed from "duplo" (live-
+    // state-now + decisions-in-period) to a single canonical band
+    // mirroring Home. The Live toggle, period/now sub-labels, and the
+    // separate kpi-now-* / kpi-confirmed / kpi-responded / kpi-noise
+    // IDs are all gone. Anchors below pin the NEW contract.
 
     #[test]
-    fn cases_band_label_uses_flex_layout_for_live_toggle() {
-        // The `.cases-band-current` modifier on the band label turns
-        // it into a flex container so the toggle button sits flush
-        // right. Without the modifier, the toggle would stack below
-        // the label text.
-        assert!(
-            INDEX_HTML.contains("class=\"cases-band-label cases-band-current\""),
-            "Current state band label must carry the .cases-band-current modifier (spec 049 PR8 flex layout)"
-        );
-    }
-
-    #[test]
-    fn threats_js_live_toggle_persists_to_localstorage() {
-        // Toggle state survives reloads — the operator's choice is
-        // sticky. Pin the localStorage key + the on/off discipline
-        // so a future "simplify localStorage usage" refactor cannot
-        // silently drop persistence.
-        assert!(
-            JS_THREATS.contains("CASES_LIVE_STORAGE_KEY = 'iw_cases_live_toggle'"),
-            "Live toggle must persist under stable key `iw_cases_live_toggle`"
-        );
-        assert!(
-            JS_THREATS.contains("function isCasesLiveEnabled("),
-            "Live toggle must expose `isCasesLiveEnabled` read-side helper"
-        );
-        assert!(
-            JS_THREATS.contains("function toggleCasesLive("),
-            "Live toggle must expose `toggleCasesLive` click handler"
-        );
-    }
-
-    #[test]
-    fn threats_js_render_current_state_band_is_gated_by_live_toggle() {
-        // When toggle is OFF, `renderCurrentStateBand` MUST early-
-        // return. This is the freeze contract — the operator's
-        // audit screenshot stays stable while they explain to a
-        // client. Anti-regression for a future "always render"
-        // simplification that would break the freeze.
-        let render_start = JS_THREATS
-            .find("function renderCurrentStateBand(")
-            .expect("renderCurrentStateBand defined");
-        let render_end = JS_THREATS[render_start..]
-            .find("\n}\n")
-            .expect("end of renderCurrentStateBand")
-            + render_start;
-        let body = &JS_THREATS[render_start..render_end];
-        assert!(
-            body.contains("if (!isCasesLiveEnabled())"),
-            "renderCurrentStateBand must early-return when toggle is OFF (spec 049 PR8 freeze contract)"
-        );
-    }
-
-    #[test]
-    fn threats_js_live_toggle_renders_catchup_on_reenable() {
-        // When the operator re-enables the toggle (was OFF, click
-        // turns ON), the band should immediately jump to the latest
-        // value instead of waiting for the next SSE event. Smooth
-        // UX — no stale-looking gap.
-        let toggle_start = JS_THREATS
-            .find("function toggleCasesLive(")
-            .expect("toggleCasesLive defined");
-        let toggle_end = JS_THREATS[toggle_start..]
-            .find("\n}\n")
-            .expect("end of toggleCasesLive")
-            + toggle_start;
-        let body = &JS_THREATS[toggle_start..toggle_end];
-        assert!(
-            body.contains("if (next && window._lastOverview)")
-                && body.contains("renderCurrentStateBand(window._lastOverview.current_state)"),
-            "toggleCasesLive must catch-up render when re-enabling (spec 049 PR8 UX)"
-        );
-    }
-
-    #[test]
-    fn app_css_defines_live_toggle_styles() {
-        for selector in [
-            ".live-toggle",
-            ".live-toggle .live-dot",
-            ".live-toggle.live-toggle-on",
-            ".live-toggle.live-toggle-on .live-dot",
-        ] {
-            assert!(
-                APP_CSS.contains(selector),
-                "app.css must define {selector} (spec 049 PR8 Live toggle styling)"
-            );
-        }
-        assert!(
-            APP_CSS.contains("@keyframes liveTogglePulse"),
-            "app.css must define @keyframes liveTogglePulse — the pulsing dot is the operator's visual signal that the band is live"
-        );
-    }
-
-    // ── Spec 049 PR6 anchors ────────────────────────────────────────
-    // Cases tab header duplo: `Current state` band (live, ignores
-    // scope picker) + `Selected period` band (follows scope picker).
-    // The two bands MUST stay independently semantic — operator
-    // picks `Yesterday 14h-16h` and Current state keeps showing live
-    // counters. Frontend reads `overview.current_state.*` (PR6
-    // backend) for the live band; existing flat counters drive the
-    // Selected period band.
-
-    #[test]
-    fn cases_tab_renders_header_duplo_with_band_labels() {
-        // Both band labels must be present, and the kpi-card IDs
-        // for each band must be distinct (live IDs prefixed
-        // `kpi-now-`, period IDs use the legacy `kpi-*` names).
-        // Spec 049 PR20 renamed both labels for operator-readability;
-        // see `pr20_cases_band_labels_distinguish_live_from_period`
-        // for the exact-string anchors. This older test pins only
-        // the structural invariant: two distinct band labels exist.
-        assert!(
-            INDEX_HTML.contains("Live state · enforced right now"),
-            "Cases tab must label the live band (PR20 rename)"
-        );
-        assert!(
-            INDEX_HTML.contains("Decisions in selected period"),
-            "Cases tab must label the picker-scoped band (PR20 rename)"
-        );
+    fn pr_cases_slim_sidebar_mirrors_home_canonical() {
+        // Operator's exact requirement (2026-05-15): "clicking 82 on
+        // Home must land on Cases where I can trace where each of
+        // the 82 came from". The slim Cases sidebar has 4 KPIs
+        // matching Home's breakdown — same source = canonical_counts.
         for id in [
-            "kpi-now-blocked",
-            "kpi-now-observing",
-            "kpi-now-needs-review",
+            "kpi-contained",
+            "kpi-observing",
+            "kpi-filtered-out",
+            "kpi-needs-review",
         ] {
             assert!(
                 INDEX_HTML.contains(&format!("id=\"{id}\"")),
-                "Cases tab must carry id={id} for the Current state band (spec 049 PR6)"
+                "Cases sidebar must carry id={id} (slim-down: 4-KPI canonical band)"
             );
         }
-        // Legacy IDs survive — they back the Selected period band now.
-        for id in ["kpi-confirmed", "kpi-responded", "kpi-noise"] {
-            assert!(
-                INDEX_HTML.contains(&format!("id=\"{id}\"")),
-                "Cases tab MUST keep legacy id={id} (now drives Selected period band)"
-            );
-        }
-    }
-
-    #[test]
-    fn cases_tab_current_state_band_carries_now_label_not_period_label() {
-        // The window labels in the Current state band's kpi-cards
-        // must say `now` (live), and the Selected period band's
-        // window labels must say `period` (scope-dependent). A
-        // future refactor that flips them silently would invert
-        // the bands' semantics.
-        let html = INDEX_HTML;
-        let now_cards = [
-            "kpi-now-blocked",
-            "kpi-now-observing",
-            "kpi-now-needs-review",
-        ];
-        for id in now_cards {
-            let card_idx = html.find(&format!("id=\"{id}\"")).expect("id present");
-            let tail = &html[card_idx..card_idx + 400];
-            assert!(
-                tail.contains(">now<"),
-                "Current state card {id} must carry `>now<` window label (spec 049 PR6)"
-            );
-        }
-        for id in ["kpi-confirmed", "kpi-responded", "kpi-noise"] {
-            let card_idx = html.find(&format!("id=\"{id}\"")).expect("id present");
-            let tail = &html[card_idx..card_idx + 400];
-            assert!(
-                tail.contains(">period<"),
-                "Selected period card {id} must carry `>period<` window label (spec 049 PR6)"
-            );
-        }
-    }
-
-    #[test]
-    fn threats_js_renders_current_state_band_from_backend() {
-        // `renderCurrentStateBand` must be defined and called from
-        // BOTH refresh paths (refreshLeft + refreshLeftLive) so the
-        // live band updates on every dashboard tick, not just SSE
-        // pushes. Reads strictly from `overview.current_state.*`;
-        // never derives from selected-period counters (which would
-        // make the live band wrongly track the scope picker).
+        // The total label must exist so operator sees "<N> Warden
+        // decisions" — exactly the label Home uses on its strip.
         assert!(
-            JS_THREATS.contains("function renderCurrentStateBand("),
-            "renderCurrentStateBand helper must be defined (spec 049 PR6)"
+            INDEX_HTML.contains("id=\"cases-band-total\""),
+            "Cases sidebar must carry the total label (cases-band-total)"
         );
-        let invocations = JS_THREATS
-            .matches("renderCurrentStateBand(ov && ov.current_state)")
-            .count();
-        assert_eq!(
-            invocations, 2,
-            "renderCurrentStateBand must be invoked from BOTH refreshLeft and refreshLeftLive (saw {invocations})"
+        // No-residue: the pre-slim IDs MUST NOT come back. Catches a
+        // refactor that re-introduces the period-vs-now duplicate band.
+        for orphan in [
+            "id=\"kpi-now-blocked\"",
+            "id=\"kpi-now-observing\"",
+            "id=\"kpi-now-needs-review\"",
+            "id=\"kpi-confirmed\"",
+            "id=\"kpi-responded\"",
+            "id=\"kpi-noise\"",
+            "id=\"cases-live-toggle\"",
+            "class=\"cases-band-label cases-band-current\"",
+            "Live state · enforced right now",
+            "Decisions in selected period",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(orphan),
+                "Cases slim-down: `{orphan}` was removed; bringing it back resurrects \
+                 the duplicate-band confusion the operator explicitly asked to drop"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_cases_slim_js_populates_canonical_band() {
+        // renderCasesSidebarBand reads canonical fields from /api/overview
+        // (same as Home) and writes into the 4 new KPI IDs + total label.
+        // Anti-regression for a refactor that drops the wire-up or routes
+        // through a non-canonical source.
+        assert!(
+            JS_THREATS.contains("function renderCasesSidebarBand("),
+            "threats.js must define renderCasesSidebarBand (canonical Cases band)"
         );
         for id in [
-            "kpi-now-blocked",
-            "kpi-now-observing",
-            "kpi-now-needs-review",
+            "kpi-contained",
+            "kpi-observing",
+            "kpi-filtered-out",
+            "kpi-needs-review",
         ] {
             assert!(
                 JS_THREATS.contains(&format!("setNum('{id}',")),
-                "renderCurrentStateBand must write into {id}"
+                "renderCasesSidebarBand must populate {id}"
             );
         }
-    }
-
-    #[test]
-    fn app_css_defines_cases_band_label_styles() {
-        for selector in [".cases-band-label", ".cases-band-label.cases-band-period"] {
+        // Source must be ov.blocked_count / observing_count / filtered_out_count
+        // / attention_count — the same canonical fields Home reads.
+        for field in [
+            "ov.blocked_count",
+            "ov.observing_count",
+            "ov.filtered_out_count",
+            "ov.attention_count",
+        ] {
             assert!(
-                APP_CSS.contains(selector),
-                "app.css must define {selector} (spec 049 PR6 band-label styling)"
+                JS_THREATS.contains(field),
+                "renderCasesSidebarBand must source from canonical field {field} (matches Home)"
+            );
+        }
+        // The total label uses warden_decisions_count (= blocked + observing +
+        // filtered_out, excludes needs_review) so the Cases header total
+        // matches Home's "Warden decisions" strip exactly.
+        assert!(
+            JS_THREATS.contains("ov.warden_decisions_count")
+                && JS_THREATS.contains("Warden decision"),
+            "renderCasesSidebarBand must render the total as `<N> Warden decisions` \
+             from warden_decisions_count (matches Home strip)"
+        );
+        // No-residue: the pre-slim function names MUST NOT come back as
+        // production callers (they would write into IDs that no longer
+        // exist and re-introduce the cardinality drift).
+        for orphan_fn in [
+            "function isCasesLiveEnabled(",
+            "function toggleCasesLive(",
+            "function applyCasesLiveToggleUi(",
+            "function initCasesLiveToggle(",
+            "function syncThreatsKpiWindowLabels(",
+        ] {
+            assert!(
+                !JS_THREATS.contains(orphan_fn),
+                "Cases slim-down: `{orphan_fn}` was removed; do not re-introduce"
             );
         }
     }
@@ -2320,29 +2197,13 @@ mod tests {
     // TZ label flows from `overview.timezone` (backend-emitted), so
     // operators / analysts / clients always read the same TZ.
 
-    #[test]
-    fn cases_tab_has_hour_scope_picker_inputs() {
-        // Both hour inputs must be present in the Cases tab filter
-        // row, ABOVE the Advanced filters toggle (operator's primary
-        // audit question "what happened yesterday at 15h?" deserves
-        // visible controls, not a buried sub-menu).
-        for id in ["flt-hour-from", "flt-hour-to", "flt-tz-label"] {
-            assert!(
-                INDEX_HTML.contains(&format!("id=\"{id}\"")),
-                "Cases scope picker requires id={id} (spec 049 PR5)"
-            );
-        }
-        // Both must be `type="number"` with the 0-23 range, so the
-        // browser's default validation rejects out-of-range values
-        // before they ever reach the backend.
-        for id in ["flt-hour-from", "flt-hour-to"] {
-            let snippet = format!("id=\"{id}\" type=\"number\" min=\"0\" max=\"23\"");
-            assert!(
-                INDEX_HTML.contains(&snippet),
-                "Cases scope picker {id} must be type=number min=0 max=23 (browser-side validation matches `parse_hour_filter` backend contract)"
-            );
-        }
-    }
+    // 2026-05-15 slim-down: hour-scope picker (flt-hour-from / flt-hour-to /
+    // flt-tz-label) was removed from the Cases sidebar — operator confirmed
+    // "filtros e tralha pode remover tudo". The backend `parse_hour_filter`
+    // continues to exist for any URL-deep-link replay flow; the related JS
+    // state fields (hour_from / hour_to in state.filters) are kept so a
+    // URL with `?hour_from=15&hour_to=16` still parses cleanly. The UI
+    // inputs are gone.
 
     #[test]
     fn state_js_carries_hour_filter_in_state_filters() {
@@ -2414,49 +2275,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn threats_js_renders_tz_label_from_overview_response() {
-        // renderTzLabel must read `overview.timezone` and write it
-        // into `#flt-tz-label`. NEVER falls back to browser TZ
-        // (`Intl.DateTimeFormat().resolvedOptions().timeZone`) — that
-        // drifts across analyst / client / MSSP operator and breaks
-        // the multi-tenant TZ contract from spec 049 §7.1.
-        assert!(
-            JS_THREATS.contains("function renderTzLabel("),
-            "renderTzLabel helper must be defined (spec 049 PR5)"
-        );
-        assert!(
-            JS_THREATS.contains("getElementById('flt-tz-label')"),
-            "renderTzLabel must target the picker label element"
-        );
-        assert!(
-            !JS_THREATS.contains("Intl.DateTimeFormat()"),
-            "renderTzLabel must NOT fall back to browser TZ — backend `overview.timezone` is the single source (spec 049 §7.1)"
-        );
-        // Called from both refresh paths.
-        let renders = JS_THREATS
-            .matches("renderTzLabel(ov && ov.timezone)")
-            .count();
-        assert_eq!(
-            renders, 2,
-            "renderTzLabel must be invoked from BOTH refreshLeft and refreshLeftLive (saw {renders})"
-        );
-    }
+    // 2026-05-15 slim-down: TZ label was removed with the hour scope
+    // picker. renderTzLabel kept as a no-op for any caller surviving the
+    // slim-down; backend `overview.timezone` is still emitted on the API
+    // response so a future surface that wants to display TZ has it.
 
-    #[test]
-    fn app_css_defines_hour_scope_picker_styles() {
-        for selector in [
-            ".flt-hour-row",
-            ".flt-hour-row .flt-hour-label",
-            ".flt-hour-row input[type=\"number\"]",
-            ".flt-hour-row .flt-tz-label",
-        ] {
-            assert!(
-                APP_CSS.contains(selector),
-                "app.css must define {selector} (spec 049 PR5 scope picker styling)"
-            );
-        }
-    }
+    // 2026-05-15 slim-down: scope-picker CSS (.flt-hour-row + variants)
+    // was removed with the hour-scope picker UI. Backend
+    // `parse_hour_filter` still parses `?hour_from=&hour_to=` query args
+    // for URL-deep-link replay; no UI surface.
 
     // ── Spec 049 PR2 anchors ────────────────────────────────────────
     // Home strip migrated from frontend bucket-sum math to backend-
@@ -2686,43 +2513,12 @@ mod tests {
 
     #[test]
     fn phase_14_qa_polish_anchors_present() {
-        // Phase 14 (QA polish, 2026-04-29): bundle anchors for the six
-        // operator-reported polish fixes. Each one was a small
-        // user-visible behaviour that's easy to break in a future
-        // refactor that doesn't know what the fix was for; pin them.
-
-        // 1. compare-date placeholder + clarifying title (operator
-        //    confused this with the main date picker).
-        assert!(
-            INDEX_HTML.contains("Compare with another date"),
-            "flt-compare-date placeholder must explain the field"
-        );
-
-        // 2. detector autocomplete datalist is wired and seeded.
-        assert!(
-            INDEX_HTML.contains("list=\"detector-options\""),
-            "flt-detector must reference the datalist"
-        );
-        assert!(
-            INDEX_HTML.contains("<datalist id=\"detector-options\">"),
-            "datalist with known detector slugs must be present"
-        );
-        for det in ["ssh_bruteforce", "kill_chain", "honeypot"] {
-            assert!(
-                INDEX_HTML.contains(det),
-                "datalist must include '{det}' detector slug"
-            );
-        }
-
-        // 3. Show-details stopPropagation was needed when the home
-        //    Data Collection card had `onclick="showView('sensors')"`
-        //    on its wrapper. The 2026-04-30 home redesign moved the
-        //    collector strip INSIDE the (already opt-in) details
-        //    panel, so the wrapper onclick is gone and the inline
-        //    Show-details button was removed too. The stopPropagation
-        //    contract this assert pinned no longer applies — there is
-        //    no clickable wrapper to bubble into. Anchor retained as a
-        //    breadcrumb pointing to the redesign rationale.
+        // 2026-05-15 Cases slim-down: items 1, 2, 5, 6 of the original
+        // Phase 14 anchor pinned now-removed UI (compare-date placeholder,
+        // detector datalist, pivot-tab active styles, KPI window labels).
+        // Items 3 (Show-details stopPropagation) and 4 (hide "0 evt" tail)
+        // are retained — item 4 still applies because the card-render
+        // path on Cases stays. Item 3 is breadcrumb-only.
 
         // 4. Hide "0 evt" tail when event_count is zero. Both render
         //    paths (initial render and SSE refresh) must respect it.
@@ -2733,29 +2529,6 @@ mod tests {
         assert!(
             JS_THREATS.contains("evt > 0 ? ' \u{00b7} ' + evt + ' evt' : ''"),
             "SSE count refresh must hide '0 evt' tail too"
-        );
-
-        // 5. Pivot tab active state contrast bumped so the selected
-        //    tab is visibly distinct from the inactive hover state.
-        assert!(
-            APP_CSS.contains("rgba(120, 229, 255, 0.22)"),
-            "pivot-tab.active must use the stronger 22% accent fill"
-        );
-        assert!(
-            APP_CSS.contains("rgba(120, 229, 255, 0.60)"),
-            "pivot-tab.active must use the bolder 60% accent border"
-        );
-
-        // 6. KPI window labels on Threats track the active flt-date
-        //    so they don't read "Today" while showing yesterday's
-        //    data.
-        assert!(
-            JS_THREATS.contains("syncThreatsKpiWindowLabels"),
-            "helper that re-labels the KPI window strings must exist"
-        );
-        assert!(
-            JS_THREATS.contains("'Today'"),
-            "Today label still used when picker is empty or matches today"
         );
     }
 
@@ -2957,52 +2730,34 @@ mod tests {
 
     #[test]
     fn threats_kpi_tile_label_is_blocks_not_blocked() {
-        // 2026-04-30: the KPI tile counts BLOCK ACTIONS (per-decision
-        // increment in compute_overview_counts_from_sqlite) while the
-        // list-section group below counts UNIQUE ATTACKERS. Operator
-        // saw "Blocked 41" on top and "Blocked 24" right below for
-        // the same date and could not tell why.
-        //
-        // Wave 10 (label honesty, 2026-05-05): the original "Blocks"
-        // / "Blocked attackers" disambiguation was not enough — the
-        // operator hit the same confusion class again on Home (26
-        // attackers handled today) vs Threats (12 Blocked attackers).
-        // Renamed both labels to make the snapshot-vs-aggregate axis
-        // explicit:
-        //   * KPI: "Block actions" / window "today" — aggregate, decision-level
-        //   * List: "Currently blocked attackers" — snapshot, IP-level
-        // The "Currently" prefix is the load-bearing word: it tells the
-        // operator that a smaller number on the list does not contradict
-        // a larger aggregate on the KPI / Home tile.
+        // 2026-05-15 slim-down: replaced "Block actions" tile with
+        // 4-KPI canonical band (Contained / Observing / Filtered out /
+        // Needs review). The Wave-10 lesson — the KPI count and the
+        // list count have DIFFERENT cardinalities — still applies:
+        //   * KPI "Contained": unique attackers contained today
+        //   * List "Currently blocked attackers": same number, list view
+        // The list label keeps "Currently blocked attackers" (Wave 10)
+        // so a smaller number on the list does not look like a contradiction.
         assert!(
-            INDEX_HTML.contains("<div class=\"kpi-label\">Block actions</div>"),
-            "KPI tile must read 'Block actions' (Wave 10) to disambiguate aggregate decisions from snapshot list 'Currently blocked attackers'"
-        );
-        // Spec 049 PR6: the Block actions tile sits in the Selected
-        // period band now, so its window label says `period` (tracks
-        // the picker), not `today` (Wave 10 default). The Wave 10
-        // intent — make the aggregation window explicit on the tile
-        // — survives the rename. A separate Current state band on
-        // the same tab carries the live `Currently blocked` tile
-        // with window=`now`, pinned by spec 049 PR6 anchors.
-        assert!(
-            INDEX_HTML.contains("<div class=\"kpi-window\">period</div>"),
-            "KPI window must read 'period' (Selected period band tracks the scope picker, spec 049 PR6)"
+            INDEX_HTML.contains("<div class=\"kpi-label\">Contained</div>"),
+            "Slim Cases band must label the contained-attackers KPI 'Contained' (matches Home)"
         );
         assert!(
             JS_THREATS.contains("label: 'Currently blocked attackers'"),
-            "list group header must read 'Currently blocked attackers' (Wave 10) so the operator reads the count as a snapshot, not an aggregate"
+            "list group header must read 'Currently blocked attackers' (Wave 10) so the operator reads the count as a snapshot"
         );
-        // Anti-regression: the pre-Wave-10 strings must NOT come back.
-        // A future "shorten the labels" PR would silently re-create the
-        // 2026-04-22 / 2026-05-05 confusion class.
+        // Anti-regression: the pre-Wave-10 / pre-slim strings must NOT come back.
         assert!(
             !INDEX_HTML.contains("<div class=\"kpi-label\">Blocks</div>"),
-            "KPI tile must NOT revert to 'Blocks' (pre-Wave-10); use 'Block actions' so the unit is explicit"
+            "KPI tile must NOT revert to 'Blocks' (pre-Wave-10); the slim Cases band uses 'Contained'"
+        );
+        assert!(
+            !INDEX_HTML.contains("<div class=\"kpi-label\">Block actions</div>"),
+            "KPI tile must NOT revert to 'Block actions' (pre-slim); the slim Cases band uses 'Contained' to match Home's vocabulary"
         );
         assert!(
             !JS_THREATS.contains("label: 'Blocked attackers'"),
-            "list group header must NOT revert to bare 'Blocked attackers' (pre-Wave-10); use 'Currently blocked attackers' so the snapshot axis is explicit"
+            "list group header must NOT revert to bare 'Blocked attackers' (pre-Wave-10); use 'Currently blocked attackers'"
         );
     }
 
@@ -5154,43 +4909,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn threats_status_filter_dropdown_wired_end_to_end() {
-        // Audit 2.6 partial: outcome bucket filter shipped client-side.
-        // The HTML control, state field, sync helper, and grouped-list
-        // filter must agree on the field name `status` so selecting a
-        // bucket actually narrows the rendered list.
-        assert!(
-            INDEX_HTML.contains("id=\"flt-status\""),
-            "flt-status dropdown missing from advanced filters (audit 2.6 partial)"
-        );
-        assert!(
-            JS_STATE.contains("status: ''"),
-            "state.filters.status default missing — operator picks an outcome and the filter is lost on refresh"
-        );
-        assert!(
-            JS_STATE.contains("state.filters.status = document.getElementById('flt-status').value")
-        );
-        assert!(
-            JS_THREATS.contains("state.filters && state.filters.status"),
-            "buildGroupedList must read state.filters.status (audit 2.6 partial)"
-        );
-        // The status options the dropdown exposes must exist in the
-        // outcomeOf domain so the filter is non-empty for every choice.
-        for outcome in [
-            "needs_attention",
-            "blocked",
-            "monitoring",
-            "honeypot",
-            "dismissed",
-            "allowlisted",
-        ] {
-            assert!(
-                INDEX_HTML.contains(&format!("value=\"{outcome}\"")),
-                "flt-status must expose '{outcome}' option (audit 2.6 partial)"
-            );
-        }
-    }
+    // 2026-05-15 slim-down: the flt-status dropdown was removed from the
+    // Cases sidebar. The operator can browse the outcome buckets directly
+    // in the grouped attacker list (Currently blocked / Filtered out /
+    // Observing / Needs your attention); a redundant dropdown filter on
+    // top of that was tralha. State.filters.status is kept on the JS
+    // side so a deep-link URL with `?status=blocked` still parses.
 
     #[test]
     fn journey_verdict_card_includes_scale_summary() {
@@ -6846,69 +6570,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pr20_cases_band_labels_distinguish_live_from_period() {
-        // Operator-reported: "Current state · now" vs "Selected
-        // period" were too similar — both showed 34/1/0 when scope=
-        // today and the operator read the same 3 numbers twice. The
-        // labels now make the semantic distinction obvious without
-        // needing a hover tooltip.
-        assert!(
-            INDEX_HTML.contains("Live state · enforced right now"),
-            "PR20 — the top band's label must read 'Live state · \
-             enforced right now' so the operator sees `state` (not \
-             `decisions`) at a glance"
-        );
-        assert!(
-            INDEX_HTML.contains("Decisions in selected period"),
-            "PR20 — the bottom band's label must read 'Decisions in \
-             selected period' so the operator sees `flow` (not \
-             `state`) at a glance. The two-band distinction is \
-             load-bearing for the audit story when scope=past."
-        );
-        // Anti-regression: the old labels should be gone.
-        assert!(
-            !INDEX_HTML.contains(">Current state · now<"),
-            "PR20 — the legacy 'Current state · now' label must not \
-             survive the rename"
-        );
-        assert!(
-            !INDEX_HTML.contains(">Selected period<"),
-            "PR20 — the legacy 'Selected period' label must not \
-             survive the rename"
-        );
-    }
-
-    #[test]
-    fn pr20_pivot_picker_lives_inside_advanced_filters() {
-        // Operator-reported: IP / User / Detector pivot picker was a
-        // primary control next to date/hour but 95% of operator flows
-        // are IP-centric. PR20 moves it below the "Advanced filters"
-        // toggle so the picker is one collapse away — still
-        // accessible, no longer dominating the sidebar.
-        let adv_block_start = INDEX_HTML
-            .find("id=\"advFilters\"")
-            .expect("advFilters block must exist in index.html");
-        let adv_block_end = INDEX_HTML[adv_block_start..]
-            .find("</div>\n      <div class=\"search-wrap\"")
-            .expect("advFilters block must close before search-wrap");
-        let adv_block = &INDEX_HTML[adv_block_start..adv_block_start + adv_block_end];
-        assert!(
-            adv_block.contains("data-pivot=\"ip\""),
-            "PR20 — the pivot picker (IP/User/Detector) must live \
-             INSIDE the #advFilters block. Without this it sits at \
-             the top of the sidebar dominating the operator's \
-             attention for a feature 95% of flows never use."
-        );
-        assert!(
-            adv_block.contains("data-pivot=\"user\""),
-            "PR20 — the User pivot must also be inside advanced filters"
-        );
-        assert!(
-            adv_block.contains("data-pivot=\"detector\""),
-            "PR20 — the Detector pivot must also be inside advanced filters"
-        );
-    }
+    // 2026-05-15 slim-down: pr20_cases_band_labels_distinguish_live_from_period
+    // and pr20_pivot_picker_lives_inside_advanced_filters pinned UI that
+    // was removed in the slim-down (the period-vs-live duplicate band; the
+    // pivot picker; the advanced filters wrapper). The new Cases sidebar
+    // has a single canonical band — see pr_cases_slim_sidebar_mirrors_home_canonical
+    // for the slim-side anchor.
 
     #[test]
     fn pr20_sensors_status_drops_dead_jsonl_probes() {

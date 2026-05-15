@@ -1,87 +1,45 @@
-// Spec 049 PR5: write the operator timezone into the scope-picker
-// label. Defensive against an absent label element (some test
-// fixtures inject only part of the HTML) and against a missing
-// `overview.timezone` field (older API responses default to UTC).
-function renderTzLabel(tz) {
-  var el = document.getElementById('flt-tz-label');
-  if (!el) return;
-  var label = (typeof tz === 'string' && tz.trim()) ? tz.trim() : 'UTC';
-  el.textContent = 'TZ: ' + label;
-}
+// 2026-05-15: noop kept for any caller that survived the slim-down.
+// The TZ label was on the removed hour-from/to scope picker.
+function renderTzLabel(_tz) { /* removed with the scope picker */ }
 
-// Spec 049 PR6: render the `Current state` band on Cases. ALWAYS
-// reads from `overview.current_state.*` — backend-computed against
-// today's full-day window regardless of the scope picker. The
-// operator can pick `Yesterday 14h-16h` and this band keeps
-// reporting what is alive RIGHT NOW.
-//
-// Spec 049 PR8: gated on the Live toggle. When the toggle is OFF
-// the operator wants the band frozen on its last value (audit
-// screenshot, deliberate snapshot). The render call is a no-op
-// in that case — the DOM keeps whatever it last rendered.
-function renderCurrentStateBand(currentState) {
-  if (!isCasesLiveEnabled()) {
-    return;
-  }
-  var cs = currentState || {};
+// 2026-05-15: Cases sidebar band — mirrors Home's canonical numbers.
+// 4 KPIs (Contained / Observing / Filtered out / Needs review) sourced
+// from /api/overview canonical_counts fields. Sums to `warden_decisions
+// + needs_review`. Header label "Today" + "<N> Warden decisions" so the
+// operator-visible total agrees with Home's "<N> Warden decisions"
+// strip. Single source of truth = canonical_counts, no period-vs-now
+// duplication.
+function renderCasesSidebarBand(overview) {
+  var ov = overview || {};
+  var contained = ov.blocked_count != null ? ov.blocked_count : 0;
+  var observing = ov.observing_count != null ? ov.observing_count : 0;
+  var filteredOut = ov.filtered_out_count != null ? ov.filtered_out_count : 0;
+  var needsReview = ov.attention_count != null ? ov.attention_count : 0;
+  var warden = (ov.warden_decisions_count != null)
+    ? ov.warden_decisions_count
+    : (contained + observing + filteredOut);
+
   var setNum = function(id, val) {
     var el = document.getElementById(id);
     if (!el) return;
     el.textContent = (val == null ? 0 : val);
   };
-  setNum('kpi-now-blocked', cs.currently_blocked);
-  setNum('kpi-now-observing', cs.currently_observing);
-  setNum('kpi-now-needs-review', cs.needs_review_now);
-}
+  setNum('kpi-contained', contained);
+  setNum('kpi-observing', observing);
+  setNum('kpi-filtered-out', filteredOut);
+  setNum('kpi-needs-review', needsReview);
 
-// Spec 049 PR8 — Live toggle state. Persisted to localStorage so
-// the operator's choice survives reloads + tab switches. Defaults
-// ON (matches the pre-PR8 implicit always-live behaviour); the
-// operator opts OUT for audit screenshots or "freeze the wall
-// while I explain something to the client" moments.
-var CASES_LIVE_STORAGE_KEY = 'iw_cases_live_toggle';
-
-function isCasesLiveEnabled() {
-  try {
-    var stored = window.localStorage && window.localStorage.getItem(CASES_LIVE_STORAGE_KEY);
-    if (stored === 'off') return false;
-    return true; // default ON, includes the 'on' case and any unknown value
-  } catch (e) {
-    return true; // localStorage unavailable (private mode etc) → default ON
+  var totalEl = document.getElementById('cases-band-total');
+  if (totalEl) {
+    var word = warden === 1 ? 'Warden decision' : 'Warden decisions';
+    totalEl.textContent = warden + ' ' + word;
   }
 }
 
-function applyCasesLiveToggleUi(enabled) {
-  var btn = document.getElementById('cases-live-toggle');
-  if (!btn) return;
-  btn.classList.toggle('live-toggle-on', enabled);
-  btn.classList.toggle('live-toggle-off', !enabled);
-  btn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
-  var label = btn.querySelector('.live-label');
-  if (label) label.textContent = enabled ? 'Live' : 'Paused';
-}
-
-function toggleCasesLive() {
-  var next = !isCasesLiveEnabled();
-  try {
-    if (window.localStorage) {
-      window.localStorage.setItem(CASES_LIVE_STORAGE_KEY, next ? 'on' : 'off');
-    }
-  } catch (e) { /* localStorage unavailable — toggle still applies for this page lifetime */ }
-  applyCasesLiveToggleUi(next);
-  // When re-enabling, render once immediately so the operator sees
-  // the catch-up jump from the frozen value to the live one.
-  if (next && window._lastOverview) {
-    renderCurrentStateBand(window._lastOverview.current_state);
-  }
-}
-
-// Sync the toggle UI with the persisted state on first load. Called
-// from the Cases tab `showView('investigate')` handler — see the
-// addEventListener wiring at the bottom of this file.
-function initCasesLiveToggle() {
-  applyCasesLiveToggleUi(isCasesLiveEnabled());
-}
+// Backwards-compat alias for any caller that still says
+// renderCurrentStateBand. The new band IS today's canonical, so
+// route both names through the same function.
+function renderCurrentStateBand(overview) { renderCasesSidebarBand(overview); }
 
 var DETECTOR_PRIORITY = {
   reverse_shell: 100, fileless_exec: 95, container_escape: 90,
@@ -726,28 +684,9 @@ function setThreatsDate(date) {
   refreshLeft(true);
 }
 
-// Phase 14 (QA polish, 2026-04-29): KPI tile sub-labels were hardcoded
-// to "Today" but the underlying data is scoped by the `flt-date` picker.
-// When operator picked 2026-04-22 to investigate yesterday's incident,
-// the tiles still read "Today" — misleading. This helper makes the
-// sub-label match the active scope: "Today" when the picker is empty
-// or set to today's UTC date, otherwise the literal YYYY-MM-DD.
-function syncThreatsKpiWindowLabels() {
-  var dateInput = document.getElementById('flt-date');
-  var picked = dateInput ? (dateInput.value || '') : '';
-  var todayStr = new Date().toISOString().slice(0, 10);
-  var label = (picked === '' || picked === todayStr) ? 'Today' : picked;
-  ['kpi-confirmed', 'kpi-responded', 'kpi-noise'].forEach(function(id) {
-    var card = document.getElementById(id);
-    if (!card) return;
-    var win = card.parentElement && card.parentElement.querySelector('.kpi-window');
-    // kpi-responded reads "Now" (live observing) — leave it alone, only
-    // the date-scoped tiles ("Blocked Today" / "Needs attention Today")
-    // need to track the picker.
-    if (!win || win.textContent.trim() === 'Now') return;
-    win.textContent = label;
-  });
-}
+// 2026-05-15: removed syncThreatsKpiWindowLabels (the old KPI cards had
+// "Today" / "Now" sub-labels; the new single-band layout drops the
+// sub-label entirely — the date picker IS the scope indicator).
 
 function setThreatsPivot(p) {
   // Phase 13 (QA fix #4 follow-up, 2026-04-29): the Phase-12 fix
@@ -833,26 +772,11 @@ async function refreshLeftLive() {
     // never browser-derived (which drifts across analysts).
     renderTzLabel(ov && ov.timezone);
 
-    // Spec 049 PR6 + PR8: render the `Current state` band — live
-    // counters that IGNORE the scope picker. PR8 gates this on the
-    // Live toggle (default ON); sync the toggle UI here too so a
-    // mid-session localStorage change reflects on next refresh.
-    initCasesLiveToggle();
-    renderCurrentStateBand(ov && ov.current_state);
-
-    // 2026-04-29 (audit Phase 2): KPIs read from `/api/overview`
-    // backend-computed fields, identical to `refreshLeft`. The live
-    // SSE path used to derive counts locally from `items.outcome`,
-    // which gave different totals from the next manual refresh
-    // (different filter scope, no research_only normalisation, no
-    // execution_result honour). Backend is the single source.
-    var kpiBlocked   = ov.blocked_count   != null ? ov.blocked_count   : 0;
-    var kpiObserving = ov.observing_count != null ? ov.observing_count : 0;
-    var kpiAttention = ov.attention_count != null ? ov.attention_count : 0;
-    updateKpi('kpi-confirmed', kpiBlocked);
-    updateKpi('kpi-responded', kpiObserving);
-    updateKpi('kpi-noise',     kpiAttention);
-    syncThreatsKpiWindowLabels();
+    // 2026-05-15: Cases sidebar band reads the canonical overview
+    // (single source, same as Home). No more period-vs-now duplicate
+    // band — operator gets one set of numbers that match what Home
+    // shows. renderCasesSidebarBand fills the 4 KPIs + total label.
+    renderCasesSidebarBand(ov);
 
     const list = document.getElementById('attackerList');
     const newItems = items.filter(it => !state.knownItemValues.has(it.value));
@@ -948,32 +872,8 @@ async function refreshLeft(forceRefreshJourney = false) {
     window._lastOverview = ov;
     window._lastEntityItems = items;
 
-    // Spec 049 PR5: render operator TZ on the scope picker label.
-    renderTzLabel(ov && ov.timezone);
-
-    // Spec 049 PR6 + PR8: render the `Current state` band — live
-    // counters that IGNORE the scope picker. PR8 gates this on the
-    // Live toggle (default ON); sync the toggle UI here too so a
-    // mid-session localStorage change reflects on next refresh.
-    initCasesLiveToggle();
-    renderCurrentStateBand(ov && ov.current_state);
-
-    // Spec 037 Threats UX bundle: read the three KPIs from the
-    // backend-computed `/api/overview` fields instead of summing
-    // pivot-item outcomes locally. The previous local computation
-    // gave inconsistent counts across IP/User/Detector pivots
-    // because each pivot's `outcome` semantics differed.
-    var kpiBlocked   = ov.blocked_count   != null ? ov.blocked_count   : 0;
-    var kpiObserving = ov.observing_count != null ? ov.observing_count : 0;
-    var kpiAttention = ov.attention_count != null ? ov.attention_count : 0;
-    var setText = function(id, value) {
-      var el = document.getElementById(id);
-      if (el) el.textContent = value;
-    };
-    setText('kpi-confirmed', kpiBlocked);
-    setText('kpi-responded', kpiObserving);
-    setText('kpi-noise', kpiAttention);
-    syncThreatsKpiWindowLabels();
+    // 2026-05-15: Cases sidebar band — single canonical source.
+    renderCasesSidebarBand(ov);
     // Spec 037 Threats UX bundle: the kpi-events / kpi-incidents /
     // kpi-attackers / clusterList / topDetectors writes that used to
     // live here targeted DOM nodes that PR #188 already removed. The

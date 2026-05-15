@@ -238,40 +238,6 @@
       padding: 0 2px;
     }
 
-    .pivot-tabs {
-      display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px;
-      margin: 4px 0 8px;
-    }
-    .pivot-tab {
-      text-align: center;
-      border: 1px solid var(--line);
-      background: rgba(4, 8, 20, 0.7);
-      color: var(--muted);
-      border-radius: 8px;
-      padding: 8px 0;
-      font-size: 0.68rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      cursor: pointer;
-      min-height: 36px;
-    }
-    /* Phase 14 (QA polish, 2026-04-29): the previous active state was
-       a 11% accent fill with 35% accent border — visually identical to
-       the inactive hover (6% fill). Operator could not tell which tab
-       was selected without re-clicking. Stronger fill (22%), bolder
-       border (60%), and bold weight on the label so the active tab is
-       unambiguously the selected one. */
-    .pivot-tab.active {
-      color: var(--accent);
-      border-color: rgba(120, 229, 255, 0.60);
-      background: rgba(120, 229, 255, 0.22);
-      font-weight: 700;
-      box-shadow: 0 0 0 1px rgba(120, 229, 255, 0.20) inset;
-    }
-    .pivot-tab:hover:not(.active) {
-      background: rgba(120, 229, 255, 0.06);
-      color: var(--text);
-    }
 
     /* Section header */
     .section-title {
@@ -1008,9 +974,6 @@
       .filters .full { grid-column: auto; }
       .filters input, .filters select, .filters button { padding: 9px 10px; font-size: 0.78rem; }
 
-      .pivot-tabs { gap: 6px; }
-      .pivot-tab { padding: 9px 0; font-size: 0.7rem; min-height: 40px; }
-
       .journey-header { gap: 8px; }
       .journey-ip { font-size: 1.05rem; }
       .journey-subtitle { margin-bottom: 14px; }
@@ -1042,7 +1005,6 @@
       .kpi-label { font-size: 0.65rem; }
       .kpi-value { font-size: 1rem; }
       .kpi-grid { gap: 5px; }
-      .pivot-tab { font-size: 0.65rem; }
       .left-panel { max-height: 60vh; }
       .app-header { padding: 8px 10px 0; }
       .right-panel { padding: 14px 10px; }
@@ -1187,16 +1149,6 @@
     .toast.ok  { border-left: 3px solid var(--ok);    color: var(--text); }
     .toast.err { border-left: 3px solid var(--danger); color: var(--text); }
 
-    /* D9 - inline entity search */
-    .search-wrap { padding: 6px 12px 2px; }
-    #entitySearch {
-      width: 100%; box-sizing: border-box;
-      background: var(--bg1); border: 1px solid var(--line2); border-radius: 8px;
-      color: var(--text); font-size: 0.8rem; padding: 6px 10px;
-      outline: none; transition: border-color 0.15s;
-    }
-    #entitySearch:focus { border-color: var(--accent); }
-    #entitySearch::placeholder { color: var(--muted); }
     .attacker-card.hidden { display: none; }
     /* D7 - live timeline animations */
     @keyframes cardSlideIn {
@@ -1475,12 +1427,14 @@
       .activity-strip .activity-cell { flex-basis: calc(50% - 5px); }
     }
 
-    /* Spec 049 PR6 — Cases header duplo band label. Two stacked
-       kpi-grids on the Cases tab: `Current state` (live, ignores
-       picker) and `Selected period` (follows picker). The label
-       sits above each grid as a small UPPERCASE caption so the
-       operator can never confuse the two bands. */
+    /* 2026-05-15 slim-down: Cases sidebar has a single canonical band
+       label ("Today" + "<N> Warden decisions"). The pre-slim duplo
+       (Current state + Selected period) was removed — the duplicate
+       confused the operator without adding new information. */
     .cases-band-label {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
       font-size: 0.62rem;
       letter-spacing: 0.1em;
       text-transform: uppercase;
@@ -1488,8 +1442,12 @@
       margin: 0 0 4px 2px;
       font-weight: 600;
     }
-    .cases-band-label.cases-band-period {
-      margin-top: 14px;
+    .cases-band-label .cases-band-sub {
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: none;
+      letter-spacing: 0.02em;
+      color: var(--text);
     }
     /* Spec 049 PR10 — Recurrence block on the journey detail page.
        Sits between the journey subtitle and the timeline so the
@@ -1607,96 +1565,12 @@
       min-width: 0;
     }
 
-    /* Spec 049 PR8 — Live toggle on the Current state band. The
-       label becomes flex so the toggle sits flush right. */
-    .cases-band-label.cases-band-current {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .live-toggle {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 2px 8px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--card);
-      color: var(--muted);
-      font-size: 0.6rem;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      cursor: pointer;
-      font-family: inherit;
-      transition: color 0.15s, border-color 0.15s, background 0.15s;
-    }
-    .live-toggle:hover {
-      border-color: rgba(120, 229, 255, 0.4);
-    }
-    .live-toggle:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 1px;
-    }
-    .live-toggle .live-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--dim);
-    }
-    .live-toggle.live-toggle-on {
-      color: var(--ok);
-      border-color: rgba(34, 197, 94, 0.4);
-    }
-    .live-toggle.live-toggle-on .live-dot {
-      background: var(--ok);
-      animation: liveTogglePulse 1.6s ease-in-out infinite;
-    }
-    @keyframes liveTogglePulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50%      { opacity: 0.45; transform: scale(0.75); }
-    }
-
-    /* Spec 049 PR5 — hour-of-day scope picker on Cases tab. Sits
-       directly under the date input so the operator does not have
-       to dig under "Advanced filters" to answer their primary audit
-       question ("o que aconteceu ontem às 15h?"). */
-    .flt-hour-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      margin-top: 4px;
-      font-size: 0.74rem;
-      color: var(--muted);
-    }
-    .flt-hour-row .flt-hour-label {
-      flex-shrink: 0;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    .flt-hour-row input[type="number"] {
-      width: 4.5em;
-      padding: 2px 6px;
-      border: 1px solid var(--line);
-      background: var(--card);
-      color: var(--text);
-      border-radius: 6px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.78rem;
-    }
-    .flt-hour-row input[type="number"]:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 1px;
-    }
-    .flt-hour-row .flt-hour-sep {
-      color: var(--dim);
-    }
-    .flt-hour-row .flt-tz-label {
-      margin-left: auto;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.72rem;
-      color: var(--muted);
-      cursor: help;
-    }
+    /* 2026-05-15 slim-down: removed .cases-band-label.cases-band-current
+       (period-vs-now duplicate band gone), the entire .live-toggle button
+       + its `liveTogglePulse` keyframe (toggle removed; band is always
+       live), and the .flt-hour-row scope-picker styles (hour from/to
+       inputs removed). Backend `parse_hour_filter` survives for URL
+       deep-link replay; the picker UI does not. */
 
     /* Spec 049 sub-breakdown row under the activity strip.
        Three small chips (Contained · Observing · Filtered out) that

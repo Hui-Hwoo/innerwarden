@@ -243,170 +243,39 @@
   <!-- ── Investigate / Cases view (spec 049 PR3 renamed Threats → Cases) ── -->
   <div class="app-body" id="viewInvestigate" style="display:none">
     <aside class="left-panel">
-      <!-- 2026-04-30: top KPI tile shows BLOCK ACTIONS (per-decision
-           count from `ov.blocked_count`); the list section below
-           groups by UNIQUE ATTACKER (one row per IP). The two values
-           legitimately differ when a single IP gets multiple block
-           decisions over the day. Tile labelled "Blocks" to make the
-           unit explicit; list section labelled "Blocked attackers"
-           in OUTCOME_META so the operator sees both numbers and
-           understands they answer different questions. -->
-      <!-- Spec 049 PR6 — Cases header duplo. Two bands with
-           DELIBERATELY independent semantics:
-             1. `Current state` — live counters, IGNORE the scope
-                picker. The operator never loses situational
-                awareness for what is alive right now in the
-                product, even while auditing yesterday's 15h window.
-             2. `Selected period` — follows the scope picker
-                (date + hour range). Answers the audit question
-                "what happened then?".
-           Both bands carry the same three outcome buckets so the
-           operator's mental model stays stable across them. -->
-      <div class="cases-band-label cases-band-current">
-        <span>Live state · enforced right now</span>
-        <!-- Spec 049 PR8 — Live toggle. The band auto-refreshes
-             via SSE today; the toggle gives the operator opt-out
-             during audit work (freeze the band so screenshots stay
-             stable) and makes the live-streaming nature explicit
-             (the dot pulses green when ON — "wall display" mode
-             for the SOC TV). Persisted to localStorage. -->
-        <button id="cases-live-toggle" class="live-toggle live-toggle-on"
-                type="button" onclick="toggleCasesLive()"
-                aria-pressed="true"
-                title="Toggle live streaming on the Current state band. ON = auto-refresh on every SSE event. OFF = freeze on last value (useful during audit work).">
-          <span class="live-dot" aria-hidden="true"></span>
-          <span class="live-label">Live</span>
-        </button>
+      <!-- 2026-05-15: Cases sidebar mirrors Home's canonical breakdown.
+           Operator's exact requirement: clicking 82 on Home must land on
+           a page where the numbers trace where each of the 82 came from.
+           One band, 4 KPIs, same source as Home (canonical_counts via
+           /api/overview). Removed: the Live-state-now duplicate band,
+           the period-vs-now ambiguity, hour from/to, advanced filters,
+           and the search box — operator confirmed "filtros e tralha
+           pode remover tudo, o que eu preciso ver ali sao os 82". -->
+      <div class="cases-band-label">
+        <span>Today</span>
+        <span class="cases-band-sub" id="cases-band-total">0 Warden decisions</span>
       </div>
-      <div class="kpi-grid" style="grid-template-columns: repeat(3,1fr)">
-        <div class="kpi-card" title="Attackers currently blocked or honeypot-redirected. Live state — does not change when you pick a historical date."><div class="kpi-value" id="kpi-now-blocked" style="color:var(--ok)">0</div><div class="kpi-label">Currently blocked</div><div class="kpi-window">now</div></div>
-        <div class="kpi-card" title="Attackers Warden is observing right now. Live state."><div class="kpi-value" id="kpi-now-observing" style="color:var(--accent)">0</div><div class="kpi-label">Currently observing</div><div class="kpi-window">now</div></div>
-        <div class="kpi-card" title="Incidents that need your decision right now. Live state."><div class="kpi-value" id="kpi-now-needs-review" style="color:var(--muted)">0</div><div class="kpi-label">Needs review</div><div class="kpi-window">now</div></div>
-      </div>
-      <div class="cases-band-label cases-band-period">Decisions in selected period</div>
-      <div class="kpi-grid" style="grid-template-columns: repeat(3,1fr)">
-        <div class="kpi-card" title="Block actions in the selected period: each block decision counts once, even if the same IP triggered multiple. See 'Currently blocked attackers' below for the unique-IP count."><div class="kpi-value" id="kpi-confirmed" style="color:var(--ok)">0</div><div class="kpi-label">Block actions</div><div class="kpi-window">period</div></div>
-        <div class="kpi-card" title="Attackers Warden observed in the selected period."><div class="kpi-value" id="kpi-responded" style="color:var(--accent)">0</div><div class="kpi-label">Observing</div><div class="kpi-window">period</div></div>
-        <div class="kpi-card" title="Incidents in the selected period still waiting for a decision."><div class="kpi-value" id="kpi-noise" style="color:var(--muted)">0</div><div class="kpi-label">Needs attention</div><div class="kpi-window">period</div></div>
-      </div>
-      <div class="filters" style="grid-template-columns:1fr auto;margin-bottom:6px">
-        <input id="flt-date" type="date" class="full" style="grid-column:1/-1" title="Pick a date with on-disk graph snapshot. Empty = full graph (today)." />
-        <!-- Spec 049 PR5: hour-of-day scope picker. Operator's primary
-             audit question is "what happened yesterday at 15h?" — the
-             two hour inputs live ABOVE the Advanced toggle so the
-             operator does not have to dig. Both empty = full day.
-             Values 0-23 inclusive, UTC (matches backend semantics in
-             PR4); a follow-up may convert to operator-local TZ at
-             render time. TZ label flows from `overview.timezone`
-             (backend-emitted, never browser-derived). -->
-        <div class="flt-hour-row" style="grid-column:1/-1">
-          <label class="flt-hour-label" for="flt-hour-from">Hour</label>
-          <input id="flt-hour-from" type="number" min="0" max="23" placeholder="from" title="Hour-of-day lower bound, 0-23 inclusive (UTC)" />
-          <span class="flt-hour-sep" aria-hidden="true">–</span>
-          <input id="flt-hour-to" type="number" min="0" max="23" placeholder="to" title="Hour-of-day upper bound, 0-23 inclusive (UTC)" />
-          <span id="flt-tz-label" class="flt-tz-label" title="Operator timezone (from server config — env TZ or /etc/timezone). The hour range above is interpreted in UTC; this label is informational.">TZ: …</span>
+      <div class="kpi-grid" style="grid-template-columns: repeat(4,1fr)">
+        <div class="kpi-card" title="Attackers Warden contained today (block or honeypot redirect).">
+          <div class="kpi-value" id="kpi-contained" style="color:var(--ok)">0</div>
+          <div class="kpi-label">Contained</div>
         </div>
-        <button id="flt-adv-toggle" type="button" class="full" style="background:transparent;border:none;color:var(--muted);font-size:0.68rem;cursor:pointer;text-align:left;padding:2px 0" onclick="toggleAdvFilters()">▸ Advanced filters</button>
-      </div>
-      <div id="advFilters" style="display:none">
-        <div class="filters">
-          <!-- Phase 14 (QA polish, 2026-04-29): operator confused
-               this with the main date picker because the title was
-               just "compare date". Now explicit: this picks a SECOND
-               date to compare to the main date filter (delta view).
-               Empty = no comparison. -->
-          <input id="flt-compare-date" type="date"
-                 placeholder="Compare with another date"
-                 title="Compare to a second date (leave empty for no comparison)" />
-          <select id="flt-window">
-            <option value="">window: full day</option>
-            <option value="900">last 15m</option>
-            <option value="3600">last 1h</option>
-            <option value="21600">last 6h</option>
-          </select>
-          <select id="flt-severity">
-            <option value="">severity: any</option>
-            <option value="critical">critical+</option>
-            <option value="high">high+</option>
-            <option value="medium">medium+</option>
-          </select>
-          <!-- Audit 2.6 partial: status filter on outcome buckets so the
-               operator can narrow the threats list to "Blocked",
-               "Observing", "Needs attention", "Dismissed", "Allowlisted",
-               or "Honeypot" without scrolling each group. Country,
-               campaign, playbook outcome, AI confidence band defer to
-               their own backend extension spec. -->
-          <select id="flt-status" title="Show only attackers in this outcome bucket">
-            <option value="">status: any</option>
-            <option value="needs_attention">needs attention</option>
-            <option value="blocked">blocked</option>
-            <option value="monitoring">observing</option>
-            <option value="honeypot">honeypot</option>
-            <option value="dismissed">dismissed</option>
-            <option value="allowlisted">allowlisted</option>
-          </select>
-          <!-- Phase 14: <datalist> autocomplete with known detectors
-               so operator doesn't have to remember the exact slug. -->
-          <input id="flt-detector" type="text"
-                 placeholder="filter by detector"
-                 list="detector-options"
-                 autocomplete="off" />
-          <datalist id="detector-options">
-            <option value="ssh_bruteforce">ssh_bruteforce</option>
-            <option value="credential_stuffing">credential_stuffing</option>
-            <option value="port_scan">port_scan</option>
-            <option value="web_scan">web_scan</option>
-            <option value="threat_intel">threat_intel</option>
-            <option value="proto_anomaly">proto_anomaly</option>
-            <option value="kill_chain">kill_chain</option>
-            <option value="data_exfil_ebpf">data_exfil_ebpf</option>
-            <option value="data_exfil_cmd">data_exfil_cmd</option>
-            <option value="reverse_shell">reverse_shell</option>
-            <option value="dns_tunneling">dns_tunneling</option>
-            <option value="dns_c2">dns_c2</option>
-            <option value="rootkit">rootkit</option>
-            <option value="sudo_abuse">sudo_abuse</option>
-            <option value="suspicious_execution">suspicious_execution</option>
-            <option value="container_escape">container_escape</option>
-            <option value="crypto_miner">crypto_miner</option>
-            <option value="ransomware">ransomware</option>
-            <option value="fileless">fileless</option>
-            <option value="kernel_module_load">kernel_module_load</option>
-            <option value="process_injection">process_injection</option>
-            <option value="ssh_key_injection">ssh_key_injection</option>
-            <option value="systemd_persistence">systemd_persistence</option>
-            <option value="crontab_persistence">crontab_persistence</option>
-            <option value="user_creation">user_creation</option>
-            <option value="lateral_movement">lateral_movement</option>
-            <option value="log_tampering">log_tampering</option>
-            <option value="outbound_anomaly">outbound_anomaly</option>
-            <option value="packet_flood">packet_flood</option>
-            <option value="web_shell">web_shell</option>
-            <option value="sigma">sigma</option>
-            <option value="yara">yara</option>
-            <option value="mitre_hunt">mitre_hunt</option>
-            <option value="shield">shield</option>
-            <option value="honeypot">honeypot</option>
-          </datalist>
-          <button id="flt-apply" class="full" type="button">Apply</button>
-          <!-- Spec 049 PR20 — pivot picker moved INSIDE advanced
-               filters. Operator-reported on 2026-05-13: this picker
-               sat as a primary control next to date/hour but 95% of
-               operator flows are IP-centric. Moving it below
-               "Advanced filters" reclaims sidebar real estate for
-               the things operators actually click. User and Detector
-               pivots are still available — just one collapse deeper. -->
-          <div class="pivot-tabs full" style="grid-column:1/-1">
-            <button type="button" class="pivot-tab active" data-pivot="ip">IP</button>
-            <button type="button" class="pivot-tab" data-pivot="user">User</button>
-            <button type="button" class="pivot-tab" data-pivot="detector">Detector</button>
-          </div>
+        <div class="kpi-card" title="Attackers Warden is observing.">
+          <div class="kpi-value" id="kpi-observing" style="color:var(--accent)">0</div>
+          <div class="kpi-label">Observing</div>
+        </div>
+        <div class="kpi-card" title="Decisions Warden filtered out as noise / low-risk.">
+          <div class="kpi-value" id="kpi-filtered-out" style="color:var(--muted)">0</div>
+          <div class="kpi-label">Filtered out</div>
+        </div>
+        <div class="kpi-card" title="Incidents awaiting your decision.">
+          <div class="kpi-value" id="kpi-needs-review" style="color:var(--warn)">0</div>
+          <div class="kpi-label">Needs review</div>
         </div>
       </div>
-      <div class="search-wrap">
-        <input id="entitySearch" type="search" placeholder="search threats…" autocomplete="off" spellcheck="false" />
+      <div class="filters" style="grid-template-columns:1fr;margin-bottom:6px">
+        <input id="flt-date" type="date" class="full" title="Pick a date — empty = today. Use the picker to audit any previous day." />
       </div>
-      <div class="section-title" id="entityTitle">AI Defense Log</div>
       <div id="attackerList"><div class="empty">Loading…</div></div>
     </aside>
     <main class="right-panel" id="rightPanel">

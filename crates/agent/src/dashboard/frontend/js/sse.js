@@ -80,54 +80,22 @@ function _renderConnectionStatus() {
 // no new events arrive.
 setInterval(_renderConnectionStatus, 5000);
 
-// ── Entity search ────────────────────────────────────────────────────
-function applyEntitySearch() {
-  const q = (document.getElementById('entitySearch').value || '').trim().toLowerCase();
-  const cards = document.querySelectorAll('#attackerList .attacker-card');
-  let visible = 0;
-  cards.forEach(card => {
-    const text = card.textContent.toLowerCase();
-    const match = !q || text.includes(q);
-    card.classList.toggle('hidden', !match);
-    if (match) visible++;
-  });
-  let countEl = document.getElementById('searchCount');
-  if (!countEl) {
-    countEl = document.createElement('span');
-    countEl.id = 'searchCount';
-    countEl.style.cssText = 'font-size:0.62rem;color:var(--muted);margin-left:6px';
-    const searchBox = document.getElementById('entitySearch');
-    if (searchBox && searchBox.parentNode) searchBox.parentNode.appendChild(countEl);
-  }
-  countEl.textContent = q ? visible + ' of ' + cards.length : '';
-  let noRes = document.getElementById('searchNoResults');
-  if (!visible && q) {
-    if (!noRes) {
-      noRes = document.createElement('div');
-      noRes.id = 'searchNoResults';
-      noRes.className = 'empty';
-      noRes.textContent = 'No matches for "' + q + '"';
-      document.getElementById('attackerList').appendChild(noRes);
-    } else {
-      noRes.textContent = 'No matches for "' + q + '"';
-    }
-  } else if (noRes) {
-    noRes.remove();
-  }
-}
+// 2026-05-15 slim-down: removed search-threats input + the dynamic
+// search-count / no-results markers. Function kept as a defensive
+// no-op so threats.js call sites continue to function (the search
+// input no longer exists, so there's nothing to filter on).
+function applyEntitySearch() { /* removed with the search box */ }
 
 // ══════════════════════════════════════════════════════════════════════
 // INIT — runs after all modules are loaded
 // ══════════════════════════════════════════════════════════════════════
 
-// Hydrate filters from URL
+// Hydrate filter from URL. 2026-05-15 slim-down: Cases sidebar keeps
+// only a single date picker — the compare-date, severity, detector,
+// window, status and search inputs were all removed.
 hydrateStateFromQuery();
-document.getElementById('flt-date').value = state.filters.date || today;
-document.getElementById('flt-compare-date').value = state.filters.compare_date || '';
-document.getElementById('flt-severity').value = state.filters.severity_min || '';
-document.getElementById('flt-detector').value = state.filters.detector || '';
-document.getElementById('flt-window').value = state.filters.window_seconds || '';
-document.getElementById('flt-status').value = state.filters.status || '';
+var fltDateEl = document.getElementById('flt-date');
+if (fltDateEl) fltDateEl.value = state.filters.date || today;
 updatePivotUi();
 loadActionConfig();
 loadReportDates();
@@ -140,53 +108,24 @@ document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') closeActionModal();
 });
 
-// 2026-04-29: cap the date pickers at today so the calendar widget
-// greys out future dates. Browser enforces this only on the calendar
-// UI; `syncFiltersFromUi` adds the matching guard against typed-in
-// future dates.
-(function capDatePickersAtToday() {
-  var today = new Date().toISOString().slice(0, 10);
+// Cap the date picker at today so future dates grey out in the
+// calendar widget. `syncFiltersFromUi` adds the matching guard
+// against typed-in future dates.
+(function capDatePickerAtToday() {
+  var todayStr = new Date().toISOString().slice(0, 10);
   var el = document.getElementById('flt-date');
-  if (el) el.max = today;
-  var cmp = document.getElementById('flt-compare-date');
-  if (cmp) cmp.max = today;
+  if (el) el.max = todayStr;
 })();
 
-// Filter event listeners
-document.getElementById('flt-apply').addEventListener('click', () => {
-  const list = document.getElementById('attackerList');
-  if (list) list.innerHTML = '<div class="loading" style="padding:20px">Loading...</div>';
-  refreshLeft(true);
-});
-document.querySelectorAll('.pivot-tab').forEach((tab) => {
-  tab.addEventListener('click', () => {
-    const pivot = tab.dataset.pivot || 'ip';
-    state.pivot = pivot;
-    state.selected = { type: pivot, value: null };
-    updatePivotUi();
-    refreshLeft(false);
-  });
-});
-document.getElementById('flt-detector').addEventListener('keydown', (ev) => {
-  if (ev.key === 'Enter') refreshLeft(true);
-});
-document.getElementById('flt-severity').addEventListener('change', () => refreshLeft(true));
-document.getElementById('flt-date').addEventListener('change', () => refreshLeft(true));
-document.getElementById('flt-compare-date').addEventListener('change', () => {
-  if (state.selected.value) {
-    loadJourney(state.selected.type, state.selected.value);
-    return;
-  }
-  refreshLeft(false);
-});
-document.getElementById('flt-window').addEventListener('change', () => refreshLeft(true));
-document.getElementById('flt-status').addEventListener('change', () => refreshLeft(true));
-document.getElementById('entitySearch').addEventListener('input', applyEntitySearch);
+// Filter event listener (date is the only knob now).
+var fltDateChangeEl = document.getElementById('flt-date');
+if (fltDateChangeEl) {
+  fltDateChangeEl.addEventListener('change', () => refreshLeft(true));
+}
 
 // Initial data load — route first, then load data for visible view
 initRouter();
 refreshLeft(false).then(() => {
-  applyEntitySearch();
   if (state.selected.value) {
     loadJourney(state.selected.type, state.selected.value);
   }

@@ -144,9 +144,13 @@ function syncUrl() {
 }
 
 function updatePivotUi() {
+  // 2026-05-15 slim-down: pivot tabs + entity-title header were removed
+  // from the Cases sidebar. Function kept as a defensive no-op so older
+  // call sites do not need to be touched all at once.
   document.querySelectorAll('.pivot-tab').forEach((tab) => {
     tab.classList.toggle('active', tab.dataset.pivot === state.pivot);
   });
-  document.getElementById('entityTitle').textContent = pivotTitle(state.pivot);
+  var title = document.getElementById('entityTitle');
+  if (title) title.textContent = pivotTitle(state.pivot);
 }
 
