@@ -109,21 +109,6 @@
       <div class="status-hero-sub" id="homeHeroSub"></div>
     </div>
 
-    <!-- 2. CRITICAL BANNER: only renders when an active critical
-         incident has no decision yet. The single thing that breaks
-         the "you are protected" narrative — and the only thing that
-         deserves to break it. Bottom-of-page Critical was a UX bug. -->
-    <div class="home-alert-banner home-alert-critical" id="homeCriticalBanner" style="display:none" role="alert">
-      <span class="home-alert-icon" aria-hidden="true">
-        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
-      </span>
-      <div class="home-alert-body">
-        <div class="home-alert-title" id="homeCriticalTitle">Critical incident — needs you now</div>
-        <div class="home-alert-sub" id="homeCriticalSub"></div>
-      </div>
-      <a class="home-alert-cta" href="#threats" id="homeCriticalCta" onclick="return openTopCritical(event)">Review &rarr;</a>
-    </div>
-
     <!-- 3. REVIEW QUEUE BANNER: only renders when attention_count > 0.
          AI couldn't decide, so it's the operator's call. Amber, less
          loud than the critical banner. -->
@@ -193,22 +178,6 @@
       </div>
     </div>
 
-    <!-- 4a. SINCE-LAST-VISIT BANNER (audit 5.11): only renders when
-         localStorage has a `iw_last_visit_ts` from a prior visit AND
-         at least one new incident or decision landed in the
-         meantime. Quietly gives the operator a "what changed" cue
-         for the MSSP morning-rounds use case — no dismiss button,
-         the banner self-resets when the visit timestamp updates. -->
-    <div class="home-section home-since-last-visit" id="homeSinceLastVisit" style="display:none">
-      <div class="home-since-icon" aria-hidden="true">
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="10"/></svg>
-      </div>
-      <div class="home-since-body">
-        <div class="home-since-title" id="homeSinceTitle">Since your last visit</div>
-        <div class="home-since-sub" id="homeSinceSub"></div>
-      </div>
-    </div>
-
     <!-- 4b. ONBOARDING / CLEAN-DAY TIP (audit 5.10): only renders
          when the day has produced zero attackers AND zero items in
          the review queue. Gives the operator context that the agent
@@ -238,64 +207,11 @@
       </div>
     </div>
 
-    <!-- 5b. HOST POSTURE (spec 044 Phase 4): live snapshot of sshd /
-         services / sudo / firewall. Read-only — refreshed by the
-         agent's slow loop every 10 min. The downgrade engine reads
-         this same data; surfacing it here lets the operator see WHY
-         certain alerts get demoted. -->
-    <div class="home-section" id="postureSection">
-      <div class="home-section-title">Host posture</div>
-      <div id="postureContent" style="font-size:0.78rem;color:var(--text);line-height:1.55">
-        <div style="color:var(--muted)">Loading posture&hellip;</div>
-      </div>
-    </div>
-
-    <!-- 6. SYSTEM HEALTH LINE: 1-row summary. ✓ when healthy. -->
-    <div class="home-health-line" id="homeHealthLine">
-      <span class="home-health-icon" id="homeHealthIcon" aria-hidden="true">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-      </span>
-      <span id="homeHealthSummary">Checking system health&hellip;</span>
-      <button class="home-health-toggle" id="homeDetailsToggle" onclick="toggleHomeDetails()" aria-expanded="false">Show details</button>
-    </div>
-
-    <!-- 7. DETAILS: opt-in for the 1% routine-scan persona. Holds
-         the per-detector breakdown, pending buckets, sensor list,
-         mode/heartbeat metadata. Hidden by default. -->
-    <div class="home-details" id="homeDetailsPanel" hidden>
-      <!-- Audit 3.6: when the toggle expands the panel, this heading
-           plus the dashed border below make the "where the technical
-           detail is" boundary unambiguous. The audit operator
-           reported clicking the toggle and "no content appearing"
-           because the meta row alone read as page chrome. -->
-      <div class="home-details-heading">Technical details</div>
-      <!-- Pending breakdown — only renders cells with count > 0 -->
-      <div class="home-section" id="homePendingPanel" style="display:none">
-        <div class="home-section-title">
-          Still being analyzed
-          <span class="home-section-sub" id="homePendingHint"></span>
-        </div>
-        <div class="pending-grid" id="homePendingGrid"></div>
-      </div>
-
-      <!-- Sensor list -->
-      <div class="home-section">
-        <div class="home-section-title">
-          Data sources
-          <a href="#sensors" class="home-link" style="font-size:0.65rem;font-weight:600" onclick="event.preventDefault();showView('sensors')">View timeline &rarr;</a>
-        </div>
-        <div class="collector-strip" id="homeCollectorStrip">
-          <div class="collector-summary-line">Loading&hellip;</div>
-        </div>
-      </div>
-
-      <!-- Mode + heartbeat: low-importance metadata. -->
-      <div class="home-meta-row" id="homeMetaRow">
-        <span class="home-meta-item">Mode: <strong id="homeMetaMode">&mdash;</strong></span>
-        <span class="home-meta-item" id="homeMetaHeartbeatItem">Last data: <strong id="homeMetaHeartbeat">&mdash;</strong></span>
-        <a href="#health" class="home-link" onclick="event.preventDefault();viewSystemHealth()">View system health &rarr;</a>
-      </div>
-    </div>
+    <!-- 2026-05-15: removed Host Posture, System Health line + Show
+         details toggle, and the Technical Details panel (which held
+         pending-buckets, collector-strip and mode/heartbeat metadata).
+         Operator confirmed those sections were noise on Home; the
+         data they surfaced is reachable from Sensors / Health / Cases. -->
   </div>
 
   <!-- ── Sensors view ── -->
@@ -671,8 +587,9 @@
 
   <!-- Action toast (single, action confirmations) -->
   <div class="toast" id="toast"></div>
-  <!-- Real-time alert stack (max 3 visible, FIFO; "+N more" badge after) -->
-  <div class="alert-stack" id="alertStack" aria-live="polite" aria-atomic="false"></div>
+  <!-- 2026-05-15: removed the real-time alert-stack (top-right toasts).
+       Live alerts still arrive via SSE; the dashboard refreshes counters
+       and the Cases timeline in-place rather than stacking notifications. -->
 
 </div>
 

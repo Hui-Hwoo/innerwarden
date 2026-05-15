@@ -629,9 +629,9 @@ pub async fn serve(
         // AI Intelligence Briefing
         .route("/api/briefing", get(api_briefing))
         .route("/api/briefing/generate", post(api_briefing_generate))
-        // Spec 044 Phase 4 — live host posture snapshot consumed by
-        // the Health tab's posture card.
-        .route("/api/posture", get(api_posture))
+        // 2026-05-15: removed /api/posture — the dashboard's Home
+        // posture card was removed. The posture module remains in
+        // crate::posture (used by telegram summaries + downgrade).
         // AI Explain — plain-language threat explanation for non-technical operators
         .route("/api/ai-explain", get(api_ai_explain))
         // Sensors activity
@@ -1206,28 +1206,10 @@ mod tests {
         // (Phase 7 typed snapshot contract). 2026-04-30 redesign drops
         // the `incidents` field from the home — unique-attacker is the
         // only count rendered, matching the unified attacker semantic
-        // from Phase 10. The pending pipeline still reads `snap.pending`.
+        // from Phase 10. The 2026-05-15 slim-down removed the
+        // pending-breakdown panel; `snap.pending` is no longer read.
         assert!(JS_HOME.contains("overview.snapshot"));
         assert!(JS_HOME.contains("snap.buckets.blocked.unique_attackers"));
-        assert!(JS_HOME.contains("snap.pending"));
-    }
-
-    #[test]
-    fn home_js_renders_pending_breakdown_panel() {
-        // 2026-04-30 redesign: pending grid now renders dynamically —
-        // cells with count > 0 are emitted by name, no static DOM IDs.
-        // Anchor pins the keys updatePendingPanel reads from snapshot
-        // so a future schema change on `pending.*` is caught.
-        assert!(JS_HOME.contains("pending.in_flight"));
-        assert!(JS_HOME.contains("pending.declined_by_ai"));
-        assert!(JS_HOME.contains("pending.cooldown_suppressed"));
-        assert!(JS_HOME.contains("pending.stuck"));
-        // Plain-English labels rendered into each cell. Operator sees
-        // these strings, not SOC jargon.
-        assert!(JS_HOME.contains("Being analyzed now"));
-        assert!(JS_HOME.contains("AI escalated to you"));
-        assert!(JS_HOME.contains("Same threat already decided"));
-        assert!(JS_HOME.contains("No decision after 1 hour"));
     }
 
     #[test]
@@ -1240,20 +1222,6 @@ mod tests {
     }
 
     #[test]
-    fn index_html_carries_pending_breakdown_panel() {
-        // 2026-04-30 redesign: pending grid is now dynamic — only the
-        // panel container + grid mount-point ship in HTML, the cells
-        // are rendered from JS only when count > 0. The previous
-        // anchor required the 4 static cell IDs which no longer exist.
-        assert!(INDEX_HTML.contains("id=\"homePendingPanel\""));
-        assert!(INDEX_HTML.contains("id=\"homePendingGrid\""));
-        // The legacy IDs MUST NOT come back — that signals someone
-        // re-introduced the always-render-zero-cells regression.
-        assert!(!INDEX_HTML.contains("id=\"homePendingInFlight\""));
-        assert!(!INDEX_HTML.contains("id=\"homePendingStuck\""));
-    }
-
-    #[test]
     fn index_html_attention_first_home_layout() {
         // 2026-04-30 redesign: the Home was rebuilt for the 95%
         // 5-second-visit operator. Reading order: hero verb → critical
@@ -1263,12 +1231,11 @@ mod tests {
         // anchor pins the structural IDs so a future "improvement"
         // cannot silently drop them. See loadHome() for the
         // orchestration this anchors against.
+        // 2026-05-15 slim-down: removed critical banner, health line,
+        // details panel + its children (pending grid, collector strip,
+        // mode/heartbeat). Anchor pins only the IDs that still ship.
         for id in [
             "homeHero",
-            "homeCriticalBanner",
-            "homeCriticalTitle",
-            "homeCriticalSub",
-            "homeCriticalCta",
             "homeReviewBanner",
             "homeReviewCount",
             "homeActivitySection",
@@ -1284,16 +1251,6 @@ mod tests {
             "briefingSection",
             "briefingContent",
             "briefingBtn",
-            "homeHealthLine",
-            "homeHealthIcon",
-            "homeHealthSummary",
-            "homeDetailsToggle",
-            "homeDetailsPanel",
-            "homePendingPanel",
-            "homePendingGrid",
-            "homeCollectorStrip",
-            "homeMetaMode",
-            "homeMetaHeartbeat",
         ] {
             assert!(
                 INDEX_HTML.contains(id),
@@ -1310,17 +1267,14 @@ mod tests {
         // The render orchestration must call each block's renderer
         // explicitly. A future refactor that drops one renderer
         // produces an empty block on screen — anchor catches it.
+        // 2026-05-15 slim-down: removed critical banner, health line,
+        // details panel, since-last-visit, and posture renderers.
         for fn_name in [
             "updateHomeHero",
-            "renderCriticalBanner",
             "renderReviewBanner",
             "renderActivityStrip",
-            "renderHealthLine",
-            "renderDetailsPanel",
+            "renderOnboardingTip",
             "loadBriefing",
-            "toggleHomeDetails",
-            "openTopCritical",
-            "findTopOpenCritical",
         ] {
             assert!(
                 JS_HOME.contains(fn_name),
@@ -1347,6 +1301,171 @@ mod tests {
             !body.contains("section.style.display = 'none';"),
             "loadBriefing must NOT hide section on error (always-visible contract)"
         );
+    }
+
+    // ── 2026-05-15 slim-down anchors ─────────────────────────────────
+    // The Home page lost 4 sections (critical banner, since-last-visit,
+    // host posture, system health line + Show details toggle + the
+    // entire Technical Details panel) and 1 cross-page element (the
+    // top-right alert-toast stack). These anchors pin (a) the removed
+    // markup MUST NOT come back, (b) the renderers that survived stay
+    // wired up, and (c) the AI Briefing generate path is intact since
+    // it's the single piece of narrative the operator relies on.
+
+    #[test]
+    fn pr_home_slim_orphan_ids_are_gone_from_index_html() {
+        // Sentinel against a future "let's bring it back" PR. Every ID
+        // in this list was deleted in the 2026-05-15 slim-down. If any
+        // of them comes back, this test fires with the exact name.
+        for orphan in [
+            "id=\"homeCriticalBanner\"",
+            "id=\"homeCriticalTitle\"",
+            "id=\"homeCriticalSub\"",
+            "id=\"homeCriticalCta\"",
+            "id=\"homeSinceLastVisit\"",
+            "id=\"homeSinceTitle\"",
+            "id=\"homeSinceSub\"",
+            "id=\"postureSection\"",
+            "id=\"postureContent\"",
+            "id=\"homeHealthLine\"",
+            "id=\"homeHealthIcon\"",
+            "id=\"homeHealthSummary\"",
+            "id=\"homeDetailsToggle\"",
+            "id=\"homeDetailsPanel\"",
+            "id=\"homePendingPanel\"",
+            "id=\"homePendingGrid\"",
+            "id=\"homePendingHint\"",
+            "id=\"homeCollectorStrip\"",
+            "id=\"homeMetaRow\"",
+            "id=\"homeMetaMode\"",
+            "id=\"homeMetaHeartbeat\"",
+            "id=\"alertStack\"",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(orphan),
+                "2026-05-15 slim-down: {orphan} was removed; re-adding it brings back \
+                 a section the operator explicitly asked to drop"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_home_slim_orphan_functions_are_gone_from_home_js() {
+        // Every renderer in the slim-down delete list. Anchor enforces
+        // they stay deleted — if any comes back without an HTML target,
+        // the operator gets dead code in the home bundle.
+        for orphan_fn in [
+            "function findTopOpenCritical",
+            "function homeBannerEntityLink",
+            "function homeBannerOpenPivot",
+            "function renderCriticalBanner",
+            "function openTopCritical",
+            "function renderHealthLine",
+            "function renderDetailsPanel",
+            "function toggleHomeDetails",
+            "function computeSinceLastVisitCounts",
+            "function renderSinceLastVisitBanner",
+            "function _humanAgo",
+            "function updatePendingPanel",
+            "function updateCollectorStrip",
+            "function toggleCollectorDetails",
+            "function viewSystemHealth",
+            "async function loadPosture",
+        ] {
+            assert!(
+                !JS_HOME.contains(orphan_fn),
+                "2026-05-15 slim-down: `{orphan_fn}` was removed; bringing it back \
+                 re-introduces dead code (the HTML target was deleted)"
+            );
+        }
+        // The corresponding call sites must not reappear either.
+        for orphan_call in [
+            "renderCriticalBanner(",
+            "renderHealthLine(",
+            "renderDetailsPanel(",
+            "renderSinceLastVisitBanner(",
+            "loadPosture(",
+            "toggleHomeDetails(",
+        ] {
+            assert!(
+                !JS_HOME.contains(orphan_call),
+                "2026-05-15 slim-down: call site `{orphan_call}` resurfaced — \
+                 the renderer either came back or the loadHome orchestration \
+                 is calling a function that no longer exists"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_home_slim_no_alert_toast_stack_in_sse_or_css() {
+        // The top-right notification stack was removed. Pin the
+        // absence at every bundle boundary: HTML (already covered by
+        // pr_home_slim_orphan_ids_are_gone_from_index_html), JS, CSS.
+        assert!(!JS_SSE.contains("function showAlertToast"));
+        assert!(!JS_SSE.contains("_alertStackOverflow"));
+        assert!(!JS_SSE.contains("ALERT_STACK_MAX_VISIBLE"));
+        // The action-toast (single confirmation toast used by showToast
+        // in actions.js) is a separate concern and MUST stay.
+        assert!(INDEX_HTML.contains("id=\"toast\""));
+        // CSS: no .alert-toast / .alert-stack / .alert-overflow rules.
+        assert!(!APP_CSS.contains(".alert-toast"));
+        assert!(!APP_CSS.contains(".alert-stack"));
+        assert!(!APP_CSS.contains(".alert-overflow"));
+        // The .toast (action confirmation) styles MUST remain.
+        assert!(APP_CSS.contains(".toast {"));
+    }
+
+    #[test]
+    fn pr_home_slim_briefing_generate_posts_to_canonical_endpoint() {
+        // The AI Briefing is the single narrative surface on Home.
+        // Operator's exact words: "o que for mantido na home deve
+        // funcionar perfeitamente inclusive o resumo da AI". Anchor
+        // the generate path so a future refactor doesn't accidentally
+        // break the canonical POST endpoint or drop the visible UX
+        // states (loading / regenerate / error).
+        assert!(
+            JS_HOME.contains("'/api/briefing/generate'"),
+            "generateBriefing must POST to /api/briefing/generate"
+        );
+        assert!(
+            JS_HOME.contains("method: 'POST'"),
+            "generateBriefing must use POST (server expects it)"
+        );
+        assert!(
+            JS_HOME.contains("btn.textContent = 'Generating...'"),
+            "generateBriefing must show 'Generating...' on the button while in-flight"
+        );
+        assert!(
+            JS_HOME.contains("btn.textContent = 'Regenerate'"),
+            "generateBriefing must flip the button to 'Regenerate' after the call completes"
+        );
+    }
+
+    #[test]
+    fn pr_home_slim_loadhome_orchestration_only_calls_kept_renderers() {
+        // Whitelist what loadHome calls; anything else inside its body
+        // is either a removed renderer (caught by orphan tests) or new
+        // code that needs review. Anchor explicitly lists the kept
+        // renderers + the briefing loader.
+        let start = JS_HOME
+            .find("async function loadHome()")
+            .expect("loadHome present");
+        let end = JS_HOME[start..].find("\n}\n").expect("end of loadHome") + start;
+        let body = &JS_HOME[start..end];
+        // The five things that must be called inside loadHome today.
+        for fn_call in [
+            "updateHomeHero(",
+            "renderReviewBanner(",
+            "renderActivityStrip(",
+            "renderOnboardingTip(",
+            "loadBriefing(",
+        ] {
+            assert!(
+                body.contains(fn_call),
+                "loadHome must call `{fn_call}` — slim-down kept this renderer; \
+                 missing call leaves the section blank on page load"
+            );
+        }
     }
 
     // ── Spec 049 PR3 anchors ────────────────────────────────────────
@@ -2483,36 +2602,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn home_pending_panel_renders_only_nonzero_cells() {
-        // 2026-04-30 redesign: the pending grid used to render all 4
-        // cells with "0" placeholders even when every count was zero,
-        // which the operator legitimately read as engineer-debug
-        // noise. Steady state must be: panel hidden entirely. Anchor
-        // pins the pattern by requiring the dynamic-render code path
-        // (cells.filter(c => c.n > 0)) to be present.
-        assert!(
-            JS_HOME.contains("var visible = cells.filter(function(c) { return c.n > 0; });"),
-            "updatePendingPanel must filter to non-zero cells before rendering"
-        );
-        assert!(
-            JS_HOME.contains("if (visible.length === 0) {"),
-            "updatePendingPanel must hide the panel when no cell is non-zero"
-        );
-    }
-
-    #[test]
-    fn home_critical_banner_only_renders_open_critical_high() {
-        // The critical banner must (a) show only for open + critical/
-        // high, (b) hide when no such incident exists, (c) deep-link
-        // to the journey view via openTopCritical. Pin the predicates
-        // so a future "improvement" doesn't widen the trigger and
-        // make the banner fire on routine traffic.
-        assert!(JS_HOME.contains("if (i.outcome !== 'open') return false;"));
-        assert!(JS_HOME.contains("if (sevRank[sev] < 3) return false;"));
-        // Hide path when no top critical.
-        assert!(JS_HOME.contains("banner.style.display = 'none';"));
-    }
+    // 2026-05-15 slim-down: removed home_pending_panel_renders_only_nonzero_cells
+    // (the Technical Details panel that hosted the pending grid is gone) and
+    // home_critical_banner_only_renders_open_critical_high (the critical
+    // banner was removed from Home — critical incidents still surface on
+    // the Cases view and via Telegram).
 
     #[test]
     fn home_no_summary_pyramid_or_homenow_dom_ids_remain() {
@@ -2573,17 +2667,15 @@ mod tests {
 
     #[test]
     fn app_css_defines_attention_first_home_styles() {
+        // 2026-05-15 slim-down: dropped .home-alert-critical, .home-health-line,
+        // .home-health-bad, .home-details, .home-meta-row — those sections
+        // were removed from Home.
         for selector in [
             ".home-alert-banner",
-            ".home-alert-critical",
             ".home-alert-warn",
             ".activity-strip",
             ".activity-cell",
             ".activity-cell-attention-active",
-            ".home-health-line",
-            ".home-health-bad",
-            ".home-details",
-            ".home-meta-row",
         ] {
             assert!(
                 APP_CSS.contains(selector),
@@ -4664,67 +4756,12 @@ mod tests {
     // future refactor is most likely to drop the contract without any
     // unit-test coverage noticing.
 
-    #[test]
-    fn index_html_carries_alert_stack_container() {
-        // Audit 4.8: a stack container must exist so `showAlertToast`
-        // has somewhere to append toasts. Single-toast behaviour is
-        // not enough — that was the regression the audit caught.
-        assert!(
-            INDEX_HTML.contains("id=\"alertStack\""),
-            "alert stack container missing — toast burst will collapse to a single overwriting toast (audit 4.8)"
-        );
-        // The legacy single-toast div MUST stay for action confirmations
-        // (showToast in actions.js). Those are a different concern.
-        assert!(INDEX_HTML.contains("id=\"toast\""));
-    }
-
-    #[test]
-    fn app_css_defines_alert_stack_styles() {
-        for cls in [
-            ".alert-stack",
-            ".alert-toast",
-            ".alert-toast.visible",
-            ".alert-toast-critical",
-            ".alert-toast-high",
-            ".alert-overflow",
-        ] {
-            assert!(
-                APP_CSS.contains(cls),
-                "alert-stack styling rule {cls} missing — toasts render unstyled (audit 4.8)"
-            );
-        }
-    }
-
-    #[test]
-    fn sse_js_caps_alert_stack_and_overflows() {
-        // Audit 4.8 contract: a hard cap on visible toasts and a
-        // surfaced overflow badge. Both must be present at the bundle
-        // boundary or a future refactor can silently regress to the
-        // pre-fix wall-of-toasts behaviour.
-        assert!(
-            JS_SSE.contains("ALERT_STACK_MAX_VISIBLE"),
-            "sse.js must declare ALERT_STACK_MAX_VISIBLE — caps toast burst"
-        );
-        assert!(JS_SSE.contains("_alertStackOverflow"));
-        assert!(JS_SSE.contains("alert-overflow"));
-        // Each toast must be its own element under the stack so a
-        // dismiss does not rip the whole stack out (regression risk).
-        assert!(JS_SSE.contains("querySelectorAll('.alert-toast')"));
-    }
-
-    #[test]
-    fn sse_js_pivots_alert_into_open_journey() {
-        // Audit 2.10: when the operator already has the journey
-        // open, an alert for that IP must reload the journey instead
-        // of stacking a redundant toast on top of the page they are
-        // looking at.
-        assert!(
-            JS_SSE.contains("_journeyOpenForIp"),
-            "sse.js must define _journeyOpenForIp — pivots alert into open journey (audit 2.10)"
-        );
-        // The branch that calls loadJourney must be reachable.
-        assert!(JS_SSE.contains("loadJourney('ip', alertIp)"));
-    }
+    // 2026-05-15 slim-down: the alert-toast stack was removed from the
+    // dashboard (operator-confirmed noise). The anchors that pinned the
+    // stack container, CSS rules, JS cap-and-overflow logic, and the
+    // open-journey pivot are gone with it. The single-toast div (id
+    // "toast", used by showToast in actions.js for action confirmations)
+    // is unaffected and still anchored implicitly by actions.js tests.
 
     #[tokio::test]
     async fn js_and_css_handlers_set_no_store_cache_control() {
@@ -4773,28 +4810,13 @@ mod tests {
     }
 
     #[test]
-    fn home_critical_banner_deeplink_passes_incident_id_to_journey() {
-        // 2026-05-02 audit (release ladder f.): when the operator
-        // clicks "Review →" on the Home critical-alert banner, the
-        // resulting Threats journey must scroll to the specific
-        // incident the banner referred to and flash a highlight on
-        // it. Pre-fix the click pivoted by IP only, leaving the
-        // operator at the top of a long journey for that IP.
-
-        // Home: openTopCritical extracts top.incident_id and passes it
-        // as the third arg to loadJourney.
-        assert!(
-            JS_HOME.contains("var focusIncidentId = top.incident_id || null"),
-            "home.js::openTopCritical must extract incident_id from the cached top critical \
-             alert (audit release ladder f.)"
-        );
-        assert!(
-            JS_HOME.contains("loadJourney(pivotKind, pivotEntity.value, focusIncidentId)"),
-            "home.js must thread focusIncidentId through to loadJourney as the third arg"
-        );
-
-        // Journey: loadJourney accepts the third arg, scrolls the
-        // matching group into view, and applies the flash class.
+    fn journey_deeplink_supports_focus_incident_id() {
+        // 2026-05-02 audit (release ladder f.) originally pinned the
+        // Home critical-banner deeplink. The Home banner was removed
+        // in the 2026-05-15 slim-down; the journey.js machinery for
+        // deeplinking to a specific incident is retained because it is
+        // still useful for future surfaces (e.g. Telegram deeplinks,
+        // Cases tab focus). Anchor the journey-side contract only.
         assert!(
             JS_JOURNEY
                 .contains("async function loadJourney(subjectType, subjectValue, focusIncidentId)"),
@@ -4809,23 +4831,17 @@ mod tests {
             "journey.js must apply the deeplink flash class so the operator's eye lands on \
              the correct incident"
         );
-
-        // Singletons must be wrappable so the selector finds them too.
         assert!(
             JS_JOURNEY.contains("div class=\"tl-singleton\" data-group-key="),
             "journey.js::renderEntryGroup must wrap singleton incident entries with a \
              data-group-key attribute so the deeplink selector matches them"
         );
-
-        // Selector matches both grouped and singleton incidents.
         assert!(
             JS_JOURNEY.contains("div.tl-group[data-group-key=")
                 && JS_JOURNEY.contains("div.tl-singleton[data-group-key="),
             "journey.js deeplink selector must match both .tl-group and .tl-singleton — \
              singleton incidents (no related entries) deeplink the same way as grouped ones"
         );
-
-        // CSS keyframe animation defined.
         assert!(
             APP_CSS.contains("@keyframes tlDeeplinkFlash"),
             "app.css must define the tlDeeplinkFlash keyframe animation"
@@ -5038,23 +5054,8 @@ mod tests {
         assert!(JS_JOURNEY.contains("e.kind === 'incident'"));
     }
 
-    #[test]
-    fn home_js_renders_since_last_visit_diff() {
-        // Audit 5.11: localStorage-tracked last visit timestamp drives
-        // a "Since your last visit" diff banner so the MSSP morning-
-        // rounds operator sees what changed in their absence. Anchor
-        // pins the storage key + the pure compute helper + the
-        // renderer hook.
-        assert!(JS_HOME.contains("SINCE_LAST_VISIT_KEY = 'iw_last_visit_ts'"));
-        assert!(JS_HOME.contains("function computeSinceLastVisitCounts"));
-        assert!(JS_HOME.contains("function renderSinceLastVisitBanner"));
-        assert!(
-            JS_HOME.contains("renderSinceLastVisitBanner(items, responsesData)"),
-            "loadHome must call renderSinceLastVisitBanner — without the wire-up the banner never updates (audit 5.11)"
-        );
-        // The HTML container has to exist or the renderer no-ops.
-        assert!(INDEX_HTML.contains("id=\"homeSinceLastVisit\""));
-    }
+    // 2026-05-15 slim-down: removed home_js_renders_since_last_visit_diff
+    // (the Since your last visit banner was removed from Home).
 
     #[test]
     fn helpers_glossary_carries_required_audit_terms() {
@@ -5354,52 +5355,14 @@ mod tests {
         assert!(JS_HOME.contains("renderOnboardingTip(overview)"));
     }
 
-    #[test]
-    fn home_js_critical_banner_pivots_user_links() {
-        // Audit 5.5: IP and User mentions in the critical banner
-        // sub-line are now clickable. Anchor pins the helper that
-        // generates the link AND the call sites in
-        // renderCriticalBanner.
-        assert!(JS_HOME.contains("function homeBannerEntityLink"));
-        assert!(JS_HOME.contains("function homeBannerOpenPivot"));
-        // Both branches (ip / user) must be present so the operator
-        // pivots correctly regardless of which entity surfaces.
-        assert!(JS_HOME.contains("homeBannerEntityLink(ipEntity)"));
-        assert!(JS_HOME.contains("homeBannerEntityLink(userEntity)"));
-    }
-
-    #[test]
-    fn app_css_defines_onboarding_and_details_heading() {
-        assert!(APP_CSS.contains(".home-onboarding-tip"));
-        assert!(APP_CSS.contains(".home-onboarding-link"));
-        // Audit 3.6: the visible heading inside the details panel
-        // must be styled or it reads as plain unstyled text.
-        assert!(APP_CSS.contains(".home-details-heading"));
-        // Audit 5.5: the home-alert pivot link must have a
-        // distinguishing style so it reads as a clickable target,
-        // not plain text.
-        assert!(APP_CSS.contains(".home-alert-banner .home-alert-link"));
-    }
-
-    #[test]
-    fn home_js_toggle_details_is_defensive_about_display() {
-        // Audit 3.6: the toggle MUST also clear inline display:none
-        // (defensive against earlier state) AND scroll the panel
-        // into view. Both are belt-and-braces fixes for the audit
-        // report "no content appears".
-        let start = JS_HOME
-            .find("function toggleHomeDetails")
-            .expect("toggleHomeDetails");
-        let body = &JS_HOME[start..start + 1500];
-        assert!(
-            body.contains("panel.style.display = ''"),
-            "toggleHomeDetails must clear inline display so the panel actually shows (audit 3.6)"
-        );
-        assert!(
-            body.contains("scrollIntoView"),
-            "toggleHomeDetails must scrollIntoView when expanding (audit 3.6)"
-        );
-    }
+    // 2026-05-15 slim-down: removed three anchors tied to deleted Home
+    // sections — home_js_critical_banner_pivots_user_links (critical
+    // banner gone), app_css_defines_onboarding_and_details_heading (the
+    // .home-details-heading rule was removed with the details panel;
+    // .home-onboarding-tip rules still ship and are pinned implicitly
+    // by home_js_renders_onboarding_tip_when_quiet above), and
+    // home_js_toggle_details_is_defensive_about_display (toggleHomeDetails
+    // no longer exists).
 
     #[test]
     fn index_html_carries_modal_preview_block() {
