@@ -4843,34 +4843,38 @@ mod tests {
     #[test]
     fn baseline_tab_renders_three_level_ux() {
         // 2026-05-03 redesign: operator complaint was that the
-        // Baseline tab dumped raw learned state in long tables with
+        // Baseline view dumped raw learned state in long tables with
         // SOC vocabulary nobody understood. The redesign answers
         // three questions in order via three UX levels:
         //   1. Hero card: "is everything normal right now?"
         //   2. Deviation cards: "if not, what changed in the last 24h?"
         //   3. Collapsed learned-baseline section: "what does the
         //      agent consider normal here?" (heatmap + sparkline)
-        // This anchor pins the structure so a future refactor that
-        // collapses back to a flat table fails CI.
+        //
+        // 2026-05-15 PR-C: Baseline moved from the Intel sub-tab to a
+        // section on the Health tab. The renderers + helpers were
+        // hoisted from intel.js into status.js (single owner: the
+        // Health view). This anchor now reads from JS_STATUS instead
+        // of JS_INTEL — the three-level structure itself is unchanged.
 
         // Level 1: hero card builder + status keywords.
         assert!(
-            JS_INTEL.contains("function baselineHeroCard"),
-            "intel.js must define baselineHeroCard — the operator's \
+            JS_STATUS.contains("function baselineHeroCard"),
+            "status.js must define baselineHeroCard — the operator's \
              1-line answer to 'is everything normal?'"
         );
         // PR #419 Wave 2: translated to English. The earlier PT-BR
         // copy ("Aprendendo o normal deste servidor" / "Algo diferente")
         // was replaced because the rest of the dashboard is English.
-        assert!(JS_INTEL.contains("Learning what's normal on this server"));
-        assert!(JS_INTEL.contains("Something changed"));
-        assert!(JS_INTEL.contains("baseline-hero-normal"));
-        assert!(JS_INTEL.contains("baseline-hero-deviation"));
-        assert!(JS_INTEL.contains("baseline-hero-learning"));
+        assert!(JS_STATUS.contains("Learning what's normal on this server"));
+        assert!(JS_STATUS.contains("Something changed"));
+        assert!(JS_STATUS.contains("baseline-hero-normal"));
+        assert!(JS_STATUS.contains("baseline-hero-deviation"));
+        assert!(JS_STATUS.contains("baseline-hero-learning"));
 
         // Level 2: friendly anomaly labels, NOT raw enum values, for
         // each anomaly_type the backend can emit.
-        assert!(JS_INTEL.contains("BASELINE_ANOMALY_LABELS"));
+        assert!(JS_STATUS.contains("BASELINE_ANOMALY_LABELS"));
         for kind in [
             "event_rate_drop",
             "event_rate_spike",
@@ -4879,21 +4883,21 @@ mod tests {
             "new_destination",
         ] {
             assert!(
-                JS_INTEL.contains(kind),
+                JS_STATUS.contains(kind),
                 "BASELINE_ANOMALY_LABELS must cover anomaly type `{kind}` \
                  — without it that anomaly renders as the generic fallback"
             );
         }
         assert!(
-            JS_INTEL.contains("function baselineCardForAnomaly"),
-            "intel.js must build deviation cards via a dedicated helper \
+            JS_STATUS.contains("function baselineCardForAnomaly"),
+            "status.js must build deviation cards via a dedicated helper \
              so each card carries icon + headline + explainer + why-string"
         );
 
         // Level 3: collapsed learned-baseline section, heatmap, sparkline.
-        assert!(JS_INTEL.contains("baseline-learned"));
-        assert!(JS_INTEL.contains("function loginHeatmap"));
-        assert!(JS_INTEL.contains("function eventRateAggregateSparkline"));
+        assert!(JS_STATUS.contains("baseline-learned"));
+        assert!(JS_STATUS.contains("function loginHeatmap"));
+        assert!(JS_STATUS.contains("function eventRateAggregateSparkline"));
         // Heatmap is grid-based (24 columns) — not a table.
         assert!(APP_CSS.contains(".login-heatmap-cells"));
         assert!(APP_CSS.contains("repeat(24, 1fr)"));
@@ -4901,6 +4905,16 @@ mod tests {
         assert!(APP_CSS.contains(".baseline-hero-normal"));
         assert!(APP_CSS.contains(".baseline-deviation-card"));
         assert!(APP_CSS.contains(".baseline-sparkline"));
+        // intel.js MUST NOT carry any baseline rendering anymore — the
+        // hoist is the contract.
+        assert!(
+            !JS_INTEL.contains("function baselineHeroCard"),
+            "Post-PR-C: baseline renderers MUST live in status.js, not intel.js"
+        );
+        assert!(
+            !JS_INTEL.contains("BASELINE_ANOMALY_LABELS"),
+            "Post-PR-C: BASELINE_ANOMALY_LABELS MUST be in status.js"
+        );
     }
 
     #[test]
@@ -4956,16 +4970,18 @@ mod tests {
              stale fetch still resolves and overwrites the new content"
         );
 
-        // ── (e) P8 Intel sub-tab clear-before-fetch + AbortController.
-        assert!(
-            JS_INTEL.contains("window._activeFetch_intel"),
-            "intel.js::switchIntelTab must abort the previous sub-tab fetch (audit P8)"
-        );
-        assert!(
-            JS_INTEL.contains("Loading...</div>"),
-            "intel.js::switchIntelTab must clear intelContent synchronously so the previous \
-             tab's content does not paint under the new tab's title (audit P8)"
-        );
+        // ── (e) Historical P8 (Intel sub-tab clear-before-fetch +
+        //        AbortController) — 2026-05-15 PR-B/C collapsed Intel
+        //        to a single surface (Profiles list). The sub-tab
+        //        cycling problem the audit fixed no longer exists; the
+        //        `_activeFetch_intel` controller is still attached in
+        //        fetchAndRenderIntel for the sort/min-risk re-fetches,
+        //        and the original "clear before fetch" intent is now
+        //        carried by `loadIntel()` which resets state and
+        //        re-fetches from offset 0. The two anchors below are
+        //        dropped because the surfaces they pinned are gone —
+        //        the bug class itself can't recur in a single-surface
+        //        page (audit P8).
     }
 
     #[test]
@@ -5423,13 +5439,13 @@ mod tests {
     }
 
     // ── 2026-05-15 PR-B: Intel slim — Campaigns/Chains/MITRE deleted ─
-    // Intel page trimmed to Profiles + Baseline sub-tabs. Operator:
-    // - Campaigns → will become a tag in the Cases header (PR-D);
-    //               aggregate listing is overkill for the daily flow.
-    // - Chains → already on the Cases journey per-incident; aggregate
-    //            timeline was rarely opened.
-    // - MITRE → coverage heatmap already on the Monthly threat report.
-    // Baseline stays for now; moves to Health in PR-C.
+    // Intel page collapsed to a single surface — the Profiles list.
+    // PR-B (#632) dropped Campaigns / Chains / MITRE sub-tabs;
+    // PR-C (this PR) moves Baseline → Health, removing the last reason
+    // to keep a sub-tab toolbar. `switchIntelTab` and `currentIntelTab`
+    // are deleted from intel.js — the Profiles list is the only thing
+    // Intel renders. The PR-D campaign tag will live on the Cases
+    // header, not Intel.
 
     #[test]
     fn pr_intel_slim_deleted_sub_tab_buttons_are_gone_from_index_html() {
@@ -5437,96 +5453,149 @@ mod tests {
             "id=\"intelTabCampaigns\"",
             "id=\"intelTabChains\"",
             "id=\"intelTabMitre\"",
-            "switchIntelTab('campaigns')",
-            "switchIntelTab('chains')",
-            "switchIntelTab('mitre')",
+            "id=\"intelTabProfiles\"",
+            "id=\"intelTabBaseline\"",
+            "switchIntelTab(",
             ">Campaigns</button>",
             ">Chains</button>",
             ">MITRE</button>",
+            ">Profiles</button>",
+            ">Baseline</button>",
         ] {
             assert!(
                 !INDEX_HTML.contains(orphan),
-                "2026-05-15 PR-B Intel slim: `{orphan}` was deleted; the Campaigns / \
-                 Chains / MITRE sub-tab surfaces must stay gone"
+                "2026-05-15 PR-B/C Intel slim: `{orphan}` was deleted; Intel has no \
+                 sub-tab toolbar anymore — the Profiles list is the only rendering"
             );
         }
-        // Profiles + Baseline buttons MUST still be present (Baseline
-        // moves to Health in PR-C; until then the tab toggle stays).
+        // The Intel view itself still exists with its content mount.
         assert!(
-            INDEX_HTML.contains("id=\"intelTabProfiles\""),
-            "Profiles sub-tab button MUST stay — it's the only remaining Intel surface"
+            INDEX_HTML.contains("id=\"viewIntel\""),
+            "Intel view container MUST stay — Profiles list still mounts here"
         );
         assert!(
-            INDEX_HTML.contains("id=\"intelTabBaseline\""),
-            "Baseline sub-tab button stays until PR-C moves it to Health"
+            INDEX_HTML.contains("id=\"intelContent\""),
+            "intelContent mount MUST stay — fetchAndRenderIntel renders into it"
         );
     }
 
     #[test]
     fn pr_intel_slim_deleted_sub_tab_loaders_are_gone_from_intel_js() {
+        // PR-B deleted the three sub-tab loaders. PR-C hoists Baseline
+        // out of intel.js entirely — `loadBaseline` and every baseline
+        // helper now lives in status.js (Health view).
         for orphan in [
             "async function loadCampaigns",
             "async function loadChains",
             "async function loadMitreCoverage",
+            "async function loadBaseline",
             "function loadCampaigns",
             "function loadChains",
             "function loadMitreCoverage",
+            "function loadBaseline",
             "loadCampaigns(",
             "loadChains(",
             "loadMitreCoverage(",
+            // PR-C: switch dispatcher + state both gone. (The
+            // explanatory comment in intel.js may name the dead
+            // identifiers, so we only assert their declarations are
+            // gone — `let currentIntelTab` would be re-introduced
+            // only by code, never by docs.)
+            "function switchIntelTab",
+            "let currentIntelTab",
+            // Baseline helpers must not linger in intel.js.
+            "function baselineHeroCard",
+            "function baselineCardForAnomaly",
+            "function loginHeatmap",
+            "function eventRateAggregateSparkline",
+            "BASELINE_ANOMALY_LABELS",
         ] {
             assert!(
                 !JS_INTEL.contains(orphan),
-                "2026-05-15 PR-B Intel slim: `{orphan}` was deleted; the legacy \
-                 sub-tab loaders + call sites must stay gone (no dead code)"
+                "2026-05-15 PR-B/C Intel slim: `{orphan}` was deleted; the legacy \
+                 sub-tab + Baseline surfaces must stay gone (no dead code in intel.js)"
             );
         }
     }
 
     #[test]
-    fn pr_intel_slim_switch_tab_dispatcher_lists_only_remaining_tabs() {
-        // The dispatcher walks the `tabs` array to update button styles
-        // and routes each name to a loader. Both surfaces must reflect
-        // the deletion — anchor catches a paste error that re-introduces
-        // 'campaigns' / 'chains' / 'mitre' to the array or the dispatch
-        // switch (which would then NPE on click because the loaders are
-        // gone).
-        let start = JS_INTEL
-            .find("function switchIntelTab(tab)")
-            .expect("switchIntelTab present");
-        let end = JS_INTEL[start..]
+    fn pr_intel_slim_only_profiles_entry_point_remains() {
+        // Post-PR-C: the only entry into the Intel view is `loadIntel()`,
+        // and the only render path is `fetchAndRenderIntel(append)` →
+        // the profile list. Profile-row click opens the shared dossier
+        // modal from PR-A. Anchor pins the surface so a regression that
+        // re-introduces sub-tab machinery fails CI.
+        assert!(
+            JS_INTEL.contains("async function loadIntel()"),
+            "loadIntel() MUST stay — it's the Intel view's single entry"
+        );
+        assert!(
+            JS_INTEL.contains("async function fetchAndRenderIntel(append)"),
+            "fetchAndRenderIntel(append) MUST stay — it's the Profiles list renderer"
+        );
+        // The Profiles-row click MUST keep targeting the modal.
+        assert!(
+            JS_INTEL.contains("onclick=\"openProfileModal(\\'"),
+            "Intel profile-list rows MUST still onclick into openProfileModal(ip)"
+        );
+    }
+
+    #[test]
+    fn pr_baseline_lives_on_health_tab_and_is_wired_into_load_status() {
+        // PR-C: Baseline content (Hero + deviation cards + collapsed
+        // learned-baseline) moved to the Health tab as a section
+        // mounted under `#baseline-health-mount`. The Health loader
+        // `loadStatus` renders the mount and lazy-hydrates it via
+        // `renderBaselineHealthSection(mountSelector)` (defined in
+        // status.js).
+        assert!(
+            INDEX_HTML.contains("id=\"baseline-health-mount\"")
+                || JS_STATUS.contains("id=\"baseline-health-mount\""),
+            "Health view MUST carry the `baseline-health-mount` div (rendered by loadStatus \
+             into #statusContent)"
+        );
+        assert!(
+            JS_STATUS.contains("async function renderBaselineHealthSection(mountSelector)"),
+            "status.js MUST define `renderBaselineHealthSection(mountSelector)` — the \
+             Baseline entry on the Health tab"
+        );
+        // loadStatus invokes the renderer.
+        let load_start = JS_STATUS
+            .find("async function loadStatus()")
+            .expect("loadStatus present");
+        let load_end = JS_STATUS[load_start..]
             .find("\n}\n")
-            .expect("end of switchIntelTab")
-            + start;
-        let body = &JS_INTEL[start..end];
-        for ghost in [
-            "'Campaigns'",
-            "'Chains'",
-            "'Mitre'",
-            "'campaigns'",
-            "'chains'",
-            "'mitre'",
-        ] {
-            assert!(
-                !body.contains(ghost),
-                "switchIntelTab MUST NOT reference `{ghost}` — that sub-tab was \
-                 deleted in PR-B; reviving the name in the dispatcher would NPE \
-                 at click time because the loader is gone too"
-            );
-        }
-        // The remaining-tab vocabulary must be present.
+            .expect("end of loadStatus")
+            + load_start;
+        let load_body = &JS_STATUS[load_start..load_end];
         assert!(
-            body.contains("['Profiles', 'Baseline']"),
-            "switchIntelTab `tabs` array MUST list ['Profiles', 'Baseline'] — the \
-             only remaining sub-tabs"
+            load_body.contains("renderBaselineHealthSection('baseline-health-mount')"),
+            "loadStatus MUST call renderBaselineHealthSection('baseline-health-mount') \
+             so the Baseline section hydrates when Health opens"
+        );
+        // Anti-regression: no Intel-vocabulary references inside the
+        // Baseline section (the move severs the dependency).
+        let bs_start = JS_STATUS
+            .find("async function renderBaselineHealthSection(mountSelector)")
+            .expect("renderBaselineHealthSection present");
+        let bs_end = JS_STATUS[bs_start..]
+            .find("\n}\n")
+            .expect("end of renderBaselineHealthSection")
+            + bs_start;
+        let bs_body = &JS_STATUS[bs_start..bs_end];
+        assert!(
+            !bs_body.contains("intelContent"),
+            "renderBaselineHealthSection MUST NOT reference the Intel content mount — \
+             it owns its own `baseline-health-mount`"
         );
         assert!(
-            body.contains("if (tab === 'baseline') loadBaseline();"),
-            "switchIntelTab MUST dispatch 'baseline' → loadBaseline()"
+            !bs_body.contains("intelViewStatus"),
+            "renderBaselineHealthSection MUST NOT reference the Intel status pill"
         );
         assert!(
-            body.contains("else loadIntel();"),
-            "switchIntelTab default branch MUST fall through to loadIntel() (Profiles)"
+            !bs_body.contains("_activeFetch_intel"),
+            "renderBaselineHealthSection MUST NOT reuse the Intel abort controller — \
+             Health has no sub-tab cycling so the signal is meaningless here"
         );
     }
 
@@ -5950,7 +6019,7 @@ mod tests {
         );
     }
 
-    // ─── PR #419 Wave 2 — Baseline tab is in English ────────────
+    // ─── PR #419 Wave 2 — Baseline section is in English ────────
     #[test]
     fn js_intel_baseline_tab_is_english_not_pt_br() {
         // Operator-facing strings in the Baseline section must be
@@ -5958,16 +6027,23 @@ mod tests {
         // known-translated phrases (positive) and on common PT-BR
         // signature words (negative) so a regression that re-imports
         // PT-BR copy is caught by tests.
+        //
+        // 2026-05-15 PR-C: Baseline moved to the Health tab; the
+        // renderers now live in status.js. The test name is preserved
+        // for historical continuity with the PT-BR regression that
+        // motivated it, but it now reads JS_STATUS.
 
         // Positive: known EN strings landed.
-        assert!(JS_INTEL.contains("Learning what's normal on this server"));
-        assert!(JS_INTEL.contains("Something changed"));
-        assert!(JS_INTEL.contains("What changed in the last 24 hours"));
-        assert!(JS_INTEL.contains("What I consider normal here"));
-        assert!(JS_INTEL.contains("Learned process lineages"));
-        assert!(JS_INTEL.contains("Failed to load Baseline"));
+        assert!(JS_STATUS.contains("Learning what's normal on this server"));
+        assert!(JS_STATUS.contains("Something changed"));
+        assert!(JS_STATUS.contains("What changed in the last 24 hours"));
+        assert!(JS_STATUS.contains("What I consider normal here"));
+        assert!(JS_STATUS.contains("Learned process lineages"));
+        assert!(JS_STATUS.contains("Failed to load Baseline"));
 
-        // Negative: PT-BR copy must not return.
+        // Negative: PT-BR copy must not return anywhere it could be
+        // operator-visible (status.js owns baseline now; intel.js is
+        // the legacy origin so we keep it negative there too).
         let banned = [
             "Carregando…",
             "Aprendendo (",
@@ -5983,8 +6059,13 @@ mod tests {
         ];
         for needle in banned {
             assert!(
+                !JS_STATUS.contains(needle),
+                "Baseline regressed to PT-BR — found {:?} in status.js",
+                needle
+            );
+            assert!(
                 !JS_INTEL.contains(needle),
-                "Baseline regressed to PT-BR — found {:?} in intel.js",
+                "Baseline regressed to PT-BR — found {:?} in intel.js (legacy host)",
                 needle
             );
         }
@@ -6136,34 +6217,39 @@ mod tests {
     // filter / toggle / pagination ships red.
     #[test]
     fn js_login_heatmap_hides_service_accounts_by_default() {
+        // 2026-05-15 PR-C: Baseline moved from Intel sub-tab to Health
+        // tab — the loginHeatmap renderer now lives in status.js. Test
+        // updated to read JS_STATUS; semantics unchanged.
+
         // Default-hide branch: filter on the `service` class label.
         assert!(
-            JS_INTEL.contains("if (c === 'service') return showServices"),
+            JS_STATUS.contains("if (c === 'service') return showServices"),
             "loginHeatmap must hide entries with class === 'service' by default"
         );
         // Receives `userClasses` as the second argument. A renderer
         // that drops the parameter would silently fall back to
         // showing every entry (regression).
-        assert!(JS_INTEL.contains("function loginHeatmap(logins, userClasses)"));
+        assert!(JS_STATUS.contains("function loginHeatmap(logins, userClasses)"));
         // Operator-facing toggle copy must clearly name the hidden set.
-        assert!(JS_INTEL.contains("Show system accounts"));
-        assert!(JS_INTEL.contains("Hide system accounts"));
+        assert!(JS_STATUS.contains("Show system accounts"));
+        assert!(JS_STATUS.contains("Hide system accounts"));
         // Toggle handler exists and is wired through the same data
-        // path as the initial render (calls `loadBaseline()`).
-        assert!(JS_INTEL.contains("toggleLoginHeatmapServices"));
-        assert!(JS_INTEL.contains("loginHeatmapSetShowServices"));
+        // path as the initial render (re-renders via the shared
+        // mount-aware helper `_rerenderBaseline`).
+        assert!(JS_STATUS.contains("toggleLoginHeatmapServices"));
+        assert!(JS_STATUS.contains("loginHeatmapSetShowServices"));
         // Choice persists in localStorage so it survives reloads.
-        assert!(JS_INTEL.contains("innerwarden.baseline.showServices"));
+        assert!(JS_STATUS.contains("innerwarden.baseline.showServices"));
         // Pagination is wired (anchored at 20-per-page).
-        assert!(JS_INTEL.contains("LOGIN_HEATMAP_PAGE_SIZE = 20"));
-        assert!(JS_INTEL.contains("loginHeatmapNextPage"));
-        assert!(JS_INTEL.contains("loginHeatmapPrevPage"));
+        assert!(JS_STATUS.contains("LOGIN_HEATMAP_PAGE_SIZE = 20"));
+        assert!(JS_STATUS.contains("loginHeatmapNextPage"));
+        assert!(JS_STATUS.contains("loginHeatmapPrevPage"));
         // Per-row class badge is rendered so the operator can see
         // why something was kept visible (Human / Root / Unknown).
         // The class names are interpolated in JS (`login-class-badge-${c}`),
         // so the literal strings live in the CSS — anchor there.
-        assert!(JS_INTEL.contains("classBadge"));
-        assert!(JS_INTEL.contains("login-class-badge-${c}"));
+        assert!(JS_STATUS.contains("classBadge"));
+        assert!(JS_STATUS.contains("login-class-badge-${c}"));
         assert!(APP_CSS.contains(".login-class-badge-human"));
         assert!(APP_CSS.contains(".login-class-badge-service"));
         assert!(APP_CSS.contains(".login-class-badge-root"));
@@ -6171,8 +6257,8 @@ mod tests {
         // The endpoint enrichment path is the SoT — frontend must
         // read `b.user_classes`, not classify on its own.
         assert!(
-            JS_INTEL.contains("loginHeatmap(b.user_login_hours, b.user_classes)"),
-            "loadBaseline must pass user_classes from the endpoint, not classify locally"
+            JS_STATUS.contains("loginHeatmap(b.user_login_hours, b.user_classes)"),
+            "renderBaselineHealthSection must pass user_classes from the endpoint, not classify locally"
         );
         // Anti-regression: the operator-visible complaint was that
         // `.login-heatmap` had `max-width: 720px` and stopped halfway

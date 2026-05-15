@@ -14,7 +14,12 @@ async function loadStatus() {
       // 2026-05-15: Enforcement section migrated here from the removed
       // Responses tab. Mount point gets populated lazily by
       // renderEnforcementHealthSection (defined in responses.js).
-      + '<div id="enforcement-health-mount"></div>';
+      + '<div id="enforcement-health-mount"></div>'
+      // 2026-05-15 PR-C: Baseline section folded in from the Intel tab.
+      // `renderBaselineHealthSection` (defined later in this file)
+      // hydrates this mount with the three-level Baseline UX
+      // (Hero / deviation cards / collapsed learned-baseline).
+      + '<div id="baseline-health-mount"></div>';
     loadDeepSecurity();
     // Spec 024: populate the Metrics Drift section after the table
     // skeleton lands in the DOM.
@@ -24,6 +29,11 @@ async function loadStatus() {
     // existing content so the rest of the Health page stays unchanged.
     if (typeof renderEnforcementHealthSection === 'function') {
       renderEnforcementHealthSection('enforcement-health-mount');
+    }
+    // 2026-05-15 PR-C: Baseline (anomaly/observability surface) lives
+    // here on Health, not as an Intel sub-tab.
+    if (typeof renderBaselineHealthSection === 'function') {
+      renderBaselineHealthSection('baseline-health-mount');
     }
   } catch(e) {
     status.textContent = 'error';
@@ -575,5 +585,446 @@ function formatMetricValue(v) {
 function collapseLeftOnMobile() {
   if (window.innerWidth <= 860 && leftPanelOpen) {
     toggleLeftPanel();
+  }
+}
+
+// ── Baseline (Health tab) — three-level UX (2026-05-03 redesign, ──
+//                           moved from Intel 2026-05-15 PR-C) ─────────
+//
+// Operator complaint: the previous version dumped every learned
+// signal as a long table and used SOC vocabulary ("lineages",
+// "observations", "EMA"). Both the security analyst and the lay
+// operator bounced off it. The redesign answers three questions in
+// order:
+//
+//   1. Is everything normal right now?  → Hero (1 line, always visible)
+//   2. If not, what changed?              → Deviation cards (top 5)
+//   3. What does the agent consider normal here? → "Show learned baseline" (collapsed)
+//
+// The Hero card paints semaphore colours; deviation cards are
+// actionable (each links to the relevant journey); the learned
+// baseline section is opt-in. Layouts use heatmap + sparkline so
+// the operator can read a week's pattern in one glance instead of
+// scrolling a 24-row table per user.
+
+// Friendly headlines + emoji + suggested action text per anomaly type.
+// Server returns the raw `anomaly_type` enum value; this map turns it
+// into a card the operator can read in 2 seconds.
+// 2026-05-03 (PR #419 Wave 2): translated PT-BR → EN to align with
+// the rest of the dashboard. Original strings were Portuguese-only,
+// inconsistent with all other tabs. Operator request.
+const BASELINE_ANOMALY_LABELS = {
+  event_rate_drop: {
+    icon: '📉',
+    headline: (a) => `${prettySource(a)} went silent`,
+    explainer: (a) => `Expected this hour: about ${a.expected}. Seen: ${a.observed}.`,
+    why: 'Could mean nobody used the service or something disabled the logs. Worth checking.',
+  },
+  event_rate_spike: {
+    icon: '📈',
+    headline: (a) => `${prettySource(a)} spiked above normal`,
+    explainer: (a) => `Expected: about ${a.expected}. Seen: ${a.observed}.`,
+    why: 'Sudden activity peak. Could be a deploy, an external scan, or an attack in progress.',
+  },
+  process_lineage: {
+    icon: '🌿',
+    headline: (a) => 'Process lineage never seen before',
+    explainer: (a) => a.description,
+    why: 'The agent has never observed this parent → child on this host. Often indicates a shell spawning out of a web service.',
+  },
+  user_login_time: {
+    icon: '🌙',
+    headline: (a) => `${a.subject || 'User'} logged in outside typical hours`,
+    explainer: (a) => `Typical hours: ${a.expected}. Login now: ${a.observed}.`,
+    why: 'Access outside the historical pattern. Confirm whether it was you or an authorised user.',
+  },
+  new_destination: {
+    icon: '🔀',
+    headline: (a) => `${a.subject || 'Process'} connected to a new destination`,
+    explainer: (a) => `Typical destinations: ${a.expected}. Now: ${a.observed}.`,
+    why: 'A known process talking to an unfamiliar endpoint. Risk profile changes.',
+  },
+};
+
+function prettySource(a) {
+  // Pull a friendly source name from the description if present, or
+  // fall back to a generic phrase. Server passes details inline.
+  const m = (a.description || '').match(/source ['"]?([a-z_]+)['"]?/i);
+  return m ? m[1] : 'Event collection';
+}
+
+function baselineCardForAnomaly(a) {
+  const meta = BASELINE_ANOMALY_LABELS[a.anomaly_type] || {
+    icon: '⚠️',
+    headline: () => 'Pattern outside normal',
+    explainer: (x) => x.description || '',
+    why: '',
+  };
+  const ageMin = Math.max(0, Math.floor((Date.now() - new Date(a.ts).getTime()) / 60000));
+  const ageStr = ageMin < 60
+    ? `${ageMin}m ago`
+    : ageMin < 1440
+      ? `${Math.floor(ageMin / 60)}h ago`
+      : `${Math.floor(ageMin / 1440)}d ago`;
+  const sevColor = a.severity === 'critical' ? '#e74c3c'
+    : a.severity === 'high' ? '#f39c12'
+    : a.severity === 'medium' ? '#f59e0b'
+    : 'var(--dim)';
+  const subjectLink = a.subject
+    ? `<button type="button" onclick="homeBannerOpenPivot('${a.anomaly_type === 'user_login_time' ? 'user' : 'ip'}', '${esc(a.subject)}')" style="margin-top:6px;padding:4px 10px;border-radius:4px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;font-size:0.75rem;">Investigate ${esc(a.subject)} →</button>`
+    : '';
+  return `
+    <div class="baseline-deviation-card">
+      <div style="display:flex;align-items:flex-start;gap:10px;">
+        <div style="font-size:1.5rem;line-height:1;">${meta.icon}</div>
+        <div style="flex:1;">
+          <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;">
+            <span style="font-weight:600;font-size:0.92rem;">${esc(meta.headline(a))}</span>
+            <span style="font-size:0.7rem;color:${sevColor};text-transform:uppercase;letter-spacing:0.05em;">${esc(a.severity)}</span>
+            <span style="font-size:0.7rem;color:var(--dim);">${ageStr}</span>
+          </div>
+          <div style="font-size:0.82rem;color:var(--text);margin-top:4px;line-height:1.5;">${esc(meta.explainer(a))}</div>
+          ${meta.why ? `<div style="font-size:0.75rem;color:var(--dim);margin-top:4px;font-style:italic;">${esc(meta.why)}</div>` : ''}
+          ${subjectLink}
+        </div>
+      </div>
+    </div>`;
+}
+
+function baselineHeroCard(b, deviations24h) {
+  if (!b.mature) {
+    const days = b.training_days || 0;
+    const remaining = Math.max(0, 7 - days);
+    return `
+      <div class="baseline-hero baseline-hero-learning">
+        <div class="baseline-hero-icon">🔵</div>
+        <div class="baseline-hero-body">
+          <div class="baseline-hero-title">Learning what's normal on this server</div>
+          <div class="baseline-hero-sub">${days} of 7 days collected. Anomaly detection starts in ${remaining} ${remaining === 1 ? 'day' : 'days'}.</div>
+        </div>
+      </div>`;
+  }
+  if (deviations24h === 0) {
+    return `
+      <div class="baseline-hero baseline-hero-normal">
+        <div class="baseline-hero-icon">🟢</div>
+        <div class="baseline-hero-body">
+          <div class="baseline-hero-title">Normal</div>
+          <div class="baseline-hero-sub">The server is behaving the same as on recent days. No patterns outside normal in the last 24 hours.</div>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="baseline-hero baseline-hero-deviation">
+      <div class="baseline-hero-icon">🟡</div>
+      <div class="baseline-hero-body">
+        <div class="baseline-hero-title">Something changed</div>
+        <div class="baseline-hero-sub">${deviations24h} ${deviations24h === 1 ? 'pattern' : 'patterns'} outside normal in the last 24 hours. See what changed below.</div>
+      </div>
+    </div>`;
+}
+
+// 2026-05-03 (Wave 5): pagination state for the login heatmap. Stays a
+// module-level let so back/forward inside the same Baseline render
+// preserves the page; switching tabs resets via `_loginHeatmapPage = 0`
+// in `loadBaseline`. Toggle state is persisted in localStorage so the
+// operator's choice survives reloads.
+let _loginHeatmapPage = 0;
+const LOGIN_HEATMAP_PAGE_SIZE = 20;
+const LOGIN_HEATMAP_LS_KEY = 'innerwarden.baseline.showServices';
+// 2026-05-10: persist the "What I consider normal here" <details>
+// open state so pagination re-renders don't collapse the section
+// the operator was actively reading. Operator complaint: clicking
+// Next on the user-list pagination collapsed the entire learned-
+// baseline section. The HTML <details> default is closed, and
+// loadBaseline() re-renders intelContent.innerHTML on every page
+// change, so the open attribute was never preserved.
+const BASELINE_LEARNED_OPEN_LS_KEY = 'innerwarden.baseline.learnedOpen';
+
+function baselineLearnedIsOpen() {
+  try {
+    return localStorage.getItem(BASELINE_LEARNED_OPEN_LS_KEY) === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
+function baselineLearnedSetOpen(v) {
+  try {
+    localStorage.setItem(BASELINE_LEARNED_OPEN_LS_KEY, v ? '1' : '0');
+  } catch (_) {}
+}
+
+function loginHeatmapShowServices() {
+  try {
+    return localStorage.getItem(LOGIN_HEATMAP_LS_KEY) === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
+function loginHeatmapSetShowServices(v) {
+  try {
+    localStorage.setItem(LOGIN_HEATMAP_LS_KEY, v ? '1' : '0');
+  } catch (_) {}
+}
+
+// Exposed onclick handlers for the toggle + pagination. Re-renders by
+// re-calling `renderBaselineHealthSection(_baselineMountSelector)` so
+// the controls go through the same data path as the initial load — a
+// single source of truth for what the user sees.
+function _rerenderBaseline() {
+  if (_baselineMountSelector) renderBaselineHealthSection(_baselineMountSelector);
+}
+window.toggleLoginHeatmapServices = function () {
+  loginHeatmapSetShowServices(!loginHeatmapShowServices());
+  _loginHeatmapPage = 0;
+  _rerenderBaseline();
+};
+window.loginHeatmapNextPage = function () {
+  _loginHeatmapPage += 1;
+  _rerenderBaseline();
+};
+window.loginHeatmapPrevPage = function () {
+  _loginHeatmapPage = Math.max(0, _loginHeatmapPage - 1);
+  _rerenderBaseline();
+};
+// 2026-05-10: persist <details open> state for the learned-baseline
+// section so re-renders triggered by user-list pagination do not
+// collapse the section the operator was actively reading.
+window.baselineLearnedOnToggle = function (el) {
+  baselineLearnedSetOpen(el && el.open);
+};
+
+function loginHeatmap(logins, userClasses) {
+  // Full-width 24×N heatmap. Each user gets a single row of 24 cells.
+  // Bright cell = login activity seen in that hour historically.
+  //
+  // 2026-05-03 (Wave 5 — semantics fix):
+  // - PAM emits "session opened" entries for daemon accounts
+  //   (snap_daemon, systemd-resolve, messagebus, _apt, ...) that share
+  //   plumbing with real SSH logins. Without filtering, the heatmap
+  //   reads as "many users have logged in" when in reality only the
+  //   `Human` + `Root` rows are real human SSH sessions.
+  // - The endpoint enriches the JSON with `user_classes`. When that
+  //   field is missing (older agent / classification failed), every
+  //   user falls back to `unknown` and is shown — operator visibility
+  //   beats false reassurance.
+  // - The "Show system accounts" toggle is persisted in localStorage
+  //   so the operator's choice survives reloads.
+  // - Pagination kicks in only when visible humans exceed
+  //   LOGIN_HEATMAP_PAGE_SIZE (20). Below that threshold, no paging
+  //   controls render at all — keeps the simple case simple.
+  const allUsers = Object.entries(logins);
+  if (allUsers.length === 0) return '';
+  const classes = userClasses || {};
+  const classOf = (u) => classes[u] || 'unknown';
+
+  const showServices = loginHeatmapShowServices();
+  const visible = allUsers.filter(([user]) => {
+    const c = classOf(user);
+    if (c === 'service') return showServices;
+    return true; // human, root, unknown — always visible
+  });
+  const hiddenServices = allUsers.length - visible.length;
+
+  const totalPages = Math.max(1, Math.ceil(visible.length / LOGIN_HEATMAP_PAGE_SIZE));
+  if (_loginHeatmapPage >= totalPages) _loginHeatmapPage = totalPages - 1;
+  const pageStart = _loginHeatmapPage * LOGIN_HEATMAP_PAGE_SIZE;
+  const pageUsers = visible.slice(pageStart, pageStart + LOGIN_HEATMAP_PAGE_SIZE);
+
+  const classBadge = (c) => {
+    const labels = { human: 'human', root: 'root', service: 'service', unknown: 'unknown' };
+    const label = labels[c] || c;
+    return `<span class="login-class-badge login-class-badge-${c}">${label}</span>`;
+  };
+
+  const rows = pageUsers.map(([user, hours]) => {
+    const c = classOf(user);
+    const cells = hours.map((v, i) => {
+      const active = v > 0;
+      const cls = active ? 'login-cell login-cell-active' : 'login-cell';
+      const tip = `${user} (${c}) - ${i}:00 ${active ? '✓ session at this hour' : '(no record)'}`;
+      return `<div class="${cls}" title="${esc(tip)}"></div>`;
+    }).join('');
+    return `
+      <div class="login-heatmap-row">
+        <div class="login-heatmap-user">
+          ${classBadge(c)}
+          <span class="login-heatmap-user-name" title="${esc(user)}">${esc(user)}</span>
+        </div>
+        <div class="login-heatmap-cells">${cells}</div>
+      </div>`;
+  }).join('');
+
+  // Toggle row + (optional) pagination row + (optional) hint about
+  // hidden service entries. Keep them above the grid so the operator
+  // sees the controls before the data.
+  const showHideLabel = showServices
+    ? `Hide system accounts`
+    : (hiddenServices > 0
+      ? `Show system accounts (${hiddenServices})`
+      : `Show system accounts`);
+  const toggleRow = `
+    <div class="login-heatmap-controls">
+      <button type="button" class="login-heatmap-toggle" onclick="toggleLoginHeatmapServices()">
+        ${esc(showHideLabel)}
+      </button>
+      ${hiddenServices > 0 && !showServices ? `
+        <span class="login-heatmap-hint">
+          ${hiddenServices} ${hiddenServices === 1 ? 'daemon PAM session is' : 'daemon PAM sessions are'} hidden (snap_daemon, systemd-resolve, etc.) — they share SSH plumbing but are not real human logins.
+        </span>` : ''}
+    </div>`;
+
+  const paginationRow = visible.length > LOGIN_HEATMAP_PAGE_SIZE ? `
+    <div class="login-heatmap-pagination">
+      <button type="button" onclick="loginHeatmapPrevPage()" ${_loginHeatmapPage === 0 ? 'disabled' : ''}>← Prev</button>
+      <span class="login-heatmap-page-meta">Page ${_loginHeatmapPage + 1} of ${totalPages} · showing ${pageUsers.length} of ${visible.length} users</span>
+      <button type="button" onclick="loginHeatmapNextPage()" ${_loginHeatmapPage >= totalPages - 1 ? 'disabled' : ''}>Next →</button>
+    </div>` : '';
+
+  return `
+    ${toggleRow}
+    <div class="login-heatmap">
+      <div class="login-heatmap-axis"><span>0h</span><span>6h</span><span>12h</span><span>18h</span><span>23h</span></div>
+      ${rows}
+    </div>
+    ${paginationRow}`;
+}
+
+function eventRateAggregateSparkline(rates) {
+  const sourceCount = Object.keys(rates).length;
+  if (sourceCount === 0) return '';
+  // Aggregate: sum per hour across all sources. Operator wants the
+  // overall pulse, not per-source detail at this level.
+  const aggregate = new Array(24).fill(0);
+  for (const hours of Object.values(rates)) {
+    for (let i = 0; i < 24; i++) aggregate[i] += hours[i] || 0;
+  }
+  const max = Math.max(...aggregate, 1);
+  const bars = aggregate.map((v, i) => {
+    const h = Math.max(2, (v / max) * 36);
+    const tooltip = `${i}:00 - ~${v.toFixed(0)} typical events`;
+    return `<div class="sparkline-bar" style="height:${h}px;" title="${tooltip}"></div>`;
+  }).join('');
+  return `
+    <div class="baseline-sparkline">
+      <div class="baseline-sparkline-label">Typical activity per hour (all ${sourceCount} sources combined)</div>
+      <div class="baseline-sparkline-bars">${bars}</div>
+      <div class="baseline-sparkline-axis"><span>0h</span><span>6h</span><span>12h</span><span>18h</span><span>23h</span></div>
+    </div>`;
+}
+
+function topProcessDestinations(dests, limit) {
+  const entries = Object.entries(dests)
+    .map(([p, ips]) => ({ proc: p, count: Array.isArray(ips) ? ips.length : 0 }))
+    .filter((x) => x.count > 0)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+  if (entries.length === 0) return '<p style="color:var(--dim);font-size:0.8rem;">No destinations observed yet.</p>';
+  return `
+    <ul class="baseline-dest-list">
+      ${entries.map((x) => `
+        <li><code>${esc(x.proc)}</code> connects to <strong>${x.count}</strong> ${x.count === 1 ? 'known destination' : 'known destinations'}</li>
+      `).join('')}
+    </ul>`;
+}
+
+function topProcessLineages(lineages, limit) {
+  // The wire shape can be either an array of strings ("nginx→sh") or
+  // an object map. Normalise.
+  let list = [];
+  if (Array.isArray(lineages)) list = lineages;
+  else if (lineages && typeof lineages === 'object') list = Object.keys(lineages);
+  if (list.length === 0) return '';
+  return `
+    <p style="font-size:0.8rem;margin:6px 0;color:var(--dim);">
+      ${list.length} parent→child chains considered normal. Examples:
+      ${list.slice(0, limit).map((l) => `<code>${esc(l)}</code>`).join(' · ')}
+    </p>`;
+}
+
+// 2026-05-15 PR-C: Baseline moved from Intel to Health. Targets a
+// mount-point id on the Health page (parallel to
+// renderEnforcementHealthSection in responses.js). No abort
+// controller — Health doesn't have sub-tab cycling, so the
+// _activeFetch_intel signal is not needed here.
+//
+// `_baselineMountSelector` remembers the last mount so the pagination/
+// toggle handlers above can re-fetch + re-render without the caller
+// having to re-pass the id.
+let _baselineMountSelector = null;
+async function renderBaselineHealthSection(mountSelector) {
+  _baselineMountSelector = mountSelector;
+  const content = document.getElementById(mountSelector);
+  if (!content) return;
+  content.innerHTML = '<div style="color:var(--muted);padding:24px;text-align:center">Loading baseline…</div>';
+  try {
+    const b = await loadJson('/api/baseline-status');
+
+    // Anomalies in the last 24h. Server may or may not surface them;
+    // tolerate both shapes.
+    const anomalies = Array.isArray(b.recent_anomalies) ? b.recent_anomalies : [];
+    const since24h = Date.now() - 24 * 3600 * 1000;
+    const recent = anomalies
+      .filter((a) => a.ts && new Date(a.ts).getTime() >= since24h)
+      .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+
+    let html = '';
+
+    // ── Level 1: Hero ────────────────────────────────────────
+    html += baselineHeroCard(b, recent.length);
+
+    // ── Level 2: deviation cards (top 5) ─────────────────────
+    if (recent.length > 0) {
+      html += '<h3 class="baseline-section-title">What changed in the last 24 hours</h3>';
+      html += '<div class="baseline-deviations">';
+      html += recent.slice(0, 5).map(baselineCardForAnomaly).join('');
+      html += '</div>';
+      if (recent.length > 5) {
+        html += `<p style="font-size:0.78rem;color:var(--dim);margin-top:8px;">+${recent.length - 5} other patterns. <a href="#threats" style="color:var(--accent);">See in investigation →</a></p>`;
+      }
+    } else if (b.mature) {
+      html += '<div class="baseline-empty-deviations">No deviations detected in the last 24 hours.</div>';
+    }
+
+    // ── Level 3: collapsed "learned baseline" ────────────────
+    const lineages = b.process_lineages;
+    const lineageCount = Array.isArray(lineages)
+      ? lineages.length
+      : (lineages && typeof lineages === 'object' ? Object.keys(lineages).length : 0);
+    const learnedSummary = `
+      ${(b.training_days || 0) >= 7 ? '✓ 7+ days of learning' : `${b.training_days || 0}/7 days of learning`}
+      · ${(b.total_observations || 0).toLocaleString('en-US')} events observed
+      · ${lineageCount} known process lineages
+    `;
+    const learnedOpenAttr = baselineLearnedIsOpen() ? 'open' : '';
+    html += `
+      <details class="baseline-learned" id="baselineLearnedSection" ${learnedOpenAttr} ontoggle="window.baselineLearnedOnToggle && window.baselineLearnedOnToggle(this)">
+        <summary class="baseline-learned-summary">
+          <span>What I consider normal here</span>
+          <span class="baseline-learned-meta">${learnedSummary.replace(/\s+/g, ' ').trim()}</span>
+        </summary>
+        <div class="baseline-learned-body">
+          ${eventRateAggregateSparkline(b.event_rate_by_hour || {})}
+          ${Object.keys(b.user_login_hours || {}).length > 0 ? `
+            <h4 class="baseline-subtitle">Who logs in, when</h4>
+            <p style="font-size:0.8rem;color:var(--dim);margin:0 0 8px;">Each row is a user; each square is an hour of the day this user was seen with an active session. System accounts (snap_daemon, systemd-resolve, _apt, ...) are hidden by default — they share PAM plumbing with real SSH logins but are not human sessions.</p>
+            ${loginHeatmap(b.user_login_hours, b.user_classes)}
+          ` : ''}
+          ${Object.keys(b.process_destinations || {}).length > 0 ? `
+            <h4 class="baseline-subtitle">Processes that talk to the outside</h4>
+            ${topProcessDestinations(b.process_destinations, 6)}
+          ` : ''}
+          ${lineageCount > 0 ? `
+            <h4 class="baseline-subtitle">Learned process lineages</h4>
+            ${topProcessLineages(lineages, 6)}
+          ` : ''}
+        </div>
+      </details>`;
+
+    content.innerHTML = html;
+  } catch(e) {
+    content.innerHTML = `<p style="color:#e74c3c">Failed to load Baseline: ${e.message}</p>`;
   }
 }
