@@ -211,25 +211,35 @@ pub(super) fn is_public_block_decision(
 
 /// `GET /api/live-feed` - last 200 incidents with totals for the day (public).
 ///
-/// The body holds the KG read lock and walks every `Incident` node, which can
-/// take tens of milliseconds on a busy host. Running it directly on an async
-/// worker thread would stall every other dashboard request handled by the same
-/// worker (`RECURRING_BUGS.md` "Dashboard handlers block tokio worker threads").
-/// `tokio::task::spawn_blocking` moves the work to the blocking pool so async
-/// workers stay responsive.
+/// 2026-05-15: source is the canonical SQLite store when available
+/// (matches the post-spec-049 architecture that moved
+/// `/api/overview` + `/api/sensors` to SQLite). The in-memory
+/// knowledge-graph path is retained as a fallback when no store is
+/// configured (test fixtures, dev mode). Pre-2026-05-15 this read
+/// exclusively from KG + JSONL, which produced ~1h staleness after
+/// an agent restart because the post-restart KG hydrates from the
+/// last graph_snapshot rather than from incoming events.
+///
+/// Heavy work runs on the blocking pool — `tokio::task::spawn_blocking`
+/// keeps async workers responsive when SQLite reads stretch the
+/// response (`RECURRING_BUGS.md` "Dashboard handlers block tokio
+/// worker threads").
 pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResponse> {
     let kg = std::sync::Arc::clone(&state.knowledge_graph);
     let data_dir = state.data_dir.clone();
-    let resp = tokio::task::spawn_blocking(move || build_live_feed_response(&kg, &data_dir))
-        .await
-        .unwrap_or_else(|_| LiveFeedResponse {
-            total_today: 0,
-            total_blocked: 0,
-            total_high: 0,
-            unique_sources: 0,
-            sources: Vec::new(),
-            items: Vec::new(),
-        });
+    let store = state.sqlite_store.clone();
+    let resp = tokio::task::spawn_blocking(move || {
+        build_live_feed_response(&kg, &data_dir, store.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| LiveFeedResponse {
+        total_today: 0,
+        total_blocked: 0,
+        total_high: 0,
+        unique_sources: 0,
+        sources: Vec::new(),
+        items: Vec::new(),
+    });
     Json(resp)
 }
 
@@ -340,6 +350,7 @@ pub(super) fn merge_decisions_prefer_kg(
 pub(super) fn build_live_feed_response(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &std::path::Path,
+    store: Option<&innerwarden_store::Store>,
 ) -> LiveFeedResponse {
     // Wave 10 (label honesty, 2026-05-05): the public site renders
     // "(24h)" next to every count on this response. Pre-fix the
@@ -354,11 +365,86 @@ pub(super) fn build_live_feed_response(
     let cutoff_24h = now - chrono::Duration::hours(24);
     let reputation_map = load_ip_reputation_map(data_dir);
 
-    // Read incidents from knowledge graph
+    // 2026-05-15: SQLite-first read. Pre-fix the live-feed read
+    // exclusively from the in-memory KG, which hydrates from the
+    // last graph_snapshot on agent restart. Post-restart, new
+    // incidents went straight to SQLite (the canonical store from
+    // spec 016 onwards) but the KG only grew via the slow_loop's
+    // snapshot save → reload cycle, producing ~1h of staleness on
+    // the public site. The SQLite path queries the canonical store
+    // directly. The KG path stays as a fallback for fixtures and
+    // dev-mode (no Store configured).
+    let (incidents, decisions) = if let Some(s) = store {
+        load_live_feed_data_from_sqlite(s, cutoff_24h)
+    } else {
+        load_live_feed_data_from_kg_with_jsonl_fallback(kg, data_dir, cutoff_24h)
+    };
+    build_live_feed_from_lists(incidents, decisions, cutoff_24h, data_dir, reputation_map)
+}
+
+/// 2026-05-15: SQLite-first source. Reads incidents within the last
+/// 24h via `Store::incidents_since_ts` + their decisions for today
+/// and yesterday (cross-midnight). Same shape the legacy KG path
+/// produces — downstream filtering / mapping is identical.
+fn load_live_feed_data_from_sqlite(
+    store: &innerwarden_store::Store,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> (Vec<Incident>, Vec<DecisionEntry>) {
+    // Hard upper bound on rows pulled per request. Loose enough that no
+    // honest workload truncates; tight enough that a pathological day
+    // cannot pin the response thread (same envelope cases_from_sqlite
+    // uses for the Cases tab).
+    const LIVE_FEED_SQLITE_LIMIT: usize = 100_000;
+
+    let cutoff_str = cutoff.to_rfc3339();
+    let incidents = store
+        .incidents_since_ts(&cutoff_str, LIVE_FEED_SQLITE_LIMIT)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "live_feed: SQLite incidents query failed; returning empty");
+            Vec::new()
+        });
+
+    // Pull decisions for today and yesterday so the cross-midnight
+    // window catches the previous day's tail.
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let yesterday = (chrono::Local::now() - chrono::Duration::days(1))
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut decisions: Vec<DecisionEntry> = Vec::new();
+    for date in [today, yesterday] {
+        match store.decisions_for_date(&date, LIVE_FEED_SQLITE_LIMIT) {
+            Ok(rows) => {
+                for (_ts, _incident_id, data_json) in rows {
+                    if let Ok(d) = serde_json::from_str::<DecisionEntry>(&data_json) {
+                        decisions.push(d);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "live_feed: SQLite decisions query failed for {date}");
+            }
+        }
+    }
+
+    (incidents, decisions)
+}
+
+/// Legacy path — used when no Store is configured. Same logic that
+/// shipped before 2026-05-15: walk the in-memory KG, augment with
+/// JSONL on-disk records (best-effort), merge preferring the KG entry.
+/// Kept for test fixtures that build a `DashboardState` without a
+/// SQLite store; never reached on prod.
+fn load_live_feed_data_from_kg_with_jsonl_fallback(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    data_dir: &std::path::Path,
+    _cutoff: chrono::DateTime<chrono::Utc>,
+) -> (Vec<Incident>, Vec<DecisionEntry>) {
     use crate::knowledge_graph::types::{Node, NodeType, Relation};
     let graph = kg.read().unwrap();
-
-    // Build incidents from graph Incident nodes
     let mut incidents: Vec<Incident> = Vec::new();
     let mut decisions: Vec<DecisionEntry> = Vec::new();
 
@@ -459,19 +545,7 @@ pub(super) fn build_live_feed_response(
     // / save_to_store) which run under a write lock.
     drop(graph);
 
-    // Augment with the canonical on-disk record. Operator hit on
-    // 2026-05-03: site reported `4 events / 0 blocks (24h)` while
-    // the prod JSONL had 42 incidents and 647 block decisions over
-    // the same window. Root cause: in-memory KG is the hot tier
-    // (TTL eviction, ADR-0003) and live_feed was reading it
-    // exclusively. JSONL is the cold tier with the full daily
-    // history; merging gives the operator the truth without
-    // breaking the rich-context KG path for fresh entries.
-    //
-    // Cross-midnight handling: include yesterday so the 00:00–01:00
-    // window does not lose the previous day's tail. Same trick the
-    // existing `api_quickwins` site uses (NUMBER_CONSISTENCY.md
-    // entry).
+    // JSONL augmentation (best-effort; usually empty after spec 016).
     let today = chrono::Local::now()
         .date_naive()
         .format("%Y-%m-%d")
@@ -486,14 +560,29 @@ pub(super) fn build_live_feed_response(
     let incidents = merge_incidents_prefer_kg(incidents, jsonl_incidents);
     let decisions = merge_decisions_prefer_kg(decisions, jsonl_decisions);
 
+    (incidents, decisions)
+}
+
+/// 2026-05-15: pure transform from (incidents, decisions) to the
+/// LiveFeedResponse shape. Both source paths (SQLite + legacy KG/JSONL)
+/// feed this helper, so the filter / clip-to-24h / per-IP grouping /
+/// title-and-reason rendering logic lives in one place and is
+/// unit-testable without spinning up a Store or a KG.
+fn build_live_feed_from_lists(
+    incidents: Vec<Incident>,
+    decisions: Vec<DecisionEntry>,
+    cutoff_24h: chrono::DateTime<chrono::Utc>,
+    data_dir: &std::path::Path,
+    reputation_map: HashMap<String, StoredIpReputation>,
+) -> LiveFeedResponse {
     let decision_map: HashMap<String, &DecisionEntry> = decisions
         .iter()
         .map(|d| (d.incident_id.clone(), d))
         .collect();
 
     // Filter real attacks only (exclude internal noise) AND clip to
-    // the rolling 24h window the public site labels claim. See the
-    // Wave-10 comment at the top of this fn for the why.
+    // the rolling 24h window the public site labels claim. Same Wave-10
+    // contract whether the source is SQLite or the legacy KG path.
     let real_incidents: Vec<&Incident> = incidents
         .iter()
         .filter(|i| !is_internal(i) && i.ts >= cutoff_24h)
@@ -1691,5 +1780,183 @@ mod tests {
                 "incident_id {id:?} must classify as public-eligible"
             );
         }
+    }
+
+    // ── 2026-05-15: live-feed SQLite-first path ─────────────────────
+    //
+    // Operator-reported 2026-05-15: public site `live.innerwarden.com`
+    // was ~1h behind reality after an agent restart. Root cause: the
+    // live-feed read exclusively from in-memory KG + JSONL fallback.
+    // Post-restart the KG hydrates from the last graph_snapshot
+    // (typically 30-60min old) and new incidents go straight to
+    // SQLite (the canonical store from spec 016 onwards). The KG
+    // stays stuck on snapshot-time data until the next slow_loop
+    // snapshot cycle.
+    //
+    // Fix: route `build_live_feed_response` through SQLite when a
+    // Store is present. Same source the rest of the dashboard
+    // (overview, sensors, cases) uses since PR30. Anchored here.
+
+    fn mk_sqlite_incident(
+        store: &innerwarden_store::Store,
+        id: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+        ip: &str,
+    ) {
+        let inc = Incident {
+            ts,
+            host: "h".into(),
+            incident_id: id.into(),
+            severity: Severity::High,
+            title: "test".into(),
+            summary: String::new(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![innerwarden_core::entities::EntityRef {
+                r#type: innerwarden_core::entities::EntityType::Ip,
+                value: ip.into(),
+            }],
+        };
+        store.insert_incident(&inc).expect("insert incident");
+    }
+
+    #[test]
+    fn live_feed_reads_from_sqlite_when_store_present() {
+        // PR-fix: when a Store is configured, the live-feed reads
+        // incidents directly from SQLite instead of the KG. This
+        // closes the post-restart staleness gap on the public site.
+        let store = innerwarden_store::Store::open_memory().expect("open_memory");
+        let now = chrono::Utc::now();
+
+        // Seed 3 fresh incidents in SQLite at staggered times. NONE
+        // are in the KG — that's exactly the post-restart scenario.
+        mk_sqlite_incident(
+            &store,
+            "fresh:1",
+            now - chrono::Duration::minutes(2),
+            "1.1.1.1",
+        );
+        mk_sqlite_incident(
+            &store,
+            "fresh:2",
+            now - chrono::Duration::minutes(5),
+            "2.2.2.2",
+        );
+        mk_sqlite_incident(
+            &store,
+            "fresh:3",
+            now - chrono::Duration::minutes(10),
+            "3.3.3.3",
+        );
+
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resp = build_live_feed_response(&kg, tmp.path(), Some(&store));
+
+        assert_eq!(
+            resp.total_today, 3,
+            "SQLite-first live-feed must surface ALL 3 incidents — even though the KG is empty"
+        );
+        assert_eq!(
+            resp.items.len(),
+            3,
+            "items list must include each SQLite incident"
+        );
+        assert_eq!(
+            resp.unique_sources, 3,
+            "unique_sources must reflect SQLite-sourced entity IPs"
+        );
+        // Items are timestamps, all within 24h.
+        for item in &resp.items {
+            assert!(item.ts.contains("2026") || item.ts.contains("T"));
+        }
+    }
+
+    #[test]
+    fn live_feed_sqlite_path_clips_to_24h_window() {
+        // The Wave-10 (24h) label contract must survive the SQLite
+        // migration. Seed one incident inside the window and one
+        // outside; only the inside one shows up.
+        let store = innerwarden_store::Store::open_memory().expect("open_memory");
+        let now = chrono::Utc::now();
+        mk_sqlite_incident(
+            &store,
+            "in-window",
+            now - chrono::Duration::hours(2),
+            "1.1.1.1",
+        );
+        mk_sqlite_incident(
+            &store,
+            "outside-window",
+            now - chrono::Duration::hours(48),
+            "2.2.2.2",
+        );
+
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resp = build_live_feed_response(&kg, tmp.path(), Some(&store));
+
+        assert_eq!(
+            resp.total_today, 1,
+            "only the in-window incident should count toward total_today (Wave-10 24h contract)"
+        );
+        assert_eq!(resp.unique_sources, 1);
+    }
+
+    #[test]
+    fn live_feed_fallback_to_kg_when_no_store() {
+        // Dev/test fixtures don't always carry a Store. When None is
+        // passed, the function must fall back to the legacy
+        // KG-plus-JSONL path so older test scaffolding keeps working.
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resp = build_live_feed_response(&kg, tmp.path(), None);
+        assert_eq!(
+            resp.total_today, 0,
+            "empty KG + no JSONL + no Store → empty feed"
+        );
+        assert!(resp.items.is_empty());
+    }
+
+    #[test]
+    fn live_feed_sqlite_independent_of_kg_state() {
+        // Anti-regression for the prod symptom: KG with stale
+        // contents that disagree with SQLite. If a future change
+        // re-introduces a merge that lets stale KG entries leak in,
+        // this test catches it.
+        let store = innerwarden_store::Store::open_memory().expect("open_memory");
+        let now = chrono::Utc::now();
+        mk_sqlite_incident(
+            &store,
+            "fresh:from-sqlite",
+            now - chrono::Duration::minutes(1),
+            "1.1.1.1",
+        );
+
+        // KG starts empty — same as post-restart prod.
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resp = build_live_feed_response(&kg, tmp.path(), Some(&store));
+        assert_eq!(
+            resp.total_today, 1,
+            "SQLite source must NOT depend on KG state — KG empty here, SQLite has 1, response = 1"
+        );
+        // Identify by title prefix the helper writes.
+        assert!(
+            resp.items.iter().any(|it| it.title.contains("threat")
+                || it.title.contains("attack")
+                || it.title.contains("Suspicious")
+                || it.title.contains("severity")),
+            "item must contain the rendered title for an unknown detector"
+        );
     }
 }

@@ -175,7 +175,11 @@ fn blocks_today_agrees_across_all_graph_derived_surfaces() {
     // live feed, which consume the same endpoint.
     let tmp = tempfile::tempdir().expect("tempdir for empty data_dir");
     let kg = Arc::new(RwLock::new(graph));
-    let live_feed = super::live_feed::build_live_feed_response(&kg, tmp.path());
+    // 2026-05-15: build_live_feed_response now takes Option<&Store> as
+    // a 3rd arg. This fixture has no store (legacy KG-only test), so
+    // None routes through the KG+JSONL fallback path — same behaviour
+    // the old signature produced.
+    let live_feed = super::live_feed::build_live_feed_response(&kg, tmp.path(), None);
     let live_feed_count = live_feed.total_blocked();
 
     // Surface 3: re-call helper #1 on the shared graph. Guards against a
