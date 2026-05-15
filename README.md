@@ -777,27 +777,46 @@ The authors are not responsible for downtime, data loss, or service disruption c
 
 ---
 
+## Community & feedback
+
+InnerWarden is built in the open and we are actively trying to grow the community around it. If you are running it (or thinking about it), we want to hear from you — the install on your box tells us more than any benchmark suite.
+
+**Feedback we want, however small:**
+
+- [**Open an issue**](https://github.com/InnerWarden/innerwarden/issues/new/choose) — install problem, false positive, surprising behaviour, missing detector, anything that did not match your expectation
+- [**Start a discussion**](https://github.com/InnerWarden/innerwarden/discussions) — questions, ideas, sharing your config, "did anyone else see X?"
+- [**Star the repo**](https://github.com/InnerWarden/innerwarden) if it is useful — visibility is how more security engineers find it
+- **Quick survey:** [usage + pain points (60 sec)](https://github.com/InnerWarden/innerwarden/discussions/categories/feedback) — even one-liners help us prioritise
+- **Email** for private feedback or security disclosures: see [SECURITY.md](SECURITY.md)
+
+Tell us: what did you install it on (distro / kernel)? Did it catch anything real? What blocked you? What would make you trust it on a production box? No answer is too small.
+
 ## Contributing
 
-Contributions are welcome. Check the [contributing guide](CONTRIBUTING.md) and pick an issue:
+We need more hands. Detector writers, integration authors, docs hackers, testers — every contribution moves the project forward.
 
+- [**Contributing guide**](CONTRIBUTING.md) — local dev setup, PR checklist, code style
 - [**Good first issues**](https://github.com/InnerWarden/innerwarden/labels/good%20first%20issue) — documentation, config flags, small features
 - [**Help wanted**](https://github.com/InnerWarden/innerwarden/labels/help%20wanted) — new detectors, sinks, integrations, CLI commands
+- [**Module authoring**](https://github.com/InnerWarden/innerwarden/wiki/Module-Authoring) — write a vertical security module (manifest + config + docs + tests)
+- [**Integration recipes**](https://github.com/InnerWarden/innerwarden/wiki/Integration-Recipes) — declarative YAML to wire an external tool in minutes, no Rust required
 
-New detectors, integration recipes, and module documentation are especially appreciated.
+New detectors, integration recipes, and module documentation are especially appreciated. If you have a specific use case (different distro, weird kernel, missing collector for your stack), open an issue and we will help you ship it.
 
 ---
 
 ## Links
 
 - [Website](https://www.innerwarden.com)
-- [Live attack feed](https://innerwarden.com/live)
+- [Live attack feed](https://innerwarden.com/live) — real attacks against our prod box, in real time
 - [Blog](https://innerwarden.com/blog)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Documentation](https://github.com/InnerWarden/innerwarden/wiki)
 - [Module authoring](https://github.com/InnerWarden/innerwarden/wiki/Module-Authoring)
+- [GitHub Discussions](https://github.com/InnerWarden/innerwarden/discussions) — questions, ideas, war stories
+- [Report an issue](https://github.com/InnerWarden/innerwarden/issues/new/choose) — install problems, FPs, missing detectors
 
 ## License
 

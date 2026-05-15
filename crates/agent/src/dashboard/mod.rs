@@ -4983,6 +4983,83 @@ mod tests {
     }
 
     #[test]
+    fn pr_health_xdp_detection_keys_off_allowed_skills_not_ebpf_events() {
+        // 2026-05-15: pre-fix the XDP Firewall card on Health read
+        // `!!s.ebpf_events` — a field the agent NEVER emits on
+        // /api/status. The card therefore always rendered OFF even
+        // on hosts with the innerwarden_xdp BPF program actively
+        // loaded in the kernel (verified on prod via bpftool prog +
+        // 15k entries in blocked-ips.txt while the card said OFF).
+        //
+        // The honest signal is `responder.allowed_skills` carrying
+        // `block-ip-xdp` — that's the operator-wired indicator that
+        // XDP is part of the response pipeline.
+        assert!(
+            JS_STATUS.contains("resp.allowed_skills.indexOf('block-ip-xdp')"),
+            "Health tab must derive XDP ON/OFF from responder.allowed_skills (the honest signal). \
+             Pre-fix the card read !!s.ebpf_events which was always undefined → always OFF."
+        );
+        // Anti-regression: do NOT key off the legacy field.
+        assert!(
+            !JS_STATUS.contains("!!s.ebpf_events"),
+            "Health tab must NOT revert to reading `!!s.ebpf_events` — that field is not in the \
+             /api/status payload and the legacy check always rendered OFF (operator-reported \
+             2026-05-15 with XDP loaded + 15k IPs blocked but card said OFF)."
+        );
+    }
+
+    #[test]
+    fn pr_health_kill_chain_keys_off_status_block_existence() {
+        // 2026-05-15: kill chain is integrated inline in every build
+        // (post-PR-258, see CLAUDE.md). The status payload always
+        // emits a `kill_chain` object. Pre-fix the JS checked
+        // `kc.pids_tracked !== undefined` — a field never emitted —
+        // so the card always rendered OFF.
+        assert!(
+            JS_STATUS.contains("s.kill_chain !== undefined && s.kill_chain !== null"),
+            "Health tab must key Kill Chain ON/OFF on the presence of the s.kill_chain block. \
+             Pre-fix it tested kc.pids_tracked (a field /api/status never emitted) so the card \
+             always read OFF even on every shipped build."
+        );
+    }
+
+    #[test]
+    fn pr_health_drops_data_files_section() {
+        // 2026-05-15 slim-down: removed the Data Files table from the
+        // Health tab. Post-spec-016 events + incidents live in
+        // SQLite; the two remaining JSONL files (decisions /
+        // telemetry) are implementation detail the operator never
+        // acts on. Data directory path stays as a single inline line
+        // for the rare on-call case where the path matters.
+        assert!(
+            !JS_STATUS.contains("'Data Files - '"),
+            "Health tab Data Files section was removed; do not bring it back"
+        );
+        // The Data Directory line stays.
+        assert!(JS_STATUS.contains("Data Directory"));
+    }
+
+    #[test]
+    fn pr_health_filters_not_applicable_collectors() {
+        // 2026-05-15: collectors flagged `not_applicable=true` (e.g.
+        // macOS unified log on a Linux host) must not render. PR29
+        // health badges accurately said "NOT FOUND" but a forever-red
+        // row for a tool that cannot physically exist on this OS is
+        // noise. The agent emits `not_applicable: !cfg!(target_os
+        // = "macos")` for macos_log; the dashboard filters those out.
+        assert!(
+            JS_STATUS.contains("c.not_applicable"),
+            "status.js must filter collectors with not_applicable=true"
+        );
+        // Sensor side: macos_log carries the cfg!() platform tag.
+        const SENSORS_SRC: &str = include_str!("sensors.rs");
+        assert!(
+            SENSORS_SRC.contains("!cfg!(target_os = \"macos\")"),
+            "sensors.rs must tag macos_log with not_applicable on non-macOS hosts"
+        );
+    }
+
+    #[test]
     fn nav_drops_responses_tab_after_slim_down() {
         // 2026-05-15: the standalone Responses tab was removed from
         // the dashboard. Per-attacker enforcement detail moved to the

@@ -218,9 +218,15 @@ function renderStatus(s, collectors) {
 
   // ── Build Kill Chain card (needs runtime data) ──
   const kcCard = (function() {
+    // 2026-05-15: kill chain is integrated inline in every agent build
+    // (crates/killchain/ migration, see CLAUDE.md). The `kill_chain`
+    // block being present on /api/status is the ground truth that it
+    // is loaded — the legacy `pids_tracked !== undefined` check tested
+    // a field that was never emitted, so the card always read OFF
+    // even on hosts with active chain detection.
     const kc = s.kill_chain || {};
+    const kcOn = s.kill_chain !== undefined && s.kill_chain !== null;
     const kcTotal = (kc.total_blocked || 0) + (kc.total_pre_chain || 0);
-    const kcOn = (kc.pids_tracked !== undefined) || kcTotal > 0; // ON if tracker is loaded
     const kcDesc = kcTotal > 0
       ? kcTotal + ' chain(s) detected today — ' + (kc.total_blocked||0) + ' blocked, ' + (kc.total_pre_chain||0) + ' pre-chain'
       : 'Multi-step attack correlation — detects reverse shells, privilege escalation chains';
@@ -230,6 +236,17 @@ function renderStatus(s, collectors) {
     return card(lucideIcon('link'), 'Kill Chain', kcOn, kcDesc, kcOn ? 'ON' : 'OFF', 'native', kcCost, '');
   })();
 
+  // 2026-05-15: XDP Firewall detection — pre-fix the card keyed off a
+  // status field that the agent never populated, so the indicator
+  // always rendered OFF even on hosts with the XDP program actively
+  // loaded in the kernel. The honest signal is the operator having
+  // added `block-ip-xdp` to `responder.allowed_skills` (i.e. wired
+  // XDP into the response pipeline). Verified on prod: agent had this
+  // flag set + `bpftool prog` showed innerwarden_xdp loaded +
+  // blocked-ips.txt had 15k+ entries — but the card still said OFF.
+  const xdpOn = (resp && Array.isArray(resp.allowed_skills)
+    && resp.allowed_skills.indexOf('block-ip-xdp') !== -1);
+
   html += '<div class="report-section"><div class="report-section-title">Active Integrations</div>' +
     groupStyle +
 
@@ -238,7 +255,7 @@ function renderStatus(s, collectors) {
       card(lucideIcon('bot'), 'AI Analysis',   s.ai_enabled,     'Analyzes threats and selects the best response action',       s.ai_enabled ? 'ON' : 'OFF', 'native', 'Built into InnerWarden - no external service needed.', 'innerwarden enable ai'),
       card(lucideIcon('shield'), 'IP Blocker',    resp.enabled,     'Automatically blocks IPs via UFW/iptables when AI decides',   resp.enabled ? 'ON' : 'OFF', 'native', 'Zero cost. Uses your existing firewall.',               'innerwarden enable block-ip'),
       card(lucideIcon('flask-conical'), 'Honeypot',      hpMode !== 'off', 'Decoy server that captures and logs attacker behavior',       hpBadge,                     'native', 'listener mode activates on AI demand; always_on keeps it permanently open.', ''),
-      card(lucideIcon('flame'), 'XDP Firewall',  !!s.ebpf_events,  'Wire-speed IP blocking at network driver - 10M+ pps drop',    s.ebpf_events ? 'ON' : 'OFF', 'native', 'Requires eBPF sensor + BPF filesystem mounted. Layered: XDP + firewall + Cloudflare + AbuseIPDB.', ''),
+      card(lucideIcon('flame'), 'XDP Firewall',  xdpOn,            'Wire-speed IP blocking at network driver - 10M+ pps drop',    xdpOn ? 'ON' : 'OFF',         'native', 'Layered defense: XDP drops in-kernel at line rate alongside the ufw/iptables backend. Enable: add `block-ip-xdp` to `responder.allowed_skills` in agent.toml.', ''),
     ], true) +
 
     // ── Kernel Hardening (expanded — v0.6.0 features) ──
@@ -335,6 +352,11 @@ function renderStatus(s, collectors) {
   }
 
   // ── Section 3: Sensor Collectors ──────────────────────────────────────
+  // 2026-05-15: drop collectors flagged `not_applicable` (e.g. macOS
+  // unified log on Linux). The PR29 health badges accurately said
+  // "NOT FOUND" for those, but on a Linux host they cannot physically
+  // exist — better to hide than to render a forever-red row.
+  collectors = collectors.filter(function(c) { return !c.not_applicable; });
   if (collectors.length > 0) {
     const colIcons = {
       auth_log: lucideIcon('lock'), journald: lucideIcon('clipboard-list'), docker: lucideIcon('server'), nginx_access: lucideIcon('globe'), nginx_error: lucideIcon('alert-triangle'),
@@ -399,25 +421,11 @@ function renderStatus(s, collectors) {
     html += '</div></div>';
   }
 
-  // ── Section 4: Data files ──────────────────────────────────────────────
-  html += '<div class="report-section"><div class="report-section-title">Data Files - ' + esc(s.date || '-') + '</div>' +
-    '<table class="report-table"><thead><tr><th>File</th><th>Status</th><th>Size</th></tr></thead><tbody>';
-  Object.entries(files).forEach(([k, v]) => {
-    const exists = v.exists;
-    // events.jsonl no longer used — events go to SQLite (spec 016)
-    const isSqlite = (k === 'events' && !exists);
-    const statusLabel = isSqlite
-      ? '<span class="health-ok" style="display:inline-flex;align-items:center;gap:4px">' + lucideIcon('check',{size:12}) + ' SQLite</span>'
-      : exists ? '<span class="health-ok" style="display:inline-flex;align-items:center;gap:4px">' + lucideIcon('check',{size:12}) + ' Present</span>'
-      : '<span style="color:var(--muted)">- Absent</span>';
-    html += '<tr>' +
-      '<td style="font-family:\'JetBrains Mono\',monospace;font-size:0.72rem">' + esc(k) + (isSqlite ? ' (db)' : '.jsonl') + '</td>' +
-      '<td>' + statusLabel + '</td>' +
-      '<td style="color:var(--muted)">' + (exists ? fmt(v.size_bytes) : isSqlite ? 'innerwarden.db' : '-') + '</td>' +
-      '</tr>';
-  });
-  html += '</tbody></table></div>';
-
+  // 2026-05-15 slim-down: removed the "Data Files" section. Post-spec-016
+  // events + incidents live in SQLite; the two remaining JSONL files
+  // (decisions / telemetry) are implementation detail the operator
+  // never acts on. Data directory path moved to a single inline line
+  // for the rare on-call case where the path matters.
   html += '<div class="report-section"><div class="report-section-title">Data Directory</div>' +
     '<div style="font-family:\'JetBrains Mono\',monospace;font-size:0.78rem;color:var(--muted);padding:4px 0">' + esc(s.data_dir || '-') + '</div></div>';
 

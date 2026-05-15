@@ -1102,12 +1102,26 @@ pub(super) struct GeoIpResult {
 
 // Public feed: only show real external attacks (with attacker IP).
 // Filter out internal detections, system noise, and advisory-only detectors.
+//
+// 2026-05-15: pre-fix `has_external_ip` was testing only that an IP
+// entity existed on the incident — NOT that the IP was actually
+// external. Operator reported public-site FPs surfacing 127.0.0.1,
+// 10.0.0.0/8 RFC1918 hosts, and Cloudflare-edge IPs with titles like
+// "DNS tunneling detected" and "Suspicious activity detected and
+// logged." The fix routes each IP entity through the two canonical
+// helpers — `incident_auto_rules::is_internal_ip_pub` covers loopback
+// + RFC1918, `cloud_safelist::is_self_traffic_ip` covers Cloudflare +
+// the operator's own cloud edge ranges. An incident has a real
+// external IP only if AT LEAST ONE of its entities passes BOTH
+// checks; otherwise it's self-traffic noise that does not belong on
+// the public sales-demo live feed.
 pub(super) fn is_internal(inc: &innerwarden_core::incident::Incident) -> bool {
     let det = inc.incident_id.split(':').next().unwrap_or("");
-    let has_external_ip = inc
-        .entities
-        .iter()
-        .any(|e| e.r#type == innerwarden_core::entities::EntityType::Ip);
+    let has_external_ip = inc.entities.iter().any(|e| {
+        e.r#type == innerwarden_core::entities::EntityType::Ip
+            && !crate::incident_auto_rules::is_internal_ip_pub(&e.value)
+            && !crate::cloud_safelist::is_self_traffic_ip(&e.value)
+    });
     is_internal_incident_fields(det, &inc.title, has_external_ip)
 }
 
@@ -1835,19 +1849,19 @@ mod tests {
             &store,
             "fresh:1",
             now - chrono::Duration::minutes(2),
-            "1.1.1.1",
+            "203.0.113.1",
         );
         mk_sqlite_incident(
             &store,
             "fresh:2",
             now - chrono::Duration::minutes(5),
-            "2.2.2.2",
+            "203.0.113.2",
         );
         mk_sqlite_incident(
             &store,
             "fresh:3",
             now - chrono::Duration::minutes(10),
-            "3.3.3.3",
+            "203.0.113.3",
         );
 
         let kg = std::sync::Arc::new(std::sync::RwLock::new(
@@ -1886,13 +1900,13 @@ mod tests {
             &store,
             "in-window",
             now - chrono::Duration::hours(2),
-            "1.1.1.1",
+            "203.0.113.1",
         );
         mk_sqlite_incident(
             &store,
             "outside-window",
             now - chrono::Duration::hours(48),
-            "2.2.2.2",
+            "203.0.113.2",
         );
 
         let kg = std::sync::Arc::new(std::sync::RwLock::new(
@@ -1937,7 +1951,7 @@ mod tests {
             &store,
             "fresh:from-sqlite",
             now - chrono::Duration::minutes(1),
-            "1.1.1.1",
+            "203.0.113.1",
         );
 
         // KG starts empty — same as post-restart prod.

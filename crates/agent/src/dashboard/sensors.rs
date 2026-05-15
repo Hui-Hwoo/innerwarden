@@ -635,7 +635,12 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
             "detected": has_binary("log"),
             "active": has_binary("log"),
             "events_today": count_source("macos_log"),
-            "desc": "macOS unified log stream - auth events, process exec, network"
+            "desc": "macOS unified log stream - auth events, process exec, network",
+            // 2026-05-15: mark Linux-irrelevant. Dashboard hides
+            // rows where `not_applicable=true` so the Health tab
+            // does not lie about "NOT FOUND" for a tool that
+            // physically cannot exist on this OS.
+            "not_applicable": !cfg!(target_os = "macos")
         },
     ]);
 
