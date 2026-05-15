@@ -73,13 +73,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 fs2 = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
+sha2_011 = { package = "sha2", version = "=0.11.0-rc.5" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 serde_yaml = "0.9"
 russh = "0.60"
 regex = "1"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
 aes-gcm = "0.10"
-hkdf = "0.12"
+hkdf = "0.13"
 bytes = "1"
 
 # Pure-Rust ONNX inference (no C runtime dependency, slightly slower than ort

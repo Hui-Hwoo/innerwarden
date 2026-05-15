@@ -26,7 +26,7 @@ use p256::{
 };
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2_011::Sha256 as HkdfSha256;
 use tracing::warn;
 
 use crate::config::WebPushConfig;
@@ -154,7 +154,7 @@ fn encrypt_payload(plaintext: &[u8], subscription: &WebPushSubscription) -> Resu
     let receiver_public_bytes = EncodedPoint::from(receiver_public).to_bytes().to_vec();
 
     // --- PRK = HKDF-Extract(salt=auth_secret, ikm=shared_secret) ---
-    let prk = Hkdf::<Sha256>::new(Some(&auth_secret), shared_bytes.as_slice());
+    let prk = Hkdf::<HkdfSha256>::new(Some(&auth_secret), shared_bytes.as_slice());
 
     // --- IKM = HKDF-Expand(PRK, "WebPush: info\0" || receiver_pub || sender_pub, 32) ---
     let mut info = b"WebPush: info\x00".to_vec();
@@ -169,7 +169,7 @@ fn encrypt_payload(plaintext: &[u8], subscription: &WebPushSubscription) -> Resu
     OsRng.fill_bytes(&mut salt);
 
     // --- Key material from salt + IKM ---
-    let key_hkdf = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+    let key_hkdf = Hkdf::<HkdfSha256>::new(Some(&salt), &ikm);
 
     // CEK = HKDF-Expand(key_hkdf, "Content-Encoding: aes128gcm\0\x01", 16)
     let mut cek = [0u8; 16];
