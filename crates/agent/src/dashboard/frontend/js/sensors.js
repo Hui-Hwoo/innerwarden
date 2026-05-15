@@ -116,19 +116,15 @@ function healthBadge(status) {
   return '<span class="' + cls + '" title="' + title.replace(/"/g, '&quot;') + '">' + label + '</span>';
 }
 
-async function loadSensors() {
-  try {
-    const data = await loadJson('/api/sensors');
-    // 2026-05-15 Sensors slim: the HUD stat cards, Unresolved-Cases
-    // gauge, Detector Activity radar and Event Types tile moved to
-    // Home (rendered by renderHomeSensorsSummary). Sensors keeps the
-    // collector-health surface — telemetry/alarm/snapshot rows + the
-    // Event Timeline — because that's the diagnostic view, not the
-    // at-a-glance view.
-
-    // Per-source rows — split into active vs available
-    const srcEl = document.getElementById('sensorSources');
-    if (srcEl) {
+// 2026-05-15 Sensors fold: the standalone Sensors page was deleted —
+// its content (per-collector telemetry/alarm/snapshot breakdown + Event
+// Timeline) now lives on Home below the AI Intelligence Briefing.
+// `renderSensorSourceRows` is the shared helper Home calls. It expects
+// the `/api/sensors` payload and a target DOM id for the rows container.
+function renderSensorSourceRows(srcElId, data) {
+  const srcEl = document.getElementById(srcElId);
+  if (!srcEl) return;
+  {
       // 2026-05-14 refactor: split source list by CATEGORY, not by
       // count. A `tls_fingerprint` collector with count=0 was being
       // rendered under "ready — not collecting" alongside genuinely
@@ -249,25 +245,17 @@ async function loadSensors() {
 
       srcEl.innerHTML = shtml;
     }
-
-    // Event Timeline still lives on the Sensors page — paired with
-    // the per-collector breakdown above. The HUD stat cards, gauge,
-    // radar and Event Types tile moved to Home (renderHomeSensorsSummary).
-    drawTimelineChart(data.event_timeline || {}, data.sources || []);
-  } catch(e) { console.error('loadSensors', e); }
 }
 
-// 2026-05-15: `loadTopAction` (the "14 incidents being handled by AI"
-// banner above the Sensors HUD) was removed alongside the HUD stat
-// cards / Unresolved Cases gauge / Detector Activity radar / Event
-// Types tile. The data moved to Home in compact form via
-// `renderHomeSensorsSummary`; the banner's editorial content is now
-// covered by Home's hero + activity strip.
+// 2026-05-15 Sensors fold: the standalone Sensors page (the entire
+// `viewSensors` block, the `Sensors` nav button, `loadSensors`,
+// `loadTopAction`, `drawThreatGauge`, `drawDetectorChart`) was deleted.
+// What survives is reused on Home: `renderSensorSourceRows` for the
+// per-collector breakdown and `drawTimelineChart` for the Event
+// Timeline. home.js drives both via `renderHomeSensorsPanel`.
 
 // Chart.js global config - match site design system
 let timelineChart = null;
-let detectorChart = null;
-let gaugeChart = null;
 const CJ = typeof Chart !== 'undefined';
 if (CJ) {
   Chart.defaults.color = '#8b9db8';
@@ -299,8 +287,11 @@ function makeGradient(ctx, canvas, color, alpha1, alpha2) {
 }
 
 // ── 1. AREA CHART - Event Timeline (smooth curves + gradient fills) ──
-function drawTimelineChart(timeline, sources) {
-  const canvas = document.getElementById('sensorChart');
+// 2026-05-15: parameterised so Home can mount the timeline under its
+// own canvas id (`homeSensorChart`). The standalone Sensors page is
+// gone — see renderHomeSensorsPanel in home.js.
+function drawTimelineChart(canvasId, timeline, sources) {
+  const canvas = document.getElementById(canvasId);
   if (!canvas || !CJ) return;
 
   const buckets = Object.keys(timeline).sort();
@@ -369,137 +360,8 @@ function drawTimelineChart(timeline, sources) {
   });
 }
 
-// ── 2. THREAT GAUGE - Doughnut speedometer ──
-// 2026-05-15: parameterised so Home can mount the gauge under its own
-// DOM ids (`homeThreatGauge` / `homeThreatLabel`). The Sensors page no
-// longer renders the gauge — see renderHomeSensorsSummary in home.js.
-function drawThreatGauge(canvasId, labelId) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas || !CJ) return;
-  const label = labelId ? document.getElementById(labelId) : null;
-
-  // Scale based on UNRESOLVED threats only — blocked threats = success, not danger.
-  const ur = getUnresolved().unresolved;
-  const ratio = Math.min(ur / 10, 1);
-  let level = 'NOMINAL';
-  let color = '#4ade80';
-  if (ur >= 10) { level = 'CRITICAL'; color = '#f43f5e'; }
-  else if (ur >= 5) { level = 'ELEVATED'; color = '#fbbf24'; }
-  else if (ur >= 1) { level = 'GUARDED'; color = '#7fe7ff'; }
-
-  if (label) label.textContent = level;
-  if (label) label.style.color = color;
-
-  const val = Math.max(ratio * 100, 2); // min 2% for visibility
-
-  if (gaugeChart) gaugeChart.destroy();
-  gaugeChart = new Chart(canvas, {
-    type: 'doughnut',
-    data: {
-      datasets: [{
-        data: [val, 100 - val],
-        backgroundColor: [
-          (context) => {
-            const chart = context.chart;
-            const {ctx, chartArea} = chart;
-            if (!chartArea) return color;
-            const g = ctx.createRadialGradient(
-              (chartArea.left+chartArea.right)/2, chartArea.bottom, 0,
-              (chartArea.left+chartArea.right)/2, chartArea.bottom, (chartArea.right-chartArea.left)/2
-            );
-            g.addColorStop(0, color);
-            g.addColorStop(1, color + '44');
-            return g;
-          },
-          'rgba(26,41,67,0.3)'
-        ],
-        borderWidth: 0,
-        borderRadius: 6,
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      cutout: '78%',
-      circumference: 240,
-      rotation: -120,
-      plugins: {
-        legend: { display: false },
-        tooltip: { enabled: false },
-      },
-      animation: { animateRotate: true, duration: 1500, easing: 'easeOutQuart' },
-    },
-    plugins: [{
-      id: 'gaugeCenter',
-      afterDraw(chart) {
-        // 2026-05-02: section is labelled "UNRESOLVED THREATS" so the
-        // big number must match — show the unresolved count, not the
-        // total. Pre-fix the gauge rendered "409 NOMINAL" while the
-        // tile above said "0 incident being handled by AI": the 409
-        // was total_incidents (mostly blocked), but the heading "Unresolved
-        // Threats" made it look like 409 needed attention.
-        const {ctx, chartArea} = chart;
-        const cx = (chartArea.left + chartArea.right) / 2;
-        const cy = chartArea.bottom - 10;
-        ctx.save();
-        ctx.textAlign = 'center';
-        ctx.fillStyle = color;
-        ctx.font = "bold 22px 'JetBrains Mono', monospace";
-        ctx.shadowColor = color;
-        ctx.shadowBlur = 12;
-        ctx.fillText(ur.toString(), cx, cy - 8);
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = '#8b9db8';
-        ctx.font = "10px 'Space Grotesk', sans-serif";
-        ctx.fillText('unresolved', cx, cy + 8);
-        ctx.restore();
-      }
-    }]
-  });
-}
-
-// ── 3. POLAR AREA - Detector activity (radial, colorful) ──
-// 2026-05-15: parameterised so Home can render the radar under its own
-// canvas id (`homeDetectorChart`). The Sensors page no longer renders
-// it — see renderHomeSensorsSummary in home.js.
-function drawDetectorChart(canvasId, detectors) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas || !CJ || detectors.length === 0) return;
-
-  const top = detectors.slice(0, 8);
-  const colors = ['#7fe7ff','#4ade80','#fbbf24','#fb7185','#60a5fa','#a78bfa','#f97316','#22d3ee'];
-
-  if (detectorChart) detectorChart.destroy();
-  detectorChart = new Chart(canvas, {
-    type: 'polarArea',
-    data: {
-      labels: top.map(d => d.name),
-      datasets: [{
-        data: top.map(d => d.count),
-        backgroundColor: top.map((_, i) => colors[i % colors.length] + '66'),
-        borderColor: top.map((_, i) => colors[i % colors.length]),
-        borderWidth: 2,
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {
-        r: {
-          grid: { color: 'rgba(26,41,67,0.5)', lineWidth: 0.5 },
-          ticks: { display: false },
-          beginAtZero: true,
-        }
-      },
-      plugins: {
-        legend: {
-          position: 'right',
-          labels: { boxWidth: 8, boxHeight: 8, padding: 8, font: { size: 9, family: "'Space Grotesk', sans-serif" }, usePointStyle: true, pointStyle: 'circle' }
-        },
-        tooltip: { ...siteTooltip, callbacks: { label: (c) => c.label + ': ' + c.raw + ' incidents' } },
-      },
-      animation: { animateRotate: true, animateScale: true, duration: 1200 },
-    }
-  });
-}
-
+// 2026-05-15: `drawThreatGauge` and `drawDetectorChart` were the
+// Unresolved Cases gauge + Detector Activity radar from the old
+// Sensors HUD. PR #629 had moved them to Home; this PR removes
+// them entirely — neither rendering survived the final Sensors
+// fold-into-Home redesign (operator: "acho que podemos deletar").

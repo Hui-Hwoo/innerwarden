@@ -77,7 +77,9 @@
       <div class="nav-more-wrap">
         <button type="button" class="main-nav-btn" id="navMore" onclick="toggleMoreMenu()" aria-label="More views"><span id="moreLabel">More</span> &#9662;</button>
         <div class="nav-more-menu" id="moreMenu" style="display:none">
-          <button type="button" class="nav-more-item" id="navSensors" onclick="showView('sensors')">Sensors</button>
+          <!-- 2026-05-15: `navSensors` removed alongside the Sensors
+               view delete. The per-collector breakdown + Event Timeline
+               live on Home under `#homeSensorsPanel`. -->
           <button type="button" class="nav-more-item" id="navReport" onclick="showView('report')">Briefings</button>
           <button type="button" class="nav-more-item" id="navHoneypot" onclick="showView('honeypot')">Honeypot</button>
           <button type="button" class="nav-more-item" id="navCompliance" onclick="showView('compliance')">Compliance</button>
@@ -134,7 +136,11 @@
            with the matching outcome filter pre-applied. Resolves
            the "cade os 170 em threats?" reconciliation gap. -->
       <div class="activity-strip">
-        <div class="activity-cell" onclick="showView('sensors')" role="button" tabindex="0" title="Total events recorded by all sensors today.">
+        <!-- 2026-05-15: this cell used to deeplink into the Sensors
+             view. That view was deleted; the per-collector breakdown +
+             Event Timeline live further down on Home itself, so the
+             cell is now a passive read-only stat. -->
+        <div class="activity-cell" title="Total events recorded by all sensors today.">
           <div class="activity-num" id="homeActWatched">0</div>
           <div class="activity-label">events watched</div>
         </div>
@@ -189,7 +195,11 @@
         <div class="home-onboarding-title">No threats today — everything is being watched.</div>
         <div class="home-onboarding-sub" id="homeOnboardingSub">Sensors are streaming events. Detections appear here as soon as the AI sees them.</div>
       </div>
-      <a class="home-onboarding-link" href="#sensors" onclick="event.preventDefault();showView('sensors')">Check sensors &rarr;</a>
+      <!-- 2026-05-15: link used to jump to the Sensors view. That
+           view was deleted; the per-collector panel now lives on this
+           same page (`#homeSensorsPanel`) so the link is a same-page
+           anchor jump instead. -->
+      <a class="home-onboarding-link" href="#homeSensorsPanel">Check sensors &rarr;</a>
     </div>
 
     <!-- 5. AI INTELLIGENCE BRIEFING: always visible per operator
@@ -206,30 +216,22 @@
       </div>
     </div>
 
-    <!-- 6. SENSORS SUMMARY (migrated 2026-05-15 from the Sensors page).
-         Operator requested the HUD stat cards / Unresolved Cases gauge
-         / Detector Activity radar / Event Types tile to live below the
-         AI Intelligence Briefing. The same `/api/sensors` payload
-         feeds both surfaces; renderHomeSensorsSummary in home.js
-         mounts here. Sensors view keeps the per-collector breakdown +
-         Event Timeline (the diagnostic surface). -->
-    <div class="home-section" id="homeSensorsSummary">
-      <div class="home-section-title">Sensors Summary</div>
-      <div class="hud-stats" id="homeSensorCards"></div>
-      <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px; margin-top:14px;">
-        <div class="hud-panel" style="display:flex;flex-direction:column;align-items:center;">
-          <h3 class="hud-panel-title">Unresolved Cases</h3>
-          <div style="position:relative;height:160px;width:100%;"><canvas id="homeThreatGauge"></canvas></div>
-          <div id="homeThreatLabel" style="font-family:'JetBrains Mono',monospace;font-size:0.8rem;color:#8b9db8;margin-top:4px;"></div>
-        </div>
-        <div class="hud-panel">
-          <h3 class="hud-panel-title">Detector Activity</h3>
-          <div style="position:relative;height:200px;"><canvas id="homeDetectorChart"></canvas></div>
-        </div>
-        <div class="hud-panel">
-          <h3 class="hud-panel-title">Event Types</h3>
-          <div id="homeSensorKinds" style="font-size:0.8rem;"></div>
-        </div>
+    <!-- 6. SENSORS PANEL (folded 2026-05-15 from the deleted Sensors
+         page). Operator request: "deletar [SENSORS SUMMARY], o que
+         sobrou la em sensors vc tras pra home e deleta sensors". The
+         per-collector telemetry/alarm/snapshot breakdown lives in
+         `#homeSensorSources`; the Event Timeline draws into
+         `#homeSensorChart`. Both rendered by renderHomeSensorsPanel
+         in home.js using the same `/api/sensors` payload loadHome
+         already fetched. The standalone `viewSensors` block + the
+         `Sensors` nav button + the HUD cards/gauge/radar/Event Types
+         tile from PR #629's compromise design are all gone. -->
+    <div class="home-section" id="homeSensorsPanel">
+      <div class="home-section-title">Sensors</div>
+      <div style="display:flex; flex-wrap:wrap; gap:6px; flex-direction:column;" id="homeSensorSources"></div>
+      <div class="hud-panel" style="margin-top:14px;">
+        <h3 class="hud-panel-title">Event Timeline</h3>
+        <div style="position:relative;height:240px;"><canvas id="homeSensorChart"></canvas></div>
       </div>
     </div>
 
@@ -240,24 +242,11 @@
          data they surfaced is reachable from Sensors / Health / Cases. -->
   </div>
 
-  <!-- ── Sensors view ── 2026-05-15 slim ──
-       The HUD stat cards (Events Today / Incidents / Sources Active /
-       Detectors Firing), the "incidents being handled by AI" banner,
-       the Unresolved Cases gauge, the Detector Activity radar, and
-       the Event Types tile were moved to Home (below AI Intelligence
-       Briefing — see #homeSensorsSummary). Sensors is now the
-       collector-health diagnostic view: per-stream rows + the Event
-       Timeline. Operator's exact request: "remover essas coisas com
-       setas em vermelho da pagina sensors e nao deixar codigo morto,
-       e mover para a home do dashboard abaixo de AI Intelligence
-       Briefing". -->
-  <div class="report-view sensor-hud" id="viewSensors" style="display:flex;">
-    <div style="display:flex; flex-wrap:wrap; gap:6px; flex-direction:column;" id="sensorSources"></div>
-    <div class="hud-panel">
-      <h3 class="hud-panel-title">Event Timeline</h3>
-      <div style="position:relative;height:240px;"><canvas id="sensorChart"></canvas></div>
-    </div>
-  </div>
+  <!-- 2026-05-15: the standalone Sensors view was deleted. Its
+       content (per-collector breakdown + Event Timeline) folded into
+       Home under `#homeSensorsPanel`. Operator: "acho que podemos
+       deletar, ai o que sobrou la em sensors vc tras pra home e
+       deleta sensors". -->
 
   <!-- ── Investigate / Cases view (spec 049 PR3 renamed Threats → Cases) ── -->
   <div class="app-body" id="viewInvestigate" style="display:none">
