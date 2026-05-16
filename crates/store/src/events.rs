@@ -225,6 +225,50 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Spec 050-hotfix (issue #656) — per-minute event counts grouped
+    /// by source for a given date. Returns a sorted map of
+    /// `YYYY-MM-DDTHH:MM` bucket keys to `source → count` inner maps.
+    ///
+    /// The dashboard Event Timeline chart pre-fix consumed
+    /// `KnowledgeGraph::event_timeline`, an in-memory counter that
+    /// silently diverged from the SQLite source-of-truth used by the
+    /// tile totals (PR30 fixed that for tiles; the chart was a separate
+    /// consumer that wasn't migrated). Symptom: tiles showed 23 M
+    /// events today while the chart rendered ~80 k across two narrow
+    /// spikes — same class of bug as the operator-flagged events_today
+    /// drift in NUMBER_CONSISTENCY.md.
+    ///
+    /// Bucket key format matches
+    /// `crate::knowledge_graph::buckets::format_bucket_key` so the
+    /// dashboard's existing `strip_date_prefix` rendering pipeline
+    /// works unchanged when this replaces the legacy KG-counter path.
+    pub fn events_timeline_for_date(
+        &self,
+        date: &str,
+    ) -> Result<std::collections::BTreeMap<String, std::collections::HashMap<String, u64>>> {
+        let conn = self.conn()?;
+        let pattern = format!("{date}%");
+        let mut stmt = conn.prepare(
+            "SELECT substr(ts, 1, 16) AS bucket, source, COUNT(*) AS cnt
+             FROM events
+             WHERE ts LIKE ?1
+             GROUP BY bucket, source",
+        )?;
+        let rows = stmt.query_map(params![pattern], |row| {
+            let bucket: String = row.get(0)?;
+            let source: String = row.get(1)?;
+            let cnt: i64 = row.get(2)?;
+            Ok((bucket, source, cnt as u64))
+        })?;
+        let mut out: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
+            std::collections::BTreeMap::new();
+        for r in rows {
+            let (bucket, source, cnt) = r?;
+            out.entry(bucket).or_default().insert(source, cnt);
+        }
+        Ok(out)
+    }
+
     /// Delete events with ts < `before_ts` (ISO 8601). Returns rows deleted.
     pub fn delete_events_before(&self, before_ts: &str) -> Result<u64> {
         let conn = self.conn()?;
@@ -339,6 +383,73 @@ mod tests {
         store.insert_event(&sample_event("a")).unwrap();
         let max = store.events_max_id().unwrap();
         assert!(max > 0);
+    }
+
+    // ── spec 050-hotfix (issue #656): per-minute timeline query ─────────
+
+    fn event_at(kind: &str, source: &str, ts: chrono::DateTime<chrono::Utc>) -> Event {
+        Event {
+            ts,
+            host: "test-host".into(),
+            source: source.into(),
+            kind: kind.into(),
+            severity: Severity::Info,
+            summary: "test".into(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn events_timeline_for_date_groups_by_minute_and_source() {
+        let store = Store::open_memory().unwrap();
+        let base = chrono::DateTime::parse_from_rfc3339("2026-05-16T14:10:30+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // 14:10 — three ebpf events, one auditd event.
+        for _ in 0..3 {
+            store.insert_event(&event_at("exec", "ebpf", base)).unwrap();
+        }
+        store
+            .insert_event(&event_at("login_failed", "auth_log", base))
+            .unwrap();
+
+        // 14:11 — one ebpf event.
+        let later = base + chrono::Duration::seconds(70);
+        store
+            .insert_event(&event_at("exec", "ebpf", later))
+            .unwrap();
+
+        // 14:12 on a DIFFERENT date — must be excluded by the filter.
+        let other_day = chrono::DateTime::parse_from_rfc3339("2026-05-17T14:12:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .insert_event(&event_at("exec", "ebpf", other_day))
+            .unwrap();
+
+        let timeline = store.events_timeline_for_date("2026-05-16").unwrap();
+
+        // Two buckets on 2026-05-16.
+        assert_eq!(timeline.len(), 2, "{:?}", timeline);
+        let b1 = timeline.get("2026-05-16T14:10").expect("bucket 14:10");
+        assert_eq!(b1.get("ebpf"), Some(&3));
+        assert_eq!(b1.get("auth_log"), Some(&1));
+
+        let b2 = timeline.get("2026-05-16T14:11").expect("bucket 14:11");
+        assert_eq!(b2.get("ebpf"), Some(&1));
+
+        // 2026-05-17 bucket must NOT appear in 2026-05-16's slice.
+        assert!(timeline.keys().all(|k| k.starts_with("2026-05-16")));
+    }
+
+    #[test]
+    fn events_timeline_for_date_empty_when_no_events() {
+        let store = Store::open_memory().unwrap();
+        let timeline = store.events_timeline_for_date("2026-05-16").unwrap();
+        assert!(timeline.is_empty());
     }
 
     // ── schema v2: events.src_ip column + backfill ────────────────────

@@ -116,6 +116,8 @@ fn incidents_today_agrees_across_all_dashboard_surfaces() {
         // exercises the incidents axis, the KG fallback for events is
         // fine (graph is empty so it yields 0).
         None,
+        // Spec 050-hotfix: no canonical timeline either; KG fallback OK.
+        None,
     );
     assert_eq!(
         sensors_payload["total_incidents"].as_u64(),
@@ -201,6 +203,8 @@ fn snapshot_zero_incidents_propagates_zero_to_every_surface() {
         // assertion `total_events == 0` reflects the canonical path,
         // not the legacy KG fallback.
         Some(0),
+        // Spec 050-hotfix: no canonical timeline in this fixture.
+        None,
     );
     assert_eq!(sensors_payload["total_incidents"].as_u64(), Some(0));
     assert_eq!(sensors_payload["total_events"].as_u64(), Some(0));
@@ -291,6 +295,8 @@ fn pr30_events_today_agrees_between_overview_and_sensors_payloads() {
         dir.path(),
         None,
         Some(canonical.events_today),
+        // Spec 050-hotfix: PR30 anchor doesn't exercise timeline shape.
+        None,
     );
     assert_eq!(
         sensors_payload["total_events"].as_u64(),

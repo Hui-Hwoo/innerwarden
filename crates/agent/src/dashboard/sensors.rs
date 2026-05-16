@@ -69,10 +69,37 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
         })
         .unwrap_or((None, None));
 
+    // Spec 050-hotfix (issue #656): canonical per-minute event timeline
+    // from SQLite, same source-of-truth path as the tile totals (PR30).
+    // Pre-fix the chart consumed `graph.event_timeline` (in-memory KG
+    // counter) which silently diverged from the 23 M tile total —
+    // operator saw two narrow spikes when the baseline should have been
+    // a continuous ~18 k/min band. Failing the read gracefully so the
+    // legacy KG fallback still runs when SQLite is unavailable.
+    let event_timeline_canonical = state.sqlite_store.as_ref().and_then(|store| {
+        let today = super::helpers::resolve_date(None);
+        match store.events_timeline_for_date(&today) {
+            Ok(map) => Some(map),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "events_timeline_for_date failed — falling back to KG timeline"
+                );
+                None
+            }
+        }
+    });
+
     let kg = std::sync::Arc::clone(&state.knowledge_graph);
     let data_dir = state.data_dir.clone();
     let result = tokio::task::spawn_blocking(move || {
-        build_sensors_payload(&kg, &data_dir, snapshot.as_ref(), events_today_canonical)
+        build_sensors_payload(
+            &kg,
+            &data_dir,
+            snapshot.as_ref(),
+            events_today_canonical,
+            event_timeline_canonical,
+        )
     })
     .await
     .unwrap_or_else(|_| serde_json::json!({}));
@@ -95,7 +122,7 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
 /// `build_sensors_payload` via `spawn_blocking`.
 #[allow(dead_code)]
 pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
-    build_sensors_payload(&state.knowledge_graph, &state.data_dir, None, None)
+    build_sensors_payload(&state.knowledge_graph, &state.data_dir, None, None, None)
 }
 
 /// Test-only re-export of `build_sensors_payload` for the cross-surface
@@ -109,8 +136,17 @@ pub(super) fn tests_only_call_build_sensors_payload(
     data_dir: &std::path::Path,
     snapshot: Option<&super::types::OverviewSnapshot>,
     events_today_canonical: Option<u64>,
+    event_timeline_canonical: Option<
+        std::collections::BTreeMap<String, std::collections::HashMap<String, u64>>,
+    >,
 ) -> serde_json::Value {
-    build_sensors_payload(kg, data_dir, snapshot, events_today_canonical)
+    build_sensors_payload(
+        kg,
+        data_dir,
+        snapshot,
+        events_today_canonical,
+        event_timeline_canonical,
+    )
 }
 
 fn build_sensors_payload(
@@ -118,6 +154,9 @@ fn build_sensors_payload(
     data_dir: &std::path::Path,
     snapshot: Option<&super::types::OverviewSnapshot>,
     events_today_canonical: Option<u64>,
+    event_timeline_canonical: Option<
+        std::collections::BTreeMap<String, std::collections::HashMap<String, u64>>,
+    >,
 ) -> serde_json::Value {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
@@ -214,12 +253,47 @@ fn build_sensors_payload(
     let mut detectors: Vec<_> = detector_counts.into_iter().collect();
     detectors.sort_by(|a, b| b.1.cmp(&a.1));
 
-    // event_timeline may be empty after restart (cursor/snapshot race).
-    // Use detector_timeline as fallback — it's rebuilt from persisted Incident nodes.
-    let event_tl_source: &std::collections::BTreeMap<
+    // Spec 050-hotfix (issue #656): when SQLite-backed canonical
+    // timeline is available, use it instead of `graph.event_timeline`.
+    // The KG counter silently diverged from the SQLite source-of-truth
+    // (PR30 fixed this for tile totals; the chart was a separate
+    // consumer not migrated). Interned-key shape is built on-the-fly
+    // from the canonical map to keep the rendering pipeline unchanged.
+    //
+    // `EventTimelineSource` shorthand keeps clippy::type_complexity
+    // quiet on the let-binding and on the source-precedence reference
+    // below — both shapes have to match the KG's `event_timeline` type
+    // exactly so the existing rendering closure can borrow either.
+    type EventTimelineSource = std::collections::BTreeMap<
         std::sync::Arc<str>,
         std::collections::HashMap<std::sync::Arc<str>, usize>,
-    > = if graph.event_timeline.is_empty() {
+    >;
+    let event_timeline_interned: Option<EventTimelineSource> =
+        event_timeline_canonical.as_ref().map(|canonical| {
+            canonical
+                .iter()
+                .map(|(bucket, sources)| {
+                    let bucket_arc = crate::knowledge_graph::intern::intern(bucket);
+                    let inner: std::collections::HashMap<std::sync::Arc<str>, usize> = sources
+                        .iter()
+                        .map(|(src, &cnt)| {
+                            (crate::knowledge_graph::intern::intern(src), cnt as usize)
+                        })
+                        .collect();
+                    (bucket_arc, inner)
+                })
+                .collect()
+        });
+
+    // Source precedence: canonical (SQLite) → KG counter → detector_timeline.
+    // The detector_timeline fallback covers the cold-start case where the
+    // agent restarted and the KG event_timeline hasn't been rebuilt yet AND
+    // the SQLite store is unavailable. We keep it so existing tests that
+    // pass no SQLite still produce a non-empty chart.
+    let event_tl_source: &EventTimelineSource = if let Some(ref canonical) = event_timeline_interned
+    {
+        canonical
+    } else if graph.event_timeline.is_empty() {
         &detector_timeline
     } else {
         &graph.event_timeline
@@ -767,7 +841,7 @@ mod tests {
             crate::knowledge_graph::KnowledgeGraph::new(),
         ));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None, None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, None);
 
         // Required fields: date, total_events, total_incidents, sources,
         // top_kinds, detectors, event_timeline, detector_timeline.
@@ -806,7 +880,7 @@ mod tests {
             g.total_events_ingested = 1_000_000;
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None, Some(13));
+        let payload = build_sensors_payload(&kg, dir.path(), None, Some(13), None);
         assert_eq!(
             payload["total_events"].as_u64(),
             Some(13),
@@ -832,7 +906,7 @@ mod tests {
             g.total_events_ingested = 555;
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None, None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, None);
         assert_eq!(
             payload["total_events"].as_u64(),
             Some(555),
@@ -904,7 +978,7 @@ mod tests {
             }],
         };
 
-        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap), None);
+        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap), None, None);
         assert_eq!(
             payload["total_events"].as_u64(),
             Some(14_700_000),
@@ -962,7 +1036,7 @@ mod tests {
             crate::knowledge_graph::KnowledgeGraph::new(),
         ));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None, None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, None);
         // Total stays 0 (no graph counters AND no telemetry file).
         assert_eq!(payload["total_events"].as_u64(), Some(0));
         let sources = payload["sources"].as_array().expect("sources array");
@@ -981,7 +1055,7 @@ mod tests {
 
         let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None, None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, None);
 
         assert_eq!(payload["total_events"].as_u64(), Some(3));
         let sources = payload["sources"].as_array().expect("sources array");
@@ -1034,7 +1108,7 @@ mod tests {
 
         let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None, None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, None);
 
         let timeline = payload["event_timeline"].as_object().expect("timeline");
         // Yesterday's `03:15` MUST NOT leak into today's chart even
@@ -1051,6 +1125,93 @@ mod tests {
         );
         let today_bucket = timeline["22:00"].as_object().unwrap();
         assert_eq!(today_bucket["auth_log"].as_u64(), Some(7));
+    }
+
+    // Spec 050-hotfix (issue #656) anchor: when the caller threads a
+    // canonical event timeline (SQLite-backed), `build_sensors_payload`
+    // must paint that data instead of `graph.event_timeline`. The KG
+    // counter silently diverged from SQLite (PR30 fixed this for tile
+    // totals; the chart was a separate consumer not migrated). Asserts:
+    //
+    //   1. When canonical is Some, the chart sums to the canonical
+    //      data even if the KG counter is poisoned with a different
+    //      shape (simulating the post-restart drift the operator hit).
+    //   2. The bucket keys come through stripped of the date prefix
+    //      (HH:MM) just like the legacy KG path.
+    #[test]
+    fn build_sensors_payload_event_timeline_prefers_canonical_over_kg_counter() {
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+        // Poison the KG event_timeline with a clearly-distinguishable
+        // shape that the canonical source does NOT have. If the chart
+        // accidentally falls back to the KG, the test catches it.
+        {
+            let mut g = kg.write().unwrap();
+            let poisoned_bucket = crate::knowledge_graph::intern::intern(&format!("{today}T03:14"));
+            let poisoned_src = crate::knowledge_graph::intern::intern("kg_only_poison_src");
+            g.event_timeline
+                .entry(poisoned_bucket)
+                .or_default()
+                .insert(poisoned_src, 9_999);
+        }
+
+        // Canonical timeline: two buckets, two real collectors. This
+        // is what the SQLite source returns.
+        let mut canonical: std::collections::BTreeMap<
+            String,
+            std::collections::HashMap<String, u64>,
+        > = std::collections::BTreeMap::new();
+        let bucket_a = format!("{today}T14:10");
+        let bucket_b = format!("{today}T14:11");
+        canonical
+            .entry(bucket_a.clone())
+            .or_default()
+            .insert("ebpf".to_string(), 18_000);
+        canonical
+            .entry(bucket_b.clone())
+            .or_default()
+            .insert("ebpf".to_string(), 17_500);
+
+        let payload = build_sensors_payload(&kg, dir.path(), None, None, Some(canonical.clone()));
+        let timeline = payload["event_timeline"]
+            .as_object()
+            .expect("event_timeline must be an object");
+
+        // The poisoned KG bucket (03:14) must NOT appear — canonical wins.
+        assert!(
+            !timeline.contains_key("03:14"),
+            "KG event_timeline must NOT leak into the chart when canonical is present; \
+             chart fell back to the KG counter"
+        );
+
+        // Both canonical buckets must appear, with date prefix stripped
+        // to HH:MM (the existing rendering contract).
+        assert!(
+            timeline.contains_key("14:10"),
+            "canonical bucket 14:10 must appear in the chart"
+        );
+        assert!(
+            timeline.contains_key("14:11"),
+            "canonical bucket 14:11 must appear in the chart"
+        );
+
+        // Sum across canonical buckets must equal the SQLite truth
+        // (35,500). If the chart reverted to the KG counter, it would
+        // emit 9,999 instead.
+        let total: u64 = timeline
+            .values()
+            .filter_map(|v| v.as_object())
+            .flat_map(|bucket| bucket.values())
+            .filter_map(|v| v.as_u64())
+            .sum();
+        assert_eq!(
+            total, 35_500,
+            "chart sum must equal canonical SQLite total (35,500), not the KG poison (9,999)"
+        );
     }
 
     // 2026-05-02 audit anchor: the operator's screenshot showed
@@ -1090,7 +1251,7 @@ mod tests {
             top_detectors: vec![],
         };
 
-        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap), None);
+        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap), None, None);
         assert_eq!(
             payload["total_events"].as_u64(),
             Some(13_177_172),
