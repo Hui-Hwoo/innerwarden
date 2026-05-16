@@ -6,7 +6,7 @@ use anyhow::Result;
 use dialoguer::console::Style;
 use dialoguer::theme::ColorfulTheme;
 #[allow(unused_imports)] // MultiSelect is used only in non-test prompt_notification_channels
-use dialoguer::{MultiSelect, Select};
+use dialoguer::{Confirm, MultiSelect, Select};
 
 use crate::commands::agent::{cmd_agent, parse_selection_indices, resolve_dashboard_url};
 use crate::commands::ai::{fetch_models, WIZARD_PROVIDERS};
@@ -94,6 +94,36 @@ impl SetupResponderPlan {
             "Watch only"
         } else {
             "Auto-protect"
+        }
+    }
+}
+
+/// Outcome of the `[1/4] Local Warden Model` wizard step.
+///
+/// The on-device classifier is an alternative to a cloud LLM for the
+/// `Decide` capability (block / dismiss / escalate). Saying yes here
+/// just records the operator's intent — the actual model artefact is
+/// downloaded by `innerwarden install-warden`, which can run after the
+/// wizard once the classifier-v1 release lands (issue #642).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetupWardenPlan {
+    /// Operator said yes to the pitch (or was auto-confirmed because
+    /// they already have `[ai.warden]` configured in agent.toml).
+    enabled: bool,
+    /// True when the wizard detected an existing `[ai.warden]` or
+    /// legacy `[ai.classifier]` section. Skips the pitch and emits an
+    /// `[ok]` line — same idempotent re-run behaviour as the AI step.
+    already_configured: bool,
+}
+
+impl SetupWardenPlan {
+    fn label(&self) -> &'static str {
+        if self.already_configured {
+            "already configured"
+        } else if self.enabled {
+            "enabled (run install-warden when release lands)"
+        } else {
+            "skipped (Decide via cloud AI)"
         }
     }
 }
@@ -767,7 +797,7 @@ fn cloud_provider_for_selection(
     }
 }
 
-/// Build the menu items shown by the [1/3] AI Select dialog. The first entry
+/// Build the menu items shown by the [2/4] AI Select dialog. The first entry
 /// is the dynamic Ollama label (computed from runtime detection); the rest
 /// are static taglines for the cloud and "Other" options.
 #[allow(dead_code)] // consumed only by the non-test path of prompt_setup_ai_plan
@@ -794,9 +824,95 @@ fn prompt_setup_ai_plan() -> Result<Option<SetupAiPlan>> {
     Ok(None)
 }
 
+/// Pure builder for the wizard's `[1/4] Local Warden Model` pitch lines.
+/// Returns the dim-style benefit / cost bullets — the bold step header
+/// and the intro sentences are added by `prompt_setup_warden_plan`. Kept
+/// pure so the content (token savings, latency numbers, RAM cost, the
+/// classifier-v1 release reference) can be asserted in tests without
+/// driving the interactive prompt.
+fn warden_pitch_lines() -> &'static [&'static str] {
+    &[
+        "+ 0 tokens spent on Decide (the highest-volume LLM call)",
+        "+ ~60 ms p50 vs ~500-2000 ms cloud round-trip",
+        "+ Decide traffic never leaves the server",
+        "- costs ~91 MB disk + ~150 MB RAM",
+        "- download is staged after setup (issue #642 / classifier-v1 release)",
+    ]
+}
+
+/// Pure builder for the wizard's intro sentences — the two lines that
+/// follow the bold `[1/4] Local Warden Model` header before the bullets.
+/// Same testability rationale as `warden_pitch_lines`.
+fn warden_intro_lines() -> &'static [&'static str] {
+    &[
+        "On-device classifier for the Decide path (block / dismiss /",
+        "escalate). Cloud AI still runs Explain, Briefings, and chat.",
+    ]
+}
+
+/// Pure resolver for the prompt's outcome: maps the operator's yes/no
+/// answer onto the `SetupWardenPlan` shape the caller persists. Split
+/// out so the (currently non-binding) plan construction is exercised by
+/// unit tests instead of only by the live wizard.
+fn build_warden_plan(answer: bool) -> SetupWardenPlan {
+    SetupWardenPlan {
+        enabled: answer,
+        already_configured: false,
+    }
+}
+
+/// Test stub for the Local Warden Model step. Mirrors the AI prompt
+/// pattern — the real implementation lives in the non-test cfg below.
+#[cfg(any(test, coverage))]
+#[allow(dead_code)]
+fn prompt_setup_warden_plan() -> Result<SetupWardenPlan> {
+    Ok(build_warden_plan(false))
+}
+
+/// `[1/4] Local Warden Model` — single yes/no question pitching the
+/// on-device classifier as an alternative to cloud AI for `Decide`.
+///
+/// What the pitch promises:
+///   - **Tokens saved.** `Decide` is the highest-volume LLM call; routing
+///     it on-device removes that cost line entirely.
+///   - **Latency.** ~60 ms p50 on ARM vs ~500-2000 ms cloud round-trip.
+///   - **No data leaves the box** for the Decide path. Explain, Briefings,
+///     and operator chat still go to whatever cloud provider you pick in
+///     the next step.
+///
+/// What the pitch is honest about:
+///   - **Disk + RAM cost.** ~91 MB on disk, ~150 MB resident.
+///   - **Install is two-step right now.** The `classifier-v1` release
+///     that ships the model artefact hasn't been cut yet (tracking on
+///     issue #642). Saying yes here only records intent — the operator
+///     runs `innerwarden install-warden` once the release lands.
+#[cfg(not(any(test, coverage)))]
+fn prompt_setup_warden_plan() -> Result<SetupWardenPlan> {
+    let bold = Style::new().bold();
+    let dim = Style::new().dim();
+
+    println!("  {}\n", bold.apply_to("[1/4] Local Warden Model"));
+    for line in warden_intro_lines() {
+        println!("  {line}");
+    }
+    println!();
+    for bullet in warden_pitch_lines() {
+        println!("  {}", dim.apply_to(format!("  {bullet}")));
+    }
+    println!();
+
+    let answer = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("  Use the Local Warden Model?")
+        .default(true)
+        .interact()
+        .map_err(|err| anyhow::anyhow!("warden prompt failed: {err}"))?;
+
+    Ok(build_warden_plan(answer))
+}
+
 #[cfg(not(any(test, coverage)))]
 fn prompt_setup_ai_plan() -> Result<Option<SetupAiPlan>> {
-    println!("  [1/3] AI\n");
+    println!("  [2/4] AI\n");
 
     // Auto-detect local Ollama (check if server responds, then list models)
     let ollama_running = ureq::get("http://localhost:11434/api/tags")
@@ -903,6 +1019,40 @@ fn setup_current_ai_summary(agent_doc: Option<&toml_edit::DocumentMut>) -> Strin
     } else {
         format!("{provider} ({model})")
     }
+}
+
+/// Look up a string value at a dotted TOML path (e.g. `ai.warden.provider`).
+/// agent_str only handles a single-level section; the warden helpers need
+/// to descend through `[ai] → [warden]`.
+fn agent_str_dotted(doc: Option<&toml_edit::DocumentMut>, path: &[&str]) -> Option<String> {
+    let doc = doc?;
+    let mut path_iter = path.iter();
+    let first = path_iter.next()?;
+    let mut node = doc.get(first)?;
+    for segment in path_iter {
+        node = node.get(segment)?;
+    }
+    node.as_str().map(|s| s.to_string())
+}
+
+/// Returns true when the agent.toml already has `[ai.warden]` (canonical
+/// since the 2026-05-03 rename) or `[ai.classifier]` (preserved as a
+/// serde alias) wired up with a `provider` key. Either form counts as
+/// "configured" — we don't try to revalidate the on-disk model bytes
+/// from the wizard.
+fn agent_warden_configured(doc: Option<&toml_edit::DocumentMut>) -> bool {
+    agent_str_dotted(doc, &["ai", "warden", "provider"]).is_some()
+        || agent_str_dotted(doc, &["ai", "classifier", "provider"]).is_some()
+}
+
+fn setup_current_warden_summary(doc: Option<&toml_edit::DocumentMut>) -> String {
+    if let Some(provider) = agent_str_dotted(doc, &["ai", "warden", "provider"]) {
+        return provider;
+    }
+    if let Some(provider) = agent_str_dotted(doc, &["ai", "classifier", "provider"]) {
+        return format!("{provider} (legacy alias)");
+    }
+    "configured".to_string()
 }
 
 pub(crate) fn count_failed_setup_checks(checks: &[SetupCheck]) -> usize {
@@ -1202,7 +1352,7 @@ fn prompt_notification_channels(
     let bold = Style::new().bold();
     let dim = Style::new().dim();
 
-    println!("  {}\n", bold.apply_to("[2/3] Notification channels"));
+    println!("  {}\n", bold.apply_to("[3/4] Notification channels"));
 
     let configured =
         already_configured_channel_lines(telegram_ok, slack_ok, webhook_ok, dashboard_ok, env_vars);
@@ -1269,7 +1419,7 @@ fn resolve_env_file_path(agent_config: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/etc/innerwarden/agent.env"))
 }
 
-/// Build the `[2/3] Alerts` summary string for the already-configured banner.
+/// Build the `[3/4] Alerts` summary string for the already-configured banner.
 fn already_configured_summary(
     telegram_ok: bool,
     slack_ok: bool,
@@ -1317,7 +1467,7 @@ fn pending_channels_for_apply(
     pending
 }
 
-/// Pure post-input resolver for the `[3/3] Protection` step.
+/// Pure post-input resolver for the `[4/4] Protection` step.
 ///
 /// `selection_idx` is what the dialog returned (`0` = watch only, `1` = auto).
 /// `confirm_input` is the "type 'yes' to enable auto-protect" answer (only
@@ -1549,10 +1699,46 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     // Safe defaults applied silently during apply (block-ip, alert thresholds, etc.)
     let preconfig_plan = collect_setup_preconfig_plan(agent_doc.as_ref());
 
+    // ── [1/4] Local Warden Model ─────────────────────────────────────────
+    // Spec 032 wizard step. Asked first because saying yes here is the
+    // cheapest token-saving switch the operator can make, and the AI step
+    // below is unaffected either way (cloud LLM still runs Explain/chat).
+    //
+    // The choice is non-binding right now: we don't write `[ai.warden]`
+    // here because the model artefact lives behind the unreleased
+    // `classifier-v1` tag (issue #642). Saying yes prints a reminder to
+    // run `innerwarden install-warden` once the release lands; saying no
+    // continues silently. Re-prompted on every wizard run until the
+    // install path is wired end-to-end.
+    let warden_already = agent_warden_configured(agent_doc.as_ref());
+    let _warden_plan = if warden_already {
+        println!(
+            "  [ok] {}  {}",
+            bold.apply_to("[1/4] Local Warden Model"),
+            dim.apply_to(setup_current_warden_summary(agent_doc.as_ref()))
+        );
+        SetupWardenPlan {
+            enabled: true,
+            already_configured: true,
+        }
+    } else {
+        let plan = prompt_setup_warden_plan()?;
+        println!("\n  [ok] {}", dim.apply_to(plan.label()));
+        if plan.enabled {
+            println!(
+                "  {}",
+                dim.apply_to(
+                    "Run `sudo innerwarden install-warden` after the classifier-v1 release lands (issue #642)."
+                )
+            );
+        }
+        plan
+    };
+
     let ai_plan = if ai_ok {
         println!(
             "  [ok] {}  {}",
-            bold.apply_to("[1/3] AI"),
+            bold.apply_to("[2/4] AI"),
             dim.apply_to(setup_current_ai_summary(agent_doc.as_ref()))
         );
         None
@@ -1581,7 +1767,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
             already_configured_summary(telegram_ok, slack_ok, webhook_ok, dashboard_ok_existing);
         println!(
             "  [ok] {}  {}",
-            bold.apply_to("[2/3] Alerts"),
+            bold.apply_to("[3/4] Alerts"),
             dim.apply_to(&summary)
         );
         println!();
@@ -1618,12 +1804,12 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
         };
         println!(
             "  [ok] {}  {}",
-            bold.apply_to("[3/3] Protection"),
+            bold.apply_to("[4/4] Protection"),
             dim.apply_to(current.label())
         );
         current
     } else {
-        println!("\n  {}\n", bold.apply_to("[3/3] Protection"));
+        println!("\n  {}\n", bold.apply_to("[4/4] Protection"));
 
         let items = &[
             "Watch only (recommended for the first week) — detects and alerts, does not block",
@@ -2894,6 +3080,152 @@ mod tests {
     #[test]
     fn setup_current_ai_summary_falls_back_to_configured_when_no_doc() {
         assert_eq!(setup_current_ai_summary(None), "configured");
+    }
+
+    // ---- spec 032 wizard step: Local Warden Model ----
+
+    #[test]
+    fn agent_str_dotted_navigates_nested_tables() {
+        let toml = "[ai.warden]\nprovider = \"local_warden\"\nbase_url = \"/var/lib/innerwarden/models/classifier\"\n";
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert_eq!(
+            agent_str_dotted(Some(&doc), &["ai", "warden", "provider"]).as_deref(),
+            Some("local_warden")
+        );
+        assert_eq!(
+            agent_str_dotted(Some(&doc), &["ai", "warden", "base_url"]).as_deref(),
+            Some("/var/lib/innerwarden/models/classifier")
+        );
+    }
+
+    #[test]
+    fn agent_str_dotted_returns_none_for_missing_path() {
+        let toml = "[ai]\nprovider = \"openai\"\n";
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert_eq!(
+            agent_str_dotted(Some(&doc), &["ai", "warden", "provider"]),
+            None
+        );
+        assert_eq!(agent_str_dotted(None, &["anything"]), None);
+        assert_eq!(agent_str_dotted(Some(&doc), &[]), None);
+    }
+
+    #[test]
+    fn agent_warden_configured_detects_canonical_section() {
+        let toml = "[ai.warden]\nprovider = \"local_warden\"\nbase_url = \"/var/lib/x\"\n";
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert!(agent_warden_configured(Some(&doc)));
+    }
+
+    #[test]
+    fn agent_warden_configured_detects_legacy_classifier_alias() {
+        // 2026-05-03 rename: `[ai.classifier]` is preserved as a serde
+        // alias for `[ai.warden]`. The wizard must treat either form as
+        // "already configured" so an upgrading operator doesn't get
+        // re-prompted on every setup run.
+        let toml = "[ai.classifier]\nprovider = \"local_classifier\"\n";
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert!(agent_warden_configured(Some(&doc)));
+    }
+
+    #[test]
+    fn agent_warden_configured_is_false_without_warden_section() {
+        let toml = "[ai]\nprovider = \"openai\"\n";
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert!(!agent_warden_configured(Some(&doc)));
+        assert!(!agent_warden_configured(None));
+    }
+
+    #[test]
+    fn setup_current_warden_summary_prefers_canonical_section() {
+        let toml =
+            "[ai.warden]\nprovider = \"local_warden\"\n[ai.classifier]\nprovider = \"local_classifier\"\n";
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert_eq!(setup_current_warden_summary(Some(&doc)), "local_warden");
+    }
+
+    #[test]
+    fn setup_current_warden_summary_marks_legacy_alias() {
+        let toml = "[ai.classifier]\nprovider = \"local_classifier\"\n";
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert_eq!(
+            setup_current_warden_summary(Some(&doc)),
+            "local_classifier (legacy alias)"
+        );
+    }
+
+    #[test]
+    fn warden_pitch_lines_call_out_the_three_benefits_and_two_costs() {
+        let bullets = warden_pitch_lines();
+        // Operator must see all three "+" benefits …
+        assert!(bullets
+            .iter()
+            .any(|b| b.contains("0 tokens spent on Decide")));
+        assert!(bullets
+            .iter()
+            .any(|b| b.contains("~60 ms p50") && b.contains("cloud round-trip")));
+        assert!(bullets
+            .iter()
+            .any(|b| b.contains("Decide traffic never leaves the server")));
+        // … and the two honest "-" costs.
+        assert!(bullets
+            .iter()
+            .any(|b| b.contains("~91 MB disk") && b.contains("~150 MB RAM")));
+        assert!(bullets
+            .iter()
+            .any(|b| b.contains("#642") && b.contains("classifier-v1")));
+    }
+
+    #[test]
+    fn warden_intro_lines_describe_decide_path_and_cloud_fallback() {
+        let lines = warden_intro_lines().join(" ");
+        assert!(lines.contains("Decide path"));
+        assert!(lines.contains("block / dismiss"));
+        assert!(lines.contains("Cloud AI"));
+        assert!(lines.contains("Explain"));
+    }
+
+    #[test]
+    fn build_warden_plan_yes_marks_enabled_not_already_configured() {
+        let plan = build_warden_plan(true);
+        assert!(plan.enabled);
+        assert!(!plan.already_configured);
+        assert_eq!(
+            plan.label(),
+            "enabled (run install-warden when release lands)"
+        );
+    }
+
+    #[test]
+    fn build_warden_plan_no_marks_skipped() {
+        let plan = build_warden_plan(false);
+        assert!(!plan.enabled);
+        assert!(!plan.already_configured);
+        assert_eq!(plan.label(), "skipped (Decide via cloud AI)");
+    }
+
+    #[test]
+    fn setup_warden_plan_label_covers_three_states() {
+        let already = SetupWardenPlan {
+            enabled: true,
+            already_configured: true,
+        };
+        assert_eq!(already.label(), "already configured");
+
+        let enabled = SetupWardenPlan {
+            enabled: true,
+            already_configured: false,
+        };
+        assert_eq!(
+            enabled.label(),
+            "enabled (run install-warden when release lands)"
+        );
+
+        let skipped = SetupWardenPlan {
+            enabled: false,
+            already_configured: false,
+        };
+        assert_eq!(skipped.label(), "skipped (Decide via cloud AI)");
     }
 
     // ---- collect_setup_preconfig_plan + parse_setup_capability_hint extras ----
