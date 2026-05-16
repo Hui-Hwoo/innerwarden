@@ -1,0 +1,179 @@
+name: Release Classifier
+
+# Signs and attests Local Warden Model release artefacts (issue #642 +
+# OpenSSF Scorecard signed-release follow-up). Fires on push of a
+# `classifier-v*` tag. Expects the tarball asset (e.g. minilm-l6.tar.gz)
+# to already exist on the matching GitHub Release — the workflow does
+# not produce the tarball, only signs the operator-uploaded artefact and
+# attaches the `.sig` + Sigstore attestation bundle.
+#
+# Why this workflow exists (not just reusing release.yml):
+#   - The binary release.yml fires on `v*` tags and builds Rust sources
+#     in the repo. Model artefacts (~80 MB ONNX + tokenizer) live
+#     outside the source tree and are produced by the offline training
+#     pipeline in `ideias/detection/securebert-poc/`, so the GHA runner
+#     cannot rebuild them — it can only verify + sign what the operator
+#     uploaded.
+#   - Mixing model + binary release flows in one workflow inflated the
+#     reviewability of release.yml; spinning out the model flow keeps
+#     each side small.
+#   - The first classifier-v1 release (2026-05-16) was uploaded via
+#     `gh release create` and lacked the `.sig` companion files,
+#     which Scorecard flagged as "release artifact not signed". This
+#     workflow closes that gap for future cuts.
+#
+# Tag → release contract (when this workflow runs):
+#   1. Operator builds the tarball locally from
+#      `ideias/detection/securebert-poc/runs/<variant>/onnx/` and
+#      uploads it to the GitHub Release via `gh release create`.
+#   2. Operator pushes the tag (`classifier-vN`). This workflow fires.
+#   3. Workflow downloads every `.tar.gz` asset attached to the release,
+#      signs it with the same RELEASE_SIGNING_KEY secret the binary
+#      release uses, attests build provenance via Sigstore, and uploads
+#      the `<asset>.sig` + Sigstore bundle back to the release.
+#   4. `innerwarden install-warden` then verifies SHA-256 (compiled-in
+#      pin) and the operator can additionally verify Ed25519 via
+#      `openssl dgst -sha256 -verify <pubkey> -signature <asset>.sig <asset>`.
+
+on:
+  push:
+    tags:
+      - 'classifier-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  sign-and-attest:
+    name: Sign + attest model release assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # update the release with .sig + bundle
+      id-token: write       # Sigstore: sign the attestation
+      attestations: write   # Sigstore: publish the attestation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Resolve tag and release id
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+          release_json=$(gh release view "$REF_NAME" --json id,assets)
+          echo "$release_json" > /tmp/release.json
+          # List .tar.gz assets we plan to sign — fail early if the
+          # operator pushed a classifier-v tag with no tarball uploaded.
+          tarballs=$(jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .name' /tmp/release.json)
+          if [[ -z "$tarballs" ]]; then
+            echo "::error::No .tar.gz assets on release $REF_NAME — upload the model tarball before pushing the tag."
+            exit 1
+          fi
+          echo "Tarballs to sign:"
+          echo "$tarballs"
+
+      - name: Download release tarballs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .name' /tmp/release.json | while read -r name; do
+            echo "downloading $name..."
+            gh release download "$REF_NAME" --pattern "$name" --dir dist
+          done
+          ls -lh dist/
+
+      - name: Verify SHA-256 against companion files (if uploaded)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for tarball in dist/*.tar.gz; do
+            base=$(basename "$tarball")
+            sha_file="dist/${base}.sha256"
+            if [[ -f "$sha_file" ]]; then
+              expected=$(awk '{print $1}' "$sha_file")
+              actual=$(sha256sum "$tarball" | awk '{print $1}')
+              if [[ "$expected" != "$actual" ]]; then
+                echo "::error::SHA-256 mismatch for $base (expected $expected got $actual)"
+                exit 1
+              fi
+              echo "$base: SHA-256 verified ($actual)"
+            else
+              echo "$base: no companion .sha256 file, computing fresh"
+              sha256sum "$tarball" > "$sha_file"
+            fi
+          done
+
+      - name: Sign tarballs with Ed25519
+        if: env.RELEASE_SIGNING_KEY != ''
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          pip install -q cryptography
+          echo "$RELEASE_SIGNING_KEY" > /tmp/sign-key.pem
+          for tarball in dist/*.tar.gz; do
+            base=$(basename "$tarball")
+            echo "signing $base..."
+            python3 -c "
+          import sys, base64, hashlib
+          from cryptography.hazmat.primitives.serialization import load_pem_private_key
+          key = load_pem_private_key(open('/tmp/sign-key.pem','rb').read(), password=None)
+          digest = hashlib.sha256(open(sys.argv[1],'rb').read()).digest()
+          sig = key.sign(digest)
+          print(base64.b64encode(sig).decode(), end='')
+          " "$tarball" > "${tarball}.sig"
+          done
+          rm -f /tmp/sign-key.pem
+          echo "=== Signed assets ==="
+          ls dist/*.sig
+
+      - name: Fail when RELEASE_SIGNING_KEY is unset
+        if: env.RELEASE_SIGNING_KEY == ''
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          echo "::error::RELEASE_SIGNING_KEY secret is not configured — every classifier-v* tag must produce signed .sig files (same Spec 048 promise as the binary release path)."
+          exit 1
+
+      - name: Attest build provenance (Sigstore bundle)
+        id: attest
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+
+      - name: Copy Sigstore bundle into dist
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BUNDLE_PATH" || ! -f "$BUNDLE_PATH" ]]; then
+            echo "::error::No bundle-path output from attest-build-provenance"
+            exit 1
+          fi
+          # Scorecard recognises .intoto.jsonl Sigstore bundles attached
+          # to a release as the SLSA "release artifact has provenance"
+          # signal. Naming follows the tag so multi-asset releases share
+          # one provenance file (one provenance, multiple subjects).
+          cp "$BUNDLE_PATH" "dist/${REF_NAME}.intoto.jsonl"
+          echo "Bundle attached as ${REF_NAME}.intoto.jsonl"
+
+      - name: Upload signatures and bundle to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$REF_NAME" \
+            dist/*.tar.gz.sig \
+            "dist/${REF_NAME}.intoto.jsonl" \
+            --clobber
+          echo "=== Final release asset list ==="
+          gh release view "$REF_NAME" --json assets --jq '.assets[].name'

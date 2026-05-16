@@ -380,6 +380,7 @@ jobs:
       # GitHub API; without them the check stays partial ("signed but no
       # provenance"). See https://slsa.dev for the spec.
       - name: Attest build provenance for Linux binaries
+        id: attest_linux
         uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
           subject-path: |
@@ -389,6 +390,25 @@ jobs:
             dist/innerwarden-sensor-linux-aarch64
             dist/innerwarden-agent-linux-aarch64
             dist/innerwarden-ctl-linux-aarch64
+
+      # Copy the Sigstore bundle into `dist/` so the GitHub Release upload
+      # step below carries it as an attached asset. Without this, the
+      # attestation lives in the GitHub Attestations API but never reaches
+      # the release page — Scorecard then reports "release artifact does
+      # not have provenance" for every release we've cut so far. The
+      # single bundle covers every subject named in `subject-path` above.
+      - name: Attach Linux Sigstore bundle to release
+        env:
+          BUNDLE_PATH: ${{ steps.attest_linux.outputs.bundle-path }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${BUNDLE_PATH:-}" || ! -f "$BUNDLE_PATH" ]]; then
+            echo "::error::No bundle-path output from attest_linux"
+            exit 1
+          fi
+          cp "$BUNDLE_PATH" "dist/${REF_NAME}-linux.intoto.jsonl"
+          echo "Attached: ${REF_NAME}-linux.intoto.jsonl ($(wc -c <"$BUNDLE_PATH") bytes)"
 
       # ── Create GitHub Release ─────────────────────────────────────────────
       - name: Create GitHub Release
@@ -540,6 +560,7 @@ jobs:
 
       # ── SLSA v1 build provenance attestation (macOS) ──────────────────────
       - name: Attest build provenance for macOS binaries
+        id: attest_macos
         uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
           subject-path: |
@@ -549,6 +570,22 @@ jobs:
             dist/innerwarden-sensor-macos-aarch64
             dist/innerwarden-agent-macos-aarch64
             dist/innerwarden-ctl-macos-aarch64
+
+      # Same bundle-attach trick as the Linux job — Scorecard reads the
+      # provenance off the release page, not the GitHub Attestations API,
+      # so the Sigstore bundle has to ride along as a release asset.
+      - name: Attach macOS Sigstore bundle to release
+        env:
+          BUNDLE_PATH: ${{ steps.attest_macos.outputs.bundle-path }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${BUNDLE_PATH:-}" || ! -f "$BUNDLE_PATH" ]]; then
+            echo "::error::No bundle-path output from attest_macos"
+            exit 1
+          fi
+          cp "$BUNDLE_PATH" "dist/${REF_NAME}-macos.intoto.jsonl"
+          echo "Attached: ${REF_NAME}-macos.intoto.jsonl ($(wc -c <"$BUNDLE_PATH") bytes)"
 
       # ── Upload macOS assets to existing release ────────────────────────────
       - name: Upload macOS assets to GitHub Release
