@@ -5750,6 +5750,13 @@ mod tests {
         // Backend now returns `totals_by_risk: { high, medium, low }`
         // computed over the FULL filtered set. Frontend reads those
         // canonical numbers.
+        //
+        // 2026-05-16 PR-E: the KPI tiles themselves were deleted as
+        // part of the Intel UX slim. The backend totals_by_risk
+        // contract stays — it remains the SoT for any future chip-
+        // counts feature — but the frontend half of the test (asserting
+        // the JS reads it) is dropped because no rendering reads those
+        // buckets anymore.
         const INTEL_RS: &str = include_str!("intelligence.rs");
         assert!(
             INTEL_RS.contains("\"totals_by_risk\""),
@@ -5761,13 +5768,114 @@ mod tests {
                 "totals_by_risk must include the `{bucket}` bucket"
             );
         }
-        // Frontend must read from `data.totals_by_risk`, not from a
-        // visible-slice filter.
+    }
+
+    // ── 2026-05-16 PR-E: Intel UX slim ───────────────────────────────
+    // Operator: "tinha que deixar isso mais simples e organizado, com
+    // UX clara, facil de achar qualquer coisa e navegar, sem add 300
+    // filtro e tralha". Deleted from Intel: the 4 KPI tiles
+    // (Total Profiles / High Risk / Medium / Countries), the Sort
+    // dropdown, and the Min Risk number input. The remaining controls
+    // are one IP search box + three chips (All / ≥40 / ≥70).
+
+    #[test]
+    fn pr_e_intel_ux_slim_drops_kpi_sort_minrisk() {
+        // Markup: Sort dropdown and Min Risk input are gone from the
+        // Intel toolbar.
+        for orphan in [
+            "id=\"intelSort\"",
+            "id=\"intelMinRisk\"",
+            "Sort: Risk Score",
+            "Sort: Last Seen",
+            "Sort: Incidents",
+            "placeholder=\"Min risk\"",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(orphan),
+                "PR-E Intel slim: `{orphan}` was deleted; the Sort dropdown and Min Risk \
+                 input were operator-flagged chrome (\"sem 300 filtro e tralha\")"
+            );
+        }
+        // KPI tile rendering is gone from intel.js (the operator never
+        // acted on "Total Profiles: 4141" or "Countries"). The tile()
+        // helper that built them must stay deleted.
+        for orphan in [
+            ">Total Profiles<",
+            ">High Risk (≥70)<",
+            ">Medium (40–69)<",
+            ">Countries<",
+            "tile('Total Profiles'",
+            "tile('High Risk",
+            "tile('Medium",
+            "tile('Countries'",
+            "kpi-grid",
+        ] {
+            assert!(
+                !JS_INTEL.contains(orphan),
+                "PR-E Intel slim: `{orphan}` was deleted; KPI tile rendering must stay gone"
+            );
+        }
+        // Sort dropdown reference must be gone from JS too.
         assert!(
-            JS_INTEL.contains("data.totals_by_risk"),
-            "intel.js must read KPI counts from data.totals_by_risk (the canonical buckets), \
-             not from data.profiles.filter(...) which only sees the visible page slice"
+            !JS_INTEL.contains("getElementById('intelSort')"),
+            "PR-E: intel.js MUST NOT read from a Sort dropdown — default risk_score desc \
+             is the only useful order for a `highest risk first` rolodex"
         );
+    }
+
+    #[test]
+    fn pr_e_intel_ux_slim_keeps_search_and_three_risk_chips() {
+        // Search box stays — primary navigation tool.
+        assert!(
+            JS_INTEL.contains("id=\"intelIpSearch\""),
+            "PR-E: intel.js MUST keep `#intelIpSearch` — the operator's primary navigation"
+        );
+        assert!(
+            JS_INTEL.contains("class=\"intel-search\""),
+            "PR-E: search input MUST carry the .intel-search class for styling"
+        );
+        // Three risk chips, no more. The runtime onclick string
+        // `setIntelRiskFilter(<value>)` is built by concatenation in
+        // the chip() helper, so anchor on the chip-invocation
+        // arguments (which carry the canonical thresholds 0/40/70 and
+        // the visible labels in one place).
+        for chip_invocation in [
+            "chip('All', 0)",
+            "chip('≥40 (Medium+)', 40)",
+            "chip('≥70 (High)', 70)",
+        ] {
+            assert!(
+                JS_INTEL.contains(chip_invocation),
+                "PR-E: chip invocation `{chip_invocation}` MUST exist — risk filter is now \
+                 expressed as 3 chips with canonical thresholds 0/40/70"
+            );
+        }
+        // The chip() helper itself MUST wire onclick to setIntelRiskFilter
+        // (anchor on the prefix; the concatenated filterValue is variable).
+        assert!(
+            JS_INTEL.contains("onclick=\"setIntelRiskFilter("),
+            "PR-E: chip() helper MUST emit an onclick that calls setIntelRiskFilter \
+             with the chip's filterValue"
+        );
+        // Active chip carries the accent ring via .intel-chip-active.
+        assert!(
+            JS_INTEL.contains("intel-chip-active"),
+            "PR-E: the active chip MUST get the .intel-chip-active class so the operator \
+             always sees which slice the table reflects"
+        );
+        // CSS contract: chip + toolbar styles exist.
+        for style in [
+            ".intel-toolbar",
+            ".intel-search",
+            ".intel-chip ",
+            ".intel-chip-active",
+            ".intel-chip-group",
+        ] {
+            assert!(
+                APP_CSS.contains(style),
+                "PR-E: css must define `{style}` — without it the toolbar reverts to unstyled"
+            );
+        }
     }
 
     #[test]

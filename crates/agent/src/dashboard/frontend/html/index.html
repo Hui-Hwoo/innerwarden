@@ -410,18 +410,13 @@
   <div class="report-view" id="viewIntel" style="display:none">
     <div class="report-toolbar">
       <button type="button" class="report-refresh-btn" onclick="loadIntel()">↻ Refresh</button>
-      <select id="intelSort" onchange="loadIntel()" style="margin-left:8px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);">
-        <option value="risk_score">Sort: Risk Score</option>
-        <option value="last_seen">Sort: Last Seen</option>
-        <option value="incidents">Sort: Incidents</option>
-      </select>
-      <!-- 2026-05-08 (fix/chains-tab-honesty-bundle): dropped
-           `value="0"` so the placeholder "Min risk" actually
-           renders. Pre-fix, the input showed a bare `0` floating
-           next to the Sort dropdown, which the operator read as a
-           UI glitch. The min="0" attribute still pins the lower
-           bound at zero so the filter semantics are unchanged. -->
-      <input type="number" id="intelMinRisk" placeholder="Min risk" min="0" max="100" onchange="loadIntel()" style="margin-left:8px;width:80px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);">
+      <!-- 2026-05-16 PR-E: Intel toolbar slim. The Sort dropdown
+           (intel-sort) and Min Risk number input (intel-min-risk)
+           were deleted. Default risk_score desc is the only useful
+           order for a `highest risk first` rolodex; the Min Risk
+           filter is now expressed as three explicit chips (All / ≥40
+           / ≥70) rendered inside the content area, which the
+           operator-flagged chrome ("sem 300 filtro e tralha"). -->
       <span id="intelViewStatus" class="report-status"></span>
     </div>
     <div id="intelContent" class="report-content" style="padding:16px;">

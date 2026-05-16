@@ -25,8 +25,16 @@ async function fetchAndRenderIntel(append) {
   if (status) status.textContent = append ? 'Loading more…' : 'Loading…';
   const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
-    const sort = document.getElementById('intelSort')?.value || 'risk_score';
-    const url = '/api/attacker-profiles?sort=' + encodeURIComponent(sort)
+    // 2026-05-16 PR-E: Intel UX slim — operator: "tinha que deixar
+    // isso mais simples e organizado". Removed the 4 KPI tiles
+    // (Total Profiles / High Risk / Medium / Countries — none of
+    // them were actionable; "Total: 4141" was noise, "Countries"
+    // was trivia), the Sort dropdown (default risk_score desc is
+    // what every operator actually wants), and the Min Risk input
+    // (replaced by 3 explicit chips with active state). The result
+    // is one search box + three chips above the risk-sorted table.
+    // No 300 filtros e tralha.
+    const url = '/api/attacker-profiles?sort=risk_score'
       + '&min_risk=' + _intelRiskFilter
       + '&limit=' + INTEL_PAGE_SIZE
       + '&offset=' + _intelOffset;
@@ -39,41 +47,23 @@ async function fetchAndRenderIntel(append) {
       _intelLoadedProfiles = data.profiles.slice();
     }
 
-    const buckets = data.totals_by_risk || {};
     const totalAll = data.total || 0;
-    const totalHigh = buckets.high || 0;
-    const totalMedium = buckets.medium || 0;
-    // The visible profiles set respects the current risk filter; the
-    // bucket counts in the response are scoped to that filter (the
-    // backend computes them over `filtered`). So when filter=0
-    // buckets reflect the whole DB; when filter=70, "high" == total
-    // visible and others are 0. That's the right honesty contract.
 
-    // KPI tiles — clicking sets the risk filter. Current filter is
-    // highlighted so the operator knows which bucket they're seeing.
-    const tile = function(label, value, filterValue, active) {
-      const cursor = filterValue == null ? '' : 'cursor:pointer;';
-      const ring = active ? 'box-shadow:inset 0 0 0 1px var(--accent);' : '';
-      const onclick = filterValue == null ? ''
-        : ` onclick="setIntelRiskFilter(${filterValue})"`;
-      return '<div class="kpi-card" style="' + cursor + ring + '"' + onclick + '>'
-        + '<div class="kpi-value">' + value + '</div>'
-        + '<div class="kpi-label">' + label + '</div>'
-        + '</div>';
+    // Filter row — IP search (left) + 3 risk chips (right). One
+    // line, no clutter. The active chip carries the accent ring so
+    // the operator always sees which slice the table reflects.
+    const chip = function (label, filterValue) {
+      const active = _intelRiskFilter === filterValue;
+      const cls = active ? 'intel-chip intel-chip-active' : 'intel-chip';
+      return '<button type="button" class="' + cls + '" onclick="setIntelRiskFilter(' + filterValue + ')">' + label + '</button>';
     };
-    let html = '<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:12px;">'
-      + tile('Total Profiles', totalAll, 0, _intelRiskFilter === 0)
-      + tile('High Risk (≥70)', totalHigh, 70, _intelRiskFilter === 70)
-      + tile('Medium (40–69)', totalMedium, 40, _intelRiskFilter === 40)
-      + tile('Countries', new Set(_intelLoadedProfiles.map(p=>p.geo?.country_code).filter(Boolean)).size, null, false)
-      + '</div>';
-
-    // Filter row — IP search + sort + clear-filter (when active).
-    html += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:0.78rem;">'
-      + '<input id="intelIpSearch" type="search" placeholder="search IP…" oninput="filterIntelByIp(this.value)" autocomplete="off" spellcheck="false" style="padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);min-width:200px;" />'
-      + (_intelRiskFilter > 0
-          ? '<span style="color:var(--accent);">Filter: risk ≥ ' + _intelRiskFilter + '</span><button type="button" onclick="setIntelRiskFilter(0)" style="padding:3px 8px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;">× clear</button>'
-          : '')
+    let html = '<div class="intel-toolbar">'
+      + '<input id="intelIpSearch" type="search" placeholder="search IP…" oninput="filterIntelByIp(this.value)" autocomplete="off" spellcheck="false" class="intel-search" />'
+      + '<div class="intel-chip-group" role="group" aria-label="Risk filter">'
+      + chip('All', 0)
+      + chip('≥40 (Medium+)', 40)
+      + chip('≥70 (High)', 70)
+      + '</div>'
       + '</div>';
 
     html += '<table id="intelTable" style="width:100%;border-collapse:collapse;font-size:0.85rem;">'

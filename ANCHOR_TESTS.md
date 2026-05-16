@@ -1299,6 +1299,21 @@ The deleted Intel `Campaigns` sub-tab (PR-B) is replaced by a per-case-aware tag
 - `crates/agent/src/dashboard/mod.rs::tests::pr_d_journey_loads_and_hydrates_campaign_tag` — `loadJourney` calls `loadCampaignTagForJourney(subjectType, subjectValue)` after the timeline renders; the function bails for non-IP subjects (campaigns correlate IPs only); routes through the cached `_fetchCampaignsCached()` helper; tag onclick opens `openCampaignModal(subjectValue)` with the case's IP threaded in.
 - `crates/agent/src/dashboard/mod.rs::tests::pr_d_campaign_modal_routes_member_ips_through_shared_dossier` — `openCampaignModal(ip)` body emits member-IP chips that onclick into `openProfileModal(ip)` (single drill-down surface, PR-A); does NOT switch sub-tabs or navigate to Intel (anti-regression: the deleted tab-dance must stay buried).
 
+### Intel UX slim — KPIs/Sort/Min-Risk dropped, chips + search remain (2026-05-16 PR-E)
+
+Operator: "tinha que deixar isso mais simples e organizado, com UX clara, facil de achar qualquer coisa e navegar, sem add 300 filtro e tralha". The Intel page UX was still chrome-heavy after the PR-A through PR-D series. PR-E drops the 4 KPI tiles (Total Profiles / High Risk / Medium / Countries — none of them were actionable), the Sort dropdown (default risk_score desc is the only useful order for a "highest risk first" rolodex), and the Min Risk number input (replaced by three explicit chips with active state). The toolbar becomes one IP search box + three chips (All / ≥40 / ≥70) above the table — operator can find any IP or narrow by risk band without three layers of controls.
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr_e_intel_ux_slim_drops_kpi_sort_minrisk` — `#intelSort` / `#intelMinRisk` controls and Sort option labels are deleted from index.html; KPI tile rendering (`tile(...)` helper + the labels Total Profiles / High Risk / Medium / Countries / kpi-grid class) is gone from intel.js; no JS reads from a Sort dropdown.
+- `crates/agent/src/dashboard/mod.rs::tests::pr_e_intel_ux_slim_keeps_search_and_three_risk_chips` — `#intelIpSearch` + `.intel-search` survive; chip() helper invokes three canonical thresholds `chip('All', 0)` / `chip('≥40 (Medium+)', 40)` / `chip('≥70 (High)', 70)`; chip onclick wires to `setIntelRiskFilter(<filterValue>)`; active chip carries `.intel-chip-active`; CSS defines `.intel-toolbar` / `.intel-search` / `.intel-chip` / `.intel-chip-active` / `.intel-chip-group`.
+
+### AI Explain SQLite fallback — "todas as AI Explanation estao todas iguais" (2026-05-16 PR-E)
+
+Operator-reported on 2026-05-16: every "AI Explanation" click on Cases returned the same generic "No incidents on record for ip X" fallback regardless of which IP was clicked. Root cause: the AI Explain endpoint built its prompt context from the in-memory knowledge graph only, which retains at most ~24h of incidents (50MB cap, LRU eviction). Cases reads from SQLite (canonical, full history), so any IP whose latest incident had aged out of the KG window hit NoData on every click. The fix adds `build_explain_context_sqlite` as a second-chance fallback that walks the SQLite incidents table, filters by entity-IP via a parameterised LIKE, joins to the latest decision per incident, and produces the same `ExplainContext::Built` shape the KG path returns.
+
+- `crates/agent/src/dashboard/data_api.rs::tests::pr_e_build_explain_context_sqlite_returns_none_for_non_ip_subject_or_empty` — `build_explain_context_sqlite` short-circuits to `None` for `subject_type != "ip"` or empty value, so non-IP subjects re-use the KG-side NoData message unchanged.
+- `crates/agent/src/dashboard/data_api.rs::tests::pr_e_build_explain_context_sqlite_returns_none_when_no_matching_incidents` — SQLite scan returns `None` when no incident's `entities` array contains the subject IP (no fabricated context for unknown IPs).
+- `crates/agent/src/dashboard/data_api.rs::tests::pr_e_build_explain_context_sqlite_builds_from_matching_incidents` — bug-replay anchor: with an IP that has incident rows in SQLite but is no longer in the KG, the fallback surfaces incident title + summary + the source-label "sqlite-only context" so the LLM knows it's working with SQLite-only data.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

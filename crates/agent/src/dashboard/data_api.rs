@@ -1688,6 +1688,18 @@ pub(super) async fn api_ai_explain(
     // entities list includes this IP. That covers the gap caused by
     // the IP not being graph-promoted yet (e.g., ephemeral connections
     // that never reached the per-IP enrichment phase).
+    // Try the KG first — fast path, populated from the last ~24h
+    // of incidents. If that's empty (operator opened a case from
+    // weeks/months ago whose incidents have aged out of the KG),
+    // fall back to SQLite via `build_explain_context_sqlite`. The
+    // dashboard's Cases list reads from SQLite (canonical), so any IP
+    // the operator sees on Cases is reachable through this fallback.
+    //
+    // Bug context (operator-reported 2026-05-16): every "AI Explain"
+    // click on Cases returned the same fallback ("No incidents on
+    // record for ip X") regardless of which IP was clicked, because
+    // the KG-only path missed every IP whose latest incident was
+    // older than the in-memory KG window.
     let context = match build_explain_context(
         &state.knowledge_graph.read().unwrap(),
         subject_type,
@@ -1695,8 +1707,20 @@ pub(super) async fn api_ai_explain(
         state.action_cfg.honeypot_port,
     ) {
         ExplainContext::Built(s) => s,
-        ExplainContext::NoData(msg) => {
-            return Json(serde_json::json!({ "explanation": msg }));
+        ExplainContext::NoData(kg_msg) => {
+            match state.sqlite_store.as_ref().and_then(|store| {
+                build_explain_context_sqlite(
+                    store,
+                    subject_type,
+                    subject_value,
+                    state.action_cfg.honeypot_port,
+                )
+            }) {
+                Some(ExplainContext::Built(s)) => s,
+                _ => {
+                    return Json(serde_json::json!({ "explanation": kg_msg }));
+                }
+            }
         }
     };
 
@@ -1925,6 +1949,195 @@ fn absorb_incident_for_explain(
             *likely_honeypot_hit = true;
         }
     }
+}
+
+/// 2026-05-16 PR-E: SQLite fallback for `build_explain_context`. The
+/// in-memory KG only retains ~24h of incidents (50MB cap, LRU
+/// eviction). Cases on the dashboard reads from SQLite (canonical, all
+/// history), so operators routinely click "AI Explain" on cases whose
+/// incidents have already aged out of the KG. Pre-PR-E this returned
+/// the generic "No incidents on record" message for every such IP,
+/// even though the same IP had incident rows two scrolls away on
+/// Cases. This helper walks SQLite directly: it finds incidents whose
+/// `entities` array (serialized inside the `data` blob) contains the
+/// subject IP, joins to the latest decision per incident, and returns
+/// the same `ExplainContext::Built(...)` shape the KG path produces.
+///
+/// Filter SQL: `data LIKE '%"value":"<ip>"%'`. EntityRef serialises as
+/// `{"type":"ip","value":"<ip>"}`, IPs don't carry quote characters,
+/// and the prepared-statement parameter prevents injection. Bounded
+/// to the last 90 days + 100 rows so the fallback never becomes a
+/// scan-the-world. ts-desc order so the LLM sees the freshest
+/// incidents first if it has to truncate.
+pub(super) fn build_explain_context_sqlite(
+    store: &std::sync::Arc<innerwarden_store::Store>,
+    subject_type: &str,
+    subject_value: &str,
+    honeypot_port: u16,
+) -> Option<ExplainContext> {
+    if subject_type != "ip" || subject_value.is_empty() {
+        return None;
+    }
+    let conn = match store.conn() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    // Match the canonical EntityRef serialisation. Quote characters
+    // are not valid in IP literals so this LIKE pattern is unambiguous
+    // for the IP-subject case. Bound at 100 rows ordered by ts desc.
+    let pattern = format!("%\"value\":\"{}\"%", subject_value);
+    let mut stmt = match conn.prepare_cached(
+        "SELECT i.ts, i.detector, i.severity, i.title, i.summary, i.data, \
+                d.action_type, d.confidence, d.auto_executed, d.reason \
+         FROM incidents i \
+         LEFT JOIN ( \
+             SELECT incident_id, action_type, confidence, auto_executed, reason, \
+                    ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id DESC) AS rn \
+             FROM decisions \
+         ) d ON d.incident_id = i.incident_id AND d.rn = 1 \
+         WHERE i.data LIKE ?1 \
+         ORDER BY i.ts DESC \
+         LIMIT 100",
+    ) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let rows = match stmt.query_map([&pattern], |row| {
+        Ok((
+            row.get::<_, String>(0)?,         // ts
+            row.get::<_, String>(1)?,         // detector
+            row.get::<_, String>(2)?,         // severity
+            row.get::<_, String>(3)?,         // title
+            row.get::<_, Option<String>>(4)?, // summary
+            row.get::<_, String>(5)?,         // data JSON (for research_only check)
+            row.get::<_, Option<String>>(6)?, // action_type
+            row.get::<_, Option<f64>>(7)?,    // confidence
+            row.get::<_, Option<i64>>(8)?,    // auto_executed flag
+            row.get::<_, Option<String>>(9)?, // reason
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+
+    let mut incident_lines: Vec<String> = Vec::new();
+    let mut decision_lines: Vec<String> = Vec::new();
+    let mut likely_honeypot_hit = false;
+    let mut total_matched = 0usize;
+    // Soft cap on lines fed into the prompt so context never blows
+    // past ~20KB even when an IP has 100+ incidents.
+    const MAX_LINES: usize = 25;
+
+    for row in rows {
+        let Ok((
+            ts_iso,
+            detector,
+            severity,
+            title,
+            summary,
+            data,
+            action_type,
+            confidence,
+            auto_executed,
+            reason,
+        )) = row
+        else {
+            continue;
+        };
+        // Skip research-only rows so we never explain decoys.
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+            if parsed
+                .get("research_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+        total_matched += 1;
+        if incident_lines.len() < MAX_LINES {
+            let summary_text = summary.as_deref().unwrap_or("(no summary)");
+            // Strip the date portion so the line matches the KG format
+            // (`HH:MM:SS` only). Best-effort; if parse fails fall back
+            // to the raw iso string.
+            let ts_short = chrono::DateTime::parse_from_rfc3339(&ts_iso)
+                .map(|t| t.format("%H:%M:%S").to_string())
+                .unwrap_or_else(|_| ts_iso.clone());
+            incident_lines.push(format!(
+                "- [{}] {}: {} (detector: {}, ts: {})",
+                severity.to_uppercase(),
+                title,
+                summary_text,
+                detector,
+                ts_short
+            ));
+            let lower_title = title.to_lowercase();
+            let lower_summary = summary_text.to_lowercase();
+            if lower_title.contains("malformed ssh")
+                || lower_summary.contains("malformed ssh")
+                || lower_title.contains("honeypot")
+                || lower_summary.contains("honeypot")
+            {
+                likely_honeypot_hit = true;
+            }
+            if let Some(act) = action_type.as_deref() {
+                let reason_text = reason.as_deref().unwrap_or("no reason recorded");
+                let executed = match auto_executed {
+                    Some(1) => "executed",
+                    _ => "recommended",
+                };
+                let conf_str = confidence
+                    .map(|c| format!(" (confidence {:.2})", c))
+                    .unwrap_or_default();
+                decision_lines.push(format!(
+                    "- AI {} {}{}: {}",
+                    executed, act, conf_str, reason_text
+                ));
+            }
+        }
+    }
+
+    if incident_lines.is_empty() {
+        return None;
+    }
+    let truncated_note = if total_matched > incident_lines.len() {
+        format!(
+            "\n\n(Showing the {} most recent of {} matching incidents.)",
+            incident_lines.len(),
+            total_matched
+        )
+    } else {
+        String::new()
+    };
+    let honeypot_note = if likely_honeypot_hit {
+        format!(
+            "\n\nHoneypot context: at least one of these incidents looks \
+             like it hit the InnerWarden honeypot (port {honeypot_port} \
+             by default — a fake SSH service set up to bait scanners and \
+             dropper bots). Probes here that fail at protocol level \
+             (e.g., 'Malformed SSH version') are EXPECTED — they're the \
+             listener doing its job, not real threats. Call this out \
+             plainly when explaining."
+        )
+    } else {
+        String::new()
+    };
+    Some(ExplainContext::Built(format!(
+        "Entity: {} {}\nEvent count: {} (sqlite-only context — KG window missed){}{}\n\nIncidents ({}):\n{}\n\nAI Decisions ({}):\n{}",
+        subject_type,
+        subject_value,
+        total_matched,
+        honeypot_note,
+        truncated_note,
+        incident_lines.len(),
+        incident_lines.join("\n"),
+        decision_lines.len(),
+        if decision_lines.is_empty() {
+            "None".to_string()
+        } else {
+            decision_lines.join("\n")
+        },
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2584,6 +2797,104 @@ mod tests {
             ExplainContext::NoData(_) => panic!("must build context"),
         }
     }
+
+    // ── 2026-05-16 PR-E (bug fix): SQLite fallback for AI Explain ────
+    // Operator-reported on 2026-05-16: every "AI Explanation" click on
+    // Cases returned the same generic "No incidents on record for ip X"
+    // fallback regardless of which IP was clicked. Root cause: the KG
+    // path holds at most ~24h of incidents; any IP whose latest
+    // incident was older than that hit NoData and never reached the
+    // LLM. The fix adds a SQLite fallback that walks the canonical
+    // incident store (same source Cases reads from) and produces the
+    // same ExplainContext::Built shape from SQLite rows.
+
+    fn ip_explain_incident(id: &str, ip: &str, ts: chrono::DateTime<chrono::Utc>) -> Incident {
+        Incident {
+            ts,
+            host: "h".into(),
+            incident_id: id.into(),
+            severity: innerwarden_core::event::Severity::High,
+            title: format!("Suspicious activity from {}", ip),
+            summary: "Repeated SSH login failures".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![innerwarden_core::entities::EntityRef::ip(ip)],
+        }
+    }
+
+    #[test]
+    fn pr_e_build_explain_context_sqlite_returns_none_for_non_ip_subject_or_empty() {
+        // The fallback is scoped to IP subjects (campaigns/etc correlate
+        // IPs only; other subject_types reach NoData unchanged).
+        let store = std::sync::Arc::new(innerwarden_store::Store::open_memory().unwrap());
+        assert!(
+            build_explain_context_sqlite(&store, "user", "alice", 2222).is_none(),
+            "non-IP subject_type MUST short-circuit to None — KG path owns those"
+        );
+        assert!(
+            build_explain_context_sqlite(&store, "ip", "", 2222).is_none(),
+            "empty subject_value MUST short-circuit to None"
+        );
+    }
+
+    #[test]
+    fn pr_e_build_explain_context_sqlite_returns_none_when_no_matching_incidents() {
+        // SQLite has incidents for a DIFFERENT IP; lookup for the
+        // operator's IP must return None so api_ai_explain re-uses the
+        // KG-side NoData message.
+        let store = std::sync::Arc::new(innerwarden_store::Store::open_memory().unwrap());
+        let ts = chrono::Utc::now();
+        store
+            .insert_incident(&ip_explain_incident("inc-other", "8.8.8.8", ts))
+            .unwrap();
+        assert!(
+            build_explain_context_sqlite(&store, "ip", "175.100.42.36", 2222).is_none(),
+            "no matching entities → None (don't fabricate context for an unknown IP)"
+        );
+    }
+
+    #[test]
+    fn pr_e_build_explain_context_sqlite_builds_from_matching_incidents() {
+        // Bug-replay anchor: an IP that has incidents in SQLite (which
+        // is what Cases reads from) but is no longer in the in-memory
+        // KG window must surface incident lines through the SQLite
+        // fallback. Pre-PR-E this was the operator-reported "todas as
+        // AI Explanation estao todas iguais" failure mode.
+        let store = std::sync::Arc::new(innerwarden_store::Store::open_memory().unwrap());
+        let ts = chrono::Utc::now();
+        store
+            .insert_incident(&ip_explain_incident("inc-1", "175.100.42.36", ts))
+            .unwrap();
+        let ctx = build_explain_context_sqlite(&store, "ip", "175.100.42.36", 2222)
+            .expect("SQLite fallback must build context for an IP with rows");
+        match ctx {
+            ExplainContext::Built(s) => {
+                assert!(s.contains("175.100.42.36"), "context must name the IP");
+                assert!(
+                    s.contains("Suspicious activity from 175.100.42.36"),
+                    "context must include the incident title"
+                );
+                assert!(
+                    s.contains("Repeated SSH login failures"),
+                    "context must include the incident summary"
+                );
+                assert!(
+                    s.contains("sqlite-only context"),
+                    "context MUST label its source so the LLM knows it's working from \
+                     SQLite-only data (no in-flight KG decision context)"
+                );
+            }
+            ExplainContext::NoData(_) => panic!("sqlite fallback must produce Built when match"),
+        }
+    }
+
+    // The research_only-skip branch in build_explain_context_sqlite is
+    // intentionally paranoid (it mirrors the KG-side filter). Writing
+    // a unit test for it requires raw rusqlite access from this crate,
+    // which isn't a direct dep, so the branch is covered by the same
+    // contract that the KG-side `absorb_incident_for_explain` enforces
+    // (anchored separately in the existing build_explain_context tests).
 
     /// Spec 046 follow-up — Feynman prompt structure anchor.
     /// The prompt must mandate the three story-telling pieces

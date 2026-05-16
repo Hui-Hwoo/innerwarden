@@ -346,6 +346,58 @@
     }
     .journey-campaign-tag-label { line-height: 1; }
 
+    /* 2026-05-16 PR-E: Intel UX slim — toolbar (search + chips) above
+       the Profiles table. Replaces the pre-PR-E grid of 4 KPI tiles +
+       Sort dropdown + Min Risk input. The single search box and three
+       chips fit on one line on desktop and wrap cleanly on narrow
+       widths. */
+    .intel-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .intel-search {
+      flex: 1 1 240px;
+      min-width: 200px;
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--card-bg);
+      color: var(--text);
+      font-size: 0.85rem;
+    }
+    .intel-search:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(120, 229, 255, 0.18);
+    }
+    .intel-chip-group {
+      display: inline-flex;
+      gap: 6px;
+    }
+    .intel-chip {
+      padding: 5px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .intel-chip:hover {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    .intel-chip-active {
+      background: rgba(120, 229, 255, 0.12);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
     .journey-actions {
       display: flex; gap: 6px; margin: 0 0 12px;
     }
