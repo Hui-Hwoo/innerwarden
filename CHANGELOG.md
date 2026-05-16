@@ -9,6 +9,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Operator-facing polish caught during the v0.13.4-rc.1 lab install on `test001` (2026-05-16). Three small PRs landed against `main` after v0.13.4 was tagged; collected here for the next stable promote.
+
+### Added
+
+- **Setup wizard step `[1/4] Local Warden Model`** (PR #644). The wizard now opens with a yes/no pitch for the on-device classifier as an alternative to a cloud LLM for the `Decide` path. The pitch quantifies the trade-off: zero tokens spent on Decide, ~60 ms p50 vs ~500-2000 ms cloud round-trip, Decide traffic stays on the server, ~91 MB disk + ~150 MB RAM cost. The other three wizard steps were renumbered to `[2/4] AI`, `[3/4] Notification channels`, `[4/4] Protection`. The operator's choice is currently non-binding because the `classifier-v1` model release has not been cut (tracked in #642); saying yes prints a reminder to run `innerwarden install-warden` once the artefact lands. Re-prompted on every wizard run until the install path is wired end-to-end; the section-detection helper already covers the `[ok] already configured` branch for re-runs once `[ai.warden]` is written.
+- **`innerwarden --version` / `-V`** (PR #641). Operators kept hitting `innerwarden --version` and getting `error: unexpected argument '--version' found` because clap only wires the flag when `version = ...` is set on the parent `#[command(...)]`. Now prints `innerwarden 0.13.4`.
+
+### Fixed
+
+- **`bash: line 50: BASH_SOURCE[0]: unbound variable`** on every `curl | sudo bash` install (PR #641). `set -u` plus `BASH_SOURCE[0]` aborts before the banner when the script is piped, because `BASH_SOURCE` is empty under that execution mode. Fall back to `${BASH_SOURCE[0]:-$0}`, then to `pwd`, so the same line works under `bash install.sh` and `curl | bash`.
+- **Setup ends with "Dashboard not reachable (Connection refused)"** even when the dashboard is live (PR #641). Two bugs in `resolve_dashboard_url`: (a) `starts_with("bind")` matched `bind_addr` inside `[honeypot]` and pulled `127.0.0.1` as the dashboard address with no port; (b) the helper defaulted to `http://` even though the agent boots `--dashboard` with a self-signed TLS cert ("dashboard HTTPS started" in the log). Rewrite parses TOML sections properly, defaults to `https://`, rewrites `0.0.0.0` / `[::]` to `127.0.0.1`, and appends `:8787` when the bind has no port.
+
+### Changed
+
+- **Install banner is now an ASCII wordmark** instead of the double-sword art (PR #641, in both `install.sh::print_install_banner` and `crates/ctl/src/welcome.rs::LOGO_WIDE`). ASCII-only (no unicode / box-drawing) so it renders identically in journald, SSH-tunnelled terminals, and curl|bash pipes. Coloured ANSI-green when stdout is a TTY; `print_centered_line` strips ANSI sequences before measuring so the wordmark stays centred.
+- **`install-warden` error explains why the SHA is a placeholder** (PR #643). When the compiled-in SHA-256 is the `TBD-publish-pin-after-release` placeholder, the error now points operators at #642, shows the exact workaround invocation (`--url <mirror> --sha256 <hex>`), and tells them what the agent will do meanwhile (fall back to the configured cloud provider for `Decide`). Bail string still contains the literal `"requires --sha256"` so the existing test anchor at `crates/ctl/src/commands/ai.rs:1188` still catches this branch.
+- **install.sh telemetry block now self-documents** (PR #643). Same `INNERWARDEN_TELEMETRY=1` opt-in (SEC-019 unchanged). The block now spells out exactly what the ping sends (version, OS family, CPU arch), what it never sends (raw IP, host identifier, agent state), how the server keeps the ping anonymous (one-way hash of `ip + UTC day + server secret` for dedup, raw IP discarded), and links the receiving endpoint in `inner-warden-site`. The curl is now `-fsS -m 5` so a transient DNS or network fault never produces stderr noise during the install.
+
+### Reference
+
+- Companion endpoint shipped to `inner-warden-site/master`: `/api/ping` is now wired up (issue #640) — install pings have a real receiver instead of returning 404. Per-IP-per-day hashing for dedup; admin view at `/admin/installs` gated by `DB_ADMIN_TOKEN`. The CLI side stays opt-in (`INNERWARDEN_TELEMETRY=1`).
+
 ## [0.13.4] - 2026-05-16
 
 Dashboard simplification release. 56 commits since v0.13.3 collapsing the dashboard from ~10 tabs with overlapping content into a 4-tab main nav (Home / Cases / Health / Intel) plus a More menu (Sensors / Briefings / Compliance). The headline is the PR-A → PR-H series (#631–#638) that finished the post-PR-H baseline; the rest is the data-source canonicalisation work (spec 049) so every panel reads from SQLite instead of the stale in-memory knowledge graph.
