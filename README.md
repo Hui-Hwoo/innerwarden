@@ -156,8 +156,9 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │                       ▼                                           │
 │              ┌──────────────────────┐                             │
 │              │   Local Warden       │  on-device ONNX classifier  │
-│              │   (warden default,   │  ~91 MB, 61 ms p50, runs    │
-│              │    securebert opt)   │  before any cloud LLM call  │
+│              │   (opt-in via        │  ~91 MB, 61 ms p50; routes  │
+│              │    install-warden,   │  Decide on-device when      │
+│              │    warden default)   │  installed (see issue #642) │
 │              └──────────┬───────────┘                             │
 │                         ▼                                         │
 │              ┌─────────────────────┐                              │
