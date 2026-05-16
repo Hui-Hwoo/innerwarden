@@ -554,15 +554,24 @@ pub(crate) struct ClassifierVariant {
 const CLASSIFIER_VARIANTS: &[ClassifierVariant] = &[
     ClassifierVariant {
         name: "minilm-l6",
-        // TODO: replace with the published release URL once the artifact
-        // is uploaded. Operators in the meantime can run with `--url`.
+        // Pinned to `classifier-v1` GitHub release published 2026-05-16
+        // (issue #642). Tarball contains model.onnx + model.onnx.data +
+        // tokenizer.json + meta.json + validation_report.json from the
+        // minilm-l6-distill-v2 training run.
         url: "https://github.com/InnerWarden/innerwarden/releases/download/classifier-v1/minilm-l6.tar.gz",
-        sha256: "TBD-publish-pin-after-release",
+        sha256: "7c1745fd64e809b698d4a3ee0edbaaf3102f8c80f5dc724347a07fc154698c3b",
         approx_size_mb: 87,
         description: "MiniLM L6 distilled (87 MB, ~60 ms p50 on ARM, recommended)",
     },
     ClassifierVariant {
         name: "roberta-v1",
+        // roberta-v1 (the SecureBERT teacher, ~474 MB) is not in the
+        // `classifier-v1` release yet — the 80 MB MiniLM-L6 student
+        // ships first because its F1 (0.793) matches the teacher's
+        // (0.791) at a fifth of the disk / RAM cost. Operators who want
+        // the heavier model can still install today by passing both
+        // `--url` and `--sha256` against a private mirror; the next
+        // `classifier-v2` cut will add the teacher artefact.
         url: "https://github.com/InnerWarden/innerwarden/releases/download/classifier-v1/roberta-v1.tar.gz",
         sha256: "TBD-publish-pin-after-release",
         approx_size_mb: 478,
@@ -1164,11 +1173,16 @@ mod tests {
 
     #[test]
     fn cmd_install_classifier_with_target_requires_sha_until_pinned() {
+        // 2026-05-16: the `minilm-l6` variant landed in `classifier-v1`
+        // with a real pinned SHA, so the placeholder branch no longer
+        // fires for it. `roberta-v1` (the SecureBERT teacher) still
+        // ships with a TBD pin until the next `classifier-v2` cut, and
+        // it remains the anchor for this regression test.
         let tmp = TempDir::new().expect("tempdir");
         let cli = make_cli(tmp.path(), true);
         let err = cmd_install_classifier_with_target(
             &cli,
-            "minilm-l6",
+            "roberta-v1",
             None,
             None,
             true,
