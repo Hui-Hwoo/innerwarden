@@ -9,6 +9,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-05-16
+
+Patch release: SHA pin for the `minilm-l6` classifier (warden) variant.
+
+### Fixed
+
+- **`innerwarden install-warden` now works end-to-end for the default `warden` variant** (PR #652, completes the work started in #642). v0.13.5 shipped with the compiled-in SHA-256 still set to the literal `TBD-publish-pin-after-release` placeholder because the `classifier-v1` model release was published *after* v0.13.5 was tagged. Operators running `sudo innerwarden install-warden` on a fresh v0.13.5 install would hit the placeholder error even though the model artefact (`minilm-l6.tar.gz`, 80 MB, SHA-256 `7c1745fd…`) was already public at https://github.com/InnerWarden/innerwarden/releases/tag/classifier-v1 — the CLI just didn't know its hash yet. v0.13.6 pins the real SHA so the install path closes end-to-end. The `roberta-v1` (SecureBERT teacher) variant remains pinned to TBD until the next `classifier-v2` cut bundles its artefact.
+
 ## [0.13.5] - 2026-05-16
 
 Operator-facing polish release. Eight PRs against `main` after v0.13.4 was tagged, all motivated by the v0.13.4-rc.1 lab install on `test001` and the operator-reported Telegram FPs during an `apt upgrade` on Oracle prod. Verified end-to-end on Oracle prod (ARM64 aarch64, kernel 6.8.0-1052-oracle, post-reboot) and `test001` (Ubuntu 24.04 x86_64, kernel 6.8.0-117-generic) before tagging.
