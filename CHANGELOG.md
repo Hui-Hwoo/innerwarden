@@ -9,6 +9,55 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-05-16
+
+Dashboard simplification release. 56 commits since v0.13.3 collapsing the dashboard from ~10 tabs with overlapping content into a 4-tab main nav (Home / Cases / Health / Intel) plus a More menu (Sensors / Briefings / Compliance). The headline is the PR-A → PR-H series (#631–#638) that finished the post-PR-H baseline; the rest is the data-source canonicalisation work (spec 049) so every panel reads from SQLite instead of the stale in-memory knowledge graph.
+
+### Changed — Dashboard simplification PR-A → PR-H (#631 – #638)
+
+- **PR-A (#631) Shared Attacker Dossier modal.** `openProfileModal(ip)` in `intel.js` is the single drill-down surface used by Cases journey "View full profile →", Intel profile-row click, and Campaign modal member-IP chip click. Fixes the operator-reported regression where the deeplink used to land on the generic Intel list because of the PR #628 120 ms setTimeout race. The modal renders `renderProfileDossierHtml(p)` from `/api/attacker-profiles/<ip>` and includes a Honeypot Intel section gated on `honeypot_sessions > 0`.
+- **PR-B (#632) Intel slim — Campaigns / Chains / MITRE sub-tabs deleted.** Campaign membership now surfaces as a tag on the Cases journey header (PR-D below); per-incident chains were already on the Cases journey; the MITRE heatmap is already on the Monthly/Briefings month view. Net: one less navigation layer for the same information.
+- **PR-C (#633) Baseline moved to Health, Intel collapses to Profiles.** Baseline was Intel's fourth sub-tab; it is now a section on the Health tab where it semantically belongs (it describes how the host normally behaves). Intel becomes a single surface — Profiles list.
+- **PR-D (#634) Campaign-membership tag on Cases journey header.** Replaces the deleted Campaigns sub-tab with an in-context affordance: when a case's IP belongs to a detected campaign cluster, the journey header shows a clickable tag that opens the Campaign modal.
+- **PR-E (#635) Intel UX slim + AI Explain SQLite fallback.** `build_explain_context_sqlite` in `data_api.rs` falls back to SQLite when the KG window (~24 h) has aged out, so any IP visible on Cases gets a real explanation instead of the generic "No incidents on record" message. Fixes a class of operator-surfaced confusion where the AI Explain looked broken on older IPs.
+- **PR-F (#636) Honeypot tab dropped, per-IP intel stays on Dossier modal.** The standalone Honeypot tab duplicated the Honeypot Intel section that already renders inside the shared dossier modal whenever an IP has honeypot sessions. Drop is safe because the per-IP intel is one click away on every IP-bearing surface.
+- **PR-G (#637) Unified Briefings tab with Day / Month period switcher.** Briefings (daily) and Monthly were two separate tabs producing structurally similar content. Now one tab with a Day / Month switcher; same API endpoints under the hood.
+- **PR-H (#638) Real pagination on Intel + Audit + visible spec leaks dropped.** Intel Profiles got 10/50/100 paginators (default 10), 3 risk chips (All / ≥40 / ≥70), and an IP-search box. Compliance's Decision Audit Records got the same 10/50/100 paginator. "spec 049 PR…" internal references that had leaked into operator-facing strings were rewritten.
+
+### Changed — Pre-series dashboard cleanup
+
+- **Sensors page deleted, content folded into Home (#629, #630).** The Sensors tab moved its collector breakdown + Event Timeline into Home below the AI Intelligence Briefing block, then the standalone Sensors page was deleted. The `Sensors` entry in the More menu now redirects to the Home anchor.
+- **Home page slim (#621).** Removed four overlapping sections (the alert-toast stack and three duplicative status blocks) so Home is now: hero strip, activity strip, AI Intelligence Briefing, Sensors panel.
+- **Cases sidebar slim (#622).** Single canonical band that mirrors Home's activity strip, replacing the five-band scrollable sidebar.
+- **Responses tab removed (#624).** Decision rows scattered into Cases (per-IP) and Health (system-wide enforcement counters); the standalone tab was deleted, and the equivalent listing now lives behind `innerwarden ctl decisions` on the CLI.
+
+### Changed — Spec 049 canonical data sources (SQLite-first)
+
+The dashboard historically blended two data sources: the in-memory knowledge graph (live and rich but ~24 h window) and SQLite (slower but complete). Mixing them produced count divergence (incident totals differed between Home, Cases, Report, Monthly) and stale reads when the agent restarted. Spec 049 routes every panel through SQLite as the canonical source, with the KG used only for the live feed.
+
+- **`canonical_counts` foundation (#558, #557, #556, #553, #551, #550)** — single helper that every count-bearing endpoint calls; eliminates "Cases says 12, Home says 14" mismatches.
+- **`/api/overview` + `/api/sensors` routed through `canonical_counts` (#619).**
+- **Live feed reads from SQLite (#626).** Pre-fix the live feed read the in-memory KG and missed any incident written after the agent's most recent KG rebuild — operators saw an empty live feed even when new incidents were landing.
+- **Cases / Home / Report / Monthly all read SQLite, not the KG (#557, #609, #610, #612, #614, #615, #623).** Includes filter-self-traffic on Top IPs (#612), research-only incidents excluded from Trend counters (#614), Trend events count from SQLite (#615), and regenerate-Monthly-for-current-month fix (#610).
+- **Boot-probe collector health wired end-to-end (#618).** Sensor emits a one-shot health probe per collector at boot; agent persists it; dashboard renders `READY / DEGRADED / FAILED` in the Sensors panel.
+- **Write-time pin of `decision_layer` at every prod writer (#556).** Closes a class of bugs where the layer attribution drifted between the AI router output and what the dashboard later displayed.
+- **Boot replays today's incidents into the KG (#553).** After an agent restart, the KG was empty until new events arrived; today's incidents are now replayed so the live feed and Cases journey are populated immediately.
+
+### Changed — Misc dashboard truth
+
+- **Health truth + public live feed FP filter + community README (#627).** Health tab numbers now match what the rest of the dashboard shows; the public live feed (sentinel.innerwarden.com) filters out known-noise false positives; community README updated.
+- **Intel deeplink + honest KPI counts + IP search (#628).** Intel KPI counters now match the underlying profile list (was double-counting in some cases); deeplink-by-IP supported on the URL; IP search box added.
+- **Removed-filter read guard in `syncFiltersFromUi` (#623).** Defensive fix for a TypeError that fired when a filter was removed mid-render.
+
+### Tests
+
+- `cargo test --workspace`: full suite green on CI. Pre-existing macOS-local flake (`incident_flow::tests::evaluate_pre_ai_flow_pipeline_test_writes_acknowledgement_decision`, `Os { code: 2, NotFound }`) remains unrelated to this release and is not regressed by any PR in the series.
+- Anchor coverage: registered anchors went from 633 → 665 across PR-A through PR-H (8 new anchor sections in `ANCHOR_TESTS.md`).
+
+### Known caveat (carried from v0.13.x line)
+
+- The `cargo zigbuild` cross-compile path used by the release workflow does NOT propagate the `--enable-prof` C flag to `jemalloc-sys`, so the `_rjem_je_opt_prof` symbol is absent from every GHA-released agent binary. **Effect:** operators who manually wire the spec-030 jeprof systemd drop-in will see the agent segfault on every spawn. **Workaround:** build via `scripts/deploy-prod.sh` (native `cargo build --release`). **Not affected:** new users installing via `curl | sudo bash` without `MALLOC_CONF`. The binary feature-parity guard treats this as a WARN until the zigbuild build path is fixed in a follow-up release.
+
 ## [0.13.3] - 2026-05-10
 
 Hotfix release for the silent Local Warden Model regression that affected every GHA-released binary in the v0.13.x line. Anyone installing via the `curl | sudo bash` script or `innerwarden upgrade` for v0.13.0–v0.13.2 was getting an agent that logged the on-device classifier as missing and silently fell back to whatever cloud provider was configured. v0.13.3 is the first release where the binary on the GitHub release page actually has the Local Warden classifier linked in.
