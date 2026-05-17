@@ -255,15 +255,49 @@ if [ "$component" = "sensor" ] || [ "$component" = "all" ]; then
 fi
 
 # Verify
+#
+# Wave 2026-05-17: the verification step used to only check the
+# services that the operator explicitly deployed in this run. That
+# missed the case where (e.g.) a one-off `deploy-prod.sh sensor`
+# happened while `innerwarden-agent` had been left inactive by an
+# earlier ad-hoc swap — and nothing in the deploy output ever
+# surfaced that the agent was down. We caught this on test001 on
+# 2026-05-17, where the agent had been SIGTERM'd 2h34min before
+# without auto-restart and no deploy run noticed.
+#
+# The verification now ALWAYS reports the state of every
+# operator-relevant service on the host, regardless of which
+# component was deployed, and exits non-zero if any of them is
+# inactive — making the "agent silently down" failure mode loud.
 echo "[4/4] Verifying..."
 if [ "$component" = "ctl" ]; then
   echo "  innerwarden-ctl: installed"
-else
-  for svc in $([ "$component" = "all" ] && echo "innerwarden-sensor innerwarden-agent" || echo "innerwarden-$component"); do
-    status=$($SSH "sudo systemctl is-active $svc" 2>/dev/null || echo "unknown")
-    version=$($SSH "$BIN_DIR/$svc --version 2>/dev/null" || echo "?")
-    echo "  $svc: $status ($version)"
-  done
 fi
 
+# Always check the full service set so an unrelated inactive unit
+# is surfaced even on a sensor-only or agent-only deploy.
+deploy_health=0
+for svc in innerwarden-sensor innerwarden-agent innerwarden-watchdog; do
+  unit_present=$($SSH "systemctl list-unit-files --no-legend 2>/dev/null | grep -c '^$svc\\.service'" 2>/dev/null || echo "0")
+  if [ "${unit_present:-0}" = "0" ]; then
+    # Watchdog is optional (only on prod with the proprietary supervisor).
+    continue
+  fi
+  status=$($SSH "sudo systemctl is-active $svc" 2>/dev/null || echo "unknown")
+  bin_name="$svc"
+  version=$($SSH "$BIN_DIR/$bin_name --version 2>/dev/null" || echo "?")
+  echo "  $svc: $status ($version)"
+  if [ "$status" != "active" ]; then
+    deploy_health=1
+    echo "    WARN: $svc is NOT active. Remediation:"
+    echo "      ssh $SERVER 'sudo systemctl status $svc --no-pager'"
+    echo "      ssh $SERVER 'sudo systemctl start $svc && sudo systemctl is-active $svc'"
+  fi
+done
+
+if [ "$deploy_health" != "0" ]; then
+  echo
+  echo "=== Done WITH WARNINGS — see remediation above ==="
+  exit 2
+fi
 echo "=== Done ==="

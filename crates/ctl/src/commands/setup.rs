@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -1673,9 +1673,56 @@ fn sensor_restart_decision(
     SensorRestartDecision::DoRestart
 }
 
+/// Pure decision: when invoked under `--dry-run` AND with a non-TTY
+/// stdin, the setup wizard cannot drive its `dialoguer` prompts and
+/// must short-circuit with a hint to the operator. Pulled out as a
+/// pure function so the rule is testable without an actual stdin.
+fn should_short_circuit_setup_for_non_tty(dry_run: bool, stdin_is_tty: bool) -> bool {
+    dry_run && !stdin_is_tty
+}
+
+/// Operator-facing guidance shown when the wizard short-circuits in
+/// the non-TTY dry-run path. Kept as a separate fn so the call site
+/// in `cmd_setup` stays compact.
+fn print_setup_non_tty_guidance() {
+    println!();
+    println!(
+        "  [DRY-RUN, non-interactive] setup wizard requires a TTY to elicit operator preferences."
+    );
+    println!("  The first step ([1/4] Local Warden Model) is a `dialoguer` prompt and cannot");
+    println!("  read from a pipe / redirected stdin in its current form.");
+    println!();
+    println!("  Re-run with stdin attached to a terminal — both of these work:");
+    println!("    bash install.sh --simulate                 # local interactive shell");
+    println!("    innerwarden setup --dry-run                # local interactive shell");
+    println!();
+    println!(
+        "  CI-friendly non-interactive simulate is on the roadmap (mirrors the prompts to default values)."
+    );
+}
+
 pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     if !cli.dry_run && !am_root() {
         return reexec_with_sudo();
+    }
+
+    // Wave 2026-05-17 — fail-fast for the install.sh --simulate path.
+    //
+    // The wizard's `[1/4] Local Warden Model` step opens an interactive
+    // Confirm prompt via `dialoguer`, which errors out with
+    //   "warden prompt failed: IO error: not a terminal"
+    // when stdin is not a TTY. This bit operators running
+    //   bash install.sh --simulate
+    // over SSH or in CI: the message is cryptic, the wizard aborts
+    // mid-step, and there's no hint about how to make progress.
+    //
+    // The full "simulate without a TTY" mode would need to gate every
+    // dialoguer call on `is_terminal()` and return defaults; that's a
+    // larger refactor on the roadmap. Until then, surface the
+    // limitation explicitly so the operator knows what to do next.
+    if should_short_circuit_setup_for_non_tty(cli.dry_run, std::io::stdin().is_terminal()) {
+        print_setup_non_tty_guidance();
+        return Ok(());
     }
 
     let setup_mode = SetupMode::from_str(mode);
@@ -2103,6 +2150,19 @@ mod tests {
                 mode: "basic".to_string(),
             }),
         }
+    }
+
+    #[test]
+    fn short_circuit_setup_when_dry_run_and_no_tty() {
+        // Wave 2026-05-17 anchor for the install.sh --simulate path.
+        // The truth table is small: only (dry_run=true, tty=false)
+        // should short-circuit. Every other quadrant must let the
+        // wizard proceed so an operator running from a real shell or
+        // applying for real isn't blocked by the new fail-fast.
+        assert!(should_short_circuit_setup_for_non_tty(true, false));
+        assert!(!should_short_circuit_setup_for_non_tty(true, true));
+        assert!(!should_short_circuit_setup_for_non_tty(false, false));
+        assert!(!should_short_circuit_setup_for_non_tty(false, true));
     }
 
     #[test]
