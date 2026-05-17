@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
@@ -139,6 +140,108 @@ fn is_loopback_dashboard_url(url: &str) -> bool {
     };
 
     matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Snapshot of the dashboard's connected-agents registry merged with a
+/// detected-process list. Returned by `build_picker_view` so the
+/// presentation layer can render each row with real connection state
+/// instead of the previous hardcoded "not connected" / unannotated UX.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PickerView {
+    /// One row per candidate, with the connection state appended in
+    /// brackets. Same order as the input.
+    pub labels: Vec<String>,
+    /// Pre-checked flags for `dialoguer::MultiSelect::defaults`: an
+    /// unconnected row is pre-checked so a plain Enter does the obvious
+    /// thing (connect everything that needs connecting).
+    pub defaults: Vec<bool>,
+    /// True when every candidate is already in the registry. The CLI
+    /// short-circuits the picker in that case and prints a friendly
+    /// summary instead of an empty-looking dialog.
+    pub all_connected: bool,
+    /// (pid, name, ag-id) entries for candidates that were already in
+    /// the registry. Populated even in mixed states so the CLI can
+    /// surface "X is already connected" hints alongside the picker.
+    pub already_connected: Vec<(u32, String, String)>,
+}
+
+/// Pure merge: given detected processes (`(name, pid, integration)`
+/// triples) and a PID → agent_id map from the registry, decide what
+/// the picker should look like. Tested without HTTP or TTY so the rule
+/// stays anchored.
+pub(crate) fn build_picker_view(
+    candidates: &[(&str, u32, &str)],
+    connected: &HashMap<u32, String>,
+) -> PickerView {
+    let mut labels = Vec::with_capacity(candidates.len());
+    let mut defaults = Vec::with_capacity(candidates.len());
+    let mut already_connected = Vec::new();
+    let mut connected_count = 0usize;
+
+    for (name, pid, integration) in candidates {
+        if let Some(ag_id) = connected.get(pid) {
+            labels.push(format!(
+                "{:<16} pid {:<7}  [{}, already connected as {}]",
+                name, pid, integration, ag_id
+            ));
+            defaults.push(false);
+            already_connected.push((*pid, (*name).to_string(), ag_id.clone()));
+            connected_count += 1;
+        } else {
+            labels.push(format!(
+                "{:<16} pid {:<7}  [{}, not connected]",
+                name, pid, integration
+            ));
+            defaults.push(true);
+        }
+    }
+
+    let all_connected = !candidates.is_empty() && connected_count == candidates.len();
+
+    PickerView {
+        labels,
+        defaults,
+        all_connected,
+        already_connected,
+    }
+}
+
+/// Pure-parse helper for `/api/agent-guard/agents`. Extracted so the
+/// degraded-response cases (missing fields, non-array `agents`, wrong
+/// types) can be exercised without an HTTP server.
+pub(crate) fn parse_connected_pids(body: &serde_json::Value) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    let Some(agents) = body.get("agents").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for agent in agents {
+        let Some(pid) = agent.get("pid").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(id) = agent.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Ok(pid) = u32::try_from(pid) {
+            out.insert(pid, id.to_string());
+        }
+    }
+    out
+}
+
+/// Query the dashboard's connected-agents registry. Returns an empty
+/// map on any failure (network, TLS, parse) so the picker degrades
+/// gracefully to "I don't know who's connected" instead of refusing to
+/// run.
+pub(crate) fn fetch_connected_pids(cli: &Cli) -> HashMap<u32, String> {
+    let dashboard_url = resolve_dashboard_url(cli);
+    let url = format!("{dashboard_url}/api/agent-guard/agents");
+    match dashboard_api_agent(&url).get(&url).call() {
+        Ok(resp) => {
+            let body: serde_json::Value = resp.into_body().read_json().unwrap_or_default();
+            parse_connected_pids(&body)
+        }
+        Err(_) => HashMap::new(),
+    }
 }
 
 pub(crate) fn parse_selection_indices(input: &str, max: usize) -> Option<Vec<usize>> {
@@ -359,27 +462,41 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
                 println!("  See supported names: innerwarden agent list");
                 println!("  To connect detected agents: innerwarden agent connect");
             } else {
+                // Wave 2026-05-17 fix: previously this rendered every
+                // detected process with a hardcoded "not connected"
+                // status — even when the process was already in the
+                // dashboard's agent-guard registry. Operator hit that
+                // on prod: `agent status` listed OpenClaw as official
+                // while `agent scan` insisted it was unconnected, two
+                // commands telling different stories. Now we query the
+                // registry once and label each row with the real state.
+                let connected = fetch_connected_pids(cli);
                 println!(
                     "  {:<6} {:<8} {:<16} {:<10} STATUS",
                     "FOUND", "PID", "NAME", "TYPE"
                 );
-                println!("  {}", "─".repeat(56));
+                println!("  {}", "─".repeat(64));
                 for (i, agent) in found.iter().enumerate() {
                     let kind = if agent.integration == "official" {
                         "agent"
                     } else {
                         "tool"
                     };
+                    let status = match connected.get(&agent.pid) {
+                        Some(ag_id) => format!("connected as {ag_id}"),
+                        None => "not connected".to_string(),
+                    };
                     println!(
-                        "  {:<6} {:<8} {:<16} {:<10} not connected",
+                        "  {:<6} {:<8} {:<16} {:<10} {}",
                         i + 1,
                         agent.pid,
                         agent.name,
-                        kind
+                        kind,
+                        status
                     );
                 }
                 println!();
-                println!("  Connect with: innerwarden agent connect");
+                println!("  Connect unconnected ones with: innerwarden agent connect");
             }
             println!();
             Ok(())
@@ -494,7 +611,41 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
                     found.iter().collect()
                 };
 
+                // Wave 2026-05-17 fix: query the dashboard's
+                // agent-guard registry so the picker can show real
+                // connection state per row. Operator on Oracle prod
+                // saw an "empty-looking" picker — both Codex CLI and
+                // OpenClaw were rendered, but the operator couldn't
+                // tell that OpenClaw was already wired up as ag-0001
+                // and didn't know what action `connect` would even
+                // take. With the view we now: (1) skip the picker
+                // entirely when everything detected is already
+                // connected, (2) pre-check only rows that actually
+                // need connecting, and (3) annotate each row with its
+                // current state.
+                let connected_pids = fetch_connected_pids(cli);
+                let view_input: Vec<(&str, u32, &str)> = candidates
+                    .iter()
+                    .map(|a| (a.name.as_str(), a.pid, a.integration.as_str()))
+                    .collect();
+                let view = build_picker_view(&view_input, &connected_pids);
+
+                if view.all_connected {
+                    println!("  All detected agents are already connected to Inner Warden:");
+                    for (pid, name, ag_id) in &view.already_connected {
+                        println!("    \x1b[32m✓\x1b[0m {name} (pid {pid})  →  {ag_id}");
+                    }
+                    println!();
+                    println!("  View them:        innerwarden agent status");
+                    println!("  Release one:      innerwarden agent disconnect <id>");
+                    println!();
+                    return Ok(());
+                }
+
                 if candidates.len() == 1 {
+                    // Single candidate, not already connected (else
+                    // `all_connected` would have short-circuited
+                    // above) → auto-pick.
                     println!(
                         "  Auto-detected: {} (pid {})",
                         candidates[0].name, candidates[0].pid
@@ -509,17 +660,23 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
                     // (CI, redirected stdin, automated scripts) so
                     // pipelines that depend on the typed-index syntax
                     // do not break.
-                    let labels: Vec<String> = candidates
-                        .iter()
-                        .map(|a| format!("{:<16} pid {:<7}  [{}]", a.name, a.pid, a.integration))
-                        .collect();
+                    let labels = view.labels.clone();
+                    let defaults = view.defaults.clone();
 
                     let selected_indexes: Vec<usize> = if std::io::stdin().is_terminal() {
                         println!("  Detected agents:");
+                        if !view.already_connected.is_empty() {
+                            for (pid, name, ag_id) in &view.already_connected {
+                                println!(
+                                    "    \x1b[2m• {name} (pid {pid}) already connected as {ag_id}\x1b[0m"
+                                );
+                            }
+                        }
                         println!();
                         match MultiSelect::with_theme(&ColorfulTheme::default())
-                            .with_prompt("  ↑/↓ to move, space to select, enter to connect")
+                            .with_prompt("  ↑/↓ to move, space to toggle, enter to connect checked")
                             .items(&labels)
+                            .defaults(&defaults)
                             .interact_opt()
                         {
                             Ok(Some(sel)) if !sel.is_empty() => sel,
@@ -540,15 +697,23 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
                         // callers and CI pipelines that pipe input
                         // into the command still work.
                         println!("  Detected agents:");
-                        println!("  {:<4} {:<8} {:<16} TYPE", "NO.", "PID", "NAME");
-                        println!("  {}", "─".repeat(48));
+                        println!(
+                            "  {:<4} {:<8} {:<16} {:<10} STATUS",
+                            "NO.", "PID", "NAME", "TYPE"
+                        );
+                        println!("  {}", "─".repeat(64));
                         for (i, agent) in candidates.iter().enumerate() {
+                            let status = match connected_pids.get(&agent.pid) {
+                                Some(ag_id) => format!("connected as {ag_id}"),
+                                None => "not connected".to_string(),
+                            };
                             println!(
-                                "  {:<4} {:<8} {:<16} {}",
+                                "  {:<4} {:<8} {:<16} {:<10} {}",
                                 i + 1,
                                 agent.pid,
                                 agent.name,
-                                agent.integration
+                                agent.integration,
+                                status
                             );
                         }
                         println!();
@@ -1070,5 +1235,165 @@ bind = "http://127.0.0.1:1"
 
         let request = handle.join().expect("server thread should finish");
         assert!(request.contains("POST /api/agent-guard/disconnect"));
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 2026-05-17 fix — picker now reflects real connection state.
+    // Anchored on the operator's exact prod scenario: Codex CLI was
+    // unconnected, OpenClaw was already wired up as ag-0001. The
+    // picker had no way to surface that delta, so the operator
+    // cancelled out without realising it was offering a useful
+    // action. These tests pin the merge rule + the response parser
+    // so the picker can never regress to the "all rows look the
+    // same" state again.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_connected_pids_extracts_pid_to_id_map_from_prod_shape() {
+        // Body byte-identical to what /api/agent-guard/agents returned
+        // on Oracle prod on 2026-05-17 — the literal trigger for this fix.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{
+                "agents":[
+                    {"id":"ag-0001","pid":1109,"name":"OpenClaw",
+                     "integration":"official","kind":"agent",
+                     "connected_at":"2026-05-17T21:33:04Z",
+                     "blocked":0,"warnings":0,"tool_calls":0,"instance_label":""}
+                ],
+                "agents_count":1,"tools_count":0,"total":1
+            }"#,
+        )
+        .expect("test fixture is valid JSON");
+        let map = parse_connected_pids(&body);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&1109), Some(&"ag-0001".to_string()));
+    }
+
+    #[test]
+    fn parse_connected_pids_drops_entries_missing_pid_or_id() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"agents":[
+                {"id":"ag-good","pid":42},
+                {"id":"ag-no-pid"},
+                {"pid":99},
+                {"id":"ag-string-pid","pid":"not-a-number"}
+            ]}"#,
+        )
+        .unwrap();
+        let map = parse_connected_pids(&body);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&42), Some(&"ag-good".to_string()));
+    }
+
+    #[test]
+    fn parse_connected_pids_handles_missing_or_non_array_agents() {
+        let empty = parse_connected_pids(&serde_json::json!({}));
+        assert!(empty.is_empty());
+        let wrong_type = parse_connected_pids(&serde_json::json!({"agents":"oops"}));
+        assert!(wrong_type.is_empty());
+    }
+
+    #[test]
+    fn build_picker_view_with_empty_registry_pre_checks_everything() {
+        let candidates = vec![
+            ("Codex CLI", 181995u32, "official"),
+            ("OpenClaw", 1109, "official"),
+        ];
+        let view = build_picker_view(&candidates, &HashMap::new());
+        assert_eq!(view.defaults, vec![true, true]);
+        assert!(!view.all_connected);
+        assert!(view.already_connected.is_empty());
+        assert!(view.labels[0].contains("not connected"));
+        assert!(view.labels[1].contains("not connected"));
+    }
+
+    #[test]
+    fn build_picker_view_with_all_connected_short_circuits() {
+        let candidates = vec![
+            ("OpenClaw", 1109u32, "official"),
+            ("Codex CLI", 181995, "official"),
+        ];
+        let mut connected = HashMap::new();
+        connected.insert(1109u32, "ag-0001".to_string());
+        connected.insert(181995u32, "ag-0002".to_string());
+        let view = build_picker_view(&candidates, &connected);
+        assert!(view.all_connected);
+        assert_eq!(view.defaults, vec![false, false]);
+        assert_eq!(view.already_connected.len(), 2);
+        assert!(view.labels[0].contains("already connected as ag-0001"));
+        assert!(view.labels[1].contains("already connected as ag-0002"));
+    }
+
+    #[test]
+    fn build_picker_view_with_mixed_state_pre_checks_only_unconnected() {
+        // The literal prod scenario that triggered this fix.
+        let candidates = vec![
+            ("Codex CLI", 181995u32, "official"),
+            ("OpenClaw", 1109, "official"),
+        ];
+        let mut connected = HashMap::new();
+        connected.insert(1109u32, "ag-0001".to_string());
+
+        let view = build_picker_view(&candidates, &connected);
+
+        // Codex (unconnected) is pre-checked; OpenClaw (connected) isn't.
+        assert_eq!(view.defaults, vec![true, false]);
+        assert!(!view.all_connected);
+        assert_eq!(view.already_connected.len(), 1);
+        assert_eq!(view.already_connected[0].0, 1109);
+        assert_eq!(view.already_connected[0].2, "ag-0001");
+
+        assert!(view.labels[0].contains("not connected"));
+        assert!(view.labels[1].contains("already connected as ag-0001"));
+    }
+
+    #[test]
+    fn build_picker_view_with_empty_candidates_is_not_all_connected() {
+        // Guards against the degenerate case where `connected_count ==
+        // candidates.len() == 0` would otherwise mark the empty list
+        // as "all connected" and short-circuit incorrectly.
+        let view = build_picker_view(&[], &HashMap::new());
+        assert!(!view.all_connected);
+        assert!(view.labels.is_empty());
+        assert!(view.defaults.is_empty());
+        assert!(view.already_connected.is_empty());
+    }
+
+    #[test]
+    fn fetch_connected_pids_returns_empty_when_dashboard_unreachable() {
+        // Closed port 1 is a reliable "connection refused" target —
+        // same trick the existing disconnect-unreachable test uses
+        // a few hundred lines up. Should NOT propagate the error: the
+        // picker degrades to "I don't know who's connected" instead
+        // of crashing.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        std::fs::write(
+            &cli.agent_config,
+            "[dashboard]\nbind = \"http://127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        let map = fetch_connected_pids(&cli);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn fetch_connected_pids_parses_real_response_shape() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let (addr, handle) = start_one_shot_json_server(
+            r#"{"agents":[{"id":"ag-0001","pid":1109,"name":"OpenClaw","integration":"official"}],"agents_count":1,"tools_count":0,"total":1}"#,
+        );
+        std::fs::write(
+            &cli.agent_config,
+            format!("[dashboard]\nbind = \"http://{addr}\"\n"),
+        )
+        .unwrap();
+
+        let map = fetch_connected_pids(&cli);
+
+        let request = handle.join().expect("server thread should finish");
+        assert!(request.contains("GET /api/agent-guard/agents"));
+        assert_eq!(map.get(&1109), Some(&"ag-0001".to_string()));
     }
 }
