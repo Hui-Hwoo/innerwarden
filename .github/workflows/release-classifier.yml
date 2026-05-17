@@ -115,19 +115,24 @@ jobs:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          pip install -q cryptography
+          # Scorecard PinnedDependencies fix: openssl CLI is pre-installed
+          # on ubuntu-latest, so we drop the `pip install -q cryptography`
+          # step that Scorecard flagged for being unpinned by hash. The
+          # signing semantics are identical — Ed25519PrivateKey.sign(digest)
+          # in Python and `openssl pkeyutl -sign -rawin` on a 32-byte
+          # SHA-256 digest both produce the same 64-byte signature, since
+          # ed25519 signs raw bytes (no internal pre-hashing).
           echo "$RELEASE_SIGNING_KEY" > /tmp/sign-key.pem
+          chmod 600 /tmp/sign-key.pem
           for tarball in dist/*.tar.gz; do
             base=$(basename "$tarball")
             echo "signing $base..."
-            python3 -c "
-          import sys, base64, hashlib
-          from cryptography.hazmat.primitives.serialization import load_pem_private_key
-          key = load_pem_private_key(open('/tmp/sign-key.pem','rb').read(), password=None)
-          digest = hashlib.sha256(open(sys.argv[1],'rb').read()).digest()
-          sig = key.sign(digest)
-          print(base64.b64encode(sig).decode(), end='')
-          " "$tarball" > "${tarball}.sig"
+            # SHA-256 digest of the tarball (32 bytes, binary) → ed25519
+            # signature (64 bytes) → base64 no-newline. Matches the
+            # legacy Python output byte-for-byte.
+            openssl dgst -sha256 -binary "$tarball" \
+              | openssl pkeyutl -sign -inkey /tmp/sign-key.pem -rawin \
+              | base64 -w 0 > "${tarball}.sig"
           done
           rm -f /tmp/sign-key.pem
           echo "=== Signed assets ==="
