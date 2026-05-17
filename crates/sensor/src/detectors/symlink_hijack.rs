@@ -118,8 +118,22 @@ impl SymlinkHijackDetector {
             return None;
         }
 
-        // Detect whether this is a symlink (-s) or hardlink (default).
-        let is_symlink = argv.iter().any(|a| a == "-s" || a == "--symbolic");
+        // Detect whether this is a symlink or a hardlink.
+        //
+        // `ln` accepts the `-s` switch either standalone (`ln -s SRC DST`)
+        // or bundled with other short flags (`ln -sf SRC DST`, `ln -fs`,
+        // `ln -snf …`). Bundles always start with a single `-` and are
+        // followed by one or more single-letter flags. We must also
+        // accept the long form `--symbolic`. The 2026-05-17 smoke test
+        // proved the bundle case: `ln -sf /etc/shadow /tmp/x` got
+        // classified as `hardlink` because the original equality check
+        // only matched the standalone `-s` token.
+        let is_symlink = argv.iter().any(|a| {
+            // long form
+            a == "--symbolic"
+                // short-flag bundle: single dash, NOT a long flag, contains `s`
+                || (a.starts_with('-') && !a.starts_with("--") && a.len() >= 2 && a[1..].contains('s'))
+        });
         let link_kind = if is_symlink { "symlink" } else { "hardlink" };
 
         // Find the sensitive-path fragment, if any, anywhere in argv.
@@ -178,11 +192,22 @@ impl SymlinkHijackDetector {
             vec!["T1574.005"]
         };
 
+        // Include the sensitive target in the incident_id so two distinct
+        // links emitted in the same second do NOT collide on SQLite's
+        // UNIQUE(incident_id) constraint. The 2026-05-17 smoke proved
+        // this: `ln -sf /etc/shadow …` and `ln /etc/sudoers …` ran in
+        // the same second, both fired the detector, but the second
+        // insert was silently dropped by the UNIQUE constraint because
+        // the timestamps matched at second resolution.
+        let target_slug: String = sensitive_target
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+            .collect();
         Some(Incident {
             ts: now,
             host: self.host.clone(),
             incident_id: format!(
-                "symlink_hijack:{link_kind}:{}",
+                "symlink_hijack:{link_kind}:{target_slug}:{}",
                 now.format("%Y-%m-%dT%H:%M:%SZ")
             ),
             severity: Severity::Critical,
@@ -379,5 +404,109 @@ mod tests {
         let mut ev = exec_event(&["ln", "-s", "/etc/shadow", "/tmp/x"], "bash", "bash", 1000);
         ev.kind = "file.write_access".into();
         assert!(det.process(&ev).is_none());
+    }
+
+    // ─── 2026-05-17 follow-up — flag-bundle + ID collision anchors ────
+
+    #[test]
+    fn classifies_ln_sf_as_symlink_not_hardlink() {
+        // 2026-05-17 prod smoke caught this: `ln -sf /etc/shadow …`
+        // was incorrectly classified as a hardlink because the original
+        // detector only matched the standalone `-s` token. The bundle
+        // case must classify as symlink AND carry T1555 in the MITRE
+        // tags (the symlink-specific id), not T1574.005.
+        let mut det = SymlinkHijackDetector::new("test");
+        let ev = exec_event(
+            &["ln", "-sf", "/etc/shadow", "/tmp/x"],
+            "bash",
+            "bash",
+            1000,
+        );
+        let inc = det.process(&ev).expect("should fire");
+        assert!(
+            inc.incident_id.contains(":symlink:"),
+            "incident_id should classify as symlink for -sf bundle: {}",
+            inc.incident_id
+        );
+        let mitre = inc.evidence[0]["mitre"].as_array().expect("mitre array");
+        assert_eq!(mitre[0], "T1555");
+    }
+
+    #[test]
+    fn classifies_ln_snf_bundle_as_symlink() {
+        // Another common bundle: `ln -snf` (symbolic + no-deref + force).
+        let mut det = SymlinkHijackDetector::new("test");
+        let ev = exec_event(
+            &["ln", "-snf", "/etc/sudoers", "/tmp/y"],
+            "bash",
+            "bash",
+            1000,
+        );
+        let inc = det.process(&ev).expect("should fire");
+        assert!(inc.incident_id.contains(":symlink:"));
+    }
+
+    #[test]
+    fn classifies_long_symbolic_flag_as_symlink() {
+        // The `--symbolic` long form must keep working alongside the
+        // bundle path.
+        let mut det = SymlinkHijackDetector::new("test");
+        let ev = exec_event(
+            &["ln", "--symbolic", "/etc/shadow", "/tmp/x"],
+            "bash",
+            "bash",
+            1000,
+        );
+        let inc = det.process(&ev).expect("should fire");
+        assert!(inc.incident_id.contains(":symlink:"));
+    }
+
+    #[test]
+    fn does_not_misclassify_hardlink_with_unrelated_flags_as_symlink() {
+        // `ln -f /etc/sudoers /tmp/x` is a hardlink with force — the
+        // bundle must NOT carry an `s`. Anti-regression for the bundle
+        // parser.
+        let mut det = SymlinkHijackDetector::new("test");
+        let ev = exec_event(
+            &["ln", "-f", "/etc/sudoers", "/tmp/x"],
+            "bash",
+            "bash",
+            1000,
+        );
+        let inc = det.process(&ev).expect("should fire");
+        assert!(
+            inc.incident_id.contains(":hardlink:"),
+            "incident_id should classify as hardlink for -f only: {}",
+            inc.incident_id
+        );
+    }
+
+    #[test]
+    fn incident_id_includes_target_to_avoid_same_second_collisions() {
+        // 2026-05-17 prod smoke caught this: two distinct sensitive
+        // targets linked in the same second produced the same
+        // incident_id, and the second insert was silently dropped by
+        // SQLite's UNIQUE(incident_id) constraint. Including the
+        // target slug in the id makes per-target incidents distinct
+        // even when their timestamps match at second resolution.
+        let mut det = SymlinkHijackDetector::new("test");
+        let now = Utc::now();
+        let make_ev = |argv: &[&str]| {
+            let mut e = exec_event(argv, "bash", "bash", 1000);
+            e.ts = now;
+            e
+        };
+        let inc_shadow = det
+            .process(&make_ev(&["ln", "-s", "/etc/shadow", "/tmp/a"]))
+            .expect("shadow link fires");
+        let inc_sudoers = det
+            .process(&make_ev(&["ln", "-s", "/etc/sudoers", "/tmp/b"]))
+            .expect("sudoers link fires");
+        assert_ne!(
+            inc_shadow.incident_id, inc_sudoers.incident_id,
+            "incident_ids must differ when targets differ even at same second"
+        );
+        assert!(inc_shadow.incident_id.contains("etcshadow"));
+        assert!(inc_sudoers.incident_id.contains("etcsudoers"));
     }
 }
