@@ -16,8 +16,8 @@
 //!   change). Low count → healthy system.
 //! * **Snapshot collectors** (suid_inventory, systemd_inventory) emit
 //!   periodically at boot or scheduled ticks. Count = number of ticks.
-//! * **External-source collectors** (nginx_access, suricata_eve,
-//!   osquery_log) need a service the host may not have installed.
+//! * **External-source collectors** (nginx_access) need a service
+//!   the host may not have installed.
 //!   Missing source → "disabled: source unavailable", not "broken".
 //!
 //! ## Portability contract
@@ -213,12 +213,19 @@ pub const COLLECTOR_MANIFEST: &[(&str, CollectorCategory)] = &[
     ("net_snapshot", CollectorCategory::Telemetry),
     ("nginx_access", CollectorCategory::Telemetry),
     ("nginx_error", CollectorCategory::Telemetry),
-    ("osquery_log", CollectorCategory::Telemetry),
+    // ── REMOVED 2026-05-17: phantom entries ──────────────────────────
+    // `osquery_log` and `suricata_eve` were listed here as if they
+    // shipped, but the corresponding collectors were never present in
+    // crates/sensor/src/collectors/. Wave 8b/8c (2026-05-04) cleaned the
+    // source-of-truth drift but missed this registry — so the dashboard
+    // kept rendering the phantom slots forever stuck at 0 events.
+    // See CLAUDE.md "Sensor source layout" note: "Older copies of this
+    // section listed [...] osquery_log and osquery_anomaly / suricata_alert
+    // as if they existed — they never did."
     ("proc_maps", CollectorCategory::Telemetry),
     ("proto_http", CollectorCategory::Telemetry),
     ("proto_smb", CollectorCategory::Telemetry),
     ("proto_ssh", CollectorCategory::Telemetry),
-    ("suricata_eve", CollectorCategory::Telemetry),
     ("syslog_firewall", CollectorCategory::Telemetry),
     ("tcp_stream", CollectorCategory::Telemetry),
     // ── Alarm: event-driven detectors. Silence = healthy. ───────────
@@ -374,8 +381,12 @@ mod tests {
         let now = chrono::Utc::now();
         let statuses = vec![
             build_status("auth_log", true, Some("/var/log/auth.log"), now),
+            // Wave 2026-05-17: switched from `suricata_eve` (phantom
+            // collector — never shipped, removed from registry) to
+            // `nginx_access`, which IS a real collector that
+            // legitimately has source_unavailable on hosts without nginx.
             build_status(
-                "suricata_eve",
+                "nginx_access",
                 true,
                 Some("/var/log/does-not-exist.json"),
                 now,
@@ -391,17 +402,44 @@ mod tests {
         assert_eq!(parsed["host"], "test-host");
         let arr = parsed["statuses"].as_array().expect("statuses array");
         assert_eq!(arr.len(), 3);
-        // suricata_eve probe must yield source_unavailable for a
+        // nginx_access probe must yield source_unavailable for a
         // missing-on-this-host file. That's the operator-visible
         // signal the dashboard renders as "SOURCE MISSING".
-        let suricata = arr
+        let nginx = arr
             .iter()
-            .find(|s| s["name"] == "suricata_eve")
-            .expect("suricata row");
-        assert_eq!(suricata["health"]["state"], "source_unavailable");
+            .find(|s| s["name"] == "nginx_access")
+            .expect("nginx_access row");
+        assert_eq!(nginx["health"]["state"], "source_unavailable");
         // ebpf has no file source — probe defaults to Active.
         let ebpf = arr.iter().find(|s| s["name"] == "ebpf").expect("ebpf row");
         assert_eq!(ebpf["health"]["state"], "active");
+    }
+
+    #[test]
+    fn registry_does_not_contain_phantom_collectors() {
+        // Wave 2026-05-17 anchor: prior versions listed `osquery_log`
+        // and `suricata_eve` here as if they existed, but the
+        // corresponding source files never shipped — the dashboard
+        // therefore rendered ghost rows that sat at 0 events forever.
+        // This test fails CI if either name (or any other known phantom)
+        // returns to the registry without also shipping a real collector.
+        for phantom in &[
+            "osquery_log",
+            "osquery_anomaly",
+            "suricata_eve",
+            "suricata_alert",
+            "falco_log",
+            "wazuh_alerts",
+        ] {
+            // `category_for` defaults to Telemetry for unknown names;
+            // an exact registry lookup is what we want here.
+            let listed = COLLECTOR_MANIFEST.iter().any(|(name, _)| name == phantom);
+            assert!(
+                !listed,
+                "phantom collector `{phantom}` is in the registry \
+                 but no source file ships under crates/sensor/src/collectors/"
+            );
+        }
     }
 
     #[test]
@@ -461,7 +499,7 @@ mod tests {
     #[test]
     fn probe_file_source_returns_unavailable_when_path_missing() {
         // Hot-path operator promise: a new install on a host without
-        // Suricata sees "source_unavailable" for suricata_eve, NOT a
+        // nginx sees "source_unavailable" for nginx_access, NOT a
         // silent zero on the HUD.
         let now = chrono::Utc::now();
         let health = probe_file_source("/var/log/does-not-exist.json", now);

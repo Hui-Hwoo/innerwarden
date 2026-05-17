@@ -22,17 +22,54 @@ use tracing::{info, warn};
 use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::{Event, Severity};
 
-/// Paths to monitor for modifications by default.
+/// Paths to monitor for modifications by default. Covers the high-
+/// value targets every PR1-6 file-write detector watches for: PAM
+/// (T1556.003), cron / systemd / init / RC (T1037 / T1053 / T1543),
+/// audit (T1562.001), SELinux (T1562.001), authorized_keys
+/// (T1098.004), shell startup files (T1546.004) plus the classic
+/// boot / auth tampering targets.
+///
+/// Wave 2026-05-17: extended to close the smoke-harness gap where
+/// file-write detectors did not fire because fanotify_watch was only
+/// hashing 9 narrowly-scoped paths.
 const DEFAULT_WATCH_PATHS: &[&str] = &[
+    // ── Classic auth + boot tampering ─────────────────────────────
     "/etc/passwd",
     "/etc/shadow",
     "/etc/sudoers",
     "/etc/ssh/sshd_config",
-    "/etc/crontab",
     "/etc/hosts",
     "/etc/resolv.conf",
     "/etc/ld.so.preload",
     "/boot/grub/grub.cfg",
+    // ── PAM tampering (T1556.003) ─────────────────────────────────
+    "/etc/pam.d/sshd",
+    "/etc/pam.d/su",
+    "/etc/pam.d/sudo",
+    "/etc/pam.d/common-auth",
+    "/etc/pam.d/common-password",
+    "/etc/pam.d/common-session",
+    "/etc/pam.conf",
+    // ── Cron persistence (T1053.003) ──────────────────────────────
+    "/etc/crontab",
+    "/etc/cron.allow",
+    "/etc/cron.deny",
+    // ── RC / init script persistence (T1037.004) ──────────────────
+    "/etc/rc.local",
+    // ── Audit subsystem tampering (T1562.001) ─────────────────────
+    "/etc/audit/auditd.conf",
+    "/etc/audit/audit.rules",
+    // ── SELinux / MAC layer disable (T1562.001) ──────────────────
+    "/etc/selinux/config",
+    // ── Shell startup files (T1546.004 + T1056.004) ───────────────
+    "/etc/profile",
+    "/etc/bash.bashrc",
+    "/etc/zsh/zshrc",
+    "/etc/zsh/zshenv",
+    "/root/.bashrc",
+    "/root/.bash_profile",
+    "/root/.profile",
+    "/root/.zshrc",
 ];
 
 /// Minimum file size for entropy analysis.
@@ -107,15 +144,24 @@ fn build_file_change_event(
         .map(|state| state.last_modified.to_rfc3339())
         .unwrap_or_default();
 
+    // Canonical schema (wave 2026-05-17):
+    //   - `kind = "file.write_access"` matches what `ebpf_syscall`
+    //     emits, so PR1-6 file-write detectors (pam_module_change,
+    //     startup_script_persistence, crontab_persistence, etc.) feed
+    //     off either source interchangeably.
+    //   - `details.filename` matches the field name detectors read.
+    //   - Encrypted-write bursts keep a distinct `file.encrypted_write`
+    //     kind for the ransomware detector to discriminate.
+    let kind = if encrypted {
+        "file.encrypted_write"
+    } else {
+        "file.write_access"
+    };
     Event {
         ts: now,
         host: host.to_string(),
         source: "fanotify".to_string(),
-        kind: if encrypted {
-            "file.encrypted_write".to_string()
-        } else {
-            "file.realtime_modified".to_string()
-        },
+        kind: kind.to_string(),
         severity,
         summary: format!(
             "File modified: {} (hash changed{})",
@@ -127,6 +173,9 @@ fn build_file_change_event(
             }
         ),
         details: serde_json::json!({
+            // canonical fields detectors read
+            "filename": path_str,
+            // legacy field name kept for any consumer still reading "path"
             "path": path_str,
             "new_hash": current.hash,
             "old_hash": prev_hash,
@@ -452,9 +501,42 @@ mod tests {
             None,
             Some(3.2),
         );
-        assert_eq!(sensitive.kind, "file.realtime_modified");
+        // Canonical schema: non-encrypted writes carry kind=file.write_access
+        // (matching the eBPF source) so PR1-6 detectors that filter on
+        // `kind == "file.write_access"` receive events from either source.
+        assert_eq!(sensitive.kind, "file.write_access");
         assert_eq!(sensitive.severity, Severity::Critical);
         assert_eq!(sensitive.details["old_hash"], "");
+        // Canonical field name: details.filename matches what
+        // pam_module_change, startup_script_persistence, etc. read.
+        assert_eq!(sensitive.details["filename"], "/etc/shadow");
+        // Legacy alias preserved for any older consumer.
+        assert_eq!(sensitive.details["path"], "/etc/shadow");
+    }
+
+    #[test]
+    fn default_watch_paths_cover_pr5_high_value_targets() {
+        // Wave 2026-05-17: the smoke-harness gap revealed that
+        // fanotify_watch only saw 9 narrow paths, missing all the PR5
+        // surface (PAM / cron.d / RC / audit / SELinux config). This
+        // test anchors that the defaults now cover those targets so a
+        // regression that drops them is caught at build time.
+        for required in &[
+            "/etc/pam.d/sshd",
+            "/etc/pam.d/su",
+            "/etc/pam.conf",
+            "/etc/crontab",
+            "/etc/rc.local",
+            "/etc/audit/audit.rules",
+            "/etc/selinux/config",
+            "/etc/profile",
+            "/root/.bashrc",
+        ] {
+            assert!(
+                DEFAULT_WATCH_PATHS.contains(required),
+                "DEFAULT_WATCH_PATHS missing high-value path `{required}`"
+            );
+        }
     }
 
     #[test]
