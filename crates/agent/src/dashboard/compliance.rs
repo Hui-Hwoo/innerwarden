@@ -1098,4 +1098,64 @@ mod tests {
         assert_eq!(resp["size"].as_u64(), Some(MAX_HONEYPOT_PAGE_SIZE as u64));
         assert!(resp["sessions"].as_array().unwrap().len() <= MAX_HONEYPOT_PAGE_SIZE);
     }
+
+    #[test]
+    fn api_honeypot_sessions_page_size_clamped_to_minimum() {
+        let all = vec![fake_session("203.0.113.10", 1, 0)];
+        let q = HoneypotSessionsQuery {
+            size: Some(0),
+            ..Default::default()
+        };
+        let resp = paginate_honeypot_sessions(all, &q);
+        assert_eq!(resp["size"].as_u64(), Some(1));
+        assert_eq!(resp["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(resp["has_more"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn api_honeypot_sessions_middle_page_has_expected_slice_and_more_flag() {
+        let all = vec![
+            fake_session("203.0.113.1", 1, 0),
+            fake_session("203.0.113.2", 0, 1),
+            fake_session("203.0.113.3", 1, 1),
+            fake_session("203.0.113.4", 1, 0),
+            fake_session("203.0.113.5", 0, 2),
+        ];
+        let q = HoneypotSessionsQuery {
+            page: Some(1),
+            size: Some(2),
+            ..Default::default()
+        };
+        let resp = paginate_honeypot_sessions(all, &q);
+        let sessions = resp["sessions"].as_array().unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["target_ip"], "203.0.113.3");
+        assert_eq!(sessions[1]["target_ip"], "203.0.113.4");
+        assert_eq!(resp["has_more"].as_bool(), Some(true));
+        assert_eq!(resp["filtered_total"].as_u64(), Some(5));
+    }
+
+    #[test]
+    fn session_is_engaged_treats_missing_or_non_numeric_counts_as_zero() {
+        assert!(!session_is_engaged(&serde_json::json!({})));
+        assert!(!session_is_engaged(&serde_json::json!({
+            "commands_count": "1",
+            "auth_attempts": "2"
+        })));
+        assert!(session_is_engaged(&serde_json::json!({
+            "commands_count": 0,
+            "auth_attempts": 1
+        })));
+    }
+
+    #[test]
+    fn verify_hash_chain_hashes_invalid_json_lines_without_panicking() {
+        let content = "not-json\n{\"action\":\"block\",\"prev_hash\":null}\n";
+        let (intact, len, last) = verify_hash_chain(content);
+
+        assert!(intact);
+        assert_eq!(len, 2);
+        assert_ne!(last, "none");
+    }
 }
