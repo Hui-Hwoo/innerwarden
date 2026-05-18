@@ -562,6 +562,49 @@ mod tests {
     }
 
     #[test]
+    fn parser_preserves_host_source_tags_and_shortens_container_id() {
+        let line = event_json("container", "stop", "nginx", "nginx:latest");
+        let (_, ev) = parse_docker_event(&line, "host-a").unwrap();
+
+        assert_eq!(ev.host, "host-a");
+        assert_eq!(ev.source, "docker");
+        assert_eq!(ev.details["container_id"], "abc123def456");
+        assert_eq!(ev.details["action"], "stop");
+        assert_eq!(ev.tags, vec!["container".to_string(), "docker".to_string()]);
+        assert_eq!(ev.entities.len(), 1);
+    }
+
+    #[test]
+    fn parser_falls_back_to_short_id_and_unknown_image() {
+        let line = serde_json::json!({
+            "Type": "container",
+            "Action": "create",
+            "Actor": { "ID": "shortid", "Attributes": {} },
+            "time": 1741788000i64,
+        })
+        .to_string();
+        let (_, ev) = parse_docker_event(&line, "host").unwrap();
+
+        assert_eq!(ev.details["container_id"], "shortid");
+        assert_eq!(ev.details["name"], "shortid");
+        assert_eq!(ev.details["image"], "unknown");
+        assert!(ev.summary.contains("shortid"));
+    }
+
+    #[test]
+    fn parser_rejects_malformed_or_incomplete_json() {
+        assert!(parse_docker_event("not-json", "host").is_none());
+        assert!(parse_docker_event("{}", "host").is_none());
+        let missing_time = serde_json::json!({
+            "Type": "container",
+            "Action": "start",
+            "Actor": { "ID": "abc" }
+        })
+        .to_string();
+        assert!(parse_docker_event(&missing_time, "host").is_none());
+    }
+
+    #[test]
     fn non_container_events_are_skipped() {
         let line = event_json("network", "connect", "bridge", "");
         assert!(parse_docker_event(&line, "host").is_none());
@@ -605,6 +648,18 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "container.sock_mount");
         assert_eq!(events[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn sock_mount_via_mount_destination_only() {
+        let info = serde_json::json!({
+            "HostConfig": { "Privileged": false, "Binds": [], "CapAdd": [] },
+            "Mounts": [{ "Type": "bind", "Source": "/tmp/docker.sock", "Destination": "/var/run/docker.sock" }]
+        });
+        let events = parse_inspect_risks(&info, "abc123", "agent", "img:1", "host");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "container.sock_mount");
+        assert_eq!(events[0].details["risk"]["path"], "/var/run/docker.sock");
     }
 
     #[test]
@@ -658,6 +713,21 @@ mod tests {
     }
 
     #[test]
+    fn cap_add_case_insensitive_and_multiple_dangerous_caps() {
+        let info = make_inspect_json(false, &[], &["sys_ptrace", "SYS_MODULE", "chown"]);
+        let events = parse_inspect_risks(&info, "abc123", "debugger", "tools:latest", "host");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "container.dangerous_cap");
+        assert_eq!(events[0].details["risk"]["capabilities"][0], "SYS_PTRACE");
+        assert_eq!(events[0].details["risk"]["capabilities"][1], "SYS_MODULE");
+        assert!(events[0].details["description"]
+            .as_str()
+            .unwrap()
+            .contains("SYS_PTRACE, SYS_MODULE"));
+    }
+
+    #[test]
     fn cap_add_net_admin_detected() {
         let info = make_inspect_json(false, &[], &["NET_ADMIN"]);
         let events = parse_inspect_risks(&info, "abc123", "vpn", "openvpn:latest", "host");
@@ -670,6 +740,23 @@ mod tests {
         let info = make_inspect_json(false, &[], &["NET_BIND_SERVICE"]);
         let events = parse_inspect_risks(&info, "abc123", "web", "nginx:latest", "host");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn risk_events_include_stable_metadata() {
+        let info = make_inspect_json(true, &[], &[]);
+        let events = parse_inspect_risks(&info, "abc123", "app", "img:1", "host-x");
+        let ev = &events[0];
+
+        assert_eq!(ev.host, "host-x");
+        assert_eq!(ev.source, "docker");
+        assert_eq!(ev.details["container_id"], "abc123");
+        assert_eq!(ev.details["name"], "app");
+        assert_eq!(ev.details["image"], "img:1");
+        assert_eq!(ev.details["risk"]["risk"], "privileged");
+        assert!(ev.tags.contains(&"security".to_string()));
+        assert!(ev.tags.contains(&"privilege-escalation".to_string()));
+        assert_eq!(ev.entities.len(), 1);
     }
 
     #[test]
