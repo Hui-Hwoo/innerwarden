@@ -280,6 +280,28 @@ mod tests {
     }
 
     #[test]
+    fn capability_metadata_is_stable() {
+        assert_eq!(ShellAuditCapability.id(), "shell-audit");
+        assert_eq!(ShellAuditCapability.name(), "Shell Audit");
+        assert!(ShellAuditCapability
+            .description()
+            .contains("explicit privacy authorization"));
+    }
+
+    #[test]
+    fn preflights_check_auditd_binary_and_rules_directory() {
+        let sensor = NamedTempFile::new().unwrap();
+        let agent = NamedTempFile::new().unwrap();
+        let opts = make_opts(&sensor, &agent);
+
+        let preflights = ShellAuditCapability.preflights(&opts);
+
+        assert_eq!(preflights.len(), 2);
+        assert_eq!(preflights[0].name(), "auditd is installed");
+        assert_eq!(preflights[1].name(), "/etc/audit/rules.d/ directory exists");
+    }
+
+    #[test]
     fn not_enabled_when_collector_off() {
         let sensor = NamedTempFile::new().unwrap();
         let agent = NamedTempFile::new().unwrap();
@@ -333,7 +355,31 @@ mod tests {
         let agent = NamedTempFile::new().unwrap();
         let opts = make_opts(&sensor, &agent);
         let effects = ShellAuditCapability.planned_disable_effects(&opts);
-        assert_eq!(effects.len(), 4);
+        let descriptions: Vec<_> = effects
+            .iter()
+            .map(|effect| effect.description.as_str())
+            .collect();
+
+        assert_eq!(descriptions.len(), 4);
+        assert!(descriptions[0].contains("enabled = false"));
+        assert!(descriptions[1].contains(AUDITD_RULE_FILE));
+        assert_eq!(descriptions[2], "Reload audit rules (augenrules --load)");
+        assert_eq!(descriptions[3], "Restart innerwarden-sensor");
+    }
+
+    #[test]
+    fn planned_disable_effects_honor_deferred_restart() {
+        let sensor = NamedTempFile::new().unwrap();
+        let agent = NamedTempFile::new().unwrap();
+        let mut opts = make_opts(&sensor, &agent);
+        opts.defer_restarts = true;
+
+        let effects = ShellAuditCapability.planned_disable_effects(&opts);
+
+        assert_eq!(
+            effects[3].description,
+            "Restart innerwarden-sensor (deferred)"
+        );
     }
 
     #[test]
@@ -342,7 +388,32 @@ mod tests {
         let agent = NamedTempFile::new().unwrap();
         let opts = make_opts(&sensor, &agent);
         let effects = ShellAuditCapability.planned_effects(&opts);
-        assert!(effects[0].description.contains("Privacy"));
+        let descriptions: Vec<_> = effects
+            .iter()
+            .map(|effect| effect.description.as_str())
+            .collect();
+
+        assert_eq!(descriptions.len(), 5);
+        assert!(descriptions[0].contains("Privacy"));
+        assert!(descriptions[1].contains("enabled = true"));
+        assert!(descriptions[2].contains(AUDITD_RULE_FILE));
+        assert_eq!(descriptions[3], "Load audit rules (augenrules --load)");
+        assert_eq!(descriptions[4], "Restart innerwarden-sensor");
+    }
+
+    #[test]
+    fn planned_effects_honor_deferred_restart() {
+        let sensor = NamedTempFile::new().unwrap();
+        let agent = NamedTempFile::new().unwrap();
+        let mut opts = make_opts(&sensor, &agent);
+        opts.defer_restarts = true;
+
+        let effects = ShellAuditCapability.planned_effects(&opts);
+
+        assert_eq!(
+            effects[4].description,
+            "Restart innerwarden-sensor (deferred)"
+        );
     }
 
     #[test]
@@ -353,9 +424,41 @@ mod tests {
         opts.defer_restarts = true;
 
         let report = ShellAuditCapability.activate(&opts).unwrap();
-        assert!(report
+        let descriptions: Vec<_> = report
             .effects_applied
             .iter()
-            .any(|effect| effect.description == "Deferred innerwarden-sensor restart"));
+            .map(|effect| effect.description.as_str())
+            .collect();
+
+        assert!(descriptions.contains(&"[collectors.exec_audit] enabled = true"));
+        assert!(descriptions.contains(&"Loaded audit rules"));
+        assert!(descriptions.contains(&"Deferred innerwarden-sensor restart"));
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn deactivate_can_defer_restart() {
+        let mut sensor = NamedTempFile::new().unwrap();
+        writeln!(sensor, "[collectors.exec_audit]\nenabled = true\n").unwrap();
+        let agent = NamedTempFile::new().unwrap();
+        let mut opts = make_opts(&sensor, &agent);
+        opts.defer_restarts = true;
+
+        let report = ShellAuditCapability.deactivate(&opts).unwrap();
+        let descriptions: Vec<_> = report
+            .effects_applied
+            .iter()
+            .map(|effect| effect.description.as_str())
+            .collect();
+
+        assert!(!config_editor::read_bool(
+            sensor.path(),
+            "collectors.exec_audit",
+            "enabled"
+        ));
+        assert!(descriptions.contains(&"[collectors.exec_audit] enabled = false"));
+        assert!(descriptions.contains(&"Reloaded audit rules"));
+        assert!(descriptions.contains(&"Deferred innerwarden-sensor restart"));
+        assert!(report.warnings.is_empty());
     }
 }
