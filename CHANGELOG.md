@@ -9,6 +9,91 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-18
+
+Major Linux MITRE ATT&CK coverage release. Adds 21 new detectors across six tactics (Reconnaissance, Collection, Command & Control, Privilege Escalation, Lateral Movement, Persistence, Defense Evasion, Impact) and 20 new cross-layer correlation rules covering full kill-chain attack patterns. **Detector count: 53 → 73. Cross-layer correlation rules: 47 → 67. MITRE technique IDs covered: 65 → 75+.** Also lands first-class OpenClaw / peer AI agent integration on the same host, dashboard counters migrated to canonical SQLite source-of-truth, telemetry name-drift cleanup, and a license harmonisation across the four satellite crates.
+
+Verified end-to-end on Oracle prod (ARM64 aarch64, kernel 6.8.0-1052-oracle) and `test001` (Ubuntu 24.04 x86_64, kernel 6.8.0-117-generic). 49 detectors active on prod, 44 eBPF kernel hooks loaded, agent-guard registry persisted across the watchdog binary swap.
+
+### Added
+
+#### Linux MITRE ATT&CK coverage (8 PRs, 21 detectors, 20 correlation rules)
+
+- **Reconnaissance detectors** (PR #657): `discovery_anomaly` — context-aware allowlist promotion (PR #655) + argv-driven anomaly scoring; `discovery_burst` upgrade. Covers T1018, T1033, T1057, T1082, T1083, T1087, T1518.
+- **Collection detectors** (PR #664): `clipboard_capture`, `screen_capture`, `archive_collection` (password-protected zip/7z/rar), `data_staged_egress`. Covers T1056.004, T1113, T1560.001, T1074.
+- **Command & Control variants** (PR #665): C2 callback over non-standard ports, tunnel detection (ngrok/cloudflared/bore), DNS/ICMP/SSH-forward protocol tunneling, encrypted channel anomaly. Covers T1071.001, T1095, T1572, T1573, T1090.
+- **Privilege Escalation + Lateral Movement** (PR #667): `setuid_exploit_pattern`, `capabilities_abuse`, `lateral_egress_ssh`, `lateral_egress_scp_rsync`. 34 anchored tests. Covers T1548.001, T1068, T1021.004, T1570.
+- **Persistence + Defense Evasion** (PR #668): `pam_module_change`, `auditd_disable`, `selinux_apparmor_disable`, `startup_script_persistence`. 41 anchored tests. Covers T1556.003, T1562.001, T1037.004.
+- **Data destruction (Impact)** (PR #669): `data_destruction_pattern` with 5 sub-shapes — `rm -rf` on user data, disk wipe, mkfs/luksFormat on mounted volumes, journal truncation, backup-target tampering. 17 anchored tests. Covers T1485, T1490, T1561.
+- **Symlink hijack + service-account shells** (PR #676): `symlink_hijack` detects `ln -s` of sensitive paths (T1555, T1574.005); `system_user_interactive` flags 47 service accounts (nobody, www-data, nginx, postgres, mysql, …) opening interactive shells (T1059, T1078.003).
+- **20 new cross-layer correlation rules CL-051 → CL-070** (PR #670). Includes a full 5-stage kill chain (CL-067: Initial Access → Foothold → Persistence → Defense Evasion → Impact) and 19 multi-stage chains across Discovery → Privesc → Lateral, eBPF-sequence data exfiltration, hypervisor + kernel ring-spanning chains.
+
+#### OpenClaw / peer AI agent integration
+
+- **Agent discovery file** (PRs #683 + #684). The agent now publishes `/run/innerwarden/agent-discovery.json` at startup describing how peer AI agents on the same host should reach Inner Warden — URL, endpoints, auth mode, TLS posture, schema/agent version. World-readable (0644) so unprivileged AI agent processes (OpenClaw runs as `ubuntu`, not root) can read it without auth. FHS-compliant runtime location; survives across deploys because the parent dir is auto-chmod'd to 0755 on every boot. End-to-end validated with OpenClaw reading the file, calling `/api/agent/security-context`, and answering "yes, Inner Warden is active here" inside its own session.
+- **Loopback-bypass auth on `/api/agent/*` and `/api/agent-guard/*`** (PR #680). Calls from `127.0.0.1` / `::1` / `localhost` no longer require Basic Auth. The middleware reads the peer IP from `axum::extract::ConnectInfo<SocketAddr>` (not from `X-Forwarded-For`, which a proxy can spoof). Six anchored tests cover the truth table.
+- **Agent-guard registry persists across agent restarts** (PR #685). The ag-id binding (`openclaw pid 1109 → ag-0001`) used to vanish on every binary swap. Now snapshotted to `<data_dir>/agent-guard-registry.json` after every connect / disconnect (atomic via `.tmp` + rename), rehydrated on dashboard start. `NEXT_ID` reseeded above the max restored ag-id so future connects can't collide.
+- **`innerwarden agent connect` picker shows real connection state** (PR #682). The picker now annotates each candidate with `[official, not connected]` or `[official, already connected as ag-0001]`, pre-checks only unconnected rows so a plain Enter does the obvious thing, and short-circuits with a friendly summary when every detected agent is already connected. Same merge logic also fixes `agent scan` (previously hardcoded "not connected" on every row).
+- **`innerwarden agent connect` arrow-key picker** (PR #680). Replaces the typed-index `"1,3,5"` flow with `dialoguer::MultiSelect` when stdin is a TTY. Numeric input retained as the non-TTY fallback so CI / scripted pipelines don't break.
+
+#### Other
+
+- **eBPF bytecode embedded by default on Linux builds** (PR #678). The sensor binary now ships with eBPF programs baked in via `include_bytes!`, removing the runtime requirement for a separate bytecode file at `/var/lib/innerwarden/ebpf/`. No-op on macOS / dev shells. Operator-visible: fresh installs go from `0 eBPF hooks loaded` to `44 hooks loaded` with no extra setup.
+- **`innerwarden agent status` over HTTPS** (PR #681). Used to shell out to `curl http://...` and fail with "connection refused" because the dashboard is HTTPS-only since v0.13. Now uses the TLS-aware ureq helper that the `connect` / `disconnect` paths use, and reads the `connected: false` flag from the server response so duplicate-pid connects no longer print "✓ connected as unknown".
+- **Smoke harness + testing map for the new detector wave** (PR #672). 75-test smoke harness with SQLite poll + per-test `BEFORE_TS` + `TEST_USER` privilege drop. `scripts/SMOKE_TEST_MAP.md` documents every detector + trigger + expected event signature.
+
+### Changed
+
+#### Dashboard counters migrated to canonical SQLite source
+
+- **`/api/overview` and `/api/sensors` now read events_today via `canonical_counts::compute`** (PRs #659, #660, #661). The process-lifetime KG counter that used to feed these endpoints reset on every restart and double-counted across uptime days — operator saw 130k events on Home but 3.7k on Sensors. Both endpoints now go through the same SQLite per-date query. Cross-endpoint anchor test asserts every dashboard handler calls the canonical function so no future handler can resurrect the divergence pattern.
+- **Sensors HUD tile roster: union of canonical SQLite + KG roster** (PR #661). Canonical gives the per-date counts; KG gives the long-lived collector list including ones quiet today. `or_insert(0)` for missing collectors so the active-vs-broken indicator never silently drops a row.
+- **Event Timeline chart uses canonical SQLite** (PR #659). Same migration as the tile totals; interned-key shape rebuilt on-the-fly from the canonical map so the rendering pipeline didn't have to change.
+
+#### Telemetry name drift killed (PR #686)
+
+Operator screenshot flagged `fanotify TELEMETRY 0` looking like broken telemetry. Three classes of bug, all fixed:
+
+- **Wire-name drift.** `fanotify_watch.rs` emits `source: "fanotify"` — the manifest entry was `fanotify_watch`. Dashboard category lookup defaulted to TELEMETRY because the wire name wasn't in the manifest. Same drift for `ebpf_syscall.rs` (emits `ebpf`) and `exec_audit.rs` (emits `auditd`). All three drift aliases removed from `COLLECTOR_MANIFEST` and the frontend `COLLECTOR_CATEGORY` map. `fanotify` now correctly renders as ALARM (silence is healthy).
+- **Phantoms.** `osquery_log` and `suricata_eve` were in the frontend map even though the collectors were retired in Wave 8b/8c. Added `KNOWN_COLLECTORS` const + roster filter so stale KG entries no longer leak through.
+- **Integration card count fix.** "Shell Audit (auditd)" card called `count_source("exec_audit")` and always showed 0. Now `count_source("auditd")`.
+
+A cross-file consistency test asserts the sensor manifest, the agent's KNOWN_COLLECTORS const, and the frontend COLLECTOR_CATEGORY map describe the same set — drift in any of the three surfaces fails CI.
+
+#### License harmonisation (PR #671)
+
+Relicensed four satellite crates from BUSL-1.1 to Apache-2.0:
+- `crates/killchain` (kill chain detection engine)
+- `crates/dna` (threat DNA behavioural fingerprinting)
+- `crates/smm` (Ring -2 firmware audit)
+- `crates/hypervisor` (Ring -1 hypervisor audit)
+
+The whole repo is now uniformly Apache-2.0.
+
+### Fixed
+
+- **`-sf` flag bundle no longer misclassified as hardlink** (PR #677). `symlink_hijack` previously matched only `argv == "-s"`, so `ln -sf` slipped through as a hardlink. Now uses a bundle parser. Same PR adds per-target slug to `incident_id` so two symlinks to different sensitive paths in the same second no longer collide on the SQLite UNIQUE constraint.
+- **Canonical `file.write_access` schema in fanotify** (PR #674). The earlier schema collided with `ebpf_syscall` field names; canonical schema now ensures the `details.filename` field matches what the PR1-6 file-write detectors read. Also dropped two phantom collectors from `COLLECTOR_MANIFEST` here.
+- **fanotify default watch paths unioned with operator config** (PR #675). Pre-fix any operator config was treated as a *replacement* for the default list — hosts with custom paths silently dropped PAM / cron / RC / audit / SELinux / shell-startup from monitoring. Defaults are now the minimum every host observes; operator config extends.
+- **Correlation rule OR-patterns cover legacy detector names** (PR #673). CL-053 / 057 / 066 / 069 chain rules now match `data_archive | suspicious_archive | data_exfil_cmd | ...` so historical detector renames don't silently break the chain match.
+- **eBPF events prefer kernel-provided ppid over `/proc` fallback** (PR #663). `/proc/<pid>/stat` is racy on short-lived processes; the kernel-provided `ppid` from the tracepoint context is the canonical source.
+- **PR1 detectors match argv[0] not comm** (PR #662). `comm` is the first 16 chars of the binary name — too narrow to identify binary identity reliably. The Reconnaissance / Privesc / Lateral detectors now match argv[0] which is the full invocation path.
+- **Honeypot recurring-attacker silent drops surfaced on the live feed** (PR #658). The auto-dismiss path used to skip the SSE feed entirely, so operators couldn't tell whether the honeypot was active or silent. Now emits a dim recurring-attacker line.
+- **`deploy-prod.sh agent` watchdog dance** (PR #681). When `innerwarden-watchdog` is active, the deploy script now stops it before `cp` and restarts it after, so the agent binary can be swapped cleanly without EBUSY. Always-on `[4/4]` health audit added.
+- **`innerwarden setup` non-TTY guidance** (PR #679). Setup now fails fast with an actionable message when stdin is not a TTY (CI, piped input) instead of looping forever on the first interactive prompt.
+
+### CI / build / release infrastructure
+
+- **Sign classifier-v* releases + attach SLSA bundles** (PR #654). Model release artefacts now ship signed alongside binaries.
+- **Replace `pip install cryptography` with `openssl pkeyutl -sign -rawin`** (PR #666). Closes OpenSSF Scorecard alert #189 (unpinned dependency in release workflow). Verified that Ed25519 signature bytes are byte-identical between `cryptography` and `openssl` CLI.
+- **CI guard renamed to vendor-neutral name** (PR #686). `scripts/verify-no-falco-mentions.sh` → `scripts/verify-retired-integrations.sh`. Workflow display name `No Falco Mentions` → `Retired Integrations Guard`. Header docstrings rewritten in vendor-neutral language so the script doesn't read like evidence-scrubbing — Inner Warden has always been a clean-room Rust implementation that briefly shipped an optional one-way input adapter for a third-party tool, then dropped the adapter when the native eBPF + detector layer covered the same surface.
+
+### Removed
+
+- **Standalone Sensors view + dead "Check sensors →" link on Home** (Wave 2026-05-15 + this release). The per-collector panel folded into Home as `#homeSensorsPanel` in the earlier Wave; the leftover Home button pointed at that same-page anchor and felt like a no-op since the panel is already visible.
+- **Phantom collector entries `osquery_log` and `suricata_eve` from the frontend telemetry map** (PR #686). Those collectors never shipped; their map entries kept rendering as TELEMETRY 0 forever.
+- **Three drift-alias manifest entries** (`fanotify_watch`, `ebpf_syscall`, `exec_audit`, all PR #686). The collectors emit `fanotify`, `ebpf`, `auditd` respectively; the duplicate manifest slots never matched a real `Event.source`.
+
 ## [0.13.6] - 2026-05-16
 
 Patch release: SHA pin for the `minilm-l6` classifier (warden) variant.
