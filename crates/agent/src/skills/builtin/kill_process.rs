@@ -174,71 +174,114 @@ fn is_valid_username(user: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn dry_run_succeeds() {
-        let ctx = SkillContext {
+    fn test_context(target_user: Option<&str>, duration_secs: Option<u64>) -> SkillContext {
+        SkillContext {
             incident: innerwarden_core::incident::Incident {
                 ts: Utc::now(),
                 host: "host".to_string(),
                 incident_id: "suspicious_execution:deploy:test".to_string(),
                 severity: innerwarden_core::event::Severity::Critical,
                 title: "t".to_string(),
-                summary: "s".to_string(),
+                summary: "suspicious process tree".to_string(),
                 evidence: serde_json::json!({}),
                 recommended_checks: vec![],
                 tags: vec![],
                 entities: vec![],
             },
             target_ip: None,
-            target_user: Some("deploy".to_string()),
+            target_user: target_user.map(str::to_string),
             target_container: None,
-            duration_secs: Some(300),
+            duration_secs,
             host: "host".to_string(),
             data_dir: std::env::temp_dir(),
             honeypot: crate::skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_succeeds() {
+        let ctx = test_context(Some("deploy"), Some(300));
 
         let res = KillProcess.execute(&ctx, true).await;
         assert!(res.success);
         assert!(res.message.contains("DRY RUN"));
         assert!(res.message.contains("deploy"));
+        assert!(res.message.contains("TTL note: 300s"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_clamps_short_ttl_to_minimum() {
+        let ctx = test_context(Some("deploy"), Some(1));
+
+        let res = KillProcess.execute(&ctx, true).await;
+
+        assert!(res.success);
+        assert!(res.message.contains("TTL note: 60s"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_clamps_long_ttl_to_maximum() {
+        let ctx = test_context(Some("deploy"), Some(100_000));
+
+        let res = KillProcess.execute(&ctx, true).await;
+
+        assert!(res.success);
+        assert!(res.message.contains("TTL note: 86400s"));
+    }
+
+    #[tokio::test]
+    async fn invalid_target_user_fails_before_command_execution() {
+        let ctx = test_context(Some("bad user"), Some(300));
+
+        let res = KillProcess.execute(&ctx, false).await;
+
+        assert!(!res.success);
+        assert!(res.message.contains("invalid username 'bad user'"));
     }
 
     #[test]
     fn username_validation_is_strict() {
         assert!(is_valid_username("deploy"));
         assert!(is_valid_username("svc_user-1"));
+        assert!(is_valid_username("_system.user$"));
         assert!(!is_valid_username(""));
         assert!(!is_valid_username("../etc/passwd"));
         assert!(!is_valid_username("bad user"));
         assert!(!is_valid_username("user;rm -rf /"));
+        assert!(!is_valid_username(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn metadata_is_written_under_process_kills_directory() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let created_at = Utc::now();
+        let meta = ProcessKillMetadata {
+            user: "deploy".to_string(),
+            created_at,
+            expires_at: created_at + Duration::seconds(300),
+            reason: "suspicious process tree".to_string(),
+        };
+
+        write_metadata(temp_dir.path(), &meta).expect("write metadata");
+
+        let metadata_path = temp_dir.path().join("process-kills/deploy.json");
+        let metadata = std::fs::read_to_string(metadata_path).expect("read metadata");
+        assert!(metadata.contains("\"user\": \"deploy\""));
+        assert!(metadata.contains("suspicious process tree"));
+    }
+
+    #[test]
+    fn metadata_dir_uses_expected_subdirectory() {
+        assert_eq!(
+            metadata_dir(Path::new("/var/lib/innerwarden")),
+            Path::new("/var/lib/innerwarden/process-kills")
+        );
     }
 
     #[tokio::test]
     async fn no_target_user_fails_gracefully() {
-        let ctx = SkillContext {
-            incident: innerwarden_core::incident::Incident {
-                ts: Utc::now(),
-                host: "host".to_string(),
-                incident_id: "test:id".to_string(),
-                severity: innerwarden_core::event::Severity::High,
-                title: "t".to_string(),
-                summary: "s".to_string(),
-                evidence: serde_json::json!({}),
-                recommended_checks: vec![],
-                tags: vec![],
-                entities: vec![],
-            },
-            target_ip: None,
-            target_user: None,
-            target_container: None,
-            duration_secs: None,
-            host: "host".to_string(),
-            data_dir: std::env::temp_dir(),
-            honeypot: crate::skills::HoneypotRuntimeConfig::default(),
-            ai_provider: None,
-        };
+        let ctx = test_context(None, None);
 
         let res = KillProcess.execute(&ctx, true).await;
         assert!(!res.success);
