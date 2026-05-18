@@ -1035,6 +1035,12 @@ mod tests {
 
         let multiple = "\x1b[1;31m bold red \x1b[0m \x1b[32m green \x1b[0m";
         assert_eq!(strip_ansi(multiple), " bold red   green ");
+
+        let non_csi_escape = "keep \x1bX visible";
+        assert_eq!(strip_ansi(non_csi_escape), "keep X visible");
+
+        let unterminated_csi = "before \x1b[31";
+        assert_eq!(strip_ansi(unterminated_csi), "before ");
     }
 
     #[test]
@@ -1043,17 +1049,41 @@ mod tests {
         let mut cfg = config::AgentConfig::default();
         cfg.ai.enabled = false;
         cfg.responder.enabled = false;
+        cfg.abuseipdb.enabled = false;
+        cfg.geoip.enabled = false;
+        cfg.slack.enabled = false;
+        cfg.cloudflare.enabled = false;
 
         let out = format_capabilities(&cfg);
         assert!(out.contains("🔴 <b>AI Analysis</b>  disabled"));
         assert!(out.contains("🔴 <b>Block IP</b>  disabled"));
+        assert!(out.contains("🔴 <b>Sudo Protection</b>  disabled"));
+        assert!(out.contains("🔴 <b>AbuseIPDB</b>  disabled"));
+        assert!(out.contains("🔴 <b>GeoIP</b>  disabled"));
+        assert!(out.contains("🔴 <b>Slack</b>  disabled"));
+        assert!(out.contains("🔴 <b>Cloudflare</b>  disabled"));
 
-        // Enable AI
+        // Enable all displayed capabilities.
         cfg.ai.enabled = true;
         cfg.ai.provider = "openai".to_string();
         cfg.ai.model = "gpt-4".to_string();
+        cfg.responder.enabled = true;
+        cfg.responder.dry_run = false;
+        cfg.responder.block_backend = "nftables".to_string();
+        cfg.responder.allowed_skills = vec!["suspend-user".to_string()];
+        cfg.abuseipdb.enabled = true;
+        cfg.geoip.enabled = true;
+        cfg.slack.enabled = true;
+        cfg.cloudflare.enabled = true;
+
         let out = format_capabilities(&cfg);
         assert!(out.contains("🟢 <b>AI Analysis</b>  <code>openai / gpt-4</code>"));
+        assert!(out.contains("🟢 <b>Block IP</b>  nftables backend - live"));
+        assert!(out.contains("🟢 <b>Sudo Protection</b>  active"));
+        assert!(out.contains("🟢 <b>AbuseIPDB</b>  IP reputation enrichment"));
+        assert!(out.contains("🟢 <b>GeoIP</b>  ip-api.com (free)"));
+        assert!(out.contains("🟢 <b>Slack</b>  notifications enabled"));
+        assert!(out.contains("🟢 <b>Cloudflare</b>  edge block push active"));
     }
 
     #[test]
@@ -1062,11 +1092,19 @@ mod tests {
         let mut cfg = config::AgentConfig::default();
         cfg.ai.enabled = false;
         cfg.responder.enabled = false;
+        cfg.abuseipdb.enabled = false;
+        cfg.geoip.enabled = false;
+        cfg.honeypot.mode = "off".to_string();
 
         let kb = capabilities_keyboard(&cfg);
         let s = serde_json::to_string(&kb).unwrap();
         assert!(s.contains("enable:ai"));
         assert!(s.contains("enable:block-ip"));
+        assert!(s.contains("enable:sudo-protection"));
+        assert!(s.contains("enable:abuseipdb"));
+        assert!(s.contains("enable:geoip"));
+        assert!(s.contains("enable:honeypot"));
+        assert_eq!(kb.as_array().unwrap()[0].as_array().unwrap().len(), 2);
 
         // All enabled should yield single status button
         cfg.ai.enabled = true;
@@ -1077,9 +1115,13 @@ mod tests {
         cfg.honeypot.mode = "listener".to_string();
 
         let kb = capabilities_keyboard(&cfg);
-        let s = serde_json::to_string(&kb).unwrap();
-        assert!(s.contains("menu:status"));
-        assert!(!s.contains("enable:ai"));
+        assert_eq!(
+            kb,
+            serde_json::json!([[{
+                "text": "✅ All capabilities active",
+                "callback_data": "menu:status"
+            }]])
+        );
     }
 
     #[tokio::test]
