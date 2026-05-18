@@ -169,12 +169,29 @@ mod tests {
     }
 
     #[test]
-    fn returns_none_on_fail_status() {
+    fn fail_response_defaults_optional_fields() {
         let json = r#"{"status":"fail","message":"private range"}"#;
         let resp: IpApiResponse = serde_json::from_str(json).unwrap();
+
         assert_eq!(resp.status, "fail");
-        // When status != "success", lookup() returns None
-        assert_ne!(resp.status, "success");
+        assert_eq!(resp.country, "");
+        assert_eq!(resp.country_code, "");
+        assert_eq!(resp.city, "");
+        assert_eq!(resp.isp, "");
+        assert_eq!(resp.asn, "");
+    }
+
+    #[test]
+    fn success_response_defaults_missing_optional_fields() {
+        let json = r#"{"status":"success","country":"Japan","countryCode":"JP"}"#;
+        let resp: IpApiResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(resp.status, "success");
+        assert_eq!(resp.country, "Japan");
+        assert_eq!(resp.country_code, "JP");
+        assert_eq!(resp.city, "");
+        assert_eq!(resp.isp, "");
+        assert_eq!(resp.asn, "");
     }
 
     #[test]
@@ -224,15 +241,37 @@ mod tests {
         assert!(!url.starts_with("https://"));
     }
 
+    #[tokio::test]
+    async fn lookup_empty_ip_returns_none_without_network() {
+        let client = GeoIpClient::new();
+
+        assert!(client.lookup("").await.is_none());
+    }
+
+    #[test]
+    fn geo_info_serializes_with_expected_fields() {
+        let geo = GeoInfo {
+            country: "Japan".to_string(),
+            country_code: "JP".to_string(),
+            city: "Tokyo".to_string(),
+            isp: "Example ISP".to_string(),
+            asn: "AS64500 Example".to_string(),
+        };
+
+        let value = serde_json::to_value(&geo).unwrap();
+
+        assert_eq!(value["country"], "Japan");
+        assert_eq!(value["country_code"], "JP");
+        assert_eq!(value["city"], "Tokyo");
+        assert_eq!(value["isp"], "Example ISP");
+        assert_eq!(value["asn"], "AS64500 Example");
+    }
+
     #[test]
     fn not_configured_when_disabled() {
         // GeoIpClient::new() is always available (no key needed).
-        // Verify that lookup returns None for an empty IP string synchronously.
-        // We test the guard at the start of lookup() rather than making a network call.
-        // The empty-string guard is the only sync-testable path.
+        // Network paths are covered by integration tests; unit tests keep the
+        // client offline and verify construction plus the empty-IP guard.
         let _client = GeoIpClient::new();
-        // GeoIpClient::new() constructs successfully without requiring a key.
-        // The empty-string guard (if ip.is_empty() { return None; }) is the
-        // only sync-testable path; network calls are skipped in unit tests.
     }
 }
