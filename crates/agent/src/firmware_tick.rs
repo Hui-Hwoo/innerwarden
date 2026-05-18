@@ -348,10 +348,30 @@ mod tests {
     #[test]
     fn parse_suppressed_ids_ignores_comments_and_blanks() {
         // Ensures suppression file parsing keeps only valid incident-id patterns.
-        let parsed = parse_suppressed_ids("# comment\n\nfirmware:trust_degraded\n  hypervisor  \n");
+        let parsed = parse_suppressed_ids(
+            "# comment\n\nfirmware:trust_degraded\n  hypervisor  \n#another\n",
+        );
         assert!(parsed.contains("firmware:trust_degraded"));
         assert!(parsed.contains("hypervisor"));
         assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn load_suppressed_ids_reads_file_and_handles_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(load_suppressed_ids(dir.path()).is_empty());
+
+        std::fs::write(
+            dir.path().join("suppressed-incidents.txt"),
+            "firmware:trust_degraded\n\n# ignored\nfirmware:corr",
+        )
+        .expect("write suppression file");
+
+        let loaded = load_suppressed_ids(dir.path());
+        assert!(loaded.contains("firmware:trust_degraded"));
+        assert!(loaded.contains("firmware:corr"));
+        assert_eq!(loaded.len(), 2);
     }
 
     #[test]
@@ -367,15 +387,19 @@ mod tests {
     fn classify_firmware_trust_severity_uses_score_bands_on_bare_metal() {
         // Verifies trust-score thresholds map to stable severity levels off-VM.
         assert!(matches!(
-            classify_firmware_trust_severity(0.2, false),
+            classify_firmware_trust_severity(0.29, false),
             Severity::Critical
         ));
         assert!(matches!(
-            classify_firmware_trust_severity(0.5, false),
+            classify_firmware_trust_severity(0.30, false),
             Severity::High
         ));
         assert!(matches!(
-            classify_firmware_trust_severity(0.8, false),
+            classify_firmware_trust_severity(0.59, false),
+            Severity::High
+        ));
+        assert!(matches!(
+            classify_firmware_trust_severity(0.60, false),
             Severity::Medium
         ));
     }
@@ -392,15 +416,19 @@ mod tests {
     fn classify_correlated_threat_severity_follows_confidence_thresholds() {
         // Confirms correlated threat confidence translates to deterministic severity bands.
         assert!(matches!(
-            classify_correlated_threat_severity(0.95),
+            classify_correlated_threat_severity(0.90),
             Severity::Critical
         ));
         assert!(matches!(
-            classify_correlated_threat_severity(0.75),
+            classify_correlated_threat_severity(0.89),
             Severity::High
         ));
         assert!(matches!(
-            classify_correlated_threat_severity(0.50),
+            classify_correlated_threat_severity(0.70),
+            Severity::High
+        ));
+        assert!(matches!(
+            classify_correlated_threat_severity(0.69),
             Severity::Medium
         ));
     }
