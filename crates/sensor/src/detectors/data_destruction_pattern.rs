@@ -64,6 +64,54 @@ const USER_DATA_PATH_PREFIXES: &[&str] = &[
 /// other detectors (process_injection, log_tampering).
 const RM_SAFE_EXACT_PATHS: &[&str] = &["/tmp/", "/var/tmp/", "/var/cache/", "/dev/shm/"];
 
+/// Path segments that, when present anywhere in an `rm -rf` target,
+/// indicate a build cache / package cache rather than user data.
+/// Match is whole-segment (split on `/`) so `/home/me/targetdata/`
+/// does NOT match `target` here — only `/home/me/project/target/...`
+/// does.
+///
+/// Wave 2026-05-18: the FP that triggered this list. Every
+/// `cargo build --release` on Oracle prod ran `rm -rf
+/// /home/ubuntu/innerwarden/target/release/incremental` (cargo's
+/// own incremental cache cleanup), which the detector correctly
+/// flagged as `rm -rf` of a `/home/` path but is in fact routine
+/// build noise. Five critical alerts in one day, all from the
+/// operator's own deploys. The same FP would hit any host doing
+/// node / python / go / java builds in the user's home dir.
+const RM_BUILD_CACHE_SEGMENTS: &[&str] = &[
+    // Rust
+    "target",
+    ".cargo",
+    // Node / JS
+    "node_modules",
+    ".npm",
+    ".pnpm-store",
+    ".next",
+    ".turbo",
+    // Python
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    // Go
+    ".gopath",
+    // Java / JVM
+    ".gradle",
+    // Cross-language
+    ".cache",
+    ".local",
+    "dist",
+];
+
+/// True iff any `/`-separated segment of `path` exactly equals one of
+/// the build-cache names. Pure for unit testing.
+fn path_has_build_cache_segment(path: &str) -> bool {
+    path.split('/')
+        .any(|seg| RM_BUILD_CACHE_SEGMENTS.contains(&seg))
+}
+
 const BLOCK_DEVICE_PREFIXES: &[&str] = &[
     "/dev/sd",
     "/dev/nvme",
@@ -276,6 +324,14 @@ fn detect_rm_rf_user_data(argv: &[String]) -> Option<String> {
     for t in &targets {
         // Exact-match exclusion: rm -rf /tmp/something stays silent.
         if RM_SAFE_EXACT_PATHS.iter().any(|p| t.starts_with(p)) {
+            continue;
+        }
+        // Build-cache exclusion: rm -rf /home/me/proj/target/release stays
+        // silent because cargo / npm / pip / etc. routinely wipe their
+        // own cache dirs during build. Whole-segment match so
+        // `/home/me/target-data/` (user data dir that happens to contain
+        // "target") still fires. See `RM_BUILD_CACHE_SEGMENTS`.
+        if path_has_build_cache_segment(t) {
             continue;
         }
         if USER_DATA_PATH_PREFIXES.iter().any(|p| t.starts_with(p)) {
@@ -531,5 +587,111 @@ mod tests {
         let mut ev2 = ev.clone();
         ev2.ts = ev.ts + Duration::seconds(60);
         assert!(det.process(&ev2).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 2026-05-18 — build cache allowlist. Five critical alerts
+    // fired on Oracle prod within the first day of this detector
+    // because every `cargo build --release` deploy wiped
+    // `/home/ubuntu/innerwarden/target/release/incremental`. The
+    // allowlist below silences those without weakening detection
+    // for real user-data wipes.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn path_has_build_cache_segment_matches_known_caches() {
+        for path in &[
+            "/home/ubuntu/innerwarden/target/release/incremental",
+            "/home/me/project/target",
+            "/home/me/project/target/",
+            "/home/me/web/node_modules",
+            "/home/me/web/node_modules/some-pkg",
+            "/home/me/py/__pycache__/foo.cpython-310.pyc",
+            "/home/me/.cache/cargo",
+            "/home/me/proj/.gradle/caches",
+            "/home/me/py/.venv",
+            "/home/me/py/.tox/py310",
+            "/root/.cargo/registry",
+            "/home/me/.npm/_logs",
+        ] {
+            assert!(
+                path_has_build_cache_segment(path),
+                "should detect build-cache segment in {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_has_build_cache_segment_does_not_substring_match() {
+        // Whole-segment match: a path that *contains* the cache name
+        // as a substring inside a real user-data dir name must NOT
+        // be silenced. This guards real attacks like
+        // `rm -rf /home/me/target-data/` from being misclassified.
+        for path in &[
+            "/home/me/targetdata",
+            "/home/me/target-data",
+            "/home/me/notmytarget/file",
+            "/home/me/distillery",
+            "/home/me/important/.cachefile",
+            "/home/me/venv-thing",
+            "/etc/passwd",
+            "/etc",
+        ] {
+            assert!(
+                !path_has_build_cache_segment(path),
+                "should NOT match {path:?} as a build cache"
+            );
+        }
+    }
+
+    #[test]
+    fn rm_rf_of_cargo_incremental_cache_does_not_fire() {
+        // Regression anchor for the exact prod scenario: every
+        // `cargo build --release` ran this command and the detector
+        // emitted a critical incident.
+        let mut det = DataDestructionPatternDetector::new("test");
+        let ev = exec_event(
+            &[
+                "rm",
+                "-rf",
+                "/home/ubuntu/innerwarden/target/release/incremental",
+            ],
+            "rustc",
+        );
+        assert!(
+            det.process(&ev).is_none(),
+            "cargo incremental cache cleanup must not fire data_destruction_pattern"
+        );
+    }
+
+    #[test]
+    fn rm_rf_of_node_modules_does_not_fire() {
+        let mut det = DataDestructionPatternDetector::new("test");
+        let ev = exec_event(&["rm", "-rf", "/home/me/web/node_modules"], "bash");
+        assert!(det.process(&ev).is_none());
+    }
+
+    #[test]
+    fn rm_rf_of_full_target_dir_does_not_fire() {
+        // Common operator workflow: full clean rebuild = `rm -rf target`.
+        let mut det = DataDestructionPatternDetector::new("test");
+        let ev = exec_event(&["rm", "-rf", "/home/me/project/target"], "cargo");
+        assert!(det.process(&ev).is_none());
+    }
+
+    #[test]
+    fn rm_rf_of_user_data_named_like_target_still_fires() {
+        // Guard against the allowlist being too loose: a real attack
+        // wiping a directory whose name *contains* `target` (but
+        // isn't exactly `target` as a path segment) must still trip
+        // the detector.
+        let mut det = DataDestructionPatternDetector::new("test");
+        let ev = exec_event(&["rm", "-rf", "/home/me/important-target-data"], "bash");
+        let out = det.process(&ev).expect(
+            "rm -rf of a user-data dir whose name merely contains 'target' as substring \
+             (not as a `/`-separated segment) MUST still fire — this is the false-negative \
+             guard that keeps the build-cache allowlist tight.",
+        );
+        assert_eq!(out.severity, Severity::Critical);
     }
 }
