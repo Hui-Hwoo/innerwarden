@@ -23,6 +23,25 @@ fn has_json_flag(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--json")
 }
 
+fn check_style(status: CheckStatus) -> (&'static str, &'static str) {
+    match status {
+        CheckStatus::Secure => ("✓", "\x1b[32m"),
+        CheckStatus::Warning => ("⚠", "\x1b[33m"),
+        CheckStatus::Critical => ("✗", "\x1b[31m"),
+        CheckStatus::Unavailable => ("–", "\x1b[90m"),
+    }
+}
+
+fn threat_color(confidence: f64) -> &'static str {
+    if confidence >= 0.9 {
+        "\x1b[31;1m"
+    } else if confidence >= 0.7 {
+        "\x1b[31m"
+    } else {
+        "\x1b[33m"
+    }
+}
+
 /// `innerwarden-smm baseline` — capture firmware baseline.
 fn cmd_baseline() {
     let path = baseline::FirmwareBaseline::default_path();
@@ -83,12 +102,7 @@ fn cmd_audit(args: &[String]) {
 
     // Individual checks.
     for check in &report.checks {
-        let (icon, color_code) = match check.status {
-            CheckStatus::Secure => ("✓", "\x1b[32m"),
-            CheckStatus::Warning => ("⚠", "\x1b[33m"),
-            CheckStatus::Critical => ("✗", "\x1b[31m"),
-            CheckStatus::Unavailable => ("–", "\x1b[90m"),
-        };
+        let (icon, color_code) = check_style(check.status);
         let reset = "\x1b[0m";
         let conf = if check.confidence > 0.0 {
             format!(" \x1b[90m({:.0}%)\x1b[0m", check.confidence * 100.0)
@@ -110,13 +124,7 @@ fn cmd_audit(args: &[String]) {
         println!("  \x1b[35;1m══ Correlated Threats ══\x1b[0m");
         println!();
         for threat in &report.correlated_threats {
-            let color = if threat.confidence >= 0.9 {
-                "\x1b[31;1m"
-            } else if threat.confidence >= 0.7 {
-                "\x1b[31m"
-            } else {
-                "\x1b[33m"
-            };
+            let color = threat_color(threat.confidence);
             println!(
                 "  {color}⚡ [{id}] {name} ({conf:.0}% confidence)\x1b[0m",
                 id = threat.id,
@@ -264,10 +272,52 @@ mod tests {
     }
 
     #[test]
-    fn has_json_flag_is_false_when_absent() {
-        // Negative path: normal runs without `--json` should remain in
-        // human-readable mode.
-        let args = vec!["innerwarden-smm".to_string(), "audit".to_string()];
+    fn format_trust_marks_threshold_boundaries() {
+        let trusted = format_trust(0.90);
+        let degraded = format_trust(0.60);
+        let at_risk = format_trust(0.30);
+        let compromised = format_trust(0.299);
+
+        assert!(trusted.contains("90% — TRUSTED"));
+        assert!(degraded.contains("60% — DEGRADED"));
+        assert!(at_risk.contains("30% — AT RISK"));
+        assert!(compromised.contains("29% — COMPROMISED"));
+    }
+
+    #[test]
+    fn format_trust_truncates_fractional_percent_before_band_selection() {
+        let just_below_trusted = format_trust(0.899);
+        let just_below_degraded = format_trust(0.599);
+
+        assert!(just_below_trusted.contains("89% — DEGRADED"));
+        assert!(just_below_degraded.contains("59% — AT RISK"));
+    }
+
+    #[test]
+    fn check_style_maps_every_check_status() {
+        assert_eq!(check_style(CheckStatus::Secure), ("✓", "\x1b[32m"));
+        assert_eq!(check_style(CheckStatus::Warning), ("⚠", "\x1b[33m"));
+        assert_eq!(check_style(CheckStatus::Critical), ("✗", "\x1b[31m"));
+        assert_eq!(check_style(CheckStatus::Unavailable), ("–", "\x1b[90m"));
+    }
+
+    #[test]
+    fn threat_color_maps_confidence_thresholds() {
+        assert_eq!(threat_color(0.95), "\x1b[31;1m");
+        assert_eq!(threat_color(0.90), "\x1b[31;1m");
+        assert_eq!(threat_color(0.89), "\x1b[31m");
+        assert_eq!(threat_color(0.70), "\x1b[31m");
+        assert_eq!(threat_color(0.69), "\x1b[33m");
+    }
+
+    #[test]
+    fn has_json_flag_requires_exact_flag_match() {
+        let args = vec![
+            "innerwarden-smm".to_string(),
+            "--json=false".to_string(),
+            "audit-json".to_string(),
+        ];
+
         assert!(!has_json_flag(&args));
     }
 }
