@@ -78,7 +78,6 @@ jobs:
             --timeout 600 \
             --out xml \
             --skip-clean \
-            --ignore-tests \
             --exclude-files "crates/sensor-ebpf/*" \
             --exclude-files "crates/sensor-ebpf-types/*" \
             --engine llvm
