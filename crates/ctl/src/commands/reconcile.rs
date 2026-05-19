@@ -147,6 +147,9 @@ pub(crate) fn parse_ufw_rules(ufw_output: &str) -> Vec<UfwRule> {
             continue;
         };
         let target = after_deny
+            .split('#')
+            .next()
+            .unwrap_or("")
             .split_whitespace()
             .next()
             .unwrap_or("")
@@ -398,6 +401,38 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0.index, 17);
         assert_eq!(matches[0].1, "104.16.0.0/13");
+    }
+
+    #[test]
+    fn parse_ignores_malformed_rule_numbers_and_missing_brackets() {
+        let out = "\
+[ xx] Anywhere                   DENY IN     1.2.3.4                    # innerwarden
+[  9 Anywhere                    DENY IN     5.6.7.8                    # innerwarden
+  10] Anywhere                   DENY IN     9.9.9.9                    # innerwarden
+";
+        assert!(parse_ufw_rules(out).is_empty());
+    }
+
+    #[test]
+    fn parse_ignores_agent_rule_without_target_after_deny_in() {
+        let out =
+            "[ 11] Anywhere                   DENY IN                              # innerwarden\n";
+        assert!(parse_ufw_rules(out).is_empty());
+    }
+
+    #[test]
+    fn match_safelist_rejects_invalid_cidr_prefix_lengths() {
+        let list = safelist_cidrs();
+        assert!(match_safelist("104.16.0.0/99", &list).is_none());
+        assert!(match_safelist("2001:db8::1/129", &list).is_none());
+    }
+
+    #[test]
+    fn safelist_cidrs_are_deduplicated() {
+        let list = safelist_cidrs();
+        let unique: std::collections::HashSet<String> =
+            list.iter().map(std::string::ToString::to_string).collect();
+        assert_eq!(unique.len(), list.len());
     }
 
     #[test]
