@@ -335,3 +335,151 @@ pub(crate) fn parse_iptables_input(s: &str) -> (DefaultPolicy, Vec<u16>, Option<
     }
     (policy, allowed, None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn posture(
+        probe_state: ProbeState,
+        policy: DefaultPolicy,
+        allowed_tcp_ports: Vec<u16>,
+    ) -> FirewallPosture {
+        FirewallPosture {
+            probe_state,
+            active_backends: vec![FirewallBackend::Ufw],
+            default_policy: policy,
+            allowed_tcp_ports,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn would_drop_port_requires_successful_probe_drop_policy_and_unopened_port() {
+        let drop_firewall = posture(ProbeState::Ok, DefaultPolicy::Drop, vec![22, 443]);
+        assert!(drop_firewall.would_drop_port(8080));
+        assert!(!drop_firewall.would_drop_port(22));
+
+        let accept_firewall = posture(ProbeState::Ok, DefaultPolicy::Accept, vec![]);
+        assert!(!accept_firewall.would_drop_port(8080));
+
+        let failed_probe = posture(ProbeState::Failed, DefaultPolicy::Drop, vec![]);
+        assert!(!failed_probe.would_drop_port(8080));
+    }
+
+    #[test]
+    fn parse_ufw_active_deny_extracts_unique_allowed_tcp_ports() {
+        let status = r#"
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW IN    Anywhere
+22/tcp                     ALLOW IN    Anywhere (v6)
+443/tcp                    ALLOW IN    Anywhere
+53/udp                     ALLOW IN    Anywhere
+8080/tcp                   DENY IN     Anywhere
+"#;
+
+        let (policy, ports, err) = parse_ufw_status(status);
+
+        assert_eq!(policy, DefaultPolicy::Drop);
+        assert_eq!(ports, vec![22, 443]);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn parse_ufw_inactive_is_permissive_even_when_default_mentions_deny() {
+        let status = r#"
+Status: inactive
+Default: deny (incoming), allow (outgoing), disabled (routed)
+22/tcp ALLOW IN Anywhere
+"#;
+
+        let (policy, ports, _) = parse_ufw_status(status);
+
+        assert_eq!(policy, DefaultPolicy::Permissive);
+        assert_eq!(ports, vec![22]);
+    }
+
+    #[test]
+    fn parse_ufw_reject_incoming_maps_to_drop_and_allow_maps_to_accept() {
+        let reject_status = "Status: active\nDefault: reject (incoming), allow (outgoing)\n";
+        let allow_status = "Status: active\nDefault: allow (incoming), allow (outgoing)\n";
+
+        assert_eq!(parse_ufw_status(reject_status).0, DefaultPolicy::Drop);
+        assert_eq!(parse_ufw_status(allow_status).0, DefaultPolicy::Accept);
+    }
+
+    #[test]
+    fn parse_nft_ruleset_extracts_input_policy_and_accept_ports() {
+        let ruleset = r#"
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        tcp dport 22 accept
+        tcp dport 8443 ct state new accept
+        udp dport 53 accept
+        tcp dport 22 accept
+    }
+}
+"#;
+
+        let (policy, ports, err) = parse_nft_ruleset(ruleset);
+
+        assert_eq!(policy, DefaultPolicy::Drop);
+        assert_eq!(ports, vec![22, 8443]);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn parse_nft_ruleset_accept_policy_and_unknown_policy_fallback() {
+        let accept_ruleset = r#"
+table inet filter {
+    chain INPUT {
+        type filter hook input priority 0; policy accept;
+    }
+}
+"#;
+        let missing_policy_ruleset = "table inet filter { chain forward { policy drop; } }";
+
+        assert_eq!(parse_nft_ruleset(accept_ruleset).0, DefaultPolicy::Accept);
+        assert_eq!(
+            parse_nft_ruleset(missing_policy_ruleset).0,
+            DefaultPolicy::Permissive
+        );
+    }
+
+    #[test]
+    fn parse_iptables_input_extracts_policy_and_unique_tcp_ports() {
+        let rules = r#"
+Chain INPUT (policy DROP)
+num  target     prot opt source               destination
+1    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:22
+2    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:22
+3    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:65535
+4    DROP       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:8080
+5    ACCEPT     udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:53
+"#;
+
+        let (policy, ports, err) = parse_iptables_input(rules);
+
+        assert_eq!(policy, DefaultPolicy::Drop);
+        assert_eq!(ports, vec![22, 65535]);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn parse_iptables_input_accept_and_unknown_policy_fallbacks() {
+        let accept_rules = "Chain INPUT (policy ACCEPT)\n";
+        let unknown_rules = "Chain INPUT (policy QUEUE)\n";
+
+        assert_eq!(parse_iptables_input(accept_rules).0, DefaultPolicy::Accept);
+        assert_eq!(
+            parse_iptables_input(unknown_rules).0,
+            DefaultPolicy::Permissive
+        );
+    }
+}

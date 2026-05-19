@@ -97,6 +97,10 @@ pub fn check_microcode() -> CheckResult {
         };
     };
 
+    classify_microcode_state(&state)
+}
+
+fn classify_microcode_state(state: &MicrocodeState) -> CheckResult {
     let core_count = state.revisions.len();
     let first_rev = state.revisions.values().next().cloned().unwrap_or_default();
 
@@ -220,6 +224,66 @@ CPU revision	: 4
         assert!(state.vendor.contains("ARM"));
         assert_eq!(state.revisions.len(), 2);
         assert!(state.uniform);
+    }
+
+    #[test]
+    fn parse_empty_cpuinfo_returns_none() {
+        assert!(MicrocodeState::parse("").is_none());
+        assert!(MicrocodeState::parse("processor : 0\nmodel name : mystery\n").is_none());
+    }
+
+    #[test]
+    fn parse_vendor_without_microcode_keeps_empty_revision_set() {
+        let state = MicrocodeState::parse(
+            "processor : 0\nvendor_id : GenuineIntel\nmodel name : Intel Test CPU\n",
+        )
+        .unwrap();
+
+        assert_eq!(state.vendor, "GenuineIntel");
+        assert_eq!(state.model, "Intel Test CPU");
+        assert!(state.revisions.is_empty());
+        assert!(state.uniform);
+    }
+
+    #[test]
+    fn parse_bad_processor_id_falls_back_to_core_zero() {
+        let state = MicrocodeState::parse(
+            "processor : not-a-number\nvendor_id : GenuineIntel\nmicrocode : 0x55\n",
+        )
+        .unwrap();
+
+        assert_eq!(state.revisions.len(), 1);
+        assert_eq!(state.revisions[&0], "0x55");
+        assert!(state.uniform);
+    }
+
+    #[test]
+    fn classify_secure_state_reports_core_count_and_revision() {
+        let state = MicrocodeState::parse(SAMPLE_X86).unwrap();
+        let result = classify_microcode_state(&state);
+
+        assert_eq!(result.id, "UCODE-001");
+        assert_eq!(result.name, "CPU Microcode");
+        assert_eq!(result.status, CheckStatus::Secure);
+        assert_eq!(result.confidence, confidence(0.6, 1.0));
+        assert!(result.detail.contains("GenuineIntel"));
+        assert!(result.detail.contains("2 cores"));
+        assert!(result.detail.contains("0xf4"));
+    }
+
+    #[test]
+    fn classify_mismatched_state_is_critical_with_per_core_versions() {
+        let state = MicrocodeState::parse(SAMPLE_MISMATCH).unwrap();
+        let result = classify_microcode_state(&state);
+
+        assert_eq!(result.status, CheckStatus::Critical);
+        assert_eq!(result.confidence, confidence(0.9, 0.95));
+        assert!(result.detail.contains("MICROCODE MISMATCH"));
+        assert!(result.detail.contains("core0=0xf4"));
+        assert!(result.detail.contains("core1=0xf2"));
+        assert!(result
+            .detail
+            .contains("Possible targeted microcode injection"));
     }
 
     #[test]

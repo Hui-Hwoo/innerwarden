@@ -292,4 +292,112 @@ mod tests {
         assert_eq!(cef_severity(&Severity::High), 7);
         assert_eq!(cef_severity(&Severity::Critical), 10);
     }
+
+    #[test]
+    fn event_cef_escapes_header_and_extension_fields() {
+        let mut event = make_event();
+        event.kind = "network|connect=outbound".into();
+        event.summary = "bash|curl=probe".into();
+        event.host = "host|one".into();
+        event.source = "sensor=ebpf".into();
+        event.details = serde_json::json!({
+            "comm": "curl|wget=probe\\child\nnext",
+            "pid": 42,
+            "dst_ip": "198.51.100.10",
+            "dst_port": 443,
+        });
+
+        let cef = format_event_cef(&event, "0.7|beta");
+
+        assert!(cef.contains("0.7|beta"));
+        assert!(cef.contains("network\\|connect\\=outbound"));
+        assert!(cef.contains("bash\\|curl\\=probe"));
+        assert!(cef.contains("shost=host\\|one"));
+        assert!(cef.contains("cs1=sensor\\=ebpf"));
+        assert!(cef.contains("dproc=curl\\|wget\\=probe\\\\child next"));
+    }
+
+    #[test]
+    fn event_cef_omits_optional_details_when_absent() {
+        let mut event = make_event();
+        event.details = serde_json::json!({});
+        event.entities = vec![];
+
+        let cef = format_event_cef(&event, "0.6.0");
+
+        assert!(cef.contains("src=0.0.0.0"));
+        assert!(!cef.contains(" dpid="));
+        assert!(!cef.contains(" dproc="));
+        assert!(!cef.contains(" dst="));
+        assert!(!cef.contains(" dpt="));
+    }
+
+    #[test]
+    fn incident_cef_escapes_identifiers_title_and_summary() {
+        let mut incident = make_incident();
+        incident.incident_id = "inc|42=abc".into();
+        incident.title = "C2|callback=detected".into();
+        incident.summary = "line1\nline2|summary=escaped".into();
+        incident.host = "edge=host".into();
+        incident.entities = vec![];
+
+        let cef = format_incident_cef(&incident, "1.0.0");
+
+        assert!(cef.contains("inc\\|42\\=abc"));
+        assert!(cef.contains("C2\\|callback\\=detected"));
+        assert!(cef.contains("src=0.0.0.0"));
+        assert!(cef.contains("shost=edge\\=host"));
+        assert!(cef.contains("msg=line1 line2\\|summary\\=escaped"));
+    }
+
+    #[test]
+    fn hostname_prefers_env_var() {
+        std::env::set_var("HOSTNAME", "sensor-test-host");
+        assert_eq!(hostname(), "sensor-test-host");
+        std::env::remove_var("HOSTNAME");
+    }
+
+    #[test]
+    fn udp_writer_sends_syslog_wrapped_cef_message() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let addr = receiver.local_addr().unwrap();
+        let config = SyslogCefConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            protocol: SyslogProtocol::Udp,
+        };
+        let mut writer = SyslogCefWriter::new(config, "0.6.0");
+
+        writer.write_event(&make_event());
+
+        let mut buf = [0_u8; 2048];
+        let (len, _) = receiver.recv_from(&mut buf).unwrap();
+        let msg = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(msg.starts_with("<14>"));
+        assert!(msg.contains(" innerwarden: CEF:0|InnerWarden|Sensor|0.6.0|"));
+        assert!(msg.ends_with('\n'));
+    }
+
+    #[test]
+    fn tcp_writer_clears_stream_after_send_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let config = SyslogCefConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            protocol: SyslogProtocol::Tcp,
+        };
+        let mut writer = SyslogCefWriter::new(config, "0.6.0");
+        handle.join().unwrap();
+
+        writer.write_event(&make_event());
+        writer.write_incident(&make_incident());
+    }
 }
