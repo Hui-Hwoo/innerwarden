@@ -435,4 +435,89 @@ mod tests {
             Some("abc123".to_string())
         );
     }
+
+    #[test]
+    fn extract_session_id_accepts_closing_paren_and_rejects_blank_marker() {
+        assert_eq!(
+            extract_session_id_from_message("Honeypot listeners started (session sess-42)"),
+            Some("sess-42".to_string())
+        );
+        assert_eq!(
+            extract_session_id_from_message("Honeypot listeners started (session   )"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_commands_ignores_non_string_empty_and_malformed_entries() {
+        let val = json!({
+            "type": "ssh_connection",
+            "shell_commands": [
+                { "command": "id" },
+                { "command": 42 },
+                { "command": "" },
+                { "not_command": "whoami" },
+                { "command": "cat /etc/passwd" }
+            ]
+        });
+
+        let cmds = extract_commands_from_json(&val).unwrap();
+        assert_eq!(cmds, vec!["id".to_string(), "cat /etc/passwd".to_string()]);
+    }
+
+    #[test]
+    fn extract_credentials_ignores_empty_user_and_preserves_empty_password() {
+        let val = json!({
+            "type": "ssh_connection",
+            "auth_attempts": [
+                { "username": "", "password": "ignored" },
+                { "username": "root", "password": "" },
+                { "username": "deploy", "password": 123 },
+                { "username": "admin", "password": "toor" }
+            ]
+        });
+
+        let creds = extract_credentials_from_json(&val).unwrap();
+        assert_eq!(creds.len(), 3);
+        assert_eq!(creds[0], ("root".to_string(), Some("".to_string())));
+        assert_eq!(creds[1], ("deploy".to_string(), None));
+        assert_eq!(creds[2], ("admin".to_string(), Some("toor".to_string())));
+    }
+
+    #[tokio::test]
+    async fn read_evidence_jsonl_skips_bad_lines_and_collects_all_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let evidence = dir.path().join("listener-session-test.jsonl");
+        tokio::fs::write(
+            &evidence,
+            concat!(
+                "not json\n",
+                r#"{"type":"ssh_connection","shell_commands":[{"command":"uname -a"}],"auth_attempts":[{"username":"root","password":"123"}]}"#,
+                "\n",
+                r#"{"type":"http_connection","shell_commands":[{"command":"ignored"}],"auth_attempts":[{"username":"ignored"}]}"#,
+                "\n",
+                r#"{"type":"ssh_connection","shell_commands":[{"command":"whoami"}],"auth_attempts":[{"username":"admin"}]}"#,
+                "\n"
+            ),
+        )
+        .await
+        .expect("write evidence");
+
+        let commands = read_shell_commands_from_evidence(&evidence).await;
+        assert_eq!(commands, vec!["uname -a".to_string(), "whoami".to_string()]);
+
+        let creds = read_credentials_from_evidence(&evidence).await;
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0], ("root".to_string(), Some("123".to_string())));
+        assert_eq!(creds[1], ("admin".to_string(), None));
+    }
+
+    #[tokio::test]
+    async fn read_evidence_missing_file_returns_empty_vectors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.jsonl");
+
+        assert!(read_shell_commands_from_evidence(&missing).await.is_empty());
+        assert!(read_credentials_from_evidence(&missing).await.is_empty());
+    }
 }
