@@ -9,6 +9,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-05-20
+
+Dashboard observability polish + correlation engine wiring fix. Seven PRs against `main` after v0.14.0 was tagged. Verified end-to-end on Oracle prod (ARM64 aarch64, kernel 6.8.0-1052-oracle) before tagging.
+
+### Added
+
+- **Community feedback banner on the Home page** (PR #752, refined in #753 / #754). Spec 051 PR1. In-dashboard ask routed through `feedback@innerwarden.com`, GitHub Discussions, Issues, and good-first-issues — preserves the zero-telemetry contract while giving operators a friction-free way to surface back to the project. Dismissible with "remind me in 30 days" or "hide forever", persisted in `localStorage`. Graceful degradation when storage is unavailable (private-mode Safari, quota errors).
+- **Local Warden Model heuristic decision markers in the reason field** (PR #751). When the local classifier shadows or drives a `block_ip` / `monitor_ip` / `escalate` decision, the operator-visible reason now exposes the heuristic markers that drove the head's vote (e.g. `[scanner-burst]`, `[c2-callback]`, `[exfil-after-recon]`). Closes the "Decide but don't explain" gap operators flagged after the v0.14.0 shadow-mode rollout — the head was already producing the markers internally, this just surfaces them.
+
+### Fixed
+
+- **Cross-layer correlation engine now actually sees firmware ticks** (PR #749). `firmware_tick` events from the SMM crate fired every 5 minutes but never reached the correlation engine, so CL-041 / CL-042 / CL-043 (Blue Pill, VM Escape, Deep Ring Compromise) could not anchor on the firmware leg. The hypervisor tick path had the wire; the firmware path was silently dropped at the `tokio::select!` dispatcher. Now firmware ticks feed the engine, which means firmware-leg correlation rules can fire as designed.
+- **`operator_timezone` test race** (PR #750). Three tests in `data_api.rs` mutated the global `TZ` env var in parallel under `cargo test`, producing intermittent CI failures on `main`. Extracted a pure `operator_timezone_from(env_tz, etc_timezone)` helper that takes its inputs as arguments, so the tests no longer touch process-global state. Race is permanently gone.
+- **Community banner copy** (PR #753, PR #754). Initial banner (#752) shipped with a pleading tone that framed the privacy stance as a deficit ("I genuinely don't know if anyone is using this") and routed feedback through a personal gmail. Reframed the copy to position zero-telemetry as the load-bearing feature it is, switched the email to `feedback@innerwarden.com`, dropped a Discord/Telegram placeholder that promised a channel before it existed.
+
+### Notes
+
+- `[Unreleased]` is now empty.
+- Cargo workspace version bumped to `0.14.1`. No breaking changes; configs from `0.14.0` upgrade with no edits.
+
 ## [0.14.0] - 2026-05-18
 
 Major Linux MITRE ATT&CK coverage release. Adds 21 new detectors across six tactics (Reconnaissance, Collection, Command & Control, Privilege Escalation, Lateral Movement, Persistence, Defense Evasion, Impact) and 20 new cross-layer correlation rules covering full kill-chain attack patterns. **Detector count: 53 → 73. Cross-layer correlation rules: 47 → 67. MITRE technique IDs covered: 65 → 75+.** Also lands first-class OpenClaw / peer AI agent integration on the same host, dashboard counters migrated to canonical SQLite source-of-truth, telemetry name-drift cleanup, and a license harmonisation across the four satellite crates.
