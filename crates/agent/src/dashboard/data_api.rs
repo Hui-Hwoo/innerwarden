@@ -217,13 +217,32 @@ pub(super) fn ts_passes_hour_filter(ts_ms: i64, hour_filter: Option<(u32, u32)>)
 /// 2. `/etc/timezone` first line (Linux convention).
 /// 3. `"UTC"` fallback.
 pub(super) fn operator_timezone() -> String {
-    if let Ok(tz) = std::env::var("TZ") {
+    let env_tz = std::env::var("TZ").ok();
+    let etc_timezone = std::fs::read_to_string("/etc/timezone").ok();
+    operator_timezone_from(env_tz.as_deref(), etc_timezone.as_deref())
+}
+
+/// Pure helper: resolves the operator timezone given an `env_tz` value
+/// (typically `$TZ`) and an `etc_timezone` file content (typically
+/// `/etc/timezone`). Same precedence chain as `operator_timezone`,
+/// but takes its inputs as parameters so unit tests do not need to
+/// mutate the process-global `TZ` env var.
+///
+/// 2026-05-20 fix: the original tests called `std::env::set_var("TZ", ...)`
+/// inside `#[test]` fns. Cargo runs test fns in parallel by default,
+/// and `std::env` writes are process-global, so two tests setting
+/// different `TZ` values raced and produced sporadic failures like
+/// "left: Etc/UTC, right: America/Sao_Paulo" on `operator_timezone_trims_whitespace_in_env_var`.
+/// Routing prod through this pure helper makes the test paths
+/// race-free without giving up coverage.
+fn operator_timezone_from(env_tz: Option<&str>, etc_timezone: Option<&str>) -> String {
+    if let Some(tz) = env_tz {
         let trimmed = tz.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
     }
-    if let Ok(content) = std::fs::read_to_string("/etc/timezone") {
+    if let Some(content) = etc_timezone {
         let first_line = content.lines().next().unwrap_or("").trim();
         if !first_line.is_empty() {
             return first_line.to_string();
@@ -2551,56 +2570,67 @@ mod tests {
 
     #[test]
     fn operator_timezone_prefers_env_var() {
-        // SAFETY: temp env var override scoped to this test. Cleared
-        // at the end to avoid cross-test contamination.
-        let original = std::env::var("TZ").ok();
-        // SAFETY: tests run single-threaded inside the test mod (no
-        // cross-thread env mutation).
-        unsafe { std::env::set_var("TZ", "America/Sao_Paulo") };
-        let resolved = operator_timezone();
-        assert_eq!(resolved, "America/Sao_Paulo");
-        match original {
-            Some(prev) => unsafe { std::env::set_var("TZ", prev) },
-            None => unsafe { std::env::remove_var("TZ") },
-        }
+        // Env-var precedence: `$TZ` wins over `/etc/timezone`. Uses
+        // the pure helper so this test does not race the sister
+        // tests below over the process-global `TZ` value.
+        assert_eq!(
+            operator_timezone_from(Some("America/Sao_Paulo"), Some("Europe/London\n")),
+            "America/Sao_Paulo",
+            "TZ env var must take precedence over /etc/timezone"
+        );
     }
 
     #[test]
     fn operator_timezone_trims_whitespace_in_env_var() {
         // Trim path: a TZ value with surrounding whitespace must
-        // resolve to the trimmed name. Does NOT cover the fallback
-        // chain — `/etc/timezone` content varies per CI runner
-        // (Ubuntu's docker image carries `Etc/UTC`, not bare `UTC`)
-        // so a fallback assertion is non-deterministic. Coverage for
-        // the fallback chain lives in `operator_timezone_falls_back`.
-        let original = std::env::var("TZ").ok();
-        // SAFETY: tests run single-threaded inside the test mod.
-        unsafe { std::env::set_var("TZ", "  America/Sao_Paulo  ") };
-        assert_eq!(operator_timezone(), "America/Sao_Paulo");
-        match original {
-            Some(prev) => unsafe { std::env::set_var("TZ", prev) },
-            None => unsafe { std::env::remove_var("TZ") },
-        }
+        // resolve to the trimmed name. Uses the pure helper so this
+        // test does not need to mutate the process-global `TZ` env
+        // var (which previously raced with the sister test below
+        // under cargo's default parallel `#[test]` execution and
+        // produced sporadic "left: Etc/UTC" failures).
+        assert_eq!(
+            operator_timezone_from(Some("  America/Sao_Paulo  "), None),
+            "America/Sao_Paulo"
+        );
     }
 
     #[test]
     fn operator_timezone_falls_back_when_env_var_blank() {
         // When `TZ` is unset OR whitespace-only, `operator_timezone`
-        // falls through to `/etc/timezone` (which the test cannot
-        // deterministically pin) and then to `"UTC"`. Anchor only
-        // checks that the helper returns a non-empty string — never
-        // panics, never returns `""`.
-        let original = std::env::var("TZ").ok();
-        unsafe { std::env::set_var("TZ", "   ") };
+        // falls through to `/etc/timezone` and then to `"UTC"`.
+        // Drive the pure helper directly so the test does not depend
+        // on the CI runner's `/etc/timezone` content.
+        assert_eq!(
+            operator_timezone_from(Some("   "), Some("America/Sao_Paulo\n")),
+            "America/Sao_Paulo",
+            "whitespace-only TZ must fall through to /etc/timezone"
+        );
+        assert_eq!(
+            operator_timezone_from(None, Some("Europe/London\n")),
+            "Europe/London",
+            "missing TZ must fall through to /etc/timezone"
+        );
+        assert_eq!(
+            operator_timezone_from(None, None),
+            "UTC",
+            "missing TZ and missing /etc/timezone must fall back to UTC"
+        );
+        assert_eq!(
+            operator_timezone_from(Some(""), Some("")),
+            "UTC",
+            "empty TZ and empty /etc/timezone must fall back to UTC"
+        );
+        // Final sanity check: the production wrapper (which DOES read
+        // env + filesystem) must always return a non-empty string,
+        // regardless of what TZ another test happens to be holding.
+        // Final sanity check: the production wrapper (which DOES read
+        // env + filesystem) must always return a non-empty string,
+        // regardless of what TZ another test happens to be holding.
         let resolved = operator_timezone();
         assert!(
             !resolved.is_empty(),
             "operator_timezone() must always return a non-empty TZ string (got empty)"
         );
-        match original {
-            Some(prev) => unsafe { std::env::set_var("TZ", prev) },
-            None => unsafe { std::env::remove_var("TZ") },
-        }
     }
 
     #[test]
