@@ -102,9 +102,10 @@ impl SetupResponderPlan {
 ///
 /// The on-device classifier is an alternative to a cloud LLM for the
 /// `Decide` capability (block / dismiss / escalate). Saying yes here
-/// just records the operator's intent — the actual model artefact is
-/// downloaded by `innerwarden install-warden`, which can run after the
-/// wizard once the classifier-v1 release lands (issue #642).
+/// triggers `apply_setup_warden_plan` to actually download the model
+/// (`innerwarden install-warden` path, ~91 MB) and persist the
+/// `[ai.warden]` section to agent.toml so the agent picks it up on
+/// the next restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SetupWardenPlan {
     /// Operator said yes to the pitch (or was auto-confirmed because
@@ -121,7 +122,7 @@ impl SetupWardenPlan {
         if self.already_configured {
             "already configured"
         } else if self.enabled {
-            "enabled (run install-warden when release lands)"
+            "installing now"
         } else {
             "skipped (Decide via cloud AI)"
         }
@@ -827,16 +828,16 @@ fn prompt_setup_ai_plan() -> Result<Option<SetupAiPlan>> {
 /// Pure builder for the wizard's `[1/4] Local Warden Model` pitch lines.
 /// Returns the dim-style benefit / cost bullets — the bold step header
 /// and the intro sentences are added by `prompt_setup_warden_plan`. Kept
-/// pure so the content (token savings, latency numbers, RAM cost, the
-/// classifier-v1 release reference) can be asserted in tests without
-/// driving the interactive prompt.
+/// pure so the content (token savings, latency numbers, RAM cost,
+/// install footprint) can be asserted in tests without driving the
+/// interactive prompt.
 fn warden_pitch_lines() -> &'static [&'static str] {
     &[
         "+ 0 tokens spent on Decide (the highest-volume LLM call)",
         "+ ~60 ms p50 vs ~500-2000 ms cloud round-trip",
         "+ Decide traffic never leaves the server",
         "- costs ~91 MB disk + ~150 MB RAM",
-        "- download is staged after setup (issue #642 / classifier-v1 release)",
+        "- adds ~30 s to setup (model downloads now)",
     ]
 }
 
@@ -882,10 +883,10 @@ fn prompt_setup_warden_plan() -> Result<SetupWardenPlan> {
 ///
 /// What the pitch is honest about:
 ///   - **Disk + RAM cost.** ~91 MB on disk, ~150 MB resident.
-///   - **Install is two-step right now.** The `classifier-v1` release
-///     that ships the model artefact hasn't been cut yet (tracking on
-///     issue #642). Saying yes here only records intent — the operator
-///     runs `innerwarden install-warden` once the release lands.
+///   - **Install runs now.** Saying yes triggers `cmd_install_classifier`
+///     inside the wizard (download + SHA verify + extract) and writes
+///     `[ai.warden]` to agent.toml. Adds ~30 s to setup. If the download
+///     fails it falls back to the next step's cloud Decide path.
 #[cfg(not(any(test, coverage)))]
 fn prompt_setup_warden_plan() -> Result<SetupWardenPlan> {
     let bold = Style::new().bold();
@@ -990,6 +991,64 @@ fn prompt_setup_ai_plan() -> Result<Option<SetupAiPlan>> {
     } else {
         Ok(None)
     }
+}
+
+/// Apply the `[1/4] Local Warden Model` plan: when the operator said yes,
+/// invoke the same install path that `innerwarden install-warden` uses,
+/// then persist the canonical `[ai.warden]` section in agent.toml so the
+/// agent picks the local Decide provider on its next restart.
+///
+/// Returns `Ok(true)` when the warden is active after the call (either
+/// just installed, or was already configured before the wizard ran).
+/// Returns `Ok(false)` when the operator said no (skipped) or when the
+/// download/install failed and was reported as a soft warning. The
+/// soft-fail behaviour is deliberate: a transient network blip during
+/// setup must not block the rest of the wizard, and `[2/4] AI` will
+/// still configure a working cloud-based Decide path when warden is
+/// absent. The operator can retry by re-running `innerwarden setup` or
+/// `sudo innerwarden install-warden`.
+fn apply_setup_warden_plan(cli: &Cli, plan: &SetupWardenPlan) -> Result<bool> {
+    if !plan.enabled {
+        return Ok(false);
+    }
+    if plan.already_configured {
+        return Ok(true);
+    }
+
+    // Default variant ("minilm-l6" → 87 MB MiniLM-L6 student) ships
+    // with a pinned SHA-256 in `commands::ai::CLASSIFIER_VARIANTS`.
+    // `--yes` skips the interactive confirmation since the wizard is
+    // already a confirmation flow.
+    match crate::commands::ai::cmd_install_classifier(
+        cli,
+        "minilm-l6",
+        None, // url override — use the pinned URL
+        None, // sha256 override — use the pinned digest
+        true, // yes — wizard already asked
+    ) {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("  [warn] Local Warden install failed: {err:#}");
+            eprintln!(
+                "  [warn] Continuing without warden — `[2/4] AI` will provide the Decide path."
+            );
+            eprintln!("  [warn] Retry later with `sudo innerwarden install-warden`.");
+            return Ok(false);
+        }
+    }
+
+    // Persist `[ai.warden]` so the agent's provider resolver picks the
+    // local_warden head. The constants here mirror the canonical config
+    // shape documented in `.claude/CLAUDE.md` Local Warden Model section.
+    config_editor::write_str(&cli.agent_config, "ai.warden", "provider", "local_warden")?;
+    config_editor::write_str(
+        &cli.agent_config,
+        "ai.warden",
+        "base_url",
+        "/var/lib/innerwarden/models/classifier",
+    )?;
+
+    Ok(true)
 }
 
 fn apply_setup_ai_plan(cli: &Cli, env_file: &Path, plan: &SetupAiPlan) -> Result<()> {
@@ -1749,16 +1808,18 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     // ── [1/4] Local Warden Model ─────────────────────────────────────────
     // Spec 032 wizard step. Asked first because saying yes here is the
     // cheapest token-saving switch the operator can make, and the AI step
-    // below is unaffected either way (cloud LLM still runs Explain/chat).
+    // below is still useful either way (cloud LLM still runs Explain,
+    // Briefings, and bot chat — only Decide moves on-device).
     //
-    // The choice is non-binding right now: we don't write `[ai.warden]`
-    // here because the model artefact lives behind the unreleased
-    // `classifier-v1` tag (issue #642). Saying yes prints a reminder to
-    // run `innerwarden install-warden` once the release lands; saying no
-    // continues silently. Re-prompted on every wizard run until the
-    // install path is wired end-to-end.
+    // Binding since the classifier-v1 release shipped: saying yes here
+    // immediately calls `cmd_install_classifier` (download + SHA pin +
+    // tar extract to /var/lib/innerwarden/models/classifier) and writes
+    // `[ai.warden]` into agent.toml, so the next agent restart picks the
+    // local Decide head. If the install fails (network, disk, sudo),
+    // `apply_setup_warden_plan` reports it as a soft warning and the
+    // wizard continues through `[2/4] AI` for a cloud-served Decide path.
     let warden_already = agent_warden_configured(agent_doc.as_ref());
-    let _warden_plan = if warden_already {
+    let warden_plan = if warden_already {
         println!(
             "  [ok] {}  {}",
             bold.apply_to("[1/4] Local Warden Model"),
@@ -1771,16 +1832,9 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     } else {
         let plan = prompt_setup_warden_plan()?;
         println!("\n  [ok] {}", dim.apply_to(plan.label()));
-        if plan.enabled {
-            println!(
-                "  {}",
-                dim.apply_to(
-                    "Run `sudo innerwarden install-warden` after the classifier-v1 release lands (issue #642)."
-                )
-            );
-        }
         plan
     };
+    let _warden_active = apply_setup_warden_plan(cli, &warden_plan)?;
 
     let ai_plan = if ai_ok {
         println!(
@@ -2419,6 +2473,56 @@ mod tests {
         let env = std::fs::read_to_string(&env_file).unwrap();
         assert!(env.contains("GROQ_API_KEY"));
         assert!(env.contains("gsk_test_key"));
+    }
+
+    #[test]
+    fn apply_setup_warden_plan_disabled_returns_false_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        let plan = SetupWardenPlan {
+            enabled: false,
+            already_configured: false,
+        };
+
+        let active = apply_setup_warden_plan(&cli, &plan).unwrap();
+
+        assert!(!active, "warden must report inactive when operator said no");
+        assert!(
+            !cli.agent_config.exists()
+                || !std::fs::read_to_string(&cli.agent_config)
+                    .unwrap()
+                    .contains("[ai.warden]"),
+            "skipped plan must not write [ai.warden] section"
+        );
+    }
+
+    #[test]
+    fn apply_setup_warden_plan_already_configured_returns_true_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let cli = make_test_cli(dir.path(), true);
+        // Pre-seed an agent.toml that already has the warden section.
+        // The wizard's `agent_warden_configured` check would have set
+        // `already_configured = true` for this state, so the apply path
+        // is a no-op and must not re-download.
+        std::fs::write(
+            &cli.agent_config,
+            "[ai.warden]\nprovider = \"local_warden\"\nbase_url = \"/var/lib/innerwarden/models/classifier\"\n",
+        )
+        .unwrap();
+        let plan = SetupWardenPlan {
+            enabled: true,
+            already_configured: true,
+        };
+        let before = std::fs::read_to_string(&cli.agent_config).unwrap();
+
+        let active = apply_setup_warden_plan(&cli, &plan).unwrap();
+
+        assert!(active, "warden must report active when already configured");
+        let after = std::fs::read_to_string(&cli.agent_config).unwrap();
+        assert_eq!(
+            before, after,
+            "already-configured path must not rewrite agent.toml"
+        );
     }
 
     #[test]
@@ -3231,9 +3335,12 @@ mod tests {
         assert!(bullets
             .iter()
             .any(|b| b.contains("~91 MB disk") && b.contains("~150 MB RAM")));
+        // Time cost — wizard installs the model right now (post-#642),
+        // so the second cost bullet mentions the setup-time penalty
+        // rather than the stale "release-not-cut-yet" caveat.
         assert!(bullets
             .iter()
-            .any(|b| b.contains("#642") && b.contains("classifier-v1")));
+            .any(|b| b.contains("~30") && b.contains("setup")));
     }
 
     #[test]
@@ -3250,10 +3357,7 @@ mod tests {
         let plan = build_warden_plan(true);
         assert!(plan.enabled);
         assert!(!plan.already_configured);
-        assert_eq!(
-            plan.label(),
-            "enabled (run install-warden when release lands)"
-        );
+        assert_eq!(plan.label(), "installing now");
     }
 
     #[test]
@@ -3276,10 +3380,7 @@ mod tests {
             enabled: true,
             already_configured: false,
         };
-        assert_eq!(
-            enabled.label(),
-            "enabled (run install-warden when release lands)"
-        );
+        assert_eq!(enabled.label(), "installing now");
 
         let skipped = SetupWardenPlan {
             enabled: false,
