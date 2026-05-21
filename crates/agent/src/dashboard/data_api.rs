@@ -1385,7 +1385,13 @@ pub(super) async fn api_incidents(
 }
 
 fn compute_incidents_blocking(state: &DashboardState, query: ListQuery) -> IncidentListResponse {
-    let date = resolve_date(query.date.as_deref());
+    // 2026-05-21 audit: use the operator-local "today" so the default
+    // (no `?date=` query) lines up with the frontend's local clock.
+    // `resolve_date_local` reads from `chrono::Local`, which respects
+    // the agent's `TZ` env var. Cases is the only operator-facing tab
+    // where this matters — `api_overview` and `api_decisions` keep
+    // using UTC for now (separate follow-up).
+    let date = resolve_date_local(query.date.as_deref());
     let limit = normalize_limit(query.limit);
 
     // Spec 049 PR20 — Cases tab reads from SQLite, not the in-memory
@@ -1399,7 +1405,19 @@ fn compute_incidents_blocking(state: &DashboardState, query: ListQuery) -> Incid
     // permanently. See `cases_from_sqlite` for the new builder.
     let (total, mut items) = match state.sqlite_store.as_deref() {
         Some(store) => {
-            super::cases_from_sqlite::build_cases_for_date(store, &date, chrono::Utc::now())
+            // 2026-05-21 audit: pass `&chrono::Local` so the date string
+            // (operator-picked or defaulted) is interpreted as operator-local,
+            // not UTC. Pre-fix the Cases tab silently dropped any incident
+            // whose UTC ts fell on yesterday's UTC date but on today's
+            // operator-local date — most commonly the late-evening hours
+            // for any operator east of UTC. chrono::Local resolves the
+            // local zone via the agent's `TZ` env var or `/etc/timezone`.
+            super::cases_from_sqlite::build_cases_for_date(
+                store,
+                &date,
+                chrono::Utc::now(),
+                &chrono::Local,
+            )
         }
         None => (0, Vec::new()),
     };

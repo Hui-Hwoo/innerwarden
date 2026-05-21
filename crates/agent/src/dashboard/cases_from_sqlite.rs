@@ -23,13 +23,15 @@
 //!    `incident_id` join. Output matches the legacy `IncidentView`
 //!    shape so the frontend code is untouched.
 //!
-//! 2. **Non-incident-pipeline decisions** (Wave-10b documented):
-//!    six `incident_id` prefixes emit decisions WITHOUT writing a
+//! 2. **Non-incident-pipeline decisions** (Wave-10b + 2026-05-21 audit):
+//!    nine `incident_id` prefixes emit decisions WITHOUT writing a
 //!    matching incident row (`honeypot:always-on:abuseipdb:`,
 //!    `honeypot:abuseipdb:`, `repeat-offender:`, `proto_anomaly:`,
-//!    `suspicious_archive:`, `logging_config_change:`). PR20
-//!    synthesises an `IncidentView` for each so the operator-visible
-//!    audit trail mirrors the site's `/api/live-feed` count.
+//!    `suspicious_archive:`, `logging_config_change:`, plus
+//!    `multi-technique:`, `correlation:`, `packet_flood:` added after
+//!    the 2026-05-21 prod orphan audit). PR20 synthesises an
+//!    `IncidentView` for each so the operator-visible audit trail
+//!    mirrors the site's `/api/live-feed` count.
 //!
 //! ## Trade-off
 //!
@@ -40,7 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use innerwarden_core::incident::Incident;
 use serde_json::Value;
 
@@ -53,21 +55,32 @@ pub(super) const MAX_CASES_PER_REQUEST: usize = 100_000;
 
 /// Build the full list of `IncidentView` rows for `date_str`.
 ///
+/// `tz` is the timezone in which `date_str` is interpreted. In prod
+/// this is `chrono::Local` (which respects the agent's `TZ` env var and
+/// `/etc/timezone`), so the operator's local "today" matches what they
+/// see in the frontend even when the UTC day has already flipped. Tests
+/// pin a fixed timezone (typically `chrono::Utc`) to keep the boundary
+/// assertions deterministic across CI hosts.
+///
 /// Returns rows sorted ts-descending (newest first), trimmed to
 /// `limit`. The total count returned in `IncidentListResponse.total`
 /// is the unbounded total (pre-`take(limit)`) so the operator-visible
 /// "N attackers · M cases" subtitle stays honest.
-pub(super) fn build_cases_for_date(
+pub(super) fn build_cases_for_date<Tz>(
     store: &innerwarden_store::Store,
     date_str: &str,
     now: DateTime<Utc>,
-) -> (usize, Vec<IncidentView>) {
+    tz: &Tz,
+) -> (usize, Vec<IncidentView>)
+where
+    Tz: TimeZone,
+{
     // 1. Read incidents for the date (sensor-emitted rows).
-    let start_ts = start_of_day_ts(date_str, now);
+    let start_ts = start_of_day_ts(date_str, now, tz);
     let incidents = match store.incidents_since_ts(&start_ts, MAX_CASES_PER_REQUEST) {
         Ok(rows) => rows
             .into_iter()
-            .filter(|i| ts_is_on_date(i.ts, date_str))
+            .filter(|i| ts_is_on_date(i.ts, date_str, tz))
             .collect::<Vec<_>>(),
         Err(e) => {
             tracing::warn!(error = %e, "cases_from_sqlite: incidents query failed");
@@ -125,23 +138,44 @@ pub(super) fn build_cases_for_date(
     (total, views)
 }
 
-/// Returns the start-of-day RFC-3339 string for `date_str`. Falls back
-/// to `now`'s date if `date_str` is malformed so the handler does not
-/// crash on a typo.
-pub(super) fn start_of_day_ts(date_str: &str, now: DateTime<Utc>) -> String {
+/// Returns the start-of-day RFC-3339 string for `date_str` in `tz`,
+/// expressed as a UTC instant for the SQLite `ts > ?` query.
+///
+/// Falls back to `now`'s UTC date if `date_str` is malformed so the
+/// handler does not crash on a typo. DST gaps (e.g. America/Sao_Paulo
+/// historically jumping the local clock at midnight) are resolved with
+/// `single().or(latest())` — single() returns the unambiguous instant,
+/// latest() picks the later of the two valid instants on a fall-back
+/// DST transition. This is operator-friendly because the user will
+/// typically expect their "today" window to include the duplicated
+/// hour, not exclude it.
+pub(super) fn start_of_day_ts<Tz>(date_str: &str, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz: TimeZone,
+{
     let day = NaiveDate::parse_from_str(date_str, "%Y-%m-%d").unwrap_or_else(|_| now.date_naive());
-    day.and_hms_opt(0, 0, 0)
-        .expect("00:00:00 is a valid time")
-        .and_utc()
-        .to_rfc3339()
+    let local_midnight = day.and_hms_opt(0, 0, 0).expect("00:00:00 is a valid time");
+    let utc_instant = tz
+        .from_local_datetime(&local_midnight)
+        .single()
+        .or_else(|| tz.from_local_datetime(&local_midnight).latest())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| local_midnight.and_utc());
+    utc_instant.to_rfc3339()
 }
 
-/// `true` when `ts` falls on the same calendar day as `date_str` (UTC).
-fn ts_is_on_date(ts: DateTime<Utc>, date_str: &str) -> bool {
+/// `true` when `ts` falls on the same calendar day as `date_str` *in `tz`*.
+/// The `tz` argument matches what was passed to `start_of_day_ts`; the
+/// pair must stay in sync so the lower bound and the per-row filter
+/// agree on what "today" means.
+fn ts_is_on_date<Tz>(ts: DateTime<Utc>, date_str: &str, tz: &Tz) -> bool
+where
+    Tz: TimeZone,
+{
     let Ok(day) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") else {
         return true; // garbage in → don't filter
     };
-    ts.naive_utc().date() == day
+    ts.with_timezone(tz).date_naive() == day
 }
 
 /// Group raw decisions by `incident_id`. Each entry is the parsed JSON
@@ -159,10 +193,25 @@ fn group_decisions_by_incident_id(
     map
 }
 
-/// Returns `true` when `incident_id` matches one of the six Wave-10b
-/// non-incident-pipeline prefixes. Hand-curated allow-list (not a
-/// regex) so adding a new auto-block path is a deliberate, reviewed
-/// change.
+/// Returns `true` when `incident_id` matches one of the
+/// non-incident-pipeline prefixes whose decisions are auto-synthesised
+/// into Cases rows. Hand-curated allow-list (not a regex) so adding a
+/// new auto-block path is a deliberate, reviewed change.
+///
+/// Wave-10b shipped six prefixes (honeypot/abuseipdb pair, repeat-offender,
+/// proto_anomaly, suspicious_archive, logging_config_change).
+///
+/// 2026-05-21 audit (operator-reported: HIGH packet_flood block at
+/// 128.203.192.244 missing from the Cases tab even though it was on the
+/// public live-feed): the SQLite store had 17 orphan `multi-technique:`
+/// block_ip decisions and one orphan `correlation:CHAIN-...` decision
+/// in the previous 24 h. Those are real autonomous actions the agent
+/// took (cross-layer correlation block, cross-detector
+/// multi-technique escalation) — they belong on the Cases tab because
+/// the operator audited them and the audit trail loses them otherwise.
+/// `packet_flood:` is added defensively for the same class of failure:
+/// when the shield path beats the sensor's aggregation window to the
+/// block, only the decision row makes it to SQLite.
 fn is_non_incident_pipeline_prefix(incident_id: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "honeypot:always-on:abuseipdb:",
@@ -171,6 +220,10 @@ fn is_non_incident_pipeline_prefix(incident_id: &str) -> bool {
         "proto_anomaly:",
         "suspicious_archive:",
         "logging_config_change:",
+        // Added 2026-05-21 from prod orphan-decision audit.
+        "multi-technique:",
+        "correlation:",
+        "packet_flood:",
     ];
     PREFIXES.iter().any(|p| incident_id.starts_with(p))
 }
@@ -308,6 +361,17 @@ fn synth_title(incident_id: &str) -> String {
     }
     if incident_id.starts_with("logging_config_change:") {
         return "Logging config change".to_string();
+    }
+    // 2026-05-21 audit: prefixes added when the prod orphan audit found
+    // them silently dropped from the Cases tab.
+    if incident_id.starts_with("multi-technique:") {
+        return "Multi-technique escalation".to_string();
+    }
+    if incident_id.starts_with("correlation:") {
+        return "Cross-layer correlation block".to_string();
+    }
+    if incident_id.starts_with("packet_flood:") {
+        return "DDoS / packet flood block".to_string();
     }
     "Auto-block".to_string()
 }
@@ -483,7 +547,7 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20));
+        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20), &chrono::Utc);
         assert_eq!(total, 10, "every today-row must surface");
         assert_eq!(items.len(), 10);
     }
@@ -517,7 +581,7 @@ mod tests {
         };
         store.insert_decision(&row).unwrap();
 
-        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20));
+        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20), &chrono::Utc);
         assert_eq!(total, 1, "the synthetic row must be counted");
         let v = &items[0];
         assert_eq!(v.incident_id, "honeypot:always-on:abuseipdb:31.14.254.81");
@@ -548,7 +612,7 @@ mod tests {
         };
         store.insert_decision(&row).unwrap();
 
-        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20));
+        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20), &chrono::Utc);
         assert_eq!(total, 0);
         assert!(items.is_empty());
     }
@@ -586,7 +650,7 @@ mod tests {
         };
         store.insert_decision(&row).unwrap();
 
-        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20));
+        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20), &chrono::Utc);
         assert_eq!(total, 1, "incident + decision must collapse to one row");
         assert_eq!(items[0].action_taken.as_deref(), Some("block_ip"));
         assert_eq!(items[0].outcome, "blocked");
@@ -606,7 +670,7 @@ mod tests {
             .insert_incident(&incident_row("today-row", day_ts(8), Severity::High))
             .unwrap();
 
-        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20));
+        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20), &chrono::Utc);
         assert_eq!(total, 1, "yesterday's row must NOT bleed in");
         assert_eq!(items[0].incident_id, "today-row");
     }
@@ -614,7 +678,7 @@ mod tests {
     #[test]
     fn cases_returns_empty_for_clean_store() {
         let store = innerwarden_store::Store::open_memory().unwrap();
-        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20));
+        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20), &chrono::Utc);
         assert_eq!(total, 0);
         assert!(items.is_empty());
     }
@@ -656,8 +720,121 @@ mod tests {
         ));
         assert!(is_non_incident_pipeline_prefix("suspicious_archive:foo"));
         assert!(is_non_incident_pipeline_prefix("logging_config_change:foo"));
+        // 2026-05-21 additions — see is_non_incident_pipeline_prefix
+        // docstring for the orphan-decision audit that drove this.
+        assert!(is_non_incident_pipeline_prefix(
+            "multi-technique:104.152.52.226:1779238966"
+        ));
+        assert!(is_non_incident_pipeline_prefix(
+            "correlation:CHAIN-0001:200.89.69.247"
+        ));
+        assert!(is_non_incident_pipeline_prefix(
+            "packet_flood:rate_anomaly:2026-05-20T23:52Z"
+        ));
         assert!(!is_non_incident_pipeline_prefix("ssh_bruteforce:1.2.3.4"));
         assert!(!is_non_incident_pipeline_prefix("kill_chain:DATA_EXFIL:1"));
+    }
+
+    #[test]
+    fn synth_title_covers_2026_05_21_prefixes() {
+        assert_eq!(
+            synth_title("multi-technique:104.152.52.226:1779238966"),
+            "Multi-technique escalation"
+        );
+        assert_eq!(
+            synth_title("correlation:CHAIN-0001:200.89.69.247"),
+            "Cross-layer correlation block"
+        );
+        assert_eq!(
+            synth_title("packet_flood:rate_anomaly:2026-05-20T23:52Z"),
+            "DDoS / packet flood block"
+        );
+    }
+
+    #[test]
+    fn cases_synthesises_view_for_orphan_multi_technique_decision() {
+        // Operator-reported 2026-05-21: 17 orphan `multi-technique:`
+        // block_ip decisions in the 24h before the audit, each one a
+        // real action the agent took, none of them visible in the
+        // Cases tab because the prefix wasn't on the synth allow-list.
+        // This test pins the regression: a multi-technique decision
+        // without a parent incident MUST surface as a synthetic row.
+        let store = innerwarden_store::Store::open_memory().unwrap();
+        let ts = day_ts(8);
+        let inc_id = "multi-technique:104.152.52.226:1779238966";
+        let dec_json = decision_json(inc_id, "block_ip", ts, Some("104.152.52.226"));
+        let row = innerwarden_store::decisions::DecisionRow {
+            ts: ts.to_rfc3339(),
+            incident_id: inc_id.into(),
+            action_type: "block_ip".into(),
+            target_ip: Some("104.152.52.226".into()),
+            target_user: None,
+            confidence: 0.95,
+            auto_executed: true,
+            reason: Some("Two detectors fired in correlation window".into()),
+            data: dec_json,
+        };
+        store.insert_decision(&row).unwrap();
+
+        let (total, items) = build_cases_for_date(&store, "2026-05-13", day_ts(20), &chrono::Utc);
+
+        assert_eq!(
+            total, 1,
+            "orphan multi-technique block must synthesise one row"
+        );
+        assert_eq!(items[0].title, "Multi-technique escalation");
+        assert_eq!(items[0].action_taken.as_deref(), Some("block_ip"));
+        assert!(
+            items[0].entities.iter().any(|e| e == "ip:104.152.52.226"),
+            "synthetic row must carry the target IP so the operator can pivot"
+        );
+    }
+
+    #[test]
+    fn build_cases_respects_operator_local_timezone_for_day_boundary() {
+        // Operator-reported 2026-05-21: a packet_flood incident at
+        // 2026-05-20T23:52Z (which is 00:52 on 2026-05-21 in any
+        // timezone +1 of UTC) was missing from the Cases tab "today"
+        // view because the day boundary was hard-coded to UTC. This
+        // test pins the fix: when `tz` is a +01:00 offset, the
+        // 23:52 UTC ts must land on the 2026-05-21 local bucket.
+        use chrono::FixedOffset;
+        let plus_one = FixedOffset::east_opt(3600).unwrap();
+        let store = innerwarden_store::Store::open_memory().unwrap();
+
+        // 2026-05-20T23:52Z = 2026-05-21T00:52 in UTC+1.
+        let late_evening_utc = chrono::NaiveDate::from_ymd_opt(2026, 5, 20)
+            .unwrap()
+            .and_hms_opt(23, 52, 0)
+            .unwrap()
+            .and_utc();
+        store
+            .insert_incident(&incident_row(
+                "packet_flood:rate_anomaly:2026-05-20T23:52Z",
+                late_evening_utc,
+                Severity::High,
+            ))
+            .unwrap();
+
+        // Querying "2026-05-21" in UTC+1 must include this row.
+        let now = late_evening_utc + chrono::Duration::hours(1);
+        let (total, items) = build_cases_for_date(&store, "2026-05-21", now, &plus_one);
+        assert_eq!(
+            total, 1,
+            "23:52 UTC = 00:52 local in UTC+1 — must appear on the 2026-05-21 Cases tab"
+        );
+        assert_eq!(
+            items[0].incident_id,
+            "packet_flood:rate_anomaly:2026-05-20T23:52Z"
+        );
+
+        // Sanity: under UTC interpretation the same row stays on
+        // the 2026-05-20 bucket, not 2026-05-21.
+        let (total_utc, _) = build_cases_for_date(&store, "2026-05-21", now, &chrono::Utc);
+        assert_eq!(
+            total_utc, 0,
+            "under UTC interpretation the 23:52Z row is still on 2026-05-20"
+        );
     }
 
     #[test]
