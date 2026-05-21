@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 
 use tracing::{info, warn};
 
+use innerwarden_killchain::detector::process_lsm_blocked;
 use innerwarden_killchain::tracker::PidTracker;
 
 use crate::correlation_engine;
@@ -71,6 +72,53 @@ pub(crate) fn process_events(
         }
 
         all_incidents.extend(incidents);
+
+        // 2026-05-21: enrich LSM-blocked execve events into structured
+        // "Kill chain BLOCKED" incidents. The kernel `bprm_check_security`
+        // LSM hook in `crates/sensor-ebpf/src/main.rs:836` writes
+        // `KILL_CHAIN_BLOCKED` into the filename slot when it denies an
+        // execve that follows an attack pattern. The sensor surfaces those
+        // as events with `kind = "lsm.exec_blocked"`, and the killchain
+        // crate's `detector::process_lsm_blocked` builds an enriched
+        // incident (pattern name, timeline, C2 IP, chain flags hex).
+        //
+        // Pre-fix the migration shipped without calling that detector — the
+        // function had ZERO callers in the workspace. The agent's
+        // `knowledge_graph::ingestion::ingest_lsm_exec_blocked` only added a
+        // graph edge (`Relation::ExecBlocked`), which never surfaces in the
+        // dashboard as an incident. Wiring the detector here makes blocked
+        // execves operator-visible alongside the regular `kill_chain:detected`
+        // incidents.
+        //
+        // Today on prod this code path is dormant because the LSM hook is
+        // failing to attach (separate bug — see `ebpf_syscall.rs:514`); the
+        // wiring is in place so the moment the hook loads, the operator
+        // sees actionable "Kill chain BLOCKED" incidents instead of silent
+        // graph edges.
+        if event.kind == "lsm.exec_blocked" {
+            if let Some(blocked_incident) = process_lsm_blocked(&json, tracker) {
+                let pattern = blocked_incident
+                    .get("evidence")
+                    .and_then(|e| e.get("pattern"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("unknown");
+                let kind = format!("killchain.blocked.{}", pattern);
+                let mut corr_event = correlation_engine::CorrelationEngine::killchain_event(
+                    &kind,
+                    serde_json::json!({
+                        "pattern": pattern,
+                        "severity": "critical",
+                        "pid": blocked_incident.get("evidence").and_then(|e| e.get("pid")),
+                        "lsm_blocked": true,
+                    }),
+                );
+                if let Some(iid) = blocked_incident.get("incident_id").and_then(|v| v.as_str()) {
+                    corr_event.incident_id = iid.to_string();
+                }
+                correlation_engine.observe(corr_event);
+                all_incidents.push(blocked_incident);
+            }
+        }
     }
 
     all_incidents
@@ -931,6 +979,66 @@ mod tests {
             std::collections::HashMap::new();
         dismiss_operator_session_incidents(tmp.path(), Some(&store), &incidents, &operator_ips);
         assert_eq!(store.decisions_count().unwrap(), 0);
+    }
+
+    /// 2026-05-21 anchor: lsm.exec_blocked events with the kernel marker
+    /// `KILL_CHAIN_BLOCKED` in the filename slot must surface as
+    /// enriched incidents via `killchain::detector::process_lsm_blocked`.
+    /// Pre-fix the migration shipped without calling that detector at
+    /// all — the function had zero callers in the workspace — so a
+    /// real kernel LSM block produced only a silent KG edge instead
+    /// of an operator-visible "Kill chain BLOCKED" critical incident.
+    #[test]
+    fn process_events_enriches_lsm_blocked_into_killchain_incident() {
+        use chrono::Utc;
+        use innerwarden_core::event::{Event, Severity};
+
+        let mut tracker = PidTracker::new();
+        // Seed the tracker with enough chain flags to make the LSM
+        // detector emit an enriched incident (without a tracked PID it
+        // falls back to a minimal-info incident — still operator-visible).
+        // The kernel emits the event when its own chain check fires,
+        // so the PID state is normally pre-populated. Even without it
+        // the detector returns Some on the well-formed event.
+        let mut engine = correlation_engine::CorrelationEngine::new();
+        let now = Utc::now();
+        let lsm_event = Event {
+            ts: now,
+            host: "h".into(),
+            source: "ebpf".into(),
+            kind: "lsm.exec_blocked".into(),
+            severity: Severity::High,
+            summary: "kernel LSM blocked execve".into(),
+            details: serde_json::json!({
+                "pid": 42u32,
+                "uid": 1000u32,
+                "comm": "bash",
+                "filename": "KILL_CHAIN_BLOCKED",
+            }),
+            tags: vec![],
+            entities: vec![],
+        };
+
+        let incidents = process_events(&mut tracker, &[lsm_event], &mut engine);
+
+        assert!(
+            !incidents.is_empty(),
+            "lsm.exec_blocked with KILL_CHAIN_BLOCKED marker must enrich \
+             into at least one incident"
+        );
+        let blocked = incidents
+            .iter()
+            .find(|inc| {
+                inc.get("incident_id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.starts_with("kill_chain:blocked:"))
+            })
+            .expect("must produce kill_chain:blocked:* incident");
+        let title = blocked.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            title.contains("Kill chain BLOCKED"),
+            "title must reflect the LSM block — got: {title}"
+        );
     }
 
     #[test]

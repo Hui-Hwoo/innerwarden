@@ -512,7 +512,22 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
 
             let btf = aya::Btf::from_sys_fs().ok();
             if let Err(e) = lsm.load("bprm_check_security", &btf.as_ref().unwrap()) {
-                info!(error = %e, "innerwarden_lsm_exec: BPF LSM not enabled in kernel (add lsm=bpf to boot cmdline)");
+                // 2026-05-21: do not claim a specific root cause in the log.
+                // The previous message ("add lsm=bpf to boot cmdline") was
+                // wrong on hosts whose `/proc/cmdline` already had bpf in
+                // the LSM list — the load can also fail for BTF mismatch,
+                // verifier rejection, or aya version skew. Log the raw
+                // aya error so the operator can grep it and act.
+                //
+                // Diagnostic hints the operator should check first:
+                //   grep bpf /sys/kernel/security/lsm   # bpf present?
+                //   ls /sys/kernel/btf/vmlinux           # BTF available?
+                //   uname -r                             # kernel ≥ 5.7?
+                info!(
+                    error = %e,
+                    "innerwarden_lsm_exec: failed to load bprm_check_security hook \
+                     — see /sys/kernel/security/lsm, /sys/kernel/btf/vmlinux, kernel >= 5.7"
+                );
                 return;
             }
             if let Err(e) = lsm.attach() {
