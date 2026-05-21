@@ -55,9 +55,7 @@ It lives where the action is. Not a tool watching from outside, not an alert in 
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
 </h3>
 
-https://github.com/user-attachments/assets/b55967a6-a2d0-4158-9007-05e689d5bf0c
-
-https://github.com/user-attachments/assets/6ea1e124-52c2-48fe-8600-4b2f3d670116
+https://github.com/user-attachments/assets/3acf547d-9c5c-4f83-bcfa-22ba68e21741
 
 ---
 
