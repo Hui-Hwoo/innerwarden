@@ -991,6 +991,61 @@ pub fn innerwarden_lsm_create_user_ns(_ctx: LsmContext) -> i32 {
     -1 // -EPERM — block container escape attempt
 }
 
+// ── PR-B: ptrace_access_check LSM hook (process injection block) ───
+//
+// `security_ptrace_access_check(struct task_struct *child, unsigned int mode)`
+// fires when a process attempts ptrace(PTRACE_ATTACH/SEIZE/POKETEXT) on
+// another. This is the kernel-level gatekeeper for process injection —
+// SHELLINJECT, CodeInject, MeterRefactor and most LD_PRELOAD-less
+// shellcode loaders pivot through ptrace.
+//
+// Default behaviour: observe + block only when PID is in BLOCKED_PIDS.
+// We do NOT block unconditionally because legitimate ptrace users:
+// gdb, strace, lldb, perf, container debug tools, valgrind, rr.
+// These never get registered as attackers so they pass through.
+//
+// Note: this hook only checks the CALLER (tracer). It cannot also
+// protect the TARGET (tracee) from a specific PID — that would
+// require a second map BLOCKED_TRACE_TARGETS. Phase 2 enhancement.
+// Note: ptrace_access_check is NOT in the kernel's sleepable LSM
+// allow-list (verifier: "bpf_lsm_ptrace_access_check is not sleepable").
+// Use non-sleepable LSM here. Our minimal body has no ctx access and
+// no probe_read_kernel calls so the kernel 6.4 verifier complexity
+// rejection that motivated Spec 052's sleepable-by-default for the
+// other hooks doesn't apply.
+#[lsm(hook = "ptrace_access_check")]
+pub fn innerwarden_lsm_ptrace_access(_ctx: LsmContext) -> i32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = pid_tgid as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
+        .copied()
+        .unwrap_or(0)
+        != 0;
+    let blocked_by_pid = !blocked_by_tgid
+        && unsafe { BLOCKED_PIDS.get(&pid) }
+            .copied()
+            .unwrap_or(0)
+            != 0;
+
+    if !(blocked_by_tgid || blocked_by_pid) {
+        return 0; // allow (gdb / strace / lldb / perf all unaffected)
+    }
+
+    if let Some(mut entry) = EVENTS.reserve::<LsmDecisionEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::LsmDecision as u32;
+        event.pid = pid;
+        event.tgid = tgid;
+        event.reason = innerwarden_ebpf_types::LSM_HOOK_PTRACE_ACCESS_CHECK;
+        event.ts_ns = unsafe { bpf_ktime_get_ns() };
+        entry.submit(0);
+    }
+
+    -1 // -EPERM — block process injection attempt
+}
+
 fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
     // ── Container drift detection (ALWAYS runs, even without guard mode) ──
     // Check if the binary is on an overlayfs upper layer (dropped after container start).

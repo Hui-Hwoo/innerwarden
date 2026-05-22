@@ -566,6 +566,32 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
         }
     }
 
+    // PR-B: ptrace_access_check LSM hook — process injection block.
+    // Observe by default; blocks only when caller PID is in BLOCKED_PIDS.
+    match bpf.program_mut("innerwarden_lsm_ptrace_access") {
+        Some(prog) => {
+            let lsm_res: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_res {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("ptrace_access_check", b) {
+                            warn!("innerwarden_lsm_ptrace_access: failed to load: {:?}", e);
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_ptrace_access: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_ptrace_access → ptrace_access_check (PR-B process injection block) ✅");
+                        }
+                    }
+                }
+                Err(e) => info!(error = %e, "innerwarden_lsm_ptrace_access: not available as Lsm"),
+            }
+        }
+        None => {
+            info!("innerwarden_lsm_ptrace_access program not found in .o");
+        }
+    }
+
     match bpf.program_mut("innerwarden_lsm_exec") {
         Some(prog) => {
             let lsm_try: Result<&mut Lsm, _> = prog.try_into();
