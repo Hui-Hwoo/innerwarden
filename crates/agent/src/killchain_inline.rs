@@ -42,8 +42,7 @@ pub(crate) fn process_events(
 
         for inc in &incidents {
             // Feed kill chain detections into the correlation engine.
-            let pattern = inc
-                .get("evidence")
+            let pattern = evidence_obj(inc)
                 .and_then(|e| e.get("pattern"))
                 .and_then(|p| p.as_str())
                 .unwrap_or("unknown");
@@ -62,15 +61,12 @@ pub(crate) fn process_events(
             // logged no-op and the existing userspace skill pipeline
             // continues unchanged.
             //
-            // Spec 053 fix (2026-05-22): `evidence` is an ARRAY of one
-            // object (tracker.rs:329 / :429 wraps `[evidence]`). Earlier
-            // code accessed it as object → silent None → register never
-            // fired. Read evidence[0].pid instead.
-            if let Some(pid) = inc
-                .get("evidence")
-                .and_then(|e| e.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|first| first.get("pid"))
+            // Spec 053 fix (2026-05-22): use `evidence_obj` helper which
+            // tolerates both Array and Object shapes. Pre-fix every site
+            // accessed `evidence` as object → silent None → register
+            // never fired.
+            if let Some(pid) = evidence_obj(inc)
+                .and_then(|ev| ev.get("pid"))
                 .and_then(|p| p.as_u64())
             {
                 let reason = format!("kill_chain:{pattern}");
@@ -83,7 +79,7 @@ pub(crate) fn process_events(
                 serde_json::json!({
                     "pattern": pattern,
                     "severity": severity_str,
-                    "pid": inc.get("evidence").and_then(|e| e.get("pid")),
+                    "pid": evidence_obj(inc).and_then(|ev| ev.get("pid")),
                 }),
             );
             // Phase 014-C: carry incident_id so link_correlated_incidents can
@@ -121,9 +117,8 @@ pub(crate) fn process_events(
         // graph edges.
         if event.kind == "lsm.exec_blocked" {
             if let Some(blocked_incident) = process_lsm_blocked(&json, tracker) {
-                let pattern = blocked_incident
-                    .get("evidence")
-                    .and_then(|e| e.get("pattern"))
+                let pattern = evidence_obj(&blocked_incident)
+                    .and_then(|ev| ev.get("pattern"))
                     .and_then(|p| p.as_str())
                     .unwrap_or("unknown");
                 let kind = format!("killchain.blocked.{}", pattern);
@@ -132,7 +127,7 @@ pub(crate) fn process_events(
                     serde_json::json!({
                         "pattern": pattern,
                         "severity": "critical",
-                        "pid": blocked_incident.get("evidence").and_then(|e| e.get("pid")),
+                        "pid": evidence_obj(&blocked_incident).and_then(|ev| ev.get("pid")),
                         "lsm_blocked": true,
                     }),
                 );
@@ -876,9 +871,8 @@ pub(crate) fn notify_telegram(
         }
 
         // Skip known service processes (socket+dup is normal for them).
-        let comm = inc
-            .get("evidence")
-            .and_then(|e| e.get("comm"))
+        let comm = evidence_obj(inc)
+            .and_then(|ev| ev.get("comm"))
             .and_then(|c| c.as_str())
             .unwrap_or("");
         if KILLCHAIN_SERVICE_ALLOWLIST
@@ -907,9 +901,8 @@ pub(crate) fn notify_telegram(
                     .and_then(|t| t.as_str())
                     .unwrap_or("Kill chain detected");
                 let summary = inc.get("summary").and_then(|s| s.as_str()).unwrap_or("");
-                let pattern = inc
-                    .get("evidence")
-                    .and_then(|e| e.get("pattern"))
+                let pattern = evidence_obj(inc)
+                    .and_then(|ev| ev.get("pattern"))
                     .and_then(|p| p.as_str())
                     .unwrap_or("unknown");
 
@@ -946,6 +939,29 @@ pub(crate) fn notify_telegram(
     }
 }
 
+/// Return the first/only evidence object from a kill chain incident.
+///
+/// The killchain crate (`tracker.rs:329 / :429`) wraps evidence as
+/// `"evidence": [evidence_obj]` — a single-element array. Pre-Spec 053
+/// (2026-05-22) six call sites in this file accessed it as `.get("pid")`,
+/// `.get("pattern")`, `.get("comm")` directly on the array Value, which
+/// silently returned None. The result: correlation_engine received
+/// `pattern="unknown"` for every chain, `pid=null` for every chain,
+/// `dismiss_self_traffic_incidents` had comm="" so its allowlist never
+/// matched, etc. All bugs silent because of `.unwrap_or` fallbacks.
+///
+/// Use this helper instead of inline `.get("evidence").and_then(...)`
+/// chains. Also tolerates an Object shape (forward-compat — if the
+/// tracker ever drops the array wrap), matching line 368's pattern that
+/// was already doing the right thing.
+fn evidence_obj(inc: &serde_json::Value) -> Option<&serde_json::Value> {
+    inc.get("evidence").and_then(|e| match e {
+        serde_json::Value::Array(arr) => arr.first(),
+        obj @ serde_json::Value::Object(_) => Some(obj),
+        _ => None,
+    })
+}
+
 /// Convert an innerwarden_core::Event to the JSON format expected by PidTracker.
 fn event_to_tracker_json(event: &innerwarden_core::event::Event) -> serde_json::Value {
     serde_json::json!({
@@ -978,6 +994,124 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect()
+    }
+
+    // ── Spec 053 anchors — evidence_obj helper ────────────────────────
+    //
+    // Six call sites in this file used to access `evidence.pid` /
+    // `evidence.pattern` / `evidence.comm` as if `evidence` were a JSON
+    // object, but `crates/killchain/src/tracker.rs:329 / :429` wraps
+    // it in an array `[evidence]`. JSON's `.get(string)` on an Array
+    // returns None silently, so:
+    //   - correlation_engine was always fed `pattern="unknown"`
+    //   - correlation_engine pid field was always null
+    //   - dismiss_self_traffic_incidents had comm="" → allowlist never matched
+    //   - notification builder said "unknown" pattern in operator messages
+    //   - register_blocked_pid (Spec 052 Phase 1b) was never called
+    // All silent because every site had `.unwrap_or(...)` fallback.
+    //
+    // These anchors prevent the same class of bug returning if the
+    // tracker output shape changes again.
+
+    fn build_incident_with_array_evidence(
+        pid: u32,
+        pattern: &str,
+        comm: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "incident_id": format!("kill_chain:detected:{}:{}:2026-05-22T16:00Z", pattern, pid),
+            "severity": "critical",
+            "evidence": [{
+                "pid": pid,
+                "pattern": pattern,
+                "comm": comm,
+                "chain_flags": "0x101",
+            }],
+        })
+    }
+
+    #[test]
+    fn evidence_obj_extracts_from_array_shape() {
+        let inc = build_incident_with_array_evidence(1234, "data_exfil", "python3");
+        let ev = evidence_obj(&inc).expect("array evidence must resolve");
+        assert_eq!(ev.get("pid").and_then(|v| v.as_u64()), Some(1234));
+        assert_eq!(
+            ev.get("pattern").and_then(|v| v.as_str()),
+            Some("data_exfil")
+        );
+        assert_eq!(ev.get("comm").and_then(|v| v.as_str()), Some("python3"));
+    }
+
+    #[test]
+    fn evidence_obj_tolerates_object_shape_forward_compat() {
+        // If the tracker ever drops the array wrap (one-element arrays
+        // are awkward), the same helper still works. This is the same
+        // pattern used by line 368's dismiss_operator_session_incidents
+        // — keep both call sites consistent.
+        let inc = serde_json::json!({
+            "incident_id": "kill_chain:detected:data_exfil:1234:2026-05-22T16:00Z",
+            "evidence": { "pid": 1234, "pattern": "data_exfil", "comm": "python3" },
+        });
+        let ev = evidence_obj(&inc).expect("object evidence must resolve");
+        assert_eq!(ev.get("pid").and_then(|v| v.as_u64()), Some(1234));
+    }
+
+    #[test]
+    fn evidence_obj_returns_none_when_evidence_missing() {
+        let inc = serde_json::json!({
+            "incident_id": "kill_chain:detected:data_exfil:1234:2026-05-22T16:00Z",
+        });
+        assert!(evidence_obj(&inc).is_none());
+    }
+
+    #[test]
+    fn evidence_obj_returns_none_when_evidence_empty_array() {
+        let inc = serde_json::json!({
+            "incident_id": "kill_chain:detected:data_exfil:1234:2026-05-22T16:00Z",
+            "evidence": [],
+        });
+        assert!(evidence_obj(&inc).is_none());
+    }
+
+    #[test]
+    fn evidence_obj_returns_none_for_invalid_shape() {
+        // Number/string/bool/null all reject — only Array/Object accepted.
+        for bogus in [
+            serde_json::json!({ "evidence": null }),
+            serde_json::json!({ "evidence": 42 }),
+            serde_json::json!({ "evidence": "string" }),
+            serde_json::json!({ "evidence": true }),
+        ] {
+            assert!(
+                evidence_obj(&bogus).is_none(),
+                "evidence_obj must reject non-Array/Object: {bogus:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_obj_demonstrates_the_silent_bug_the_old_code_had() {
+        // ANTI-REGRESSION: this test captures exactly what the buggy
+        // pre-Spec-053 code was doing. If anyone reverts to the inline
+        // pattern, this assertion documents why it's broken.
+        let inc = build_incident_with_array_evidence(1234, "data_exfil", "python3");
+
+        // OLD (BUGGY): `.get("evidence").and_then(|e| e.get("pid"))`
+        // Returns None because evidence is an Array, not an Object.
+        let buggy = inc
+            .get("evidence")
+            .and_then(|e| e.get("pid"))
+            .and_then(|v| v.as_u64());
+        assert_eq!(
+            buggy, None,
+            "documenting the silent bug: array.get(string) returns None"
+        );
+
+        // NEW (CORRECT): via evidence_obj helper.
+        let correct = evidence_obj(&inc)
+            .and_then(|ev| ev.get("pid"))
+            .and_then(|v| v.as_u64());
+        assert_eq!(correct, Some(1234), "helper recovers the pid");
     }
 
     // ── Phase 7B Slice C anchors ────────────────────────────────────
