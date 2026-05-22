@@ -833,7 +833,25 @@ fn has_capability(cap_bit: u32) -> bool {
     false
 }
 
-#[lsm(hook = "bprm_check_security")]
+// LSM hook entry point. Marked `sleepable` so the program lands in
+// the `lsm.s/` ELF section instead of `lsm/`. On kernel ≥ 6.4 the
+// verifier tightens the BTF FUNC arg0 check for `lsm/` programs: it
+// requires arg0 to match the kernel's `bpf_lsm_<hook>` signature
+// (e.g. `*const struct linux_binprm` for bprm_check_security). The
+// aya `#[lsm]` macro emits the FUNC with `arg0 = c_void`, so the
+// verifier rejects non-sleepable LSM with EINVAL + a BTF type
+// mismatch in the log. The `sleepable` flag flips the section to
+// `lsm.s/` which uses a different attach path (tracing-style with
+// attach_btf_id supplied by libbpf at load time) and bypasses the
+// per-program BTF FUNC arg check. Confirmed empirically against the
+// Bombini agent on kernel 6.8.0-1052-oracle: their only LSM hook
+// that loads is the one marked `sleepable`.
+// Constraints to keep this hook sleepable-safe: no bpf_spin_lock,
+// no bpf_for_each_map_elem with non-sleepable callbacks. This body
+// only does map lookups + ring-buffer writes + bpf_get_current_*
+// helpers — all sleepable-compatible. Return -EPERM still works
+// (sleepable LSM has supported denial since kernel 5.10).
+#[lsm(hook = "bprm_check_security", sleepable)]
 pub fn innerwarden_lsm_exec(ctx: LsmContext) -> i32 {
     match try_lsm_exec(&ctx) {
         Ok(ret) => ret,
@@ -1200,7 +1218,7 @@ fn check_overlay_drift(
 // Policy key 1 = 1 → enforce (block writes), 0 or absent → observe only.
 // Always emits FileOpenEvent with kind=FileWrite for visibility.
 
-#[lsm(hook = "file_open")]
+#[lsm(hook = "file_open", sleepable)]
 pub fn innerwarden_lsm_file_open(ctx: LsmContext) -> i32 {
     match try_lsm_file_open(&ctx) {
         Ok(ret) => ret,
@@ -2982,7 +3000,7 @@ fn try_acpi_eval(ctx: &ProbeContext) -> Result<(), i64> {
 /// LSM hook on bpf — monitors all BPF syscall operations.
 /// Detects unauthorized eBPF program loading (VoidLink rootkit defense).
 /// Logs BPF_PROG_LOAD, BPF_MAP_CREATE, etc. from non-innerwarden processes.
-#[lsm(hook = "bpf")]
+#[lsm(hook = "bpf", sleepable)]
 pub fn innerwarden_lsm_bpf(ctx: LsmContext) -> i32 {
     match try_lsm_bpf(&ctx) {
         Ok(ret) => ret,

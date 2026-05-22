@@ -9,12 +9,21 @@
 #   -C link-arg=--btf  passes `--btf` to bpf-linker. Without this flag
 #                     bpf-linker produces an eBPF `.o` with NO `.BTF`
 #                     ELF section regardless of what input bitcode it
-#                     was given. The kernel verifier then rejects any
-#                     LSM program because it cannot validate arg0's
-#                     type against the kernel's `bpf_lsm_<hook>`
-#                     signature. Mirrors the Bombini project's setup
-#                     (the only aya-based agent currently shipping LSM
-#                     on kernel ≥ 6.4).
+#                     was given. The kernel verifier and libbpf both
+#                     need this BTF for CO-RE relocations and program
+#                     metadata. Mirrors the Bombini project's setup
+#                     (open-source aya-based agent shipping LSM on
+#                     kernel ≥ 6.4).
+#
+# Note (2026-05-22): the FUNC arg0 BTF mismatch that the kernel 6.4
+# verifier added for `lsm/` (non-sleepable) programs is now sidestepped
+# at the macro layer — every LSM hook in `src/main.rs` is marked
+# `sleepable`, landing in the `lsm.s/` section. Sleepable LSM uses a
+# tracing-style attach path that supplies `attach_btf_id` from libbpf
+# at load time and does not enforce the per-program BTF FUNC arg type
+# check. The rustflags above remain mandatory: removing `--btf`
+# strips the `.BTF` section and breaks load for unrelated CO-RE
+# relocation reasons. Cross-reference: `src/main.rs:849`.
 #
 # Settings below this point are unchanged from the workspace's
 # previous behaviour — `target-dir` is preserved so cargo continues
