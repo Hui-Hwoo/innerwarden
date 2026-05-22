@@ -1,0 +1,31 @@
+# Cargo config for the eBPF crate.
+#
+# The `rustflags` line is load-bearing for LSM hook attachment on kernel
+# ≥ 6.4. The relevant flags:
+#
+#   -C debuginfo=2     emit DWARF in the Rust-compiled BPF bitcode so
+#                     bpf-linker has type information for BTF generation.
+#
+#   -C link-arg=--btf  passes `--btf` to bpf-linker. Without this flag
+#                     bpf-linker produces an eBPF `.o` with NO `.BTF`
+#                     ELF section regardless of what input bitcode it
+#                     was given. The kernel verifier then rejects any
+#                     LSM program because it cannot validate arg0's
+#                     type against the kernel's `bpf_lsm_<hook>`
+#                     signature. Mirrors the Bombini project's setup
+#                     (the only aya-based agent currently shipping LSM
+#                     on kernel ≥ 6.4).
+#
+# Settings below this point are unchanged from the workspace's
+# previous behaviour — `target-dir` is preserved so cargo continues
+# to write to `crates/sensor-ebpf/target/` (the path encoded in
+# `crates/sensor/src/collectors/ebpf_syscall.rs` and the deploy
+# script). `build-std=core` is the standard aya invocation for the
+# `bpfel-unknown-none` target.
+
+[build]
+target = "bpfel-unknown-none"
+rustflags = "-C debuginfo=2 -C link-arg=--btf"
+
+[unstable]
+build-std = ["core"]
