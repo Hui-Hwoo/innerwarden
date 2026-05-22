@@ -73,7 +73,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 fs2 = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
-sha2_011 = { package = "sha2", version = "=0.11.0-rc.5" }
+sha2_011 = { package = "sha2", version = "=0.11.0" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 serde_yaml = "0.9"
 russh = "0.60"
