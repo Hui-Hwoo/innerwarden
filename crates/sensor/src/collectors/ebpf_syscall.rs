@@ -592,6 +592,32 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
         }
     }
 
+    // PR-C: bpf_prog LSM hook — VoidLink-style eBPF weaponization block.
+    // Observe by default; blocks only when caller PID is in BLOCKED_PIDS.
+    match bpf.program_mut("innerwarden_lsm_bpf_prog_load") {
+        Some(prog) => {
+            let lsm_res: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_res {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("bpf_prog", b) {
+                            warn!("innerwarden_lsm_bpf_prog_load: failed to load: {:?}", e);
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_bpf_prog_load: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_bpf_prog_load → bpf_prog (PR-C eBPF weaponization block) ✅");
+                        }
+                    }
+                }
+                Err(e) => info!(error = %e, "innerwarden_lsm_bpf_prog_load: not available as Lsm"),
+            }
+        }
+        None => {
+            info!("innerwarden_lsm_bpf_prog_load program not found in .o");
+        }
+    }
+
     match bpf.program_mut("innerwarden_lsm_exec") {
         Some(prog) => {
             let lsm_try: Result<&mut Lsm, _> = prog.try_into();
@@ -1930,9 +1956,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                             ("ptrace_access_check", "innerwarden_lsm_ptrace_access")
                         }
                         LSM_HOOK_MMAP_FILE => ("mmap_file", "innerwarden_lsm_mmap_file"),
-                        LSM_HOOK_BPF_PROG_LOAD => {
-                            ("bpf_prog_load", "innerwarden_lsm_bpf_prog_load")
-                        }
+                        LSM_HOOK_BPF_PROG_LOAD => ("bpf_prog", "innerwarden_lsm_bpf_prog_load"),
                         _ => ("unknown", "unknown"),
                     };
 

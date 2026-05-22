@@ -1046,6 +1046,56 @@ pub fn innerwarden_lsm_ptrace_access(_ctx: LsmContext) -> i32 {
     -1 // -EPERM — block process injection attempt
 }
 
+// ── PR-C: bpf_prog LSM hook (VoidLink-style eBPF weaponization block) ─
+//
+// `security_bpf_prog(struct bpf_prog *prog)` fires when a BPF program is
+// loaded into the kernel via BPF_PROG_LOAD syscall. Modern rootkits
+// (VoidLink, Symbiote, BPFDoor) weaponize eBPF — they load programs that
+// hide files, intercept syscalls, mask network connections. This hook
+// kernel-side-denies the load attempt from chain-flagged PIDs.
+//
+// Default behaviour: observe + block only when PID is in BLOCKED_PIDS.
+// We do NOT block unconditionally — legitimate BPF loaders include:
+// innerwarden (us!), systemd-resolved, cilium-agent, falco, custom
+// monitoring. They never get registered as attackers → pass through.
+//
+// Note: the legacy `innerwarden_lsm_bpf` hook (`security_bpf`) is
+// kept in parallel — it fires for ALL bpf() syscalls including map
+// ops, this one only on program load. Operator can distinguish via
+// hook_id in lsm.blocked details.
+#[lsm(hook = "bpf_prog", sleepable)]
+pub fn innerwarden_lsm_bpf_prog_load(_ctx: LsmContext) -> i32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = pid_tgid as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
+        .copied()
+        .unwrap_or(0)
+        != 0;
+    let blocked_by_pid = !blocked_by_tgid
+        && unsafe { BLOCKED_PIDS.get(&pid) }
+            .copied()
+            .unwrap_or(0)
+            != 0;
+
+    if !(blocked_by_tgid || blocked_by_pid) {
+        return 0; // allow (innerwarden, systemd, cilium, falco all unaffected)
+    }
+
+    if let Some(mut entry) = EVENTS.reserve::<LsmDecisionEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::LsmDecision as u32;
+        event.pid = pid;
+        event.tgid = tgid;
+        event.reason = innerwarden_ebpf_types::LSM_HOOK_BPF_PROG_LOAD;
+        event.ts_ns = unsafe { bpf_ktime_get_ns() };
+        entry.submit(0);
+    }
+
+    -1 // -EPERM — block eBPF weaponization attempt
+}
+
 fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
     // ── Container drift detection (ALWAYS runs, even without guard mode) ──
     // Check if the binary is on an overlayfs upper layer (dropped after container start).
