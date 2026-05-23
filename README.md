@@ -277,7 +277,7 @@ The default `[honeypot] interaction = "llm_shell"` ships a tiered SSH listener t
 
 ## What it detects
 
-76 stateful detectors + 8 YARA rules + 8 Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across all 14 Linux tactics.** Highlights:
+77 stateful detectors + 8 YARA rules + 8 Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across all 14 Linux tactics.** Highlights:
 
 | Detector | Threat | MITRE |
 |----------|--------|-------|
@@ -290,6 +290,7 @@ The default `[honeypot] interaction = "llm_shell"` ships a tiered SSH listener t
 | `execution_guard` | Suspicious shell commands via AST analysis | T1059 |
 | `process_tree` | Suspicious parent-child: web server → shell, Java RCE | T1059 |
 | `privesc` | Real-time privilege escalation via eBPF kprobe on `commit_creds` | T1068 |
+| `suid_page_cache_integrity` | SUID-root binary page-cache SHA divergence (Copy Fail / Dirty Frag / Fragnesia class) | T1014 / T1068 |
 | `rootkit` | Kernel module and userland rootkit detection | T1014 |
 | `ransomware` | Rapid file encryption, ransom note creation, extension changes | T1486 |
 | `c2_callback` | Beaconing, C2 port connections, data exfiltration patterns | T1071 |

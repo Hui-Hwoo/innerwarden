@@ -67,6 +67,24 @@ window_seconds = 300
 # Requires 7 days of login history per user before activating (opt-in, default off).
 anomaly_hours_enabled = false
 
+[detectors.suid_page_cache_integrity]
+# Compare direct-I/O disk hashes with page-cache reads for high-value SUID-root
+# binaries. Catches Copy Fail / Dirty Frag / Fragnesia-style page-cache poisoning.
+enabled = true
+poll_interval_secs = 30
+allowlist = [
+  "/usr/bin/su",
+  "/usr/bin/sudo",
+  "/usr/bin/passwd",
+  "/usr/bin/chsh",
+  "/usr/bin/chfn",
+  "/usr/bin/mount",
+  "/usr/bin/umount",
+  "/usr/bin/newgrp",
+  "/usr/bin/gpasswd",
+  "/usr/bin/pkexec",
+]
+
 [detectors.credential_stuffing]
 enabled = false
 # distinct usernames targeted by one source IP within window

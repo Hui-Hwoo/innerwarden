@@ -223,6 +223,7 @@ pub mod web_shell;
 
 pub mod discovery_burst;
 pub mod sensitive_write;
+pub mod suid_page_cache_integrity;
 
 // v0.6.0 detectors
 pub mod cgroup_abuse;

@@ -1226,6 +1226,29 @@ async fn main() -> Result<()> {
         });
     }
 
+    // SUID page-cache integrity: detects Copy Fail / Dirty Frag / Fragnesia-style
+    // page-cache poisoning by comparing cached reads with direct-I/O disk reads.
+    if cfg.detectors.suid_page_cache_integrity.enabled {
+        let d = &cfg.detectors.suid_page_cache_integrity;
+        let tx_suid_cache = tx.clone();
+        let host_id = cfg.agent.host_id.clone();
+        let allowlist: Vec<PathBuf> = d.allowlist.iter().map(PathBuf::from).collect();
+        let poll_interval_secs = d.poll_interval_secs;
+        info!(
+            paths = allowlist.len(),
+            poll_interval_secs, "starting suid_page_cache_integrity detector"
+        );
+        tokio::spawn(async move {
+            detectors::suid_page_cache_integrity::run(
+                tx_suid_cache,
+                host_id,
+                poll_interval_secs,
+                allowlist,
+            )
+            .await;
+        });
+    }
+
     // Systemd unit inventory: detects new/suspicious services
     {
         let tx_sysd = tx.clone();
@@ -1555,6 +1578,14 @@ fn process_event(
             tags: ev.tags.clone(),
             entities: ev.entities.clone(),
         };
+        write_incident(sqlite, stats, incident, syslog, dedup_cache);
+    }
+
+    // SUID page-cache mismatch → immediate Critical incident. The periodic
+    // detector emits an event because it is file-state telemetry; the sensor
+    // promotes it here so the existing agent incident path sees it.
+    if ev.kind == "integrity.page_cache_mismatch" {
+        let incident = page_cache_mismatch_incident(&ev);
         write_incident(sqlite, stats, incident, syslog, dedup_cache);
     }
 
@@ -2442,6 +2473,46 @@ fn passthrough_incident(
     })
 }
 
+fn page_cache_mismatch_incident(
+    ev: &innerwarden_core::event::Event,
+) -> innerwarden_core::incident::Incident {
+    use innerwarden_core::incident::Incident;
+
+    let path = ev
+        .details
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let path_slug = path
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>();
+
+    Incident {
+        ts: ev.ts,
+        host: ev.host.clone(),
+        incident_id: format!(
+            "suid_page_cache_integrity:{}:{}",
+            path_slug,
+            ev.ts.format("%Y-%m-%dT%H:%MZ")
+        ),
+        severity: innerwarden_core::event::Severity::Critical,
+        title: format!("SUID binary corrupted in page cache: {path}"),
+        summary: format!(
+            "SUID-root binary {path} has different SHA-256 content via page cache versus direct disk read. \
+             This is consistent with page-cache poisoning used by local privilege-escalation exploits."
+        ),
+        evidence: serde_json::json!([ev.details.clone()]),
+        recommended_checks: vec![
+            "Treat the host as potentially compromised; preserve volatile state before rebooting".to_string(),
+            "Compare the affected SUID binary with a trusted package copy".to_string(),
+            "Check for recent local privilege-escalation activity and suspicious root shells".to_string(),
+        ],
+        tags: ev.tags.clone(),
+        entities: ev.entities.clone(),
+    }
+}
+
 fn write_incident(
     sqlite: &SqliteWriter,
     stats: &mut WriteStats,
@@ -2781,6 +2852,43 @@ mod tests {
         assert_eq!(severity_rank(&Severity::Medium), 3);
         assert_eq!(severity_rank(&Severity::High), 4);
         assert_eq!(severity_rank(&Severity::Critical), 5);
+    }
+
+    #[test]
+    fn page_cache_mismatch_event_promotes_to_critical_incident() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-23T09:12:30Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = innerwarden_core::event::Event {
+            ts,
+            host: "sensor-host".to_string(),
+            source: "suid_page_cache_integrity".to_string(),
+            kind: "integrity.page_cache_mismatch".to_string(),
+            severity: Severity::Critical,
+            summary: "SUID binary corrupted in page cache: /usr/bin/su".to_string(),
+            details: serde_json::json!({
+                "path": "/usr/bin/su",
+                "sha256_on_disk": "clean",
+                "sha256_via_page_cache": "poisoned",
+                "polled_at": ts.to_rfc3339(),
+                "mitre_techniques": ["T1014", "T1068"],
+            }),
+            tags: vec!["integrity".to_string(), "T1068".to_string()],
+            entities: vec![innerwarden_core::entities::EntityRef::path("/usr/bin/su")],
+        };
+
+        let incident = page_cache_mismatch_incident(&event);
+
+        assert!(incident
+            .incident_id
+            .starts_with("suid_page_cache_integrity:_usr_bin_su:"));
+        assert_eq!(incident.severity, Severity::Critical);
+        assert_eq!(
+            incident.title,
+            "SUID binary corrupted in page cache: /usr/bin/su"
+        );
+        assert_eq!(incident.evidence[0]["path"], "/usr/bin/su");
+        assert!(incident.summary.contains("direct disk read"));
     }
 
     #[test]

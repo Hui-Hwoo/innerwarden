@@ -206,6 +206,8 @@ pub struct DetectorsConfig {
     pub packet_flood: PacketFloodConfig,
     #[serde(default)]
     pub suspicious_login: SuspiciousLoginConfig,
+    #[serde(default)]
+    pub suid_page_cache_integrity: SuidPageCacheIntegrityConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -214,6 +216,37 @@ pub struct SuspiciousLoginConfig {
     /// When true, logins outside a user's normal hours fire a Medium-severity incident.
     #[serde(default)]
     pub anomaly_hours_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SuidPageCacheIntegrityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_suid_page_cache_integrity_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_suid_page_cache_integrity_allowlist")]
+    pub allowlist: Vec<String>,
+}
+
+impl Default for SuidPageCacheIntegrityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: default_suid_page_cache_integrity_poll_interval_secs(),
+            allowlist: default_suid_page_cache_integrity_allowlist(),
+        }
+    }
+}
+
+fn default_suid_page_cache_integrity_poll_interval_secs() -> u64 {
+    crate::detectors::suid_page_cache_integrity::DEFAULT_POLL_INTERVAL_SECS
+}
+
+fn default_suid_page_cache_integrity_allowlist() -> Vec<String> {
+    crate::detectors::suid_page_cache_integrity::DEFAULT_ALLOWLIST
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1345,6 +1378,16 @@ data_dir = "/tmp/innerwarden"
         assert!(cfg.collectors.auth_log.enabled);
         assert_eq!(cfg.collectors.integrity.poll_seconds, 60);
         assert!(cfg.detectors.ssh_bruteforce.enabled);
+        assert!(cfg.detectors.suid_page_cache_integrity.enabled);
+        assert_eq!(
+            cfg.detectors.suid_page_cache_integrity.poll_interval_secs,
+            30
+        );
+        assert!(cfg
+            .detectors
+            .suid_page_cache_integrity
+            .allowlist
+            .contains(&"/usr/bin/su".to_string()));
         assert!(cfg.detectors.log_tampering.enabled);
         assert!(cfg.allowlist.trusted_users.is_empty());
     }
@@ -1373,6 +1416,11 @@ enabled = true
 threshold = 99
 window_seconds = 42
 
+[detectors.suid_page_cache_integrity]
+enabled = true
+poll_interval_secs = 7
+allowlist = ["/tmp/test-su"]
+
 [allowlist]
 trusted_users = ["alice", "bob"]
 "#,
@@ -1387,6 +1435,15 @@ trusted_users = ["alice", "bob"]
         assert!(cfg.detectors.port_scan.enabled);
         assert_eq!(cfg.detectors.port_scan.threshold, 99);
         assert_eq!(cfg.detectors.port_scan.window_seconds, 42);
+        assert!(cfg.detectors.suid_page_cache_integrity.enabled);
+        assert_eq!(
+            cfg.detectors.suid_page_cache_integrity.poll_interval_secs,
+            7
+        );
+        assert_eq!(
+            cfg.detectors.suid_page_cache_integrity.allowlist,
+            vec!["/tmp/test-su"]
+        );
         assert_eq!(cfg.allowlist.trusted_users, vec!["alice", "bob"]);
 
         let invalid = dir.path().join("sensor-invalid.toml");
@@ -1419,6 +1476,13 @@ trusted_users = ["alice", "bob"]
         assert!(ssh.enabled);
         assert_eq!(ssh.threshold, 8);
         assert_eq!(ssh.window_seconds, 300);
+
+        let suid_page_cache = SuidPageCacheIntegrityConfig::default();
+        assert!(suid_page_cache.enabled);
+        assert_eq!(suid_page_cache.poll_interval_secs, 30);
+        assert!(suid_page_cache
+            .allowlist
+            .contains(&"/usr/bin/su".to_string()));
 
         let stuffing = CredentialStuffingConfig::default();
         assert!(!stuffing.enabled);

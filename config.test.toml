@@ -54,3 +54,19 @@ window_seconds = 60
 enabled = false
 threshold = 2
 window_seconds = 300
+
+[detectors.suid_page_cache_integrity]
+enabled = true
+poll_interval_secs = 30
+allowlist = [
+  "/usr/bin/su",
+  "/usr/bin/sudo",
+  "/usr/bin/passwd",
+  "/usr/bin/chsh",
+  "/usr/bin/chfn",
+  "/usr/bin/mount",
+  "/usr/bin/umount",
+  "/usr/bin/newgrp",
+  "/usr/bin/gpasswd",
+  "/usr/bin/pkexec",
+]

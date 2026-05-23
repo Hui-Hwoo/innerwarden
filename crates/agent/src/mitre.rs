@@ -83,6 +83,11 @@ pub fn map_detector(detector: &str) -> Option<MitreMapping> {
             "T1068",
             "Exploitation for Privilege Escalation",
         ),
+        "suid_page_cache_integrity" => m(
+            "Privilege Escalation",
+            "T1068",
+            "Exploitation for Privilege Escalation",
+        ),
         "sudo_abuse" => m(
             "Privilege Escalation",
             "T1548",
@@ -204,6 +209,15 @@ pub fn map_detector_all(detector: &str) -> Vec<MitreMapping> {
             m("Command and Control", "T1571", "Non-Standard Port"),
         ],
 
+        "suid_page_cache_integrity" => vec![
+            m(
+                "Privilege Escalation",
+                "T1068",
+                "Exploitation for Privilege Escalation",
+            ),
+            m("Defense Evasion", "T1014", "Rootkit"),
+        ],
+
         // Single-technique detectors: wrap the primary mapping
         _ => match map_detector(detector) {
             Some(mapping) => vec![mapping],
@@ -250,6 +264,7 @@ pub fn all_technique_ids() -> Vec<&'static str> {
         "user_creation",
         "container_escape",
         "privesc",
+        "suid_page_cache_integrity",
         "sudo_abuse",
         "c2_callback",
         "dns_tunneling",
@@ -314,6 +329,7 @@ pub fn generate_navigator_layer() -> serde_json::Value {
         "user_creation",
         "container_escape",
         "privesc",
+        "suid_page_cache_integrity",
         "sudo_abuse",
         "c2_callback",
         "dns_tunneling",
@@ -448,6 +464,7 @@ pub fn coverage_by_tactic(
         "user_creation",
         "container_escape",
         "privesc",
+        "suid_page_cache_integrity",
         "sudo_abuse",
         "c2_callback",
         "dns_tunneling",
@@ -692,6 +709,12 @@ mod tests {
             "T1548",
             "Abuse Elevation Control Mechanism",
         );
+        assert_mapping(
+            "suid_page_cache_integrity",
+            "Privilege Escalation",
+            "T1068",
+            "Exploitation for Privilege Escalation",
+        );
     }
 
     #[test]
@@ -846,6 +869,15 @@ mod tests {
     }
 
     #[test]
+    fn test_map_detector_all_suid_page_cache_integrity() {
+        let mappings = map_detector_all("suid_page_cache_integrity");
+        assert_eq!(mappings.len(), 2);
+        let ids: Vec<&str> = mappings.iter().map(|m| m.technique_id).collect();
+        assert!(ids.contains(&"T1068"));
+        assert!(ids.contains(&"T1014"));
+    }
+
+    #[test]
     fn test_map_detector_all_single_technique_fallback() {
         let mappings = map_detector_all("ssh_bruteforce");
         assert_eq!(mappings.len(), 1);
@@ -939,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_47_detectors_are_mapped() {
+    fn test_known_detectors_are_mapped() {
         let detectors = [
             // Original 36
             "ssh_bruteforce",
@@ -960,6 +992,7 @@ mod tests {
             "container_escape",
             "docker_anomaly",
             "privesc",
+            "suid_page_cache_integrity",
             "sudo_abuse",
             "integrity_alert",
             "log_tampering",
