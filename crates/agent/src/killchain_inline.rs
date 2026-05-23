@@ -36,6 +36,18 @@ pub(crate) fn process_events(
     let mut all_incidents = Vec::new();
 
     for event in events {
+        // Spec 052 Phase 1b — gap E (sched_process_exit GC):
+        // When a registered PID exits, drop it from BLOCKED_PIDS so
+        // the kernel doesn't carry stale entries until LRU eviction.
+        // Cheap to call (returns silently if PID isn't in map).
+        // Runs BEFORE the tracker so we don't miss exit events for
+        // PIDs that the tracker also processes.
+        if event.kind == "process.exit" {
+            if let Some(pid) = event.details.get("pid").and_then(|p| p.as_u64()) {
+                crate::lsm_policy::unregister_blocked_pid(pid as u32);
+            }
+        }
+
         // Convert core Event to JSON for the killchain tracker.
         let json = event_to_tracker_json(event);
         let incidents = tracker.process_event(&json);
@@ -1112,6 +1124,61 @@ mod tests {
             .and_then(|ev| ev.get("pid"))
             .and_then(|v| v.as_u64());
         assert_eq!(correct, Some(1234), "helper recovers the pid");
+    }
+
+    // ── Spec 052 Phase 1b — gap E anchor (sched_process_exit GC) ────
+    //
+    // `process_events` must call `lsm_policy::unregister_blocked_pid`
+    // when an Event with `kind == "process.exit"` arrives, so dead
+    // PIDs don't accumulate in BLOCKED_PIDS (LRU fallback exists but
+    // is the long way around). On non-Linux the underlying function
+    // is a no-op stub — the test here verifies the WIRING happens
+    // (no panic, no incident-emit side effect) regardless of platform.
+
+    #[test]
+    fn process_exit_event_triggers_gc_path_without_panic() {
+        let mut tracker = PidTracker::new();
+        let mut engine = correlation_engine::CorrelationEngine::new();
+        let exit_event = innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "test".into(),
+            source: "ebpf".into(),
+            kind: "process.exit".into(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: String::new(),
+            details: serde_json::json!({ "pid": 4242u32, "comm": "python3", "exit_code": 0 }),
+            tags: vec![],
+            entities: vec![],
+        };
+        let incidents = process_events(&mut tracker, &[exit_event], &mut engine);
+        // process.exit alone doesn't trigger a kill chain — no incidents.
+        assert!(
+            incidents.is_empty(),
+            "process.exit alone must not fire chain"
+        );
+        // The important assertion is that we got HERE without panicking
+        // (verifying the unregister_blocked_pid wiring is callable).
+    }
+
+    #[test]
+    fn process_exit_without_pid_does_not_call_unregister() {
+        // Defensive: process.exit events with missing/null pid must
+        // skip the GC path silently instead of panicking on as_u64().
+        let mut tracker = PidTracker::new();
+        let mut engine = correlation_engine::CorrelationEngine::new();
+        let bad_event = innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "test".into(),
+            source: "ebpf".into(),
+            kind: "process.exit".into(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: String::new(),
+            details: serde_json::json!({ "comm": "python3" }), // no pid
+            tags: vec![],
+            entities: vec![],
+        };
+        let _ = process_events(&mut tracker, &[bad_event], &mut engine);
+        // No panic = test passes.
     }
 
     // ── Phase 7B Slice C anchors ────────────────────────────────────

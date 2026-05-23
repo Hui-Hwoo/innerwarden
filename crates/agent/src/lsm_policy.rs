@@ -166,16 +166,12 @@ pub fn register_blocked_pid(pid: u32, reason: &str) {
     );
 }
 
-/// Drop a PID's registration. Called from the process-exit consumer
-/// (Phase 1b follow-up) so dead PIDs don't sit in the map forever.
-/// LRU eviction handles the leak risk if this is never called, so this
-/// is best-effort cleanup, not load-bearing.
-//
-// dead_code allow: this function is the documented entry point for the
-// sched_process_exit GC wiring that comes in the next Phase 1b sub-PR.
-// Without `#[allow]` clippy `-D warnings` rejects the PR.
+/// Drop a PID's registration. Called from `killchain_inline::process_events`
+/// when it sees a `process.exit` event (Spec 052 Phase 1b — gap E,
+/// 2026-05-22) so dead PIDs don't sit in the map forever.
+/// LRU eviction (4096-slot cap) is the fallback safety net if a process
+/// exits without an event ever reaching the agent.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 pub fn unregister_blocked_pid(pid: u32) {
     let mut guard = match map_handle().lock() {
         Ok(g) => g,
@@ -209,7 +205,6 @@ pub fn register_blocked_pid(pid: u32, reason: &str) {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn unregister_blocked_pid(_pid: u32) {
     // no-op on non-Linux
 }
