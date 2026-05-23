@@ -1521,6 +1521,28 @@ fn is_passthrough_source(source: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Returns true if the event's src_ip is in the blocked set. Pure helper,
+/// extracted so the "don't early-return for blocked IPs" rule can be anchored
+/// in a unit test without spinning up the whole `process_event` harness.
+///
+/// This used to gate a `return` inside `process_event` — see the inline
+/// comment there for the 2026-05-23 incident that proved the early-return
+/// was harmful. The helper now exists only so other code paths can use the
+/// blocked-list as a hint (severity tagging, etc) without re-parsing the
+/// event details.
+fn should_use_blocked_ip_hint(
+    ev: &innerwarden_core::event::Event,
+    blocked: &std::collections::HashSet<String>,
+) -> bool {
+    let src_ip = ev
+        .details
+        .get("ip")
+        .or_else(|| ev.details.get("src_ip"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    !src_ip.is_empty() && blocked.contains(src_ip)
+}
+
 fn process_event(
     ev: innerwarden_core::event::Event,
     sqlite: &SqliteWriter,
@@ -1607,18 +1629,32 @@ fn process_event(
         detectors.blocked_ips_last_check = std::time::Instant::now();
     }
 
-    // Blocked IP pre-check: skip detection for IPs already blocked by the agent.
-    {
-        let src_ip = ev
-            .details
-            .get("ip")
-            .or_else(|| ev.details.get("src_ip"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !src_ip.is_empty() && detectors.blocked_ips.contains(src_ip) {
-            return;
-        }
-    }
+    // Blocked-IP awareness, but NO early-return.
+    //
+    // Pre-2026-05-23 this block returned early for any event whose src_ip was
+    // already in `detectors.blocked_ips`. The intent ("don't waste CPU on IPs
+    // we already blocked") was reasonable but the side-effect was a silent
+    // pipeline kill: ssh_bruteforce, distributed_ssh, kill_chain, mitre_hunt,
+    // process_tree, etc all stopped seeing the events, so:
+    //   - Detector sliding windows went stale (next firing after the block
+    //     expired had no tracked context).
+    //   - Dashboard "ongoing activity" panels went dark — operators couldn't
+    //     tell if a block was holding or the attacker had given up.
+    //   - 135.136.44.2 specifically: blocked May 21, kept sending 12k+ ssh
+    //     failures/day for 2 days, ZERO new incidents. Bug discovered when
+    //     the operator saw the live attack on the dashboard and asked why
+    //     ssh_bruteforce hadn't fired in 48h.
+    //
+    // The agent's block_ip skill is idempotent (re-issuing a UFW rule that
+    // already exists is a no-op), so the original "save CPU" concern was
+    // largely moot. Each detector also has its own per-incident dedupe (e.g.
+    // ssh_bruteforce suppresses re-alerts for 300s per IP), so removing the
+    // early return doesn't flood the incidents table either.
+    //
+    // The `blocked_ips` set is still loaded (line above) — other code paths
+    // may want to use it as a hint (e.g. severity tagging on the dashboard).
+    // It just no longer silences the detector pipeline.
+    let _blocked_ip_hint = should_use_blocked_ip_hint(&ev, &detectors.blocked_ips);
 
     // Dynamic allowlist pre-check: skip incident generation for allowlisted
     // processes, IPs, and ports. Events are still logged -- only detectors are skipped.
@@ -2990,6 +3026,130 @@ mod tests {
         // unset so the operator's foreground run does not silently start
         // attempting a journald write that will fail.
         assert!(!use_journald_layer(Some("")));
+    }
+
+    // ── Anchor: blocked-IP early-return must STAY removed ────────────────
+    //
+    // 2026-05-23: an old `process_event` had this pattern just before the
+    // detector calls:
+    //   if !src_ip.is_empty() && detectors.blocked_ips.contains(src_ip) {
+    //       return;
+    //   }
+    // The "save CPU on already-blocked traffic" intent was reasonable but
+    // the side-effect was that ssh_bruteforce / distributed_ssh / kill_chain
+    // / mitre_hunt all stopped seeing events from blocked IPs. IP
+    // 135.136.44.2 (blocked May 21, kept attacking for 48h with 12k+ ssh
+    // failures, ZERO new incidents) made the problem visible.
+    //
+    // The helper `should_use_blocked_ip_hint` still exists so other code
+    // can use the blocked set as a HINT (severity tagging, etc), but the
+    // anchor below pins that the function is a *hint*, not a kill-switch:
+    // a future contributor must not re-add an `if ... { return; }` around
+    // its call in `process_event` without explicitly justifying it. If
+    // they do, the regression test below should also be deleted with a
+    // comment explaining why the old behaviour is acceptable again.
+    #[test]
+    fn blocked_ip_hint_returns_true_but_does_not_imply_skip() {
+        use innerwarden_core::event::{Event, Severity};
+        use std::collections::HashSet;
+
+        let mut blocked = HashSet::new();
+        blocked.insert("135.136.44.2".to_string());
+
+        let ev = Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "auth.log".to_string(),
+            kind: "ssh.login_failed".to_string(),
+            severity: Severity::Info,
+            summary: "Failed login from 135.136.44.2".to_string(),
+            details: serde_json::json!({
+                "ip": "135.136.44.2",
+                "user": "root",
+                "reason": "invalid_user",
+            }),
+            tags: vec![],
+            entities: vec![],
+        };
+
+        // The helper correctly reports that this IP is in the blocked set.
+        assert!(
+            should_use_blocked_ip_hint(&ev, &blocked),
+            "helper must return true when src_ip is in the blocked set"
+        );
+
+        // Anti-regression: search the source of `process_event` for the
+        // forbidden pattern. If anyone wires `should_use_blocked_ip_hint`
+        // to a `return;` inside `process_event`, the silent-pipeline-kill
+        // bug from 2026-05-23 comes back. The check is grep-level because
+        // we can't easily run the full process_event harness in a unit
+        // test (depends on SqliteWriter, DetectorSet, syslog, etc).
+        let main_src = include_str!("main.rs");
+        let process_event_start = main_src
+            .find("fn process_event(")
+            .expect("process_event function must exist in main.rs");
+        let process_event_body =
+            &main_src[process_event_start..(process_event_start + 8000).min(main_src.len())];
+        let forbidden_pattern = "if should_use_blocked_ip_hint";
+        assert!(
+            !process_event_body.contains(&format!("{forbidden_pattern}(&ev, &detectors.blocked_ips) {{\n        return;")) &&
+            !process_event_body.contains(&format!("{forbidden_pattern}(&ev, &detectors.blocked_ips) {{\n            return;")),
+            "process_event must NOT short-circuit on blocked IPs — see the 2026-05-23 incident comment in the function body. \
+             If you intentionally re-added the early-return, delete THIS test with a comment explaining why."
+        );
+    }
+
+    #[test]
+    fn blocked_ip_hint_returns_false_for_unblocked_ip() {
+        use innerwarden_core::event::{Event, Severity};
+        use std::collections::HashSet;
+
+        let mut blocked = HashSet::new();
+        blocked.insert("1.1.1.1".to_string());
+
+        let ev = Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "auth.log".to_string(),
+            kind: "ssh.login_failed".to_string(),
+            severity: Severity::Info,
+            summary: "Failed login from 2.2.2.2".to_string(),
+            details: serde_json::json!({ "ip": "2.2.2.2" }),
+            tags: vec![],
+            entities: vec![],
+        };
+
+        assert!(
+            !should_use_blocked_ip_hint(&ev, &blocked),
+            "helper must return false for an IP not in the blocked set"
+        );
+    }
+
+    #[test]
+    fn blocked_ip_hint_returns_false_when_event_has_no_ip() {
+        use innerwarden_core::event::{Event, Severity};
+        use std::collections::HashSet;
+
+        let mut blocked = HashSet::new();
+        blocked.insert("1.1.1.1".to_string());
+
+        let ev = Event {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            source: "exec_audit".to_string(),
+            kind: "process.exec".to_string(),
+            severity: Severity::Info,
+            summary: "exec without IP".to_string(),
+            details: serde_json::json!({ "comm": "ls" }),
+            tags: vec![],
+            entities: vec![],
+        };
+
+        assert!(
+            !should_use_blocked_ip_hint(&ev, &blocked),
+            "helper must return false when the event has no ip/src_ip field — \
+             otherwise non-network events would spuriously trip the hint"
+        );
     }
 
     #[test]
