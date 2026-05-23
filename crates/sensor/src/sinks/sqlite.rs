@@ -66,11 +66,18 @@ impl SqliteWriter {
 /// The knowledge graph still ingests them (agent reads from graph, not DB).
 /// Only the raw event audit trail skips them.
 fn is_high_volume_event(kind: &str) -> bool {
+    // Spec 052 Phase 1b — gap E (2026-05-22): `process.exit` removed
+    // from this list. The agent's killchain_inline::process_events GC
+    // path reads from SQLite events and calls
+    // `lsm_policy::unregister_blocked_pid(pid)` for every process.exit
+    // so dead PIDs leave BLOCKED_PIDS immediately. Without seeing
+    // process.exit events the GC was inert — entries stuck for ~8 days
+    // until LRU eviction. Cost: ~50K extra SQLite rows/day on a busy
+    // host; gain: clean BLOCKED_PIDS map matching live process state.
     matches!(
         kind,
         "tcp_stream.flow"
             | "tcp_stream.http"
-            | "process.exit"
             | "process.clone"
             | "process.fd_redirect"
             | "network.snapshot_connected"
@@ -86,7 +93,11 @@ mod tests {
     fn test_is_high_volume_event() {
         assert!(is_high_volume_event("tcp_stream.flow"));
         assert!(is_high_volume_event("tcp_stream.http"));
-        assert!(is_high_volume_event("process.exit"));
+        // Spec 052 Phase 1b — gap E: process.exit MUST flow to SQLite
+        // so the agent's GC path can call unregister_blocked_pid.
+        // If someone re-adds it to the filter, BLOCKED_PIDS will
+        // accumulate dead PIDs until LRU eviction (~8 days).
+        assert!(!is_high_volume_event("process.exit"));
         assert!(is_high_volume_event("process.clone"));
         assert!(is_high_volume_event("process.fd_redirect"));
         assert!(is_high_volume_event("network.snapshot_connected"));
