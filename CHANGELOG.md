@@ -9,6 +9,58 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-05-23
+
+**Headline:** 5 LSM kernel-block hooks live in prod with synchronous `-EPERM` enforcement on kernel ≥ 6.4. The "stops attacks mid-keystroke" copy is no longer half-true for the process-exec subset — it's now true for exec, user-namespace creation, ptrace attach, BPF program load, and mmap of sensitive files.
+
+Spec 052 (minimal LSM hook refactor) and Spec 053 (skip-dispatcher workaround + collateral fixes) shipped end-to-end. Validated against the Oracle prod kernel 6.8.0-1052-oracle with the sched_process_exit GC test (PID 950484, 2026-05-23): register → kill → 13 s later agent emits `lsm_policy: unregistered exited PID from BLOCKED_PIDS`, `bpftool map lookup` returns `Not found`.
+
+### Added
+
+- **5 LSM kernel-block hooks** wired into the kill-chain detector via `BLOCKED_PIDS` LRU map (4096 slots, pinned at `/sys/fs/bpf/innerwarden/blocked_pids`). Kernel decides synchronously, userspace populates the map. (#773 #774 #775 #776 #777 #778 #779 #780 #783 #784 #785 #786 #787 #788 #789)
+  - `bprm_check_security` — exec blocking (Spec 052 Phase 1a)
+  - `userns_create` — container escape via `unshare(CLONE_NEWUSER)` (PR-A, #779)
+  - `ptrace_access_check` — process injection via PTRACE_ATTACH/POKETEXT (PR-B, #780, **not** sleepable — verifier rejects sleepable on this hook)
+  - `bpf_prog_load` — VoidLink-style eBPF weaponisation (PR-C, #783)
+  - `mmap_file` — real-time RWX block, replacing the 5 s `proc_maps` polling window (PR-D, #784)
+- **sched_process_exit GC** for BLOCKED_PIDS (#787 #788 #789). When a registered PID exits, the agent's slow-loop drops it from the map — without this, the LRU filled with dead PIDs until ~8-day eviction. The `process.exit` event was previously dropped by the SQLite sink's high-volume filter; the agent never saw it.
+- **`scripts/verify-lsm-hooks.sh` + CI workflow** anchors the 7 LSM hook sections in the built `.o` against an EXPECTED list. Catches accidental hook renames, sleepable changes, and cfg gating regressions. (#785)
+- **Shield `cloudflare_failover` + `origin_lockdown` panic mode**, dry-run default (#763). Operator opts in by lowering the threshold; the failover/lockdown action records to the decision log even in dry-run.
+
+### Changed
+
+- **`process.exit` is no longer filtered out of the SQLite sink** (#788). Cost: ~50 K extra rows/day on a busy host. Benefit: the GC path can see the events. Anchored with `test_is_high_volume_event` so a future cleanup can't silently re-add it.
+- **Kill-chain `evidence` reader hardened** against shape drift (#778). Six call sites silently parsed `evidence` as Object when the producer had moved to Array, returning `None` and skipping the PID extraction. Helper `evidence_obj` now tolerates both shapes; 6 anchor tests pin the bug, including a `demonstrates_the_silent_bug` anti-pattern test.
+- **`SYSCALL_DISPATCHER` tail-call path skipped** (#777). The aya `BPF_MAP_TYPE_PROG_ARRAY` + `tail_call` pattern silently failed on kernel 6.8 (entries persisted in the array, `tail_call` fell through). Workaround: attach each hook as a standalone tracepoint, no dispatcher. The `dispatcher` Cargo feature was removed from the build path in #786.
+- **Codecov gate switched from `target: auto` (drift) to fixed floors set 2 pp below 2026-05-23 main** (#790). The auto/drift gate kept tripping on refactor PRs that moved tested code around without changing the underlying signal. New gates cover 13 components.
+- **`lsm_policy` split into `lsm_policy/{mod.rs, aya_impl.rs}`** (#789). Testable trait + inner GC logic lives in `mod.rs` with 3 new mock-driven anchor tests; the aya FFI wrapper lives in `aya_impl.rs` and is excluded from the patch coverage gate with the same justification as `main.rs` / `boot.rs`.
+- **Dashboard logo: crossed-swords SVG replaced by the steel W mark** (#791). Last surface still showing the old logo.
+- **README + wiki Home stats refreshed** to match source on 2026-05-23 (#791): 49 eBPF programs, 76 detectors, 68 cross-layer rules, 90+ MITRE technique IDs, 8000+ unit tests with 665 named anchors. Drops the playbook engine references — playbooks were removed in PR #413 (decisions flow through the AI skill executor inline now).
+
+### Fixed
+
+- **eBPF LSM section** finally loads on kernel ≥ 6.4 — `sleepable` attribute (#768), BTF emission via `shim.c` + `--btf` link flag (#767), minimal hook body refactor (Spec 052). The earlier "func 'bpf_lsm_bprm_check_security' arg0 has btf_id 3620 type STRUCT 'linux_binprm'" rejection was misleading verifier preamble; the real rejection was body-complexity-driven, diagnosed on `lsm/diagnostic-minimal` branch.
+- **`russh` bumped 0.60.1 → 0.60.3** to patch GHSA-g9f8-wqj9-fjw5 (#772).
+- **Killchain "LSM-blocked" detector wired** and the misleading `lsm=bpf` log message dropped (#764).
+- **Sensors panel zero-day fixes** for syslog_firewall + inventories (#761).
+- **jemalloc drop-in** is now version-controlled with `prof_active=false` default (#760).
+- **Cases-tab leaks** plugged from the 2026-05-21 prod orphan audit (#759).
+
+### Removed
+
+- **All `specs/` and `.specify/` files removed from the repo** (#771). Specs are local-only workspace now (operator's `.specify/` directory is gitignored).
+
+### Operator-visible numbers
+
+- Workspace version: `0.14.1` → `0.14.2`.
+- eBPF kernel programs: `44` → `49` (added 4 LSM hooks + raw_tracepoints expanded from 1 dispatcher to 7 standalone).
+- LSM kernel-block hooks: `2` (file_open, bpf — legacy) → `7` (5 new + 2 legacy retained in parallel).
+- Detectors: `73` → `76`.
+- Cross-layer correlation rules: `47–67` (drift across docs) → **68** (authoritative grep of `CL-NNN` in `correlation_engine.rs`).
+- MITRE technique IDs: `75+` → `90+` (93 unique T-IDs grep'd from source).
+- Unit tests: `7300+` → `8000+` (8010 authoritative via `cargo test --workspace -- --list`).
+- Named anchor tests: previously overstated as `1275` → corrected to **665** per `scripts/verify-anchor-tests.sh`.
+
 ## [0.14.1] - 2026-05-20
 
 Dashboard observability polish + correlation engine wiring fix. Seven PRs against `main` after v0.14.0 was tagged. Verified end-to-end on Oracle prod (ARM64 aarch64, kernel 6.8.0-1052-oracle) before tagging.
