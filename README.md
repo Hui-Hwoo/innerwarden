@@ -117,7 +117,7 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 │       └───────────┴───────────────┴─────────────┘                 │
 │                          │                                        │
 │                    ┌─────▼──────┐                                 │
-│                    │78 detectors│ + 8 YARA + 8 Sigma              │
+│                    │78 detectors│ + 8 YARA + 208 Sigma (+8 built-in)│
 │                    │ stateful   │                                 │
 │                    └─────┬──────┘                                 │
 │                          │                                        │
@@ -207,7 +207,7 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 ## What it does
 
 1. **Watches**: 29 collectors across all layers — eBPF syscall tracing (49 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, CloudTrail
-2. **Detects**: 77 stateful detectors + 8 YARA malware rules + 8 Sigma log rules identify brute-force, credential stuffing, port scans, C2 callbacks (including tunnels via ngrok/cloudflared/bore, non-standard ports, and DNS/ICMP/SSH-forward protocol tunneling), privilege escalation (non-baseline SUID exec, dangerous-capability abuse), container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID, plus scp/rsync staged-egress), timestomping, log tampering, discovery bursts (nmap, wordlist scanners, argv-driven anomaly), collection patterns (clipboard, screen capture, password-protected archives), persistence (PAM module tampering, RC scripts, systemd units, cron, SSH keys), defense evasion (auditd disable, SELinux/AppArmor disable), data destruction (rm -rf user data, disk wipe, mkfs/luksFormat on running volumes), symlink/hardlink hijack of sensitive files, service-account interactive shells (foothold signal), and more. **90+ MITRE ATT&CK techniques covered** across 14 tactics.
+2. **Detects**: 78 stateful detectors + 8 YARA malware rules + 8 built-in Sigma rules + 208 community Sigma rules identify brute-force, credential stuffing, port scans, C2 callbacks (including tunnels via ngrok/cloudflared/bore, non-standard ports, and DNS/ICMP/SSH-forward protocol tunneling), privilege escalation (non-baseline SUID exec, dangerous-capability abuse), container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID, plus scp/rsync staged-egress), timestomping, log tampering, discovery bursts (nmap, wordlist scanners, argv-driven anomaly), collection patterns (clipboard, screen capture, password-protected archives), persistence (PAM module tampering, RC scripts, systemd units, cron, SSH keys), defense evasion (auditd disable, SELinux/AppArmor disable), data destruction (rm -rf user data, disk wipe, mkfs/luksFormat on running volumes), symlink/hardlink hijack of sensitive files, service-account interactive shells (foothold signal), and more. **90+ MITRE ATT&CK techniques covered** across 14 tactics.
 3. **Correlates**: 68 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
 4. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
 5. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
@@ -277,7 +277,7 @@ The default `[honeypot] interaction = "llm_shell"` ships a tiered SSH listener t
 
 ## What it detects
 
-77 stateful detectors + 8 YARA rules + 8 Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across all 14 Linux tactics.** Highlights:
+78 stateful detectors + 8 YARA rules + 8 built-in Sigma rules + 208 community Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across all 14 Linux tactics.** Highlights:
 
 | Detector | Threat | MITRE |
 |----------|--------|-------|
@@ -319,7 +319,7 @@ The default `[honeypot] interaction = "llm_shell"` ships a tiered SSH listener t
 | **`symlink_hijack`** | Symlink/hardlink naming /etc/shadow, /etc/sudoers, /etc/pam.d/*, ~/.ssh/authorized_keys | T1555 / T1574.005 |
 | **`system_user_interactive`** | Service accounts (www-data, nobody, postgres, …) running interactive shells with tty or sshd parent | T1059 / T1078.003 |
 
-Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection`, `user_creation`, `crontab_persistence`, `systemd_persistence`, `process_injection`, `outbound_anomaly`, `data_exfil_ebpf` (sensitive file read → outbound connect by PID), `keylogger_bash_trap` (shell startup file tampering + trap-DEBUG patterns), `yara_scan` (8 built-in rules: XMRig, webshells, Cobalt Strike, Metasploit, rootkits), `sigma_rule` (8 built-in rules: cron modification, /tmp execution, shadow access, docker.sock), `cgroup_abuse` (CPU/memory resource abuse), `io_uring_anomaly`, `container_drift`, `host_drift`, `sensitive_write`.
+Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection`, `user_creation`, `crontab_persistence`, `systemd_persistence`, `process_injection`, `outbound_anomaly`, `data_exfil_ebpf` (sensitive file read → outbound connect by PID), `keylogger_bash_trap` (shell startup file tampering + trap-DEBUG patterns), `yara_scan` (8 built-in rules: XMRig, webshells, Cobalt Strike, Metasploit, rootkits), `sigma_rule` (8 built-in rules: cron modification, /tmp execution, shadow access, docker.sock; plus 208 community rules auto-loaded from `rules/sigma/`), `cgroup_abuse` (CPU/memory resource abuse), `io_uring_anomaly`, `container_drift`, `host_drift`, `sensitive_write`.
 
 `execution_guard` parses commands structurally using tree-sitter-bash. It catches `curl | sh` pipelines, `/tmp` execution, reverse shell patterns, and staged download-chmod-execute sequences.
 
@@ -724,7 +724,7 @@ innerwarden agent connect                           # connect to running agents
 
 ## Supported environments
 
-- **Linux**: Ubuntu 22.04+, any systemd-based distro. Full feature set with 22 eBPF kernel hooks (tracepoints, kprobes, LSM, XDP), kill chain enforcement, wire-speed blocking.
+- **Linux**: Ubuntu 22.04+, any systemd-based distro. Full feature set with 49 eBPF kernel programs (tracepoints, kprobes, LSM, XDP, raw_tracepoints), kill chain enforcement, wire-speed blocking.
 - **macOS**: Ventura and later (launchd, pf firewall, unified log). Detection and response work fully, but eBPF kernel programs are Linux-only. macOS uses log-based collectors instead.
 
 Pre-built binaries: `x86_64` and `aarch64` for both platforms.
@@ -759,7 +759,7 @@ No. Starts in observe-only mode. You enable response skills and disable dry-run 
 No. Detection, logging, dashboard, and reports all work without AI. AI adds confidence-scored triage for autonomous response and is entirely optional.
 
 **How is this different from Fail2ban?**
-Fail2ban blocks IPs based on regex patterns. Inner Warden has 36 detectors, 22 eBPF kernel hooks with kill chain enforcement, a collaborative defence mesh network, 10 response skills (including sudo suspension, process kill, container pause, honeypots, and traffic capture), twelve AI providers, 4-layer DDoS defence, Telegram bot, AbuseIPDB intelligence sharing, and a full investigation dashboard with MITRE ATT&CK mapping.
+Fail2ban blocks IPs based on regex patterns. Inner Warden has 78 detectors, 49 eBPF kernel programs with kill chain enforcement, a collaborative defence mesh network, 10 response skills (including sudo suspension, process kill, container pause, honeypots, and traffic capture), twelve AI providers, 4-layer DDoS defence, Telegram bot, AbuseIPDB intelligence sharing, and a full investigation dashboard with MITRE ATT&CK mapping.
 
 **How is this different from other HIDS tools?**
 Most host intrusion detection systems only observe. They write alerts for a human to act on. Inner Warden observes AND blocks. LSM hooks stop reverse shells at the kernel's execve before the process runs. XDP drops attack traffic at wire speed. Kill chain detection blocks 7 generic exploit patterns without CVE signatures, catching zero-day exploits by behaviour rather than known hashes.
