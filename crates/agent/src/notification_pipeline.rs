@@ -30,6 +30,13 @@ pub(crate) struct IncidentGroup {
     pub severity_max: Severity,
     pub auto_resolved: bool,
     pub sample_incident_id: String,
+    /// Kill-chain pattern name (DATA_EXFIL / EXEC_REPL / …) extracted
+    /// from `incident.evidence[0].pattern` when the detector is
+    /// `kill_chain`. Carried so the hourly summary can surface "🔴 2
+    /// data_exfil kill_chain from <ip>" instead of the patternless
+    /// "🔴 2 kill_chain from <ip>" that hid the operationally
+    /// useful field. None for non-kill_chain detectors.
+    pub pattern: Option<String>,
     /// Whether the first notification for this group has been dispatched.
     #[serde(skip)]
     first_notified: bool,
@@ -55,6 +62,7 @@ impl IncidentGroup {
             severity_max: incident.severity.clone(),
             auto_resolved: false,
             sample_incident_id: incident.incident_id.clone(),
+            pattern: extract_kill_chain_pattern(incident),
             first_notified: false,
             threshold_summary_sent: false,
         }
@@ -77,6 +85,11 @@ pub(crate) struct GroupSummary {
     pub auto_resolved: bool,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+    /// Kill-chain pattern (e.g. `DATA_EXFIL`, `EXEC_REPL`) carried
+    /// through from [`IncidentGroup::pattern`] so the hourly summary
+    /// can show the operationally-useful pattern name. None for
+    /// non-kill_chain detectors.
+    pub pattern: Option<String>,
 }
 
 impl GroupSummary {
@@ -88,6 +101,11 @@ impl GroupSummary {
             Severity::Medium => "\u{1f7e1}",   // 🟡
             _ => "\u{1f7e2}",                  // 🟢
         };
+        let kill_chain_label = self.pattern.as_ref().map(|p| {
+            // p is the raw pattern enum name; lowercase for the line
+            // so it reads naturally inline ("data_exfil kill_chain").
+            format!("{} kill_chain", p.to_ascii_lowercase())
+        });
         let label = match self.detector.as_str() {
             "ssh_bruteforce" => "login attempts",
             "credential_stuffing" => "credential attacks",
@@ -99,6 +117,7 @@ impl GroupSummary {
             "suspicious_execution" => "suspicious executions",
             "web_scan" => "web scans",
             "rootkit" => "kernel anomalies",
+            "kill_chain" => kill_chain_label.as_deref().unwrap_or("kill_chain"),
             _ => &self.detector,
         };
         let resolved = if self.auto_resolved {
@@ -116,6 +135,32 @@ impl GroupSummary {
             self.count,
         )
     }
+}
+
+/// Pull the kill-chain pattern off an incident's first evidence row.
+/// Returns the uppercased pattern string (e.g. "DATA_EXFIL") or None
+/// when the incident is not a kill_chain or carries no pattern field.
+/// We accept either `evidence[0].pattern` (the kill_chain emitter's
+/// shape) or `evidence.pattern` (older shape, kept for compat).
+fn extract_kill_chain_pattern(incident: &Incident) -> Option<String> {
+    let detector = incident.incident_id.split(':').next()?;
+    if detector != "kill_chain" {
+        return None;
+    }
+    let evidence = &incident.evidence;
+    // Newer shape: evidence is an array; pattern is on the first row.
+    if let Some(arr) = evidence.as_array() {
+        if let Some(first) = arr.first() {
+            if let Some(p) = first.get("pattern").and_then(|v| v.as_str()) {
+                return Some(p.to_string());
+            }
+        }
+    }
+    // Older shape: evidence is an object; pattern is at the top level.
+    evidence
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[allow(dead_code)]
@@ -280,6 +325,7 @@ impl GroupingEngine {
                     auto_resolved: group.auto_resolved,
                     first_seen: group.first_seen,
                     last_seen: group.last_seen,
+                    pattern: group.pattern.clone(),
                 });
             }
 
@@ -297,6 +343,7 @@ impl GroupingEngine {
                         auto_resolved: group.auto_resolved,
                         first_seen: group.first_seen,
                         last_seen: group.last_seen,
+                        pattern: group.pattern.clone(),
                     });
                 }
                 expired_keys.push(key.clone());
@@ -1298,6 +1345,7 @@ mod tests {
             sample_incident_id: "test:1".into(),
             first_notified: false,
             threshold_summary_sent: false,
+            pattern: None,
         }
     }
 
@@ -1372,6 +1420,7 @@ mod tests {
             auto_resolved,
             first_seen: Utc::now(),
             last_seen: Utc::now(),
+            pattern: None,
         }
     }
 
@@ -1795,6 +1844,7 @@ mod tests {
             auto_resolved: auto,
             first_seen: Utc::now(),
             last_seen: Utc::now(),
+            pattern: None,
         }
     }
 
@@ -1964,5 +2014,141 @@ mod tests {
             0,
             "Suppressed events must not increment ignored_tally"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // 2026-05-24 anchors: kill_chain pattern carry-through
+    // ---------------------------------------------------------------------
+    //
+    // Pre-fix the hourly summary read "🔴 2 kill_chain from <ip>" with the
+    // pattern (DATA_EXFIL / EXEC_REPL / …) dropped on the floor. The
+    // grouping engine had no slot for it, so format_html fell through to
+    // the bare detector name. Operator could not tell which kill-chain
+    // shape fired without going back to the raw incident.
+
+    fn make_kill_chain_incident(pattern_value: serde_json::Value) -> Incident {
+        let mut inc = make_incident("kill_chain", "203.0.113.7", Severity::Critical);
+        inc.evidence = pattern_value;
+        inc
+    }
+
+    #[test]
+    fn extract_pattern_picks_up_array_shape() {
+        let inc = make_kill_chain_incident(serde_json::json!([
+            {"pattern": "DATA_EXFIL", "score": 9}
+        ]));
+        assert_eq!(
+            extract_kill_chain_pattern(&inc),
+            Some("DATA_EXFIL".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_pattern_accepts_legacy_object_shape() {
+        let inc = make_kill_chain_incident(serde_json::json!({
+            "pattern": "EXEC_REPL"
+        }));
+        assert_eq!(
+            extract_kill_chain_pattern(&inc),
+            Some("EXEC_REPL".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_pattern_returns_none_for_non_kill_chain() {
+        // ssh_bruteforce evidence happens to carry a `pattern` key — we
+        // must still return None because this isn't a kill_chain.
+        let mut inc = make_incident("ssh_bruteforce", "203.0.113.7", Severity::High);
+        inc.evidence = serde_json::json!({"pattern": "DATA_EXFIL"});
+        assert_eq!(extract_kill_chain_pattern(&inc), None);
+    }
+
+    #[test]
+    fn extract_pattern_returns_none_when_kill_chain_has_no_pattern_field() {
+        let inc = make_kill_chain_incident(serde_json::json!([{"score": 9}]));
+        assert_eq!(extract_kill_chain_pattern(&inc), None);
+    }
+
+    #[test]
+    fn group_summary_surfaces_kill_chain_pattern_in_html() {
+        let summary = GroupSummary {
+            detector: "kill_chain".to_string(),
+            entity_type: EntityType::Ip,
+            entity_value: "203.0.113.7".to_string(),
+            count: 2,
+            severity_max: Severity::Critical,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            auto_resolved: false,
+            pattern: Some("DATA_EXFIL".to_string()),
+        };
+        let html = summary.format_html();
+        assert!(
+            html.contains("data_exfil kill_chain"),
+            "expected pattern-qualified label in {html:?}"
+        );
+        assert!(html.contains("203.0.113.7"), "expected IP in {html:?}");
+    }
+
+    #[test]
+    fn group_summary_falls_back_to_bare_kill_chain_when_pattern_missing() {
+        let summary = GroupSummary {
+            detector: "kill_chain".to_string(),
+            entity_type: EntityType::Ip,
+            entity_value: "203.0.113.7".to_string(),
+            count: 2,
+            severity_max: Severity::Critical,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            auto_resolved: false,
+            pattern: None,
+        };
+        let html = summary.format_html();
+        assert!(
+            html.contains(" kill_chain"),
+            "expected bare-kill_chain fallback in {html:?}"
+        );
+        assert!(
+            !html.contains("data_exfil"),
+            "must not invent a pattern when None"
+        );
+    }
+
+    #[test]
+    fn kill_chain_pattern_round_trips_through_insert_and_tick() {
+        // End-to-end: insert a kill_chain incident, then force a
+        // window-expired tick and confirm the emitted summary carries
+        // the pattern through to format_html.
+        crate::cloud_safelist::init();
+        let mut engine = GroupingEngine::new(&NotificationPipelineConfig {
+            group_window_secs: 1, // tight window so tick emits
+            group_count_threshold: 100,
+        });
+        let mut inc = make_incident("kill_chain", "203.0.113.7", Severity::Critical);
+        inc.evidence = serde_json::json!([{"pattern": "DATA_EXFIL"}]);
+        assert_eq!(engine.insert(&inc), GroupAction::NotifyImmediately);
+        // Sleep past the 1s window then tick to flush.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let summaries = engine.tick();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].pattern.as_deref(), Some("DATA_EXFIL"));
+        assert!(summaries[0].format_html().contains("data_exfil kill_chain"));
+    }
+
+    // ---------------------------------------------------------------------
+    // 2026-05-24 anchor: default group window
+    // ---------------------------------------------------------------------
+    //
+    // The default jumped from 3600s → 14400s after the operator received
+    // 4 identical "Critical — Threat Detected" alerts from a single IP
+    // over a 12-hour stretch. Quadrupling the window means a repeat
+    // attacker is folded into the existing group for 4h instead of 1h
+    // before a fresh NotifyImmediately can fire. Pinning the literal so
+    // a future "let's clean up these defaults" PR cannot silently roll
+    // it back.
+    #[test]
+    fn default_group_window_is_four_hours() {
+        let cfg = NotificationPipelineConfig::default();
+        assert_eq!(cfg.group_window_secs, 14400);
     }
 }

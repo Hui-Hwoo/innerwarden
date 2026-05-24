@@ -80,11 +80,20 @@ pub fn format_daily_digest_enriched(
         // bruteforces below means "60 attempts, none would have worked
         // given the host's posture", not "no high-severity detections
         // happened today". The wording reflects what the count means.
+        // Header counter rename 2026-05-24: "Blocked N attacks" was
+        // operator-misleading because `blocks_today` counts ALL
+        // decisions (block + monitor + honeypot + suspend + dismiss
+        // + ignore + …), not just blocks. Operators saw the body list
+        // "282 SSH brute force attempts blocked / 105 credential
+        // stuffing attempts blocked" right under "Blocked 4 attacks"
+        // and the arithmetic obviously did not add up. The accurate
+        // framing is: this is the number of times the agent reached a
+        // decision (which the body then breaks down per detector).
         let mut msg = format!(
             "\u{1f6e1}\u{fe0f} <b>Daily Security Briefing</b>\n\
              \n\
              While you were away, InnerWarden:\n\
-             \u{00a0}\u{00a0}\u{2022} Blocked <b>{blocks_today}</b> attacks\n\
+             \u{00a0}\u{00a0}\u{2022} Made <b>{blocks_today}</b> autonomous decisions\n\
              \u{00a0}\u{00a0}\u{2022} Analyzed <b>{incidents_today}</b> security events\n\
              \u{00a0}\u{00a0}\u{2022} Detected <b>{critical_count}</b> real compromises, <b>{high_count}</b> high-severity threats (post-posture)"
         );
@@ -522,5 +531,28 @@ mod tests {
         let technical = format_daily_digest_enriched(2, 1, 0, 0, "safe", 1, false, &pipeline);
         assert!(technical.contains("evil&lt;script&gt;&amp;=2"));
         assert!(!technical.contains("evil<script>&=2"));
+    }
+
+    /// 2026-05-24 anchor: the "Blocked N attacks" header was renamed to
+    /// "Made N autonomous decisions" because `blocks_today` counts ALL
+    /// decisions (block + monitor + honeypot + suspend + dismiss + ignore
+    /// + …), not just blocks. The operator received a briefing where the
+    /// header said "Blocked 4 attacks" while the body listed "282 SSH
+    /// brute force attempts blocked + 105 credential stuffing blocked
+    /// + …" — a flagrant contradiction. Pin the new wording so a future
+    /// "let's tighten this copy" PR cannot quietly revert to the
+    /// misleading label.
+    #[test]
+    fn enriched_header_uses_autonomous_decisions_wording() {
+        let pipeline = empty_pipeline();
+        let msg = format_daily_digest_enriched(50, 7, 1, 2, "ssh_bruteforce", 5, true, &pipeline);
+        assert!(
+            msg.contains("Made <b>7</b> autonomous decisions"),
+            "expected new 'Made N autonomous decisions' wording in: {msg}"
+        );
+        assert!(
+            !msg.contains("Blocked <b>7</b> attacks"),
+            "must not regress to misleading 'Blocked N attacks' label"
+        );
     }
 }

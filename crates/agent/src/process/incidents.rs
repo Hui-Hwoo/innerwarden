@@ -701,6 +701,20 @@ pub(crate) async fn process_incidents(
             state,
         );
 
+        // The AI just made a decision (block / monitor / honeypot /
+        // suspend / kill / dismiss / ignore / etc). The operator has
+        // already been notified of the original incident via the
+        // grouping pipeline; nothing else is going to happen on this
+        // group automatically. Mark the group auto-resolved here so
+        // the daily briefing's "needs_review" counter doesn't include
+        // groups the AI already decided on. Pre-fix only the
+        // deterministic auto-rule / abuseipdb / crowdsec / honeypot
+        // paths called this; the AI path silently left groups in the
+        // not-resolved bucket, which is what drove the 250 "groups
+        // need your review" figure on a single day's briefing
+        // 2026-05-24.
+        state.grouping_engine.mark_auto_resolved(incident);
+
         // Feed decision into knowledge graph
         {
             let (action_type, action_target) = match &decision.action {

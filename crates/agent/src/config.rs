@@ -3060,7 +3060,7 @@ pub enum DigestFrequency {
 ///
 /// ```toml
 /// [notifications]
-/// group_window_secs = 3600
+/// group_window_secs = 14400
 /// group_count_threshold = 10
 /// ```
 #[derive(Debug, Deserialize)]
@@ -3068,6 +3068,15 @@ pub enum DigestFrequency {
 pub struct NotificationPipelineConfig {
     /// Grouping window in seconds. Incidents from the same detector+entity
     /// within this window are grouped into a single notification.
+    ///
+    /// Default bumped 3600 → 14400 (1 h → 4 h) on 2026-05-24 after the
+    /// operator observed the same IP firing 4 identical
+    /// "Critical — Threat Detected" alerts across a 12-hour span. The
+    /// previous 1 h window expired between attack bursts of the same
+    /// IP+detector pair and re-fired immediate notifications each
+    /// time. 4 h covers the typical scanner re-engagement cadence
+    /// without losing genuinely-new alerts when an attack returns the
+    /// next morning.
     #[serde(default = "default_group_window_secs")]
     pub group_window_secs: u64,
 
@@ -3087,7 +3096,7 @@ impl Default for NotificationPipelineConfig {
 }
 
 fn default_group_window_secs() -> u64 {
-    3600
+    14400
 }
 fn default_group_count_threshold() -> u32 {
     10
