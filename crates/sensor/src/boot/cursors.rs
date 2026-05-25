@@ -41,10 +41,6 @@ use std::sync::{Arc, Mutex};
 /// journald / docker resume tokens; the
 /// `Mutex<HashMap<String, String>>` is the integrity baseline hash
 /// map keyed by file path.
-// 2026-05-25 (PR-F1): no production caller yet — PR-F2 adopts this
-// struct in spawn_collectors + event_loop. `#[allow(dead_code)]` keeps
-// clippy clean during the staging period.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct SharedCursors {
     pub(crate) auth_offset: Arc<AtomicU64>,

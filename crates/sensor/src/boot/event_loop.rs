@@ -26,14 +26,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use innerwarden_core::event::Event;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::boot::cursors::SharedCursors;
 use crate::detectors::datasets::Datasets;
 use crate::event_dispatch;
 use crate::sinks;
@@ -45,6 +45,16 @@ use crate::{DetectorSet, WriteStats};
 /// to sinks until either the channel closes (all collectors stopped)
 /// or a shutdown signal (SIGINT / SIGTERM) fires. On exit, persist
 /// every shared-cursor Arc into the State and write it to disk.
+///
+/// 2026-05-25 (PR-F2): signature collapsed from 16 params to 9 by
+/// taking `&SharedCursors` instead of 8 individual cursor Arcs. The
+/// `shared_X` locals destructured below preserve the original body
+/// verbatim — pure mechanical refactor, zero behaviour change.
+///
+/// 9 > clippy's 7-arg threshold, so `#[allow(too_many_arguments)]`
+/// stays. PR-F3 will lift these params into a `Sensor` struct so
+/// run_event_loop becomes a method on `&mut Sensor` — that's where
+/// the allow finally drops.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_event_loop(
     mut rx: mpsc::Receiver<Event>,
@@ -55,15 +65,18 @@ pub(crate) async fn run_event_loop(
     state: &mut State,
     state_path: &Path,
     #[cfg(unix)] mut sigterm: tokio::signal::unix::Signal,
-    shared_auth_offset: Arc<AtomicU64>,
-    shared_integrity_hashes: Arc<Mutex<HashMap<String, String>>>,
-    shared_journald_cursor: Arc<Mutex<Option<String>>>,
-    shared_docker_since: Arc<Mutex<Option<String>>>,
-    shared_exec_audit_offset: Arc<AtomicU64>,
-    shared_nginx_offset: Arc<AtomicU64>,
-    shared_nginx_error_offset: Arc<AtomicU64>,
-    shared_syslog_firewall_offset: Arc<AtomicU64>,
+    cursors: &SharedCursors,
 ) -> Result<()> {
+    let SharedCursors {
+        auth_offset: shared_auth_offset,
+        integrity_hashes: shared_integrity_hashes,
+        journald_cursor: shared_journald_cursor,
+        docker_since: shared_docker_since,
+        exec_audit_offset: shared_exec_audit_offset,
+        nginx_offset: shared_nginx_offset,
+        nginx_error_offset: shared_nginx_error_offset,
+        syslog_firewall_offset: shared_syslog_firewall_offset,
+    } = cursors.clone();
     // Main loop: drain events, run detectors, write output
     let mut stats = WriteStats::default();
 

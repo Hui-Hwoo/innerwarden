@@ -28,13 +28,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use innerwarden_core::event::Event;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::boot::cursors::SharedCursors;
 use crate::collectors;
 use crate::collectors::{
     auth_log::AuthLogCollector, cloudtrail::CloudTrailCollector, docker::DockerCollector,
@@ -53,21 +54,28 @@ use crate::sinks::state::State;
 /// consumer's `rx.recv()` returns `None`. Drops the original `tx`
 /// after spawning so the consumer side does NOT keep a sender alive
 /// indefinitely (any leftover would block shutdown forever).
-#[allow(clippy::too_many_arguments)]
+///
+/// 2026-05-25 (PR-F2): signature collapsed from 12 params to 5 by
+/// taking `&SharedCursors` instead of 8 individual cursor Arcs. The
+/// `shared_X` locals destructured below preserve the original body
+/// verbatim — pure mechanical refactor, zero behaviour change.
 pub(crate) fn spawn_collectors(
     cfg: &Config,
     _data_dir: &Path, // reserved for future per-collector data-dir routing
     state: &State,
     tx: mpsc::Sender<Event>,
-    shared_auth_offset: Arc<AtomicU64>,
-    shared_integrity_hashes: Arc<Mutex<HashMap<String, String>>>,
-    shared_journald_cursor: Arc<Mutex<Option<String>>>,
-    shared_docker_since: Arc<Mutex<Option<String>>>,
-    shared_exec_audit_offset: Arc<AtomicU64>,
-    shared_nginx_offset: Arc<AtomicU64>,
-    shared_nginx_error_offset: Arc<AtomicU64>,
-    shared_syslog_firewall_offset: Arc<AtomicU64>,
+    cursors: &SharedCursors,
 ) {
+    let SharedCursors {
+        auth_offset: shared_auth_offset,
+        integrity_hashes: shared_integrity_hashes,
+        journald_cursor: shared_journald_cursor,
+        docker_since: shared_docker_since,
+        exec_audit_offset: shared_exec_audit_offset,
+        nginx_offset: shared_nginx_offset,
+        nginx_error_offset: shared_nginx_error_offset,
+        syslog_firewall_offset: shared_syslog_firewall_offset,
+    } = cursors.clone();
     // Spawn auth_log collector
     if cfg.collectors.auth_log.enabled {
         let offset = state

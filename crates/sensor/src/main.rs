@@ -14,10 +14,8 @@ use main_helpers::{
     choose_syslog_protocol, parse_syslog_port, should_enable_syslog_sink, state_path_for,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use clap::Parser;
@@ -239,15 +237,8 @@ async fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel(1024);
 
     // Shared state - updated by collectors, read on shutdown for persistence.
-    let shared_auth_offset = Arc::new(AtomicU64::new(0));
-    let shared_integrity_hashes: Arc<Mutex<HashMap<String, String>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let shared_journald_cursor: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let shared_docker_since: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let shared_exec_audit_offset = Arc::new(AtomicU64::new(0));
-    let shared_nginx_offset = Arc::new(AtomicU64::new(0));
-    let shared_nginx_error_offset = Arc::new(AtomicU64::new(0));
-    let shared_syslog_firewall_offset = Arc::new(AtomicU64::new(0));
+    // Bundled into SharedCursors in PR-F1 (#810); adopted here in PR-F2.
+    let cursors = boot::cursors::SharedCursors::new();
 
     // Build the full DetectorSet (every per-detector cfg.enabled.then(...)
     // block + dynamic allowlist load + blocked-IP feedback file). Moved
@@ -275,20 +266,7 @@ async fn main() -> Result<()> {
     // dropped — only the per-collector clones hold the sender side,
     // so when every collector task exits the consumer's `rx.recv()`
     // returns `None` and the event loop shuts down cleanly.
-    boot::spawn_collectors::spawn_collectors(
-        &cfg,
-        data_dir,
-        &state,
-        tx,
-        Arc::clone(&shared_auth_offset),
-        Arc::clone(&shared_integrity_hashes),
-        Arc::clone(&shared_journald_cursor),
-        Arc::clone(&shared_docker_since),
-        Arc::clone(&shared_exec_audit_offset),
-        Arc::clone(&shared_nginx_offset),
-        Arc::clone(&shared_nginx_error_offset),
-        Arc::clone(&shared_syslog_firewall_offset),
-    );
+    boot::spawn_collectors::spawn_collectors(&cfg, data_dir, &state, tx, &cursors);
 
     // Apply seccomp profile if configured (Active Defence feature).
     // MUST be after all eBPF programs are loaded and sockets are opened,
@@ -394,14 +372,7 @@ async fn main() -> Result<()> {
         &state_path,
         #[cfg(unix)]
         sigterm,
-        shared_auth_offset,
-        shared_integrity_hashes,
-        shared_journald_cursor,
-        shared_docker_since,
-        shared_exec_audit_offset,
-        shared_nginx_offset,
-        shared_nginx_error_offset,
-        shared_syslog_firewall_offset,
+        &cursors,
     )
     .await?;
 
