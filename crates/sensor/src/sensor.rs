@@ -18,29 +18,77 @@
 //!   collector-health.json written, run returns cleanly when no
 //!   collectors are enabled).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use innerwarden_core::event::Event;
 use tokio::sync::mpsc;
 use tracing::info;
 #[cfg(target_os = "linux")]
 use tracing::warn;
 
 use crate::boot;
+use crate::boot::cursors::SharedCursors;
 use crate::collector_health;
 use crate::config::Config;
 use crate::detectors;
+use crate::detectors::datasets::Datasets;
 use crate::main_helpers::{
     choose_syslog_protocol, parse_syslog_port, should_enable_syslog_sink, state_path_for,
 };
 #[cfg(target_os = "linux")]
 use crate::seccomp;
 use crate::sinks::{self, sqlite::SqliteWriter, state::State};
+use crate::DetectorSet;
 
-/// Run the sensor pipeline end-to-end. Returns when the event loop
-/// exits — either because every collector task dropped its sender
-/// (channel close) or because SIGINT / SIGTERM fired.
+/// Container for every piece of boot-time state. Returned by
+/// [`boot_init`] and consumed by [`run_loop`].
+///
+/// 2026-05-26 (follow-up #1): introduced to make the boot pipeline
+/// testable. The pre-PR shape `async fn run(cfg)` was end-to-end
+/// untestable because [`boot::spawn_collectors`] starts a handful of
+/// always-on tokio tasks (eBPF syscall, firmware_integrity, proc_maps,
+/// fanotify_watch, kernel_integrity, …) that hold clones of `tx`
+/// alive forever — so `rx.recv()` in [`boot::event_loop::run_event_loop`]
+/// never returns `None` and the function never exits without a
+/// signal. Splitting into `boot_init` (no tokio spawn) + `run_loop`
+/// (the spawn + loop) lets integration tests assert "boot succeeded,
+/// sinks were created, collector-health snapshot was written" without
+/// having to drive the consumer side to completion.
+pub(crate) struct SensorContext {
+    cfg: Config,
+    data_dir: PathBuf,
+    state_path: PathBuf,
+    state: State,
+    sqlite_writer: SqliteWriter,
+    syslog_writer: Option<sinks::syslog_cef::SyslogCefWriter>,
+    tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+    cursors: SharedCursors,
+    detectors: DetectorSet,
+    threat_datasets: Datasets,
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+}
+
+/// Run the sensor pipeline end-to-end. Thin wrapper: boot + loop.
+/// Returns when the event loop exits — either because every collector
+/// task dropped its sender (channel close) or because SIGINT / SIGTERM
+/// fired.
 pub(crate) async fn run(cfg: Config) -> Result<()> {
+    let ctx = boot_init(cfg).await?;
+    run_loop(ctx).await
+}
+
+/// Run the boot-time half of `run`: load state, construct sinks, build
+/// the DetectorSet, load threat datasets, write the collector-health
+/// snapshot, set up the SIGTERM listener. Returns a fully-populated
+/// [`SensorContext`]. **Does NOT spawn any tokio tasks** — no collector
+/// is started yet, so the returned context can be dropped without
+/// leaking background work. Used by integration tests to assert boot
+/// invariants (sinks exist, collector-health.json written) without
+/// driving the consumer side.
+pub(crate) async fn boot_init(cfg: Config) -> Result<SensorContext> {
     info!(
         host = %cfg.agent.host_id,
         data_dir = %cfg.output.data_dir,
@@ -48,19 +96,19 @@ pub(crate) async fn run(cfg: Config) -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    let data_dir = Path::new(&cfg.output.data_dir);
-    let state_path = state_path_for(data_dir);
+    let data_dir: PathBuf = Path::new(&cfg.output.data_dir).to_path_buf();
+    let state_path = state_path_for(&data_dir);
 
-    let mut state = State::load(&state_path)?;
+    let state = State::load(&state_path)?;
     info!(cursors = state.cursors.len(), "state loaded");
 
     let write_events = cfg.output.write_events;
 
     // SQLite is the primary and only event/incident sink.
-    let sqlite_writer = SqliteWriter::new(data_dir, write_events)?;
+    let sqlite_writer = SqliteWriter::new(&data_dir, write_events)?;
     info!(path = %data_dir.join("innerwarden.db").display(), "sqlite sink enabled");
     // Optional syslog CEF output (configured via env or future config section)
-    let mut syslog_writer: Option<sinks::syslog_cef::SyslogCefWriter> = {
+    let syslog_writer: Option<sinks::syslog_cef::SyslogCefWriter> = {
         let syslog_host = std::env::var("INNERWARDEN_SYSLOG_HOST").unwrap_or_default();
         if !should_enable_syslog_sink(&syslog_host) {
             None
@@ -88,7 +136,7 @@ pub(crate) async fn run(cfg: Config) -> Result<()> {
     // Build the full DetectorSet (every per-detector cfg.enabled.then(...)
     // block + dynamic allowlist load + blocked-IP feedback file). Moved
     // to crates/sensor/src/boot/build_detectors.rs in PR5b1 (2026-05-25).
-    let mut detectors = boot::build_detectors::build_detector_set(&cfg, data_dir);
+    let detectors = boot::build_detectors::build_detector_set(&cfg, &data_dir);
 
     // Load threat intelligence datasets (IPs, domains, JA3, hashes, URLs).
     // Downloads public feeds on first run, reloads from disk every 60 min.
@@ -105,33 +153,12 @@ pub(crate) async fn run(cfg: Config) -> Result<()> {
         threat_datasets.reload();
     }
 
-    // Spawn every enabled collector + polling-detector as a tokio task.
-    // Moved to crates/sensor/src/boot/spawn_collectors.rs in PR5b2
-    // (2026-05-25). After this returns, the original `tx` has been
-    // dropped — only the per-collector clones hold the sender side,
-    // so when every collector task exits the consumer's `rx.recv()`
-    // returns `None` and the event loop shuts down cleanly.
-    boot::spawn_collectors::spawn_collectors(&cfg, data_dir, &state, tx, &cursors);
-
-    // Apply seccomp profile if configured (Active Defence feature).
-    // MUST be after all eBPF programs are loaded and sockets are opened,
-    // since seccomp restricts future syscalls. The profile blocks execve,
-    // connect, and other syscalls the sensor doesn't need post-startup.
-    #[cfg(target_os = "linux")]
-    {
-        let seccomp_path = data_dir.join("sensor.seccomp.json");
-        if seccomp_path.exists() {
-            match seccomp::apply_seccomp_profile(&seccomp_path) {
-                Ok(count) => info!(
-                    syscalls_allowed = count,
-                    "seccomp profile applied — sensor hardened"
-                ),
-                Err(e) => warn!("seccomp profile failed to apply: {e:#} — continuing without"),
-            }
-        }
-    }
-
-    // SIGTERM listener (Unix only)
+    // SIGTERM listener (Unix only). Set up here in boot_init so the
+    // Signal handle lives in SensorContext and is plumbed straight into
+    // run_event_loop's `tokio::select!`. Pre-split this happened after
+    // spawn_collectors; the move is safe — `signal()` only registers a
+    // handler with tokio's runtime, it does not depend on any spawned
+    // collector being live.
     #[cfg(unix)]
     let sigterm = {
         use tokio::signal::unix::{signal, SignalKind};
@@ -195,11 +222,84 @@ pub(crate) async fn run(cfg: Config) -> Result<()> {
             // sections from config.toml (or open a tracking PR to
             // add proper Suricata/Osquery collectors).
         ];
-        if let Err(e) = collector_health::write_status_file(data_dir, &cfg.agent.host_id, &statuses)
+        if let Err(e) =
+            collector_health::write_status_file(&data_dir, &cfg.agent.host_id, &statuses)
         {
             tracing::warn!(error = %e, "failed to write collector-health.json");
         } else {
             info!("collector-health.json written ({} entries)", statuses.len());
+        }
+    }
+
+    Ok(SensorContext {
+        cfg,
+        data_dir,
+        state_path,
+        state,
+        sqlite_writer,
+        syslog_writer,
+        tx,
+        rx,
+        cursors,
+        detectors,
+        threat_datasets,
+        #[cfg(unix)]
+        sigterm,
+    })
+}
+
+/// Run the loop-time half of `run`: spawn every enabled collector,
+/// apply the seccomp profile (Linux), then drain the event channel
+/// until shutdown. Consumes the [`SensorContext`] produced by
+/// [`boot_init`].
+///
+/// Not unit-tested directly — the moment `spawn_collectors` runs it
+/// starts a handful of unconditional tokio tasks (eBPF syscall,
+/// firmware_integrity, proc_maps, fanotify_watch, kernel_integrity,
+/// …) that loop forever and hold clones of `tx` alive, so
+/// `rx.recv()` never returns `None` and there is no clean way to
+/// `await` to completion in a test. Integration anchors stop at
+/// [`boot_init`].
+pub(crate) async fn run_loop(ctx: SensorContext) -> Result<()> {
+    let SensorContext {
+        cfg,
+        data_dir,
+        state_path,
+        mut state,
+        sqlite_writer,
+        mut syslog_writer,
+        tx,
+        rx,
+        cursors,
+        mut detectors,
+        mut threat_datasets,
+        #[cfg(unix)]
+        sigterm,
+    } = ctx;
+
+    // Spawn every enabled collector + polling-detector as a tokio task.
+    // Moved to crates/sensor/src/boot/spawn_collectors.rs in PR5b2
+    // (2026-05-25). After this returns, the original `tx` has been
+    // dropped — only the per-collector clones hold the sender side,
+    // so when every collector task exits the consumer's `rx.recv()`
+    // returns `None` and the event loop shuts down cleanly.
+    boot::spawn_collectors::spawn_collectors(&cfg, &data_dir, &state, tx, &cursors);
+
+    // Apply seccomp profile if configured (Active Defence feature).
+    // MUST be after all eBPF programs are loaded and sockets are opened,
+    // since seccomp restricts future syscalls. The profile blocks execve,
+    // connect, and other syscalls the sensor doesn't need post-startup.
+    #[cfg(target_os = "linux")]
+    {
+        let seccomp_path = data_dir.join("sensor.seccomp.json");
+        if seccomp_path.exists() {
+            match seccomp::apply_seccomp_profile(&seccomp_path) {
+                Ok(count) => info!(
+                    syscalls_allowed = count,
+                    "seccomp profile applied — sensor hardened"
+                ),
+                Err(e) => warn!("seccomp profile failed to apply: {e:#} — continuing without"),
+            }
         }
     }
 
@@ -224,10 +324,128 @@ pub(crate) async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-// 2026-05-25 (PR-F3): integration anchors for `run()` were drafted
-// but hung during `cargo test`. Root cause not yet identified — some
-// part of the boot path doesn't drop a sender / Arc / handle that
-// would let `rx.recv()` return None. Anchors deferred to a follow-up
-// PR after the hang is debugged. The extraction itself is pure code
-// motion; pre-existing 1416 sensor tests gate the behaviour of every
-// callee (build_detector_set, spawn_collectors, run_event_loop).
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn seed_datasets(data_dir: &std::path::Path) {
+        // is_loaded() returns true if any feed file has at least one
+        // non-empty / non-comment line. Skipping the HTTP feed download
+        // is essential — without this seed the test would block on
+        // `update_all_feeds` trying to reach abuse.ch / Blocklist.de.
+        let datasets_dir = data_dir.join("datasets");
+        std::fs::create_dir_all(&datasets_dir).expect("mkdir datasets");
+        std::fs::write(datasets_dir.join("feodo-ips.txt"), "203.0.113.1\n").expect("seed feodo");
+    }
+
+    /// Common test setup: tempdir + Config with every collector/detector
+    /// disabled + seeded datasets so the boot path doesn't hit HTTP.
+    fn test_cfg(tmp: &tempfile::TempDir) -> Config {
+        seed_datasets(tmp.path());
+        let mut cfg = Config::test_default();
+        cfg.output.data_dir = tmp.path().to_string_lossy().into_owned();
+        cfg
+    }
+
+    /// Every anchor below wraps `boot_init(cfg)` in `tokio::time::timeout`
+    /// so a regression that causes the boot pipeline to hang fails loudly
+    /// with "timed out after Xs" instead of stalling the whole `cargo
+    /// test` run.
+    ///
+    /// Why `boot_init` and not `run`: `run` calls `run_loop` which calls
+    /// `boot::spawn_collectors::spawn_collectors`, and that function
+    /// unconditionally `tokio::spawn`s ~10 collector tasks (eBPF syscall,
+    /// firmware_integrity, proc_maps, fanotify_watch, kernel_integrity,
+    /// …) that loop forever holding clones of `tx`. `rx.recv()` would
+    /// never return `None`, so `run()` would never return. `boot_init`
+    /// stops just before the spawn so the test can assert "boot worked,
+    /// sinks created, snapshot written" and then drop the context — at
+    /// which point `tx` and `rx` close cleanly with no leaked tasks.
+    const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn boot_init_with_no_collectors_completes_within_timeout() {
+        // Anchor: with every collector disabled (Config::test_default
+        // baseline), `boot_init` must complete cleanly — no HTTP feed
+        // downloads (datasets are seeded), no spawned tasks, just
+        // synchronous state/sink/detector construction + the
+        // collector-health snapshot. Far under a second in practice;
+        // the 10-second timeout is the loud-failure tripwire.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(BOOT_TIMEOUT, boot_init(cfg)).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Ok(Ok(_ctx)) => {
+                // Healthy: boot_init returned a SensorContext within
+                // the timeout. Dropping _ctx here closes tx + rx with
+                // no leaked tasks — there are none, because boot_init
+                // never spawns.
+            }
+            Ok(Err(e)) => panic!("boot_init() returned error: {e:#}"),
+            Err(_) => panic!(
+                "boot_init() hung for {elapsed:?} (>{BOOT_TIMEOUT:?}). \
+                 Some part of the boot path is doing blocking I/O \
+                 (HTTP fetch, sync sleep, file lock) that should not \
+                 happen when every collector is disabled."
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_init_creates_sqlite_database_in_data_dir() {
+        // Anchor: `SqliteWriter::new(data_dir, ...)` must create
+        // `<data_dir>/innerwarden.db` on first boot. A future refactor
+        // that delays sink construction or moves the file path would
+        // be caught here.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+
+        let _ctx = tokio::time::timeout(BOOT_TIMEOUT, boot_init(cfg))
+            .await
+            .expect("boot_init timed out")
+            .expect("boot_init errored");
+
+        let db_path = tmp.path().join("innerwarden.db");
+        assert!(
+            db_path.exists(),
+            "innerwarden.db must be created at <data_dir>/innerwarden.db"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_init_writes_collector_health_snapshot() {
+        // Anchor: the collector-health snapshot (dashboard's source of
+        // truth for the Sensors HUD per-collector tile) must be written
+        // to `<data_dir>/collector-health.json` even when no collectors
+        // are enabled — the dashboard relies on the file existing to
+        // know it can render the "all disabled" baseline rather than
+        // the "agent has no telemetry" warning.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = test_cfg(&tmp);
+
+        let _ctx = tokio::time::timeout(BOOT_TIMEOUT, boot_init(cfg))
+            .await
+            .expect("boot_init timed out")
+            .expect("boot_init errored");
+
+        let health_path = tmp.path().join("collector-health.json");
+        assert!(
+            health_path.exists(),
+            "collector-health.json must be written to <data_dir>"
+        );
+        let content = std::fs::read_to_string(&health_path).expect("read");
+        assert!(
+            !content.is_empty(),
+            "collector-health.json must not be empty"
+        );
+    }
+}
