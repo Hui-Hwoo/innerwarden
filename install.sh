@@ -832,6 +832,33 @@ fi
 
 if [[ "${ENABLE_EXEC_AUDIT}" == "true" ]]; then
   log "shell command audit enabled (include_tty=${ENABLE_EXEC_AUDIT_TTY})"
+  # 2026-05-25: auto-install auditd when missing. Pre-fix the entire
+  # exec_audit block was skipped silently if /etc/audit/rules.d did not
+  # exist, leaving the operator's shell-command trail blind on every
+  # fresh Linux box (auditd is NOT installed by default on Ubuntu cloud
+  # images). The installation is conservative — apt / dnf only, no
+  # auto-enable; we just put the package on disk so the rules file can
+  # be written and `augenrules --load` can succeed.
+  if ! run_root test -d /etc/audit/rules.d; then
+    if command -v apt-get >/dev/null 2>&1; then
+      log "auditd not present; installing via apt-get"
+      DEBIAN_FRONTEND=noninteractive run_root apt-get install -y auditd >/dev/null 2>&1 \
+        || log "WARNING: apt-get install auditd failed; exec audit will remain disabled"
+    elif command -v dnf >/dev/null 2>&1; then
+      log "auditd not present; installing via dnf"
+      run_root dnf install -y audit >/dev/null 2>&1 \
+        || log "WARNING: dnf install audit failed; exec audit will remain disabled"
+    elif command -v yum >/dev/null 2>&1; then
+      log "auditd not present; installing via yum"
+      run_root yum install -y audit >/dev/null 2>&1 \
+        || log "WARNING: yum install audit failed; exec audit will remain disabled"
+    else
+      log "WARNING: no supported package manager (apt-get / dnf / yum) found; auditd cannot be auto-installed"
+    fi
+    if run_root systemctl enable --now auditd >/dev/null 2>&1; then
+      log "auditd service enabled and started"
+    fi
+  fi
   if run_root test -d /etc/audit/rules.d; then
     log "writing auditd rules: ${AUDIT_RULE_FILE}"
     install_from_stdin "${AUDIT_RULE_FILE}" 640 "${INSTALL_USER:-root}" "${INSTALL_GROUP:-root}" <<'EOF'
@@ -1042,6 +1069,17 @@ EOF
 EOF
 else
   log "writing systemd unit: ${SENSOR_UNIT}"
+  # 2026-05-25: the sensor unit MUST grant the capabilities its core
+  # collectors need, otherwise the operator gets a working install that
+  # does almost nothing. Pre-fix this unit ran as User=innerwarden with
+  # zero AmbientCapabilities and ProtectSystem=strict — result: eBPF
+  # never loaded (needs CAP_BPF), AF_PACKET DNS/HTTP/TLS captures
+  # silently failed (need CAP_NET_RAW), exec_audit was deaf to the
+  # audit netlink (needs CAP_AUDIT_READ), /sys/fs/bpf could not be
+  # written so XDP firewall pinning never happened. The "trial profile"
+  # safety gate (no AI, responder disabled, dry_run) lives in the
+  # agent.toml below — those are what prevent harm. Capabilities here
+  # only enable OBSERVATION; removing them just blinds the sensor.
   install_from_stdin "${SENSOR_UNIT}" 644 "${INSTALL_USER:-root}" "${INSTALL_GROUP:-root}" <<'EOF'
 [Unit]
 Description=Inner Warden - Sensor (host observability)
@@ -1050,9 +1088,17 @@ Documentation=https://github.com/InnerWarden/innerwarden
 
 [Service]
 Type=simple
-User=innerwarden
+User=root
+# Group=innerwarden so files created by the sensor are group-owned by
+# the agent's user, allowing both sensor (root) and agent (innerwarden)
+# to write to incidents-*.jsonl without permission conflicts.
 Group=innerwarden
 SupplementaryGroups=adm systemd-journal
+# UMask 0007 makes new files mode 660 and directories 770. Group write
+# (combined with Group=innerwarden above) lets the agent append to files
+# created by the sensor. Without this, killchain_inline incidents are
+# silently lost with "Permission denied" errors.
+UMask=0007
 ExecStart=/usr/local/bin/innerwarden-sensor --config /etc/innerwarden/config.toml
 Restart=on-failure
 RestartSec=5
@@ -1062,12 +1108,45 @@ SendSIGKILL=yes
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=innerwarden-sensor
+
+# ── Hardening ──
+# The sensor runs as root because eBPF requires CAP_BPF + CAP_SYS_ADMIN.
+# We lock down everything else to minimize pivot risk if compromised.
+#
+# Capability rationale:
+#   CAP_BPF           — load eBPF programs (49 kernel programs)
+#   CAP_PERFMON       — required alongside CAP_BPF on kernels ≥5.8
+#   CAP_SYS_ADMIN     — bpf() syscall + perf_event_open + ringbuf
+#   CAP_NET_RAW       — AF_PACKET sockets for dns_capture /
+#                       http_capture / tls_fingerprint native captures
+#   CAP_AUDIT_READ    — read /var/log/audit/audit.log for exec_audit
+#                       (T1059 detection); auditd writes mode 0640
+#   CAP_SYS_PTRACE    — read /proc/<pid>/maps of other processes
+#                       (proc_maps collector — RWX / LD_PRELOAD
+#                       detection); without this YAMA blocks the read
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_RAW CAP_AUDIT_READ CAP_SYS_PTRACE
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/innerwarden
-ReadOnlyPaths=/var/log /etc/innerwarden
+# /sys/fs/bpf MUST be writable so the sensor can create
+# /sys/fs/bpf/innerwarden/ and pin the BLOCKLIST + ALLOWLIST + LSM
+# policy maps. Putting it in ReadOnlyPaths breaks XDP firewall pinning
+# silently — the agent then emits "XDP firewall unavailable" warnings
+# with a misleading "mount bpffs" hint (bpffs is fine, the issue is
+# this systemd path constraint).
+ReadWritePaths=/var/lib/innerwarden /sys/fs/bpf
+ReadOnlyPaths=/var/log /etc/innerwarden /proc
 ProtectHome=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=no
 
 [Install]
 WantedBy=multi-user.target

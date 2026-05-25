@@ -41,6 +41,7 @@ impl Severity {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub(super) struct Finding {
     pub(super) category: &'static str,
     pub(super) severity: Severity,

@@ -35,7 +35,19 @@ SyslogIdentifier=innerwarden-sensor
 # ── Hardening ──
 # The sensor runs as root because eBPF requires CAP_BPF + CAP_SYS_ADMIN.
 # We lock down everything else to minimize pivot risk if compromised.
-AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_RAW
+#
+# Capability rationale:
+#   CAP_BPF           — load eBPF programs (49 kernel programs)
+#   CAP_PERFMON       — required alongside CAP_BPF on kernels ≥5.8
+#   CAP_SYS_ADMIN     — bpf() syscall + perf_event_open + ringbuf
+#   CAP_NET_RAW       — AF_PACKET sockets for dns_capture /
+#                       http_capture / tls_fingerprint native captures
+#   CAP_AUDIT_READ    — read /var/log/audit/audit.log for exec_audit
+#                       (T1059 detection); auditd writes mode 0640
+#   CAP_SYS_PTRACE    — read /proc/<pid>/maps of other processes
+#                       (proc_maps collector — RWX / LD_PRELOAD
+#                       detection); without this YAMA blocks the read
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_RAW CAP_AUDIT_READ CAP_SYS_PTRACE
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
