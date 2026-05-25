@@ -1417,6 +1417,47 @@ pub fn load(path: &str) -> Result<Config> {
     toml::from_str(&content).with_context(|| "failed to parse config")
 }
 
+// 2026-05-25 (PR-F1): `test_default` is unused in this commit because
+// it's added as a foundation for PR-F2 (SharedCursors adoption) and
+// PR-F3 (Sensor::run extraction + integration anchors). Both pending
+// PRs will call it; suppressing dead_code here keeps clippy clean
+// during the staging period.
+#[allow(dead_code)]
+impl Config {
+    /// Construct a minimal Config for tests. Every collector and
+    /// detector inherits its derived `Default` impl, which for the
+    /// ones with an `enabled: bool` field means `enabled = false`.
+    /// Tests can selectively flip `cfg.collectors.X.enabled = true`
+    /// or `cfg.detectors.Y.enabled = true` to exercise a specific
+    /// path without writing a TOML file to disk.
+    ///
+    /// `host_id` is the sentinel `"test-host"`. `data_dir` is the
+    /// sentinel `"/tmp/innerwarden-test"` — tests that touch disk
+    /// should override with a `tempfile::TempDir` path.
+    ///
+    /// 2026-05-25 (PR-F1): introduced to unblock unit testing of
+    /// `boot/*` helpers. Pre-this, every test that called
+    /// `build_detector_set`, `spawn_collectors`, or `run_event_loop`
+    /// had to serialise a TOML, write it to a tempfile, then load it
+    /// back via `config::load`. That was fragile because every
+    /// detector schema change broke every test.
+    pub(crate) fn test_default() -> Self {
+        Self {
+            agent: AgentConfig {
+                host_id: "test-host".to_string(),
+            },
+            output: OutputConfig {
+                data_dir: "/tmp/innerwarden-test".to_string(),
+                write_events: true,
+            },
+            collectors: CollectorsConfig::default(),
+            detectors: DetectorsConfig::default(),
+            calibration: CalibrationConfig::default(),
+            allowlist: AllowlistConfig::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
