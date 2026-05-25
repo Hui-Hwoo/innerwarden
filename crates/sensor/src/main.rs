@@ -2,8 +2,15 @@ mod collector_health;
 mod collectors;
 mod config;
 mod detectors;
+mod main_helpers;
 mod sinks;
 mod tracing_init;
+
+use main_helpers::{
+    choose_syslog_protocol, is_passthrough_source, load_blocked_ips, parse_syslog_port,
+    severity_rank, should_enable_syslog_sink, should_spawn_integrity_collector,
+    should_use_blocked_ip_hint, state_path_for,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1444,93 +1451,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Load blocked IPs from the file written by the agent.
-/// Returns an empty set if the file does not exist.
-fn load_blocked_ips(data_dir: &Path) -> HashSet<String> {
-    let path = blocked_ips_path_for(data_dir);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => parse_blocked_ips(&contents),
-        Err(_) => HashSet::new(),
-    }
-}
-
-fn state_path_for(data_dir: &Path) -> PathBuf {
-    data_dir.join("state.json")
-}
-
-fn blocked_ips_path_for(data_dir: &Path) -> PathBuf {
-    data_dir.join("blocked-ips.txt")
-}
-
-fn parse_blocked_ips(contents: &str) -> HashSet<String> {
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn should_spawn_integrity_collector(enabled: bool, paths: &[String]) -> bool {
-    enabled && !paths.is_empty()
-}
-
-fn should_enable_syslog_sink(syslog_host: &str) -> bool {
-    !syslog_host.is_empty()
-}
-
-fn parse_syslog_port(port: Option<&str>) -> u16 {
-    port.and_then(|raw| raw.parse::<u16>().ok()).unwrap_or(514)
-}
-
-fn choose_syslog_protocol(tcp_enabled: bool) -> sinks::syslog_cef::SyslogProtocol {
-    if tcp_enabled {
-        sinks::syslog_cef::SyslogProtocol::Tcp
-    } else {
-        sinks::syslog_cef::SyslogProtocol::Udp
-    }
-}
-
-/// Numeric rank for Severity so we can compare in the dedup cache.
-fn severity_rank(s: &innerwarden_core::event::Severity) -> u8 {
-    use innerwarden_core::event::Severity;
-    match s {
-        Severity::Debug => 0,
-        Severity::Info => 1,
-        Severity::Low => 2,
-        Severity::Medium => 3,
-        Severity::High => 4,
-        Severity::Critical => 5,
-    }
-}
-
-fn is_passthrough_source(source: &str) -> bool {
-    let _ = source;
-    false
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Returns true if the event's src_ip is in the blocked set. Pure helper,
-/// extracted so the "don't early-return for blocked IPs" rule can be anchored
-/// in a unit test without spinning up the whole `process_event` harness.
-///
-/// This used to gate a `return` inside `process_event` — see the inline
-/// comment there for the 2026-05-23 incident that proved the early-return
-/// was harmful. The helper now exists only so other code paths can use the
-/// blocked-list as a hint (severity tagging, etc) without re-parsing the
-/// event details.
-fn should_use_blocked_ip_hint(
-    ev: &innerwarden_core::event::Event,
-    blocked: &std::collections::HashSet<String>,
-) -> bool {
-    let src_ip = ev
-        .details
-        .get("ip")
-        .or_else(|| ev.details.get("src_ip"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    !src_ip.is_empty() && blocked.contains(src_ip)
-}
+// 11 small helpers (load_blocked_ips, state_path_for, blocked_ips_path_for,
+// parse_blocked_ips, should_spawn_integrity_collector, should_enable_syslog_sink,
+// parse_syslog_port, choose_syslog_protocol, severity_rank, is_passthrough_source,
+// should_use_blocked_ip_hint) moved to crates/sensor/src/main_helpers.rs as part
+// of the 2026-05-25 main.rs decomposition PR2. The previous `/// Load blocked
+// IPs from the file written by the agent.` doc comment moved with `load_blocked_ips`
+// — its body is in main_helpers.rs.
 
 fn process_event(
     ev: innerwarden_core::event::Event,
@@ -2933,74 +2860,11 @@ mod tests {
     use super::*;
     use innerwarden_core::event::Severity;
 
-    #[test]
-    fn parse_blocked_ips_discards_blank_and_whitespace_lines() {
-        // Covers parser normalization so blocked-ips feedback keeps only meaningful IP tokens.
-        let parsed = parse_blocked_ips("\n 1.2.3.4 \n\n10.0.0.8\n   \n");
-        assert!(parsed.contains("1.2.3.4"));
-        assert!(parsed.contains("10.0.0.8"));
-        assert_eq!(parsed.len(), 2);
-    }
-
-    #[test]
-    fn helper_paths_resolve_inside_data_dir() {
-        // Verifies path derivation remains deterministic for state and blocked-IP files.
-        let data_dir = Path::new("/var/lib/innerwarden");
-        assert_eq!(
-            state_path_for(data_dir),
-            PathBuf::from("/var/lib/innerwarden/state.json")
-        );
-        assert_eq!(
-            blocked_ips_path_for(data_dir),
-            PathBuf::from("/var/lib/innerwarden/blocked-ips.txt")
-        );
-    }
-
-    #[test]
-    fn should_spawn_integrity_collector_requires_flag_and_paths() {
-        // Ensures collector startup logic only runs when both config prerequisites are present.
-        assert!(should_spawn_integrity_collector(
-            true,
-            &[String::from("/etc/passwd")]
-        ));
-        assert!(!should_spawn_integrity_collector(true, &[]));
-        assert!(!should_spawn_integrity_collector(
-            false,
-            &[String::from("/etc/passwd")]
-        ));
-    }
-
-    #[test]
-    fn parse_syslog_port_uses_default_for_missing_or_invalid_values() {
-        // Guards sink selection fallback so malformed env vars cannot break startup.
-        assert_eq!(parse_syslog_port(None), 514);
-        assert_eq!(parse_syslog_port(Some("not-a-port")), 514);
-        assert_eq!(parse_syslog_port(Some("6514")), 6514);
-    }
-
-    #[test]
-    fn choose_syslog_protocol_tracks_tcp_toggle() {
-        // Validates protocol selection branch used by the optional syslog sink.
-        assert!(matches!(
-            choose_syslog_protocol(true),
-            sinks::syslog_cef::SyslogProtocol::Tcp
-        ));
-        assert!(matches!(
-            choose_syslog_protocol(false),
-            sinks::syslog_cef::SyslogProtocol::Udp
-        ));
-    }
-
-    #[test]
-    fn severity_rank_orders_levels_from_debug_to_critical() {
-        // Confirms dedup ranking keeps higher-severity incidents when multiple detectors fire.
-        assert_eq!(severity_rank(&Severity::Debug), 0);
-        assert_eq!(severity_rank(&Severity::Info), 1);
-        assert_eq!(severity_rank(&Severity::Low), 2);
-        assert_eq!(severity_rank(&Severity::Medium), 3);
-        assert_eq!(severity_rank(&Severity::High), 4);
-        assert_eq!(severity_rank(&Severity::Critical), 5);
-    }
+    // (parse_blocked_ips / helper_paths_resolve_inside_data_dir /
+    //  should_spawn_integrity_collector / parse_syslog_port /
+    //  choose_syslog_protocol / severity_rank anchors moved to
+    //  crates/sensor/src/main_helpers.rs as part of the 2026-05-25
+    //  main.rs decomposition PR2.)
 
     #[test]
     fn page_cache_mismatch_event_promotes_to_critical_incident() {
@@ -3155,11 +3019,9 @@ mod tests {
         assert_eq!(kvm.max_allowed_mode, 0o660);
     }
 
-    #[test]
-    fn passthrough_sources_are_disabled_by_default() {
-        // Documents current behavior where passthrough mode is intentionally opt-in and off.
-        assert!(!is_passthrough_source("external.ids"));
-    }
+    // (passthrough_sources_are_disabled_by_default moved to main_helpers.rs
+    //  as `is_passthrough_source_returns_false_for_all_known_sources` — same
+    //  contract, broader source coverage.)
 
     #[test]
     fn cli_parses_default_and_custom_config_path() {
@@ -3176,50 +3038,12 @@ mod tests {
         assert_eq!(custom_cli.config, "/etc/innerwarden/sensor.toml");
     }
 
-    #[test]
-    fn parse_blocked_ips_deduplicates_and_keeps_comment_lines_as_tokens() {
-        // The feedback file is intentionally a raw one-IP-per-line token list;
-        // comment-looking lines are kept rather than interpreted as syntax.
-        let parsed = parse_blocked_ips("1.2.3.4\n 1.2.3.4 \n# operator note\n");
-        assert_eq!(parsed.len(), 2);
-        assert!(parsed.contains("1.2.3.4"));
-        assert!(parsed.contains("# operator note"));
-    }
-
-    #[test]
-    fn load_blocked_ips_returns_empty_for_missing_feedback_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let blocked = load_blocked_ips(dir.path());
-        assert!(blocked.is_empty());
-    }
-
-    #[test]
-    fn load_blocked_ips_reads_agent_feedback_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            blocked_ips_path_for(dir.path()),
-            "203.0.113.8\n198.51.100.9\n",
-        )
-        .expect("write blocked ips");
-
-        let blocked = load_blocked_ips(dir.path());
-        assert_eq!(blocked.len(), 2);
-        assert!(blocked.contains("203.0.113.8"));
-        assert!(blocked.contains("198.51.100.9"));
-    }
-
-    #[test]
-    fn should_enable_syslog_sink_requires_non_empty_host() {
-        assert!(!should_enable_syslog_sink(""));
-        assert!(should_enable_syslog_sink("127.0.0.1"));
-    }
-
-    #[test]
-    fn parse_syslog_port_rejects_out_of_range_values() {
-        assert_eq!(parse_syslog_port(Some("0")), 0);
-        assert_eq!(parse_syslog_port(Some("65535")), 65535);
-        assert_eq!(parse_syslog_port(Some("65536")), 514);
-    }
+    // (5 helper unit tests moved to main_helpers.rs as part of PR2:
+    //  parse_blocked_ips_deduplicates_and_keeps_comment_lines_as_tokens,
+    //  load_blocked_ips_returns_empty_for_missing_feedback_file,
+    //  load_blocked_ips_reads_agent_feedback_file,
+    //  should_enable_syslog_sink_requires_non_empty_host,
+    //  parse_syslog_port_rejects_out_of_range_values.)
 
     // ── Wave 9f anchors (2026-05-04) — journald-detection contract ───────
     //
@@ -3306,58 +3130,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn blocked_ip_hint_returns_false_for_unblocked_ip() {
-        use innerwarden_core::event::{Event, Severity};
-        use std::collections::HashSet;
-
-        let mut blocked = HashSet::new();
-        blocked.insert("1.1.1.1".to_string());
-
-        let ev = Event {
-            ts: chrono::Utc::now(),
-            host: "test".to_string(),
-            source: "auth.log".to_string(),
-            kind: "ssh.login_failed".to_string(),
-            severity: Severity::Info,
-            summary: "Failed login from 2.2.2.2".to_string(),
-            details: serde_json::json!({ "ip": "2.2.2.2" }),
-            tags: vec![],
-            entities: vec![],
-        };
-
-        assert!(
-            !should_use_blocked_ip_hint(&ev, &blocked),
-            "helper must return false for an IP not in the blocked set"
-        );
-    }
-
-    #[test]
-    fn blocked_ip_hint_returns_false_when_event_has_no_ip() {
-        use innerwarden_core::event::{Event, Severity};
-        use std::collections::HashSet;
-
-        let mut blocked = HashSet::new();
-        blocked.insert("1.1.1.1".to_string());
-
-        let ev = Event {
-            ts: chrono::Utc::now(),
-            host: "test".to_string(),
-            source: "exec_audit".to_string(),
-            kind: "process.exec".to_string(),
-            severity: Severity::Info,
-            summary: "exec without IP".to_string(),
-            details: serde_json::json!({ "comm": "ls" }),
-            tags: vec![],
-            entities: vec![],
-        };
-
-        assert!(
-            !should_use_blocked_ip_hint(&ev, &blocked),
-            "helper must return false when the event has no ip/src_ip field — \
-             otherwise non-network events would spuriously trip the hint"
-        );
-    }
+    // (blocked_ip_hint_returns_false_for_unblocked_ip and
+    //  blocked_ip_hint_returns_false_when_event_has_no_ip moved to
+    //  main_helpers.rs::tests. The anti-regression
+    //  `blocked_ip_hint_returns_true_but_does_not_imply_skip` above STAYS
+    //  here because it source-greps the process_event body via
+    //  `include_str!("main.rs")`.)
 
     // (build_tracing_env_filter anchor moved to crates/sensor/src/tracing_init.rs
     //  as part of the 2026-05-25 main.rs decomposition PR1.)
