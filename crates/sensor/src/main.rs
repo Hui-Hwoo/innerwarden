@@ -3,6 +3,7 @@ mod collectors;
 mod config;
 mod detectors;
 mod sinks;
+mod tracing_init;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -180,64 +181,9 @@ struct WriteStats {
     incidents_written: u64,
 }
 
-/// Build the tracing env-filter shared by every tracing init path.
-/// Pure so the unit test can compare it without process-global state.
-fn build_tracing_env_filter() -> Result<tracing_subscriber::EnvFilter> {
-    Ok(tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("innerwarden_sensor=info".parse()?))
-}
-
-/// Wave 9f (AUDIT-009 root): true iff the process is being captured by
-/// systemd's journal stream. systemd sets `JOURNAL_STREAM=<dev>:<inode>`
-/// on services launched via a unit file, so the binary's stdout/stderr
-/// goes into the journal. When this is set we route tracing through
-/// `tracing-journald` so each record gets a real `PRIORITY=` field
-/// (instead of letting journald guess priority off captured plain stdout).
-///
-/// Pure helper so tests pass the env value in as an argument and avoid
-/// mutating process-global state. `cfg_attr` on the dead-code lint
-/// because the only non-test caller is the Linux-cfg branch in
-/// `init_tracing` - macOS / dev-shell builds never reach the call site
-/// but the unit tests do exercise the function on every platform.
-#[cfg_attr(not(test), allow(dead_code))]
-fn use_journald_layer(journal_stream: Option<&str>) -> bool {
-    journal_stream.is_some_and(|v| !v.is_empty())
-}
-
-/// Set up tracing for the sensor binary. Routes through `tracing-journald`
-/// when running under systemd, plain stdout fmt subscriber otherwise.
-fn init_tracing() -> Result<()> {
-    let env_filter = build_tracing_env_filter()?;
-
-    #[cfg(target_os = "linux")]
-    {
-        let journal_stream = std::env::var("JOURNAL_STREAM").ok();
-        if use_journald_layer(journal_stream.as_deref()) {
-            use tracing_subscriber::layer::SubscriberExt;
-            use tracing_subscriber::util::SubscriberInitExt;
-            match tracing_journald::layer() {
-                Ok(layer) => {
-                    tracing_subscriber::registry()
-                        .with(env_filter)
-                        .with(layer)
-                        .init();
-                    return Ok(());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "tracing-journald layer unavailable ({e}); falling back to stdout fmt subscriber"
-                    );
-                }
-            }
-        }
-    }
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing()?;
+    tracing_init::init_tracing()?;
 
     let cli = Cli::parse();
     let cfg = config::load(&cli.config)?;
@@ -3286,29 +3232,8 @@ mod tests {
     // contract is caught at test time rather than by the operator one
     // morning when their `journalctl -p warning` query goes silent.
 
-    #[test]
-    fn use_journald_layer_returns_true_when_journal_stream_is_set() {
-        // The JOURNAL_STREAM=<dev>:<inode> shape that systemd documents.
-        assert!(use_journald_layer(Some("8:42")));
-    }
-
-    #[test]
-    fn use_journald_layer_returns_false_when_env_is_unset() {
-        // Off-systemd dev shell + macOS dev: env var simply absent. We
-        // must NOT try to write to a non-existent journal socket because
-        // that fails the binary at startup on macOS where there is no
-        // /run/systemd at all.
-        assert!(!use_journald_layer(None));
-    }
-
-    #[test]
-    fn use_journald_layer_returns_false_when_env_is_empty_string() {
-        // Defensive: env vars set to empty string are common operator
-        // mistakes (e.g. `JOURNAL_STREAM= cargo run`). Treat empty as
-        // unset so the operator's foreground run does not silently start
-        // attempting a journald write that will fail.
-        assert!(!use_journald_layer(Some("")));
-    }
+    // (use_journald_layer anchors moved to crates/sensor/src/tracing_init.rs
+    //  as part of the 2026-05-25 main.rs decomposition PR1.)
 
     // ── Anchor: blocked-IP early-return must STAY removed ────────────────
     //
@@ -3434,18 +3359,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_tracing_env_filter_includes_innerwarden_sensor_directive() {
-        // Anchor for the env filter. Pins the directive so a future
-        // contributor cannot accidentally drop the log routing for the
-        // sensor namespace - which would silently turn off most logs.
-        // The Display form is what tracing-subscriber shows on `--help`
-        // output, so a missing directive shows up here.
-        let f = build_tracing_env_filter().expect("env filter must build");
-        let s = format!("{}", f);
-        assert!(
-            s.contains("innerwarden_sensor"),
-            "env filter must enable innerwarden_sensor; got: {s}"
-        );
-    }
+    // (build_tracing_env_filter anchor moved to crates/sensor/src/tracing_init.rs
+    //  as part of the 2026-05-25 main.rs decomposition PR1.)
 }

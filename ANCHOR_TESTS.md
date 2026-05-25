@@ -205,13 +205,13 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/tests::build_tracing_env_filter_includes_innerwarden_directives` — the env filter MUST enable both `innerwarden_agent` (the actual code) and `telegram_audit` + `innerwarden_store` (sub-namespaces previous PRs explicitly opted into — PR #357 and the audit-ui spec). Dropping any of these silently turns off operator-visible logs for the affected subsystem.
 
-- `crates/sensor/src/main.rs::tests::use_journald_layer_returns_true_when_journal_stream_is_set` — same contract on the sensor side.
+- `crates/sensor/src/tracing_init.rs::tests::use_journald_layer_returns_true_when_journal_stream_is_set` — same contract on the sensor side.
 
-- `crates/sensor/src/main.rs::tests::use_journald_layer_returns_false_when_env_is_unset` — same defensive case for sensor.
+- `crates/sensor/src/tracing_init.rs::tests::use_journald_layer_returns_false_when_env_is_unset` — same defensive case for sensor.
 
-- `crates/sensor/src/main.rs::tests::use_journald_layer_returns_false_when_env_is_empty_string` — same empty-env defensive case for sensor.
+- `crates/sensor/src/tracing_init.rs::tests::use_journald_layer_returns_false_when_env_is_empty_string` — same empty-env defensive case for sensor.
 
-- `crates/sensor/src/main.rs::tests::build_tracing_env_filter_includes_innerwarden_sensor_directive` — the sensor's env filter MUST enable the `innerwarden_sensor` namespace; dropping it silently turns off most logs.
+- `crates/sensor/src/tracing_init.rs::tests::build_tracing_env_filter_includes_innerwarden_sensor_directive` — the sensor's env filter MUST enable the `innerwarden_sensor` namespace; dropping it silently turns off most logs. (Moved out of crates/sensor/src/main.rs in PR #801 — 2026-05-25 main.rs decomposition step 1.)
 
 ### Cloudflare CIDR validation (Wave 9g — AUDIT-017 anchor)
 
