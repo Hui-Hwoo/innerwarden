@@ -210,6 +210,8 @@ pub struct DetectorsConfig {
     pub suid_page_cache_integrity: SuidPageCacheIntegrityConfig,
     #[serde(default)]
     pub kernel_devnode_exposed: KernelDevnodeExposedConfig,
+    #[serde(default)]
+    pub imds_ssrf: ImdsSsrfConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -297,6 +299,51 @@ impl Default for KernelDevnodeExposedConfig {
 
 fn default_kernel_devnode_exposed_poll_interval_secs() -> u64 {
     crate::detectors::kernel_devnode_exposed::DEFAULT_POLL_INTERVAL_SECS
+}
+
+/// IMDS SSRF detector — watches outbound connects to cloud-metadata
+/// endpoints (`169.254.169.254` / `fd00:ec2::254`) and fires when the
+/// accessing process is not in the built-in cloud-tool allowlist.
+///
+/// Default enabled because the detector is FP-safe by construction
+/// (only fires when a non-cloud-tool process explicitly hits IMDS).
+/// `allowlist_comms` is the operator escape hatch for app processes
+/// that legitimately use IAM via the cloud SDKs — adding `python3`
+/// silences the HIGH-tier alert for that comm only.
+///
+/// Example TOML:
+///
+/// ```toml
+/// [detectors.imds_ssrf]
+/// enabled = true
+/// cooldown_seconds = 600
+/// allowlist_comms = ["python3", "ruby"]
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct ImdsSsrfConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_imds_ssrf_cooldown_seconds")]
+    pub cooldown_seconds: u64,
+    /// Operator-extended allowlist on top of the built-in cloud-tool
+    /// list. Matched with `starts_with` so the truncated 15-char
+    /// `TASK_COMM_LEN` form is what should appear here.
+    #[serde(default)]
+    pub allowlist_comms: Vec<String>,
+}
+
+impl Default for ImdsSsrfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cooldown_seconds: default_imds_ssrf_cooldown_seconds(),
+            allowlist_comms: Vec::new(),
+        }
+    }
+}
+
+fn default_imds_ssrf_cooldown_seconds() -> u64 {
+    crate::detectors::imds_ssrf::DEFAULT_COOLDOWN_SECONDS
 }
 
 #[derive(Debug, Deserialize)]

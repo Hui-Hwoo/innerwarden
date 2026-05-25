@@ -226,6 +226,9 @@ pub mod kernel_devnode_exposed;
 pub mod sensitive_write;
 pub mod suid_page_cache_integrity;
 
+// 2026-05-25 — Cyber Defense Benchmark blind-spot coverage
+pub mod imds_ssrf;
+
 // v0.6.0 detectors
 pub mod cgroup_abuse;
 pub mod container_drift;

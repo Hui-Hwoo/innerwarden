@@ -128,6 +128,7 @@ struct DetectorSet {
     container_drift: Option<detectors::container_drift::ContainerDriftDetector>,
     host_drift: Option<detectors::host_drift::HostDriftDetector>,
     data_exfil_ebpf: Option<detectors::data_exfil_ebpf::DataExfilEbpfDetector>,
+    imds_ssrf: Option<detectors::imds_ssrf::ImdsSsrfDetector>,
     yara_scan: Option<detectors::yara_scan::YaraScanDetector>,
     sigma_rule: Option<detectors::sigma_rule::SigmaRuleDetector>,
     mitre_hunt: Option<detectors::mitre_hunt::MitreHuntDetector>,
@@ -716,6 +717,20 @@ async fn main() -> Result<()> {
             info!("data_exfil_ebpf detector enabled (sensitive file read + outbound connect)");
             detectors::data_exfil_ebpf::DataExfilEbpfDetector::new(&cfg.agent.host_id, 60, 600)
         }),
+        imds_ssrf: if cfg.detectors.imds_ssrf.enabled {
+            info!(
+                "imds_ssrf detector enabled (cloud-metadata SSRF; cooldown {}s, operator allowlist={} entries)",
+                cfg.detectors.imds_ssrf.cooldown_seconds,
+                cfg.detectors.imds_ssrf.allowlist_comms.len(),
+            );
+            Some(detectors::imds_ssrf::ImdsSsrfDetector::new(
+                &cfg.agent.host_id,
+                cfg.detectors.imds_ssrf.allowlist_comms.clone(),
+                cfg.detectors.imds_ssrf.cooldown_seconds,
+            ))
+        } else {
+            None
+        },
         yara_scan: Some({
             let rules_dir = std::path::Path::new("rules/yara");
             info!("YARA binary scanner enabled");
@@ -2151,6 +2166,12 @@ fn process_event(
     }
 
     if let Some(ref mut det) = detectors.data_exfil_ebpf {
+        if let Some(incident) = det.process(&ev) {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    if let Some(ref mut det) = detectors.imds_ssrf {
         if let Some(incident) = det.process(&ev) {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }

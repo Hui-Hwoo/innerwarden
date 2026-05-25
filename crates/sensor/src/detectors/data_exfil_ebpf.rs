@@ -12,7 +12,18 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration, Utc};
 use innerwarden_core::{entities::EntityRef, event::Event, event::Severity, incident::Incident};
 
-/// Sensitive file paths that trigger tracking.
+/// Sensitive file paths that trigger tracking. Matched case-insensitively
+/// via a `contains` check (see [`is_sensitive_path`]) so trailing chrome
+/// profile paths and per-user expansions are caught without enumeration.
+///
+/// 2026-05-25 (Cyber Defense Benchmark audit): added cloud-credential and
+/// browser-credential paths to close the gaps the Simbian AI benchmark
+/// identifies as "tactic blind spots" — Credential Access and Collection
+/// where LLM threat hunters consistently miss the evidence. The
+/// read-then-outbound co-occurrence requirement plus the
+/// `is_browser_self_access` and `BACKUP_TOOLS` allowlists keep this
+/// FP-safe — Chrome reading its own Login Data and rclone uploading a
+/// home-dir backup both pass through without alert.
 const SENSITIVE_PATHS: &[&str] = &[
     "/etc/shadow",
     "/etc/passwd",
@@ -28,6 +39,90 @@ const SENSITIVE_PATHS: &[&str] = &[
     "/secret",
     "/.kube/config",
     "/token",
+    // ── Cloud credentials (Credential Access, T1552.001) ──────────────
+    // Docker Hub auth tokens: `docker login` writes a base64'd
+    // username:password (or registry token) into config.json.
+    "/.docker/config.json",
+    // gcloud OAuth refresh tokens + access token cache. Either file
+    // alone is enough to impersonate the user across all GCP services
+    // the account can reach.
+    "/.config/gcloud/credentials.db",
+    "/.config/gcloud/access_tokens.db",
+    "/.config/gcloud/application_default_credentials.json",
+    // rclone stores SSH keys, cloud-storage tokens, and S3 secrets
+    // in a single file (optionally encrypted, often not).
+    "/.config/rclone/rclone.conf",
+    // ── Browser credentials (Collection, T1555.003 / T1539) ───────────
+    // Chrome / Chromium / Edge save logins in a SQLite called
+    // literally "Login Data" (capitalised, space). Lowercase-match
+    // via `is_sensitive_path` catches it under every profile path.
+    "/login data",
+    // Firefox: key4.db holds the NSS master key, logins.json the
+    // encrypted credentials, cookies.sqlite the session cookies.
+    // Stealing all three = full account takeover for any site the
+    // user is logged into.
+    "/key4.db",
+    "/logins.json",
+    "/cookies.sqlite",
+];
+
+/// Browser process names (truncated to 15 chars by Linux's TASK_COMM_LEN
+/// where applicable). Reading browser-data paths from a browser process
+/// is the browser doing its job; we skip those reads entirely so the
+/// detector never fires on Chrome auto-syncing its own Login Data over
+/// HTTPS.
+///
+/// Matched with `starts_with`: covers `google-chrome`, `google-chrom`
+/// (the truncated comm), `chromium-browse`, `firefox-bin`,
+/// `MainThread` (Chrome's worker thread comm), etc.
+const BROWSER_PROCESS_PREFIXES: &[&str] = &[
+    "chrome",
+    "chromium",
+    "google-chrom",
+    "firefox",
+    "MainThread", // Chrome renderer/utility process comm
+    "brave",
+    "msedge",
+    "microsoft-edge",
+    "opera",
+    "vivaldi",
+    "thunderbird", // also uses logins.json + key4.db
+];
+
+/// Browser-data path substrings. Reads of these paths by a
+/// `BROWSER_PROCESS_PREFIXES` process are skipped — see
+/// [`is_browser_self_access`].
+const BROWSER_DATA_PATH_HINTS: &[&str] = &[
+    "/login data",
+    "/key4.db",
+    "/logins.json",
+    "/cookies.sqlite",
+    "/google-chrome/",
+    "/chromium/",
+    "/.mozilla/firefox/",
+    "/brave-browser/",
+    "/microsoft-edge/",
+];
+
+/// Backup tools that legitimately read everything under $HOME (including
+/// cloud creds, browser data, SSH keys) and upload to a remote target as
+/// part of their job. They cannot be distinguished from exfil by the
+/// read-then-outbound pattern alone — the operator's intent (backup vs
+/// exfil) is in the tool's config file, not in the kernel events.
+///
+/// Allowlisting here means the detector NEVER fires for these comms.
+/// Operators who run backup tools they don't trust should remove the
+/// entry locally; the trade-off is documented in the wiki Operations
+/// page.
+const BACKUP_TOOLS: &[&str] = &[
+    "rclone",
+    "restic",
+    "borg",
+    "borgmatic",
+    "duplicity",
+    "duplicati",
+    "kopia",
+    "tarsnap",
 ];
 
 /// Per-PID tracking of sensitive file access.
@@ -125,6 +220,15 @@ impl DataExfilEbpfDetector {
             return None;
         }
 
+        // 2026-05-25: backup tools (rclone, restic, borg, …) read
+        // everything under $HOME and upload to a remote target as
+        // their job. The read-then-outbound shape is indistinguishable
+        // from exfil at the kernel layer — the operator's intent is
+        // in the tool's config file, not in eBPF. Allowlist them.
+        if BACKUP_TOOLS.iter().any(|t| ev_comm.starts_with(t)) {
+            return None;
+        }
+
         // Phase 1: Track sensitive file reads
         if event.kind == "file.read_access" || event.kind == "file.write_access" {
             let filename = event
@@ -139,6 +243,14 @@ impl DataExfilEbpfDetector {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
+                // 2026-05-25: skip browsers reading their own data.
+                // Chrome auto-syncs Login Data over HTTPS continuously;
+                // Firefox writes logins.json on every saved password.
+                // Either pattern would fire Critical for every browser
+                // session if we didn't gate here.
+                if is_browser_self_access(&comm, filename) {
+                    return None;
+                }
                 self.pending_reads.insert(
                     pid,
                     SensitiveRead {
@@ -356,6 +468,24 @@ fn is_sensitive_path(path: &str) -> bool {
     SENSITIVE_PATHS
         .iter()
         .any(|sensitive| lower.contains(sensitive))
+}
+
+/// True when a browser process is reading its own credential store.
+///
+/// The check requires BOTH (a) the comm matches a known browser prefix
+/// AND (b) the path looks like browser-managed data. A non-browser
+/// process reading the same path is NOT covered by this allowlist —
+/// it still flows into `pending_reads` and fires Critical on outbound,
+/// which is the entire point of adding browser data to `SENSITIVE_PATHS`.
+fn is_browser_self_access(comm: &str, filename: &str) -> bool {
+    let f_lower = filename.to_lowercase();
+    let path_is_browser_data = BROWSER_DATA_PATH_HINTS.iter().any(|h| f_lower.contains(h));
+    if !path_is_browser_data {
+        return false;
+    }
+    BROWSER_PROCESS_PREFIXES
+        .iter()
+        .any(|prefix| comm.starts_with(prefix))
 }
 
 // ---------------------------------------------------------------------------
@@ -679,5 +809,317 @@ mod tests {
         assert!(is_sensitive_path("/home/user/.kube/config"));
         assert!(!is_sensitive_path("/var/log/syslog"));
         assert!(!is_sensitive_path("/usr/bin/ls"));
+    }
+
+    // ---------------------------------------------------------------------
+    // 2026-05-25 anchors — Cyber Defense Benchmark blind-spot coverage
+    // ---------------------------------------------------------------------
+    //
+    // The Simbian AI Cyber Defense Benchmark (arXiv:2604.19533) showed
+    // frontier LLMs near-universally miss Credential Access and Collection
+    // tactics when hunting. We don't rely on LLM hunting — these tests
+    // pin that the deterministic eBPF detector catches the same patterns
+    // the LLMs miss: Chrome / Firefox credential theft, Docker auth token
+    // exfil, gcloud OAuth refresh-token exfil, rclone backup-tool false
+    // positive avoidance.
+
+    #[test]
+    fn cloud_creds_docker_config_then_outbound_fires_critical() {
+        // T1552.001 (Credentials in Files) — Docker Hub auth tokens.
+        // `docker login` writes username:password (base64) into
+        // ~/.docker/config.json. Attacker reads it, uploads it. The
+        // detector must catch this exactly like SSH key exfil.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8100,
+            "/home/dev/.docker/config.json",
+            "cat",
+            now,
+        ));
+        let inc = det
+            .process(&connect_event_with_comm(
+                8100,
+                "5.6.7.8",
+                443,
+                "cat",
+                now + Duration::seconds(2),
+            ))
+            .expect("docker config.json read + outbound must fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("config.json"));
+    }
+
+    #[test]
+    fn cloud_creds_gcloud_oauth_then_outbound_fires_critical() {
+        // T1552.001 — gcloud OAuth refresh tokens in
+        // ~/.config/gcloud/credentials.db. Stealing this gives the
+        // attacker every GCP API the user can reach for the lifetime
+        // of the refresh token (often weeks).
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8101,
+            "/home/dev/.config/gcloud/credentials.db",
+            "exfil",
+            now,
+        ));
+        let inc = det
+            .process(&connect_event_with_comm(
+                8101,
+                "5.6.7.8",
+                443,
+                "exfil",
+                now + Duration::seconds(1),
+            ))
+            .expect("gcloud credentials.db read + outbound must fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("credentials.db"));
+    }
+
+    #[test]
+    fn cloud_creds_rclone_conf_then_outbound_fires_critical() {
+        // T1552.001 — rclone.conf often holds SSH keys, S3 secrets,
+        // and cloud-storage tokens in a single file. A non-rclone
+        // process reading it then connecting out is exfil. (Real
+        // rclone is allowlisted in BACKUP_TOOLS — see the
+        // `backup_tool_rclone_is_allowlisted` test below.)
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8102,
+            "/home/dev/.config/rclone/rclone.conf",
+            "curl",
+            now,
+        ));
+        let inc = det
+            .process(&connect_event_with_comm(
+                8102,
+                "5.6.7.8",
+                443,
+                "curl",
+                now + Duration::seconds(1),
+            ))
+            .expect("rclone.conf read by non-rclone process + outbound must fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("rclone.conf"));
+    }
+
+    #[test]
+    fn browser_data_read_by_attacker_then_outbound_fires_critical() {
+        // T1555.003 (Credentials from Web Browsers) — Chrome's
+        // "Login Data" SQLite is the canonical browser-credential
+        // theft target. A non-browser process reading it then
+        // connecting out is exfil.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8200,
+            "/home/user/.config/google-chrome/Default/Login Data",
+            "stealer",
+            now,
+        ));
+        let inc = det
+            .process(&connect_event_with_comm(
+                8200,
+                "5.6.7.8",
+                443,
+                "stealer",
+                now + Duration::seconds(1),
+            ))
+            .expect("non-browser reading Chrome Login Data + outbound must fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.to_lowercase().contains("login data"));
+    }
+
+    #[test]
+    fn browser_data_firefox_logins_json_then_outbound_fires_critical() {
+        // Firefox saved-logins exfil counterpart. logins.json is
+        // encrypted with the key in key4.db — stealing both is
+        // sufficient for offline decryption.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8201,
+            "/home/user/.mozilla/firefox/abc123.default/logins.json",
+            "stealer",
+            now,
+        ));
+        let inc = det
+            .process(&connect_event_with_comm(
+                8201,
+                "5.6.7.8",
+                443,
+                "stealer",
+                now + Duration::seconds(1),
+            ))
+            .expect("non-Firefox reading logins.json + outbound must fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("logins.json"));
+    }
+
+    #[test]
+    fn browser_self_access_chrome_reading_own_login_data_is_silent() {
+        // Negative control — Chrome auto-syncs Login Data over HTTPS
+        // constantly. If this detector fired every time Chrome wrote
+        // a saved password and then synced it, the operator would get
+        // a Critical alert per browser session. Anchor: the
+        // is_browser_self_access skip MUST hold.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8300,
+            "/home/user/.config/google-chrome/Default/Login Data",
+            "chrome",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8300,
+            "142.250.190.78", // www.google.com
+            443,
+            "chrome",
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_none(),
+            "chrome reading its own Login Data + outbound must NOT fire"
+        );
+    }
+
+    #[test]
+    fn browser_self_access_firefox_reading_own_key4_is_silent() {
+        // Firefox writes key4.db on every saved-password add and reads
+        // it on every form autofill. Same FP shape as Chrome.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8301,
+            "/home/user/.mozilla/firefox/abc.default/key4.db",
+            "firefox",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8301,
+            "34.107.221.82", // mozilla.org telemetry
+            443,
+            "firefox",
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_none(),
+            "firefox reading its own key4.db + outbound must NOT fire"
+        );
+    }
+
+    #[test]
+    fn browser_self_access_truncated_comm_chrome_is_silent() {
+        // Linux TASK_COMM_LEN truncates comm to 15 chars, so
+        // `google-chrome` becomes `google-chrom` in eBPF events.
+        // BROWSER_PROCESS_PREFIXES includes both — verify the
+        // truncated form is covered.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8302,
+            "/home/user/.config/google-chrome/Profile 1/Login Data",
+            "google-chrom",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8302,
+            "142.250.190.78",
+            443,
+            "google-chrom",
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_none(),
+            "google-chrom (truncated comm) reading own Login Data + outbound must NOT fire"
+        );
+    }
+
+    #[test]
+    fn backup_tool_rclone_is_allowlisted() {
+        // rclone legitimately reads everything under $HOME (including
+        // SSH keys, cloud creds, browser data) and uploads to the
+        // configured backup target. Kernel events cannot distinguish
+        // backup from exfil — operator's intent is in the tool's
+        // config file. Allowlist is the FP-safe choice.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8400,
+            "/home/user/.ssh/id_ed25519",
+            "rclone",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8400,
+            "5.6.7.8",
+            443,
+            "rclone",
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_none(),
+            "rclone reading SSH key + outbound must be allowlisted as backup activity"
+        );
+    }
+
+    #[test]
+    fn backup_tool_restic_is_allowlisted() {
+        // Anti-regression: BACKUP_TOOLS contains restic too — same
+        // logic. Anchor pins the entry so a future cleanup that
+        // narrows the list cannot silently drop restic.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8401,
+            "/home/user/.docker/config.json",
+            "restic",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8401,
+            "5.6.7.8",
+            443,
+            "restic",
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_none(),
+            "restic reading docker config + outbound must be allowlisted"
+        );
+    }
+
+    #[test]
+    fn is_browser_self_access_path_alone_is_insufficient() {
+        // A non-browser comm reading a browser path is NOT
+        // self-access — it's the attack signature. Tests the
+        // both-must-match logic in `is_browser_self_access`.
+        assert!(!is_browser_self_access(
+            "stealer",
+            "/home/user/.config/google-chrome/Default/Login Data"
+        ));
+        // Browser comm reading a non-browser path is also not
+        // browser self-access (correctly; would fall through to
+        // the normal sensitive-path check).
+        assert!(!is_browser_self_access("chrome", "/etc/shadow"));
+    }
+
+    #[test]
+    fn is_browser_self_access_both_match_returns_true() {
+        assert!(is_browser_self_access(
+            "chrome",
+            "/home/user/.config/google-chrome/Default/Login Data"
+        ));
+        assert!(is_browser_self_access(
+            "firefox",
+            "/home/user/.mozilla/firefox/abc.default/logins.json"
+        ));
+        assert!(is_browser_self_access(
+            "google-chrom",
+            "/home/user/.config/google-chrome/Profile 1/key4.db"
+        ));
     }
 }
