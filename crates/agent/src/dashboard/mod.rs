@@ -8406,15 +8406,19 @@ mod tests {
         // this the dashboard's `/api/sensors.collector_health` is
         // always null and the operator never sees per-host health
         // (suricata_eve missing on host X but present on host Y).
-        const SENSOR_MAIN: &str = include_str!("../../../sensor/src/main.rs");
+        //
+        // 2026-05-25: source-grep target moved from main.rs to
+        // sensor.rs when async fn main's body was extracted into
+        // `sensor::run` (PR-F3 of the test-foundations series).
+        const SENSOR_RUN: &str = include_str!("../../../sensor/src/sensor.rs");
         assert!(
-            SENSOR_MAIN.contains("collector_health::write_status_file"),
-            "PR29 — sensor main.rs must call write_status_file at \
+            SENSOR_RUN.contains("collector_health::write_status_file"),
+            "PR29 — sensor::run must call write_status_file at \
              boot. Without the call the dashboard falls back to its \
              legacy per-collector counter view."
         );
         assert!(
-            SENSOR_MAIN.contains("collector_health::build_status"),
+            SENSOR_RUN.contains("collector_health::build_status"),
             "PR29 — sensor must populate each collector's status via \
              `build_status(name, enabled, source, now)` so the probe \
              yields source_unavailable / source_empty / etc when the \
