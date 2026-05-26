@@ -31,6 +31,7 @@ use crate::boot;
 use crate::boot::cursors::SharedCursors;
 use crate::collector_health;
 use crate::config::Config;
+use crate::detector_set::DetectorSet;
 use crate::detectors;
 use crate::detectors::datasets::Datasets;
 use crate::main_helpers::{
@@ -39,7 +40,6 @@ use crate::main_helpers::{
 #[cfg(target_os = "linux")]
 use crate::seccomp;
 use crate::sinks::{self, sqlite::SqliteWriter, state::State};
-use crate::DetectorSet;
 
 /// Container for every piece of boot-time state. Returned by
 /// [`boot_init`] and consumed by [`run_loop`].

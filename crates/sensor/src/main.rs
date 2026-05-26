@@ -2,6 +2,7 @@ mod boot;
 mod collector_health;
 mod collectors;
 mod config;
+mod detector_set;
 mod detectors;
 mod event_dispatch;
 mod incident_builders;
@@ -10,8 +11,6 @@ mod seccomp;
 mod sensor;
 mod sinks;
 mod tracing_init;
-
-use std::collections::HashSet;
 
 use anyhow::Result;
 use clap::Parser;
@@ -22,41 +21,12 @@ use clap::Parser;
 // crates/sensor/src/boot/spawn_collectors.rs as part of the 2026-05-25
 // main.rs decomposition PR5b2 — they're only constructed inside that
 // module's spawn fn.
-use detectors::c2_callback::C2CallbackDetector;
-use detectors::container_escape::ContainerEscapeDetector;
-use detectors::credential_harvest::CredentialHarvestDetector;
-use detectors::credential_stuffing::CredentialStuffingDetector;
-use detectors::crontab_persistence::CrontabPersistenceDetector;
-use detectors::crypto_miner::CryptoMinerDetector;
-use detectors::data_exfiltration::DataExfiltrationDetector;
-use detectors::distributed_ssh::DistributedSshDetector;
-use detectors::dns_tunneling::DnsTunnelingDetector;
-use detectors::docker_anomaly::DockerAnomalyDetector;
-use detectors::execution_guard::ExecutionGuardDetector;
-use detectors::fileless::FilelessDetector;
-use detectors::integrity_alert::IntegrityAlertDetector;
-use detectors::kernel_module_load::KernelModuleLoadDetector;
-use detectors::lateral_movement::LateralMovementDetector;
-use detectors::log_tampering::LogTamperingDetector;
-use detectors::outbound_anomaly::OutboundAnomalyDetector;
-use detectors::packet_flood::PacketFloodDetector;
-use detectors::port_scan::PortScanDetector;
-use detectors::privesc::PrivescDetector;
-use detectors::process_injection::ProcessInjectionDetector;
-use detectors::process_tree::ProcessTreeDetector;
-use detectors::ransomware::RansomwareDetector;
-use detectors::reverse_shell::ReverseShellDetector;
-use detectors::rootkit::RootkitDetector;
-use detectors::search_abuse::SearchAbuseDetector;
-use detectors::ssh_bruteforce::SshBruteforceDetector;
-use detectors::ssh_key_injection::SshKeyInjectionDetector;
-use detectors::sudo_abuse::SudoAbuseDetector;
-use detectors::suspicious_login::SuspiciousLoginDetector;
-use detectors::systemd_persistence::SystemdPersistenceDetector;
-use detectors::user_agent_scanner::UserAgentScannerDetector;
-use detectors::user_creation::UserCreationDetector;
-use detectors::web_scan::WebScanDetector;
-use detectors::web_shell::WebShellDetector;
+//
+// All detector type imports (35 of them: SshBruteforceDetector,
+// CredentialStuffingDetector, PortScanDetector, …) moved to
+// crates/sensor/src/detector_set.rs as part of follow-up #2 of the
+// post-PR-F3 punch list (2026-05-26). They're only mentioned inside
+// the DetectorSet struct, which now lives next to them.
 
 #[derive(Parser)]
 #[command(
@@ -69,111 +39,11 @@ struct Cli {
     config: String,
 }
 
-pub(crate) struct DetectorSet {
-    /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
-    /// Checked before all detectors -- if a process/IP is allowlisted,
-    /// the event is still logged but no incident is generated.
-    pub(crate) dynamic_allowlist: detectors::allowlists::DynamicAllowlist,
-    /// Last time we checked the allowlist file for changes.
-    pub(crate) allowlist_last_check: std::time::Instant,
-
-    /// IPs blocked by the agent. Loaded from blocked-ips.txt and
-    /// reloaded every 60s. Events from these IPs skip detection.
-    pub(crate) blocked_ips: HashSet<String>,
-    /// Last time we reloaded blocked-ips.txt.
-    pub(crate) blocked_ips_last_check: std::time::Instant,
-
-    pub(crate) ssh: Option<SshBruteforceDetector>,
-    pub(crate) credential_stuffing: Option<CredentialStuffingDetector>,
-    pub(crate) port_scan: Option<PortScanDetector>,
-    pub(crate) sudo_abuse: Option<SudoAbuseDetector>,
-    pub(crate) search_abuse: Option<SearchAbuseDetector>,
-    pub(crate) web_scan: Option<WebScanDetector>,
-    pub(crate) user_agent_scanner: Option<UserAgentScannerDetector>,
-    pub(crate) execution_guard: Option<ExecutionGuardDetector>,
-    pub(crate) docker_anomaly: Option<DockerAnomalyDetector>,
-    pub(crate) integrity_alert: Option<IntegrityAlertDetector>,
-    pub(crate) log_tampering: Option<LogTamperingDetector>,
-    pub(crate) distributed_ssh: Option<DistributedSshDetector>,
-    pub(crate) suspicious_login: Option<SuspiciousLoginDetector>,
-    pub(crate) c2_callback: Option<C2CallbackDetector>,
-    pub(crate) process_tree: Option<ProcessTreeDetector>,
-    pub(crate) container_escape: Option<ContainerEscapeDetector>,
-    pub(crate) privesc: Option<PrivescDetector>,
-    pub(crate) fileless: Option<FilelessDetector>,
-    pub(crate) dns_tunneling: Option<DnsTunnelingDetector>,
-    pub(crate) lateral_movement: Option<LateralMovementDetector>,
-    pub(crate) crypto_miner: Option<CryptoMinerDetector>,
-    pub(crate) outbound_anomaly: Option<OutboundAnomalyDetector>,
-    pub(crate) rootkit: Option<RootkitDetector>,
-    pub(crate) reverse_shell: Option<ReverseShellDetector>,
-    pub(crate) ssh_key_injection: Option<SshKeyInjectionDetector>,
-    pub(crate) web_shell: Option<WebShellDetector>,
-    pub(crate) kernel_module_load: Option<KernelModuleLoadDetector>,
-    pub(crate) crontab_persistence: Option<CrontabPersistenceDetector>,
-    pub(crate) data_exfiltration: Option<DataExfiltrationDetector>,
-    pub(crate) process_injection: Option<ProcessInjectionDetector>,
-    pub(crate) user_creation: Option<UserCreationDetector>,
-    pub(crate) systemd_persistence: Option<SystemdPersistenceDetector>,
-    pub(crate) ransomware: Option<RansomwareDetector>,
-    pub(crate) credential_harvest: Option<CredentialHarvestDetector>,
-    pub(crate) packet_flood: Option<PacketFloodDetector>,
-    pub(crate) sensitive_write: Option<detectors::sensitive_write::SensitiveWriteDetector>,
-    pub(crate) discovery_burst: Option<detectors::discovery_burst::DiscoveryBurstDetector>,
-    pub(crate) io_uring_anomaly: Option<detectors::io_uring_anomaly::IoUringAnomalyDetector>,
-    pub(crate) container_drift: Option<detectors::container_drift::ContainerDriftDetector>,
-    pub(crate) host_drift: Option<detectors::host_drift::HostDriftDetector>,
-    pub(crate) data_exfil_ebpf: Option<detectors::data_exfil_ebpf::DataExfilEbpfDetector>,
-    pub(crate) imds_ssrf: Option<detectors::imds_ssrf::ImdsSsrfDetector>,
-    pub(crate) yara_scan: Option<detectors::yara_scan::YaraScanDetector>,
-    pub(crate) sigma_rule: Option<detectors::sigma_rule::SigmaRuleDetector>,
-    pub(crate) mitre_hunt: Option<detectors::mitre_hunt::MitreHuntDetector>,
-    pub(crate) dns_c2: Option<detectors::dns_c2::DnsC2Detector>,
-    pub(crate) data_encoding: Option<detectors::data_encoding::DataEncodingDetector>,
-    pub(crate) sandbox_evasion: Option<detectors::sandbox_evasion::SandboxEvasionDetector>,
-    pub(crate) threat_intel: Option<detectors::threat_intel::ThreatIntelDetector>,
-    pub(crate) proto_anomaly: Option<detectors::proto_anomaly::ProtoAnomalyDetector>,
-    // spec 050-PR1 — Reconnaissance
-    pub(crate) nmap_scan: Option<detectors::nmap_scan::NmapScanDetector>,
-    pub(crate) wordlist_scan: Option<detectors::wordlist_scan::WordlistScanDetector>,
-    pub(crate) discovery_anomaly: Option<detectors::discovery_anomaly::DiscoveryAnomalyDetector>,
-    // spec 050-PR2 — Collection
-    pub(crate) clipboard_read: Option<detectors::clipboard_read::ClipboardReadDetector>,
-    pub(crate) screen_capture: Option<detectors::screen_capture::ScreenCaptureDetector>,
-    pub(crate) keylogger_bash_trap:
-        Option<detectors::keylogger_bash_trap::KeyloggerBashTrapDetector>,
-    pub(crate) archive_pwd_protected:
-        Option<detectors::archive_pwd_protected::ArchivePwdProtectedDetector>,
-    pub(crate) automated_file_collection:
-        Option<detectors::automated_file_collection::AutomatedFileCollectionDetector>,
-    // spec 050-PR3 — C2 variants
-    pub(crate) c2_web_tunnel: Option<detectors::c2_web_tunnel::C2WebTunnelDetector>,
-    pub(crate) c2_protocol_tunneling:
-        Option<detectors::c2_protocol_tunneling::C2ProtocolTunnelingDetector>,
-    pub(crate) c2_non_standard_port:
-        Option<detectors::c2_non_standard_port::C2NonStandardPortDetector>,
-    // spec 050-PR4 — Privilege Escalation + Lateral Movement
-    pub(crate) setuid_exploit_pattern:
-        Option<detectors::setuid_exploit_pattern::SetuidExploitPatternDetector>,
-    pub(crate) capabilities_abuse: Option<detectors::capabilities_abuse::CapabilitiesAbuseDetector>,
-    pub(crate) lateral_egress_ssh: Option<detectors::lateral_egress_ssh::LateralEgressSshDetector>,
-    pub(crate) lateral_egress_scp_rsync:
-        Option<detectors::lateral_egress_scp_rsync::LateralEgressScpRsyncDetector>,
-    // spec 050-PR5 — Persistence + Defense Evasion
-    pub(crate) pam_module_change: Option<detectors::pam_module_change::PamModuleChangeDetector>,
-    pub(crate) auditd_disable: Option<detectors::auditd_disable::AuditdDisableDetector>,
-    pub(crate) selinux_apparmor_disable:
-        Option<detectors::selinux_apparmor_disable::SelinuxApparmorDisableDetector>,
-    pub(crate) startup_script_persistence:
-        Option<detectors::startup_script_persistence::StartupScriptPersistenceDetector>,
-    // spec 050-PR6 — Impact
-    pub(crate) data_destruction_pattern:
-        Option<detectors::data_destruction_pattern::DataDestructionPatternDetector>,
-    // 2026-05-17 wave — gap closers
-    pub(crate) symlink_hijack: Option<detectors::symlink_hijack::SymlinkHijackDetector>,
-    pub(crate) system_user_interactive:
-        Option<detectors::system_user_interactive::SystemUserInteractiveDetector>,
-}
+// DetectorSet moved to crates/sensor/src/detector_set.rs as part of
+// follow-up #2 of the post-PR-F3 punch list (2026-05-26). It pulled
+// 35 detector type imports + ~100 LoC of fields out of main.rs;
+// callers that previously imported `crate::DetectorSet` now import
+// `crate::detector_set::DetectorSet`.
 
 #[derive(Default)]
 pub(crate) struct WriteStats {

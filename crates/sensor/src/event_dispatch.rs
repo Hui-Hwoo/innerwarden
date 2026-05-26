@@ -22,11 +22,17 @@
 //!
 //! ## DetectorSet visibility
 //!
-//! `DetectorSet` and `WriteStats` live in `main.rs` and were promoted
-//! to `pub(crate)` (struct + every field) so this module can reach
-//! them. The constructor still lives in `main.rs` — that's the right
-//! place because `async fn main` is responsible for wiring every
-//! collector to its detector. This module only RUNS the dispatch.
+//! `DetectorSet` lives in `crate::detector_set` (moved out of
+//! `main.rs` on 2026-05-26 as follow-up #2 of the post-PR-F3 punch
+//! list — 35 detector imports + ~100 LoC of fields). `WriteStats`
+//! still lives in `main.rs` because it's a 4-line stats counter
+//! tightly coupled to the event-loop's shutdown log line; moving it
+//! would be churn without value. Both stay `pub(crate)` so this
+//! module can reach them.
+//!
+//! The actual DetectorSet constructor still lives in
+//! `crate::boot::build_detectors` — that's the right place because
+//! it owns the per-config wiring. This module only RUNS the dispatch.
 //!
 //! ## The anti-regression test
 //!
@@ -41,6 +47,7 @@ use std::collections::HashMap;
 
 use tracing::info;
 
+use crate::detector_set::DetectorSet;
 use crate::detectors;
 use crate::incident_builders::{
     devnode_exposed_incident, page_cache_mismatch_incident, passthrough_incident,
@@ -49,7 +56,7 @@ use crate::main_helpers::{
     is_passthrough_source, load_blocked_ips, severity_rank, should_use_blocked_ip_hint,
 };
 use crate::sinks::{self, sqlite::SqliteWriter};
-use crate::{DetectorSet, WriteStats};
+use crate::WriteStats;
 
 pub(crate) fn process_event(
     ev: innerwarden_core::event::Event,

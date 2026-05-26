@@ -34,12 +34,13 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::boot::cursors::SharedCursors;
+use crate::detector_set::DetectorSet;
 use crate::detectors::datasets::Datasets;
 use crate::event_dispatch;
 use crate::sinks;
 use crate::sinks::sqlite::SqliteWriter;
 use crate::sinks::state::State;
-use crate::{DetectorSet, WriteStats};
+use crate::WriteStats;
 
 /// Drain the event channel into the detector dispatch + write incidents
 /// to sinks until either the channel closes (all collectors stopped)

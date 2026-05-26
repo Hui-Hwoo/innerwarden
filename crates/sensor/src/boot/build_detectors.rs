@@ -30,6 +30,7 @@ use std::path::Path;
 use tracing::info;
 
 use crate::config::Config;
+use crate::detector_set::DetectorSet;
 use crate::detectors;
 use crate::detectors::c2_callback::C2CallbackDetector;
 use crate::detectors::container_escape::ContainerEscapeDetector;
@@ -67,7 +68,6 @@ use crate::detectors::user_creation::UserCreationDetector;
 use crate::detectors::web_scan::WebScanDetector;
 use crate::detectors::web_shell::WebShellDetector;
 use crate::main_helpers::load_blocked_ips;
-use crate::DetectorSet;
 
 /// Build the complete DetectorSet from the operator's config + data
 /// directory. Every `Option<...>` field is populated iff the
