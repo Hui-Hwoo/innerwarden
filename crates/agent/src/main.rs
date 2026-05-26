@@ -168,6 +168,7 @@ mod state_store;
 // polling loop through this group; honeypot listener migrates in a
 // dedicated PR (shutdown contract change). Call sites are free to
 // use `state.task_group.spawn(...)`.
+mod silent_stream_alarm;
 mod task_group;
 mod telegram;
 mod telemetry;

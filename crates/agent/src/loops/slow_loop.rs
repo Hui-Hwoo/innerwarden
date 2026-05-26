@@ -1322,6 +1322,23 @@ pub(crate) async fn process_narrative_tick(
 
     narrative_autofp::maybe_suggest_allowlist_from_fp_reports(data_dir, state).await;
 
+    // Silent telemetry stream detection (2026-05-26). Catches the
+    // failure mode where a previously-active collector / log source
+    // goes quiet because its upstream daemon broke, log rotated and
+    // wasn't reopened, or the feed was misconfigured. Emits an
+    // Incident through the normal notification stack when a high-
+    // baseline source produces zero events today after the day has
+    // had time to settle; emits a Recovery Incident when the source
+    // starts producing again. See `silent_stream_alarm` module docs
+    // for the full policy + the prod incident that motivated it.
+    crate::silent_stream_alarm::check_silent_streams(
+        cfg,
+        state,
+        data_dir,
+        &crate::silent_stream_alarm::SilentStreamConfig::default(),
+    )
+    .await;
+
     // Update deep security snapshot for dashboard.
     if let Some(ref ds) = state.deep_security_snapshot {
         let (kc_tracked, kc_pre, kc_full) = killchain_inline::stats(&state.killchain_tracker);
