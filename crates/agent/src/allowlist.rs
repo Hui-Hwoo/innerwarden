@@ -3,7 +3,13 @@
 /// Incidents involving allowlisted entities are still logged, still sent to
 /// webhook/Telegram/Slack, but are not forwarded to the AI gate and will
 /// never trigger an automatic skill execution.
+///
+/// Sources (merged at check time):
+/// 1. Static config: `[allowlist]` in agent.toml
+/// 2. YAML rules: `suppress_response` rules in /etc/innerwarden/rules/event_pipeline/
+use std::collections::HashSet;
 use std::net::IpAddr;
+use std::path::Path;
 
 /// Returns true if `ip` matches any entry in `trusted_ips`.
 /// Entries may be exact IPs ("1.2.3.4") or CIDR notation ("192.168.0.0/24").
@@ -49,6 +55,133 @@ fn ip_matches(ip_str: &str, entry: &str) -> bool {
             (u128::from(ip6) & mask) == (u128::from(base6) & mask)
         }
         _ => false,
+    }
+}
+
+/// YAML-sourced response suppressions loaded from /etc/innerwarden/rules/event_pipeline/.
+/// Merged with static config at check time.
+pub struct YamlResponseRules {
+    pub trusted_ips: Vec<String>,
+    pub trusted_users: Vec<String>,
+    pub trusted_processes: Vec<String>,
+    pub suppress_detectors: std::collections::HashMap<String, HashSet<String>>,
+}
+
+impl YamlResponseRules {
+    pub fn load(rules_dir: &Path) -> Self {
+        let mut rules = Self {
+            trusted_ips: Vec::new(),
+            trusted_users: Vec::new(),
+            trusted_processes: Vec::new(),
+            suppress_detectors: std::collections::HashMap::new(),
+        };
+
+        if !rules_dir.is_dir() {
+            return rules;
+        }
+
+        let Ok(entries) = std::fs::read_dir(rules_dir) else {
+            return rules;
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if (!name.ends_with(".yml") && !name.ends_with(".yaml"))
+                || !entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+                continue;
+            };
+            let Some(rule_list) = doc.get("rules").and_then(|v| v.as_sequence()) else {
+                continue;
+            };
+
+            for rule_val in rule_list {
+                let disabled = rule_val
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if disabled {
+                    continue;
+                }
+
+                let action = rule_val
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                match action {
+                    "suppress_response" => {
+                        let Some(suppress) = rule_val.get("suppress") else {
+                            continue;
+                        };
+                        let scope = suppress.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+                        let values: Vec<String> = suppress
+                            .get("values")
+                            .and_then(|v| v.as_sequence())
+                            .map(|seq| {
+                                seq.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        match scope {
+                            "ip" => rules.trusted_ips.extend(values),
+                            "user" => rules.trusted_users.extend(values),
+                            "process" => rules.trusted_processes.extend(values),
+                            _ => {}
+                        }
+                    }
+                    "suppress_incident" => {
+                        let Some(suppress) = rule_val.get("suppress") else {
+                            continue;
+                        };
+                        let detector = suppress
+                            .get("detector")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if detector.is_empty() {
+                            continue;
+                        }
+                        let values: Vec<String> = suppress
+                            .get("values")
+                            .and_then(|v| v.as_sequence())
+                            .map(|seq| {
+                                seq.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let entry = rules
+                            .suppress_detectors
+                            .entry(detector.to_string())
+                            .or_default();
+                        for v in values {
+                            entry.insert(v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        rules
+    }
+
+    #[allow(dead_code)]
+    pub fn empty() -> Self {
+        Self {
+            trusted_ips: Vec::new(),
+            trusted_users: Vec::new(),
+            trusted_processes: Vec::new(),
+            suppress_detectors: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -132,5 +265,111 @@ mod tests {
     #[test]
     fn is_user_allowlisted_empty_list() {
         assert!(!is_user_allowlisted("root", &[]));
+    }
+
+    #[test]
+    fn yaml_rules_load_suppress_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: protect-docker
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["172.18.0.0/16", "10.0.0.0/8"]
+  - id: protect-deploy
+    action: suppress_response
+    suppress:
+      scope: user
+      values: [deploy, backup]
+  - id: protect-sshd
+    action: suppress_response
+    suppress:
+      scope: process
+      values: [sshd]
+"#;
+        std::fs::write(dir.path().join("30-response-rules.yml"), yaml).unwrap();
+        let rules = YamlResponseRules::load(dir.path());
+        assert_eq!(rules.trusted_ips, vec!["172.18.0.0/16", "10.0.0.0/8"]);
+        assert_eq!(rules.trusted_users, vec!["deploy", "backup"]);
+        assert_eq!(rules.trusted_processes, vec!["sshd"]);
+    }
+
+    #[test]
+    fn yaml_rules_load_suppress_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: allow-bcache
+    action: suppress_incident
+    suppress:
+      detector: kernel_module_load
+      values: [bcache, dm_raid]
+"#;
+        std::fs::write(dir.path().join("20-suppress.yml"), yaml).unwrap();
+        let rules = YamlResponseRules::load(dir.path());
+        assert!(rules
+            .suppress_detectors
+            .get("kernel_module_load")
+            .unwrap()
+            .contains("bcache"));
+    }
+
+    #[test]
+    fn yaml_rules_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = YamlResponseRules::load(dir.path());
+        assert!(rules.trusted_ips.is_empty());
+        assert!(rules.trusted_users.is_empty());
+    }
+
+    #[test]
+    fn yaml_rules_nonexistent_dir() {
+        let rules = YamlResponseRules::load(std::path::Path::new("/nonexistent"));
+        assert!(rules.trusted_ips.is_empty());
+    }
+
+    #[test]
+    fn yaml_rules_disabled_rule_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: disabled-rule
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["1.2.3.4"]
+    disabled: true
+"#;
+        std::fs::write(dir.path().join("10-disabled.yml"), yaml).unwrap();
+        let rules = YamlResponseRules::load(dir.path());
+        assert!(rules.trusted_ips.is_empty());
+    }
+
+    #[test]
+    fn yaml_rules_merged_with_static_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: protect-yaml-ip
+    action: suppress_response
+    suppress:
+      scope: ip
+      values: ["10.0.0.0/8"]
+"#;
+        std::fs::write(dir.path().join("10-test.yml"), yaml).unwrap();
+        let rules = YamlResponseRules::load(dir.path());
+
+        // Merge: static config has 192.168.1.0/24, YAML has 10.0.0.0/8
+        let mut all_ips = vec!["192.168.1.0/24".to_string()];
+        all_ips.extend(rules.trusted_ips);
+
+        assert!(is_ip_allowlisted("192.168.1.50", &all_ips));
+        assert!(is_ip_allowlisted("10.0.0.1", &all_ips));
+        assert!(!is_ip_allowlisted("1.2.3.4", &all_ips));
     }
 }

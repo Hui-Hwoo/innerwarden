@@ -496,6 +496,8 @@ fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<LoadedRules, St
                 Ok((detector, values)) => suppressions.push((detector, values)),
                 Err(e) => warn!(source = source_name, "event_pipeline: {e}"),
             }
+        } else if raw.action == ActionKind::SuppressResponse {
+            // Agent-side rules; sensor skips them silently.
         } else {
             match compile_rule(raw) {
                 Ok(rule) => event_rules.push(rule),

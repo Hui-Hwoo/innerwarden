@@ -1724,25 +1724,13 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         state.last_operator_refresh = std::time::Instant::now();
                     }
 
-                    // Hot-reload dynamic allowlist from /etc/innerwarden/allowlist.toml.
-                    // Operators can add IPs/users/processes via Telegram or by editing the file.
+                    // Hot-reload response rules from /etc/innerwarden/rules/event_pipeline/.
                     {
-                        let allowlist_path = std::path::Path::new("/etc/innerwarden/allowlist.toml");
-                        if allowlist_path.exists() {
-                            if let Ok(content) = std::fs::read_to_string(allowlist_path) {
-                                if let Ok(table) = content.parse::<toml::Table>() {
-                                    let extract = |key: &str| -> Vec<String> {
-                                        table.get(key)
-                                            .and_then(|v| v.as_table())
-                                            .map(|t| t.keys().cloned().collect())
-                                            .unwrap_or_default()
-                                    };
-                                    state.dynamic_trusted_ips = extract("ips");
-                                    state.dynamic_trusted_users = extract("users");
-                                    state.dynamic_trusted_processes = extract("processes");
-                                }
-                            }
-                        }
+                        let rules_dir = std::path::Path::new("/etc/innerwarden/rules/event_pipeline");
+                        let yaml_rules = crate::allowlist::YamlResponseRules::load(rules_dir);
+                        state.dynamic_trusted_ips = yaml_rules.trusted_ips;
+                        state.dynamic_trusted_users = yaml_rules.trusted_users;
+                        state.dynamic_trusted_processes = yaml_rules.trusted_processes;
                     }
 
                     // Autoencoder nightly training — at 3 AM UTC.

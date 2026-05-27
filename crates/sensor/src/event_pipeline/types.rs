@@ -75,6 +75,7 @@ pub enum ActionKind {
     Sample,
     ScoreIncrement,
     SuppressIncident,
+    SuppressResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,11 +312,10 @@ pub fn compile_rule(raw: &RawRule) -> Result<CompiledRule, String> {
             ));
         }
     }
-    if raw.action == ActionKind::SuppressIncident {
-        // Validated and loaded by the caller, not compiled into a CompiledRule.
+    if raw.action == ActionKind::SuppressIncident || raw.action == ActionKind::SuppressResponse {
         return Err(format!(
-            "rule '{}': suppress_incident rules are handled separately",
-            raw.id
+            "rule '{}': {:?} rules are handled separately",
+            raw.id, raw.action
         ));
     }
 
@@ -338,7 +338,9 @@ pub fn compile_rule(raw: &RawRule) -> Result<CompiledRule, String> {
                 decay_minutes: si.decay_minutes,
             }
         }
-        ActionKind::SuppressIncident => unreachable!("handled above"),
+        ActionKind::SuppressIncident | ActionKind::SuppressResponse => {
+            unreachable!("handled above")
+        }
     };
 
     let mp = raw.match_preds.as_ref().unwrap();

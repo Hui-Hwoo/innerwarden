@@ -81,7 +81,25 @@ Fields are extracted from `event.details` JSON: `comm`, `filename`/`path`,
 | `force_emit`    | Yes       | Persist event. Stop evaluation. No downstream rule can drop it. |
 | `drop`          | Yes       | Discard event from disk. Still seen by detectors in memory. |
 | `sample`        | Yes       | Persist with probability `sample` (0.0-1.0). |
-| `score_increment`| No       | (Phase 5) Bump per-PID score. Continue evaluating. |
+| `score_increment`| No       | Bump per-PID score. Continue evaluating. |
+| `suppress_incident`| N/A   | Suppress detector incidents by detector name + values. |
+| `suppress_response`| N/A   | Protect IPs/users/processes from auto-response actions. |
+
+### suppress_incident / suppress_response format
+
+```yaml
+- id: allow-bcache-kmod
+  action: suppress_incident
+  suppress:
+    detector: kernel_module_load
+    values: [bcache, dm_raid]
+
+- id: protect-internal-network
+  action: suppress_response
+  suppress:
+    scope: ip              # ip, user, or process
+    values: ["172.18.0.0/16"]
+```
 
 ## Built-in Rules
 
