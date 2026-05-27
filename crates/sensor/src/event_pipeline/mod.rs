@@ -52,6 +52,7 @@ pub struct EventPipeline {
     rules_dir: PathBuf,
     last_mtime: Option<SystemTime>,
     last_check: Instant,
+    last_backstop_check: Instant,
     enabled: bool,
     sample_counter: u64,
     counters: HashMap<String, RuleCounters>,
@@ -78,6 +79,7 @@ impl EventPipeline {
             rules_dir: rules_dir.to_path_buf(),
             last_mtime: None,
             last_check: Instant::now(),
+            last_backstop_check: Instant::now(),
             enabled,
             sample_counter: 0,
             counters: HashMap::new(),
@@ -93,6 +95,7 @@ impl EventPipeline {
             rules_dir: PathBuf::new(),
             last_mtime: None,
             last_check: Instant::now(),
+            last_backstop_check: Instant::now(),
             enabled: false,
             sample_counter: 0,
             counters: HashMap::new(),
@@ -117,18 +120,54 @@ impl EventPipeline {
         &self.counters
     }
 
-    pub fn check_backstop(&self) {
+    pub fn check_backstop(&mut self, host: &str) -> Option<innerwarden_core::incident::Incident> {
+        if self.last_backstop_check.elapsed().as_secs() < 3600 {
+            return None;
+        }
+        self.last_backstop_check = Instant::now();
         let total = self.total_persisted() + self.total_dropped();
         if total < 1000 {
-            return;
+            return None;
         }
         let drop_rate = self.total_dropped() as f64 / total as f64;
         if drop_rate > 0.99 {
             warn!(
                 total_events = total,
                 drop_pct = format!("{:.1}%", drop_rate * 100.0),
-                "event_pipeline backstop: drop rate exceeds 99% — verify rules are not too aggressive"
+                "event_pipeline backstop: drop rate exceeds 99%"
             );
+            Some(innerwarden_core::incident::Incident {
+                ts: chrono::Utc::now(),
+                host: host.to_string(),
+                incident_id: format!(
+                    "event_pipeline:runaway_drop:{}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%MZ")
+                ),
+                severity: innerwarden_core::event::Severity::Critical,
+                title: "Event pipeline runaway drop".to_string(),
+                summary: format!(
+                    "Event pipeline is dropping {:.1}% of events ({} total). \
+                     Collector data going dark. Verify pipeline rules are not \
+                     too aggressive. Run: innerwarden rule list",
+                    drop_rate * 100.0,
+                    total
+                ),
+                evidence: serde_json::json!({
+                    "total_events": total,
+                    "total_dropped": self.total_dropped(),
+                    "total_persisted": self.total_persisted(),
+                    "drop_rate_pct": format!("{:.1}", drop_rate * 100.0),
+                    "rule_count": self.rules.len(),
+                }),
+                recommended_checks: vec![
+                    "innerwarden rule list".to_string(),
+                    "Review pipeline rules for overly broad drop patterns".to_string(),
+                ],
+                tags: vec!["event_pipeline".to_string(), "backstop".to_string()],
+                entities: vec![],
+            })
+        } else {
+            None
         }
     }
 
@@ -140,7 +179,6 @@ impl EventPipeline {
             return false;
         }
         self.last_check = Instant::now();
-        self.check_backstop();
 
         let current_mtime = dir_max_mtime(&self.rules_dir);
         if current_mtime == self.last_mtime {
@@ -977,7 +1015,8 @@ rules:
         }
 
         // 50% drop rate, backstop should not fire (only fires > 99%)
-        pipeline.check_backstop();
+        pipeline.last_backstop_check = Instant::now() - std::time::Duration::from_secs(7200);
+        pipeline.check_backstop("test");
     }
 
     #[test]
@@ -1002,7 +1041,8 @@ rules:
 
         assert!(pipeline.total_dropped() > 1990);
         // This would log a warning; we just verify the check runs without panic
-        pipeline.check_backstop();
+        pipeline.last_backstop_check = Instant::now() - std::time::Duration::from_secs(7200);
+        pipeline.check_backstop("test");
     }
 
     #[test]
@@ -1216,6 +1256,107 @@ rules:
             pipeline.scored_pids_count() <= PID_SCORE_MAP_CAP,
             "map should be capped at {PID_SCORE_MAP_CAP}, got {}",
             pipeline.scored_pids_count()
+        );
+    }
+
+    #[test]
+    fn caldera_replay_anchor_security_events_never_dropped() {
+        let fixture = include_str!(
+            "../../../../testdata/event_pipeline_fixtures/security-events-must-persist.jsonl"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        let mut dropped = Vec::new();
+        for (i, line) in fixture.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut event: innerwarden_core::event::Event =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("line {i}: {e}"));
+            if !pipeline.should_persist(&mut event) {
+                dropped.push(format!(
+                    "line {}: {} {} ({})",
+                    i + 1,
+                    event.source,
+                    event.kind,
+                    event.summary
+                ));
+            }
+        }
+
+        assert!(
+            dropped.is_empty(),
+            "Pipeline dropped {} security-critical events that MUST persist:\n  {}",
+            dropped.len(),
+            dropped.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn backstop_emits_critical_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: drop-everything
+    priority: 999
+    match:
+      source: test
+    action: drop
+"#;
+        std::fs::write(dir.path().join("10-drop-all.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        for i in 0..2000 {
+            let mut ev = make_event("test", "x", serde_json::json!({"i": i}));
+            pipeline.should_persist(&mut ev);
+        }
+
+        // Force backstop to fire (bypass 1h timer)
+        pipeline.last_backstop_check = Instant::now() - std::time::Duration::from_secs(7200);
+        let incident = pipeline.check_backstop("test-host");
+        assert!(
+            incident.is_some(),
+            "backstop should emit incident when > 99% dropped"
+        );
+        let inc = incident.unwrap();
+        assert_eq!(inc.severity, innerwarden_core::event::Severity::Critical);
+        assert!(inc.title.contains("runaway drop"));
+        assert!(inc.tags.contains(&"event_pipeline".to_string()));
+    }
+
+    #[test]
+    fn backstop_silent_within_1h() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+        // Backstop should return None within the first hour
+        assert!(pipeline.check_backstop("test").is_none());
+    }
+
+    #[test]
+    fn benchmark_anchor_pipeline_latency() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        let n = 100_000;
+        let start = Instant::now();
+        for i in 0..n {
+            let mut ev = make_event(
+                "ebpf",
+                "file.read_access",
+                serde_json::json!({"comm": "nginx", "pid": i, "filename": "/var/www/index.html"}),
+            );
+            pipeline.should_persist(&mut ev);
+        }
+        let elapsed = start.elapsed();
+        let per_event_ns = elapsed.as_nanos() / n as u128;
+
+        assert!(
+            per_event_ns < 30_000,
+            "p_avg should be < 30us/event, got {}ns/event ({:.1}us)",
+            per_event_ns,
+            per_event_ns as f64 / 1000.0
         );
     }
 }

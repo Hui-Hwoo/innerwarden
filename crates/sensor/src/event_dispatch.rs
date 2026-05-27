@@ -141,9 +141,12 @@ pub(crate) fn process_event(
         write_incident(sqlite, stats, incident, syslog, dedup_cache);
     }
 
-    // Reload event pipeline rules every 60s (checks dir mtime, no-op if unchanged).
+    // Event pipeline: reload rules + backstop check (both on the 60s timer inside reload_if_changed).
     if detectors.event_pipeline.reload_if_changed() {
         info!("event_pipeline rules reloaded");
+    }
+    if let Some(backstop_incident) = detectors.event_pipeline.check_backstop(&ev.host) {
+        write_incident(sqlite, stats, backstop_incident, syslog, dedup_cache);
     }
 
     // Reload dynamic allowlist every 60s (checks file mtime, no-op if unchanged).
