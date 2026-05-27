@@ -3,6 +3,139 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Result<()> {
+    let rules_base = PathBuf::from("/etc/innerwarden/rules");
+
+    let types: Vec<(&str, &str)> = vec![
+        ("event_pipeline", "Event Pipeline"),
+        ("sigma", "Sigma"),
+        ("yara", "YARA"),
+        ("atr", "ATR"),
+    ];
+
+    let mut total = 0u32;
+    for (subdir, label) in &types {
+        if let Some(filter) = type_filter {
+            if filter != *subdir {
+                continue;
+            }
+        }
+
+        let dir = rules_base.join(subdir);
+        if *subdir == "event_pipeline" {
+            let ep_dir = resolve_rules_dir(Path::new("/var/lib/innerwarden"), sensor_config);
+            let (rules, errors) = load_all_rules(&ep_dir);
+            if !rules.is_empty() || !errors.is_empty() {
+                println!("{label} ({} rules, {} errors):", rules.len(), errors.len());
+                let header = format!(
+                    "  {:<40} {:<10} {:<12} {:<8} {}",
+                    "RULE ID", "PRIORITY", "ACTION", "STATUS", "SOURCE"
+                );
+                println!("{header}");
+                for rule in &rules {
+                    let status = if rule.disabled {
+                        "disabled"
+                    } else if rule.expired {
+                        "expired"
+                    } else {
+                        "active"
+                    };
+                    println!(
+                        "  {:<40} {:<10} {:<12} {:<8} {}",
+                        rule.id, rule.priority, rule.action, status, rule.source_file
+                    );
+                }
+                total += rules.len() as u32;
+                println!();
+            }
+        } else if dir.is_dir() {
+            let count = count_yaml_rules(&dir, subdir);
+            if count > 0 {
+                println!("{label} ({count} rules):");
+                list_generic_rules(&dir, subdir);
+                total += count;
+                println!();
+            }
+        }
+    }
+
+    if total == 0 && type_filter.is_none() {
+        println!("No rules found.");
+    }
+
+    println!("Rules directory: {}", rules_base.display());
+    Ok(())
+}
+
+fn count_yaml_rules(dir: &Path, _rule_type: &str) -> u32 {
+    let mut count = 0u32;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if (name.ends_with(".yml") || name.ends_with(".yaml"))
+            && entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                let doc: Result<serde_yaml::Value, _> = serde_yaml::from_str(&content);
+                if let Ok(doc) = doc {
+                    if let Some(rules) = doc.get("rules").and_then(|v| v.as_sequence()) {
+                        count += rules.len() as u32;
+                    } else if doc.get("title").is_some() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+fn list_generic_rules(dir: &Path, rule_type: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<_> = entries.flatten().collect();
+    files.sort_by_key(|e| e.file_name());
+
+    for entry in files {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if (!name.ends_with(".yml") && !name.ends_with(".yaml"))
+            || !entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+            println!("  {name}: parse error");
+            continue;
+        };
+
+        if rule_type == "atr" {
+            let id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("(no id)");
+            let title = doc
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no title)");
+            let status = doc
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("  {:<25} {:<12} {}", id, status, title);
+        } else {
+            // sigma / yara: title + id + level
+            let id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("(no id)");
+            let title = doc.get("title").and_then(|v| v.as_str()).unwrap_or(&name);
+            let level = doc.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+            println!("  {:<40} {:<8} {}", &id[..id.len().min(38)], level, title);
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub fn cmd_rule_list(data_dir: &Path, sensor_config: &Path) -> Result<()> {
     let rules_dir = resolve_rules_dir(data_dir, sensor_config);
     let (rules, errors) = load_all_rules(&rules_dir);

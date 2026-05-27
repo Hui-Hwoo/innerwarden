@@ -1028,8 +1028,17 @@ enum IntegrateCommand {
 
 #[derive(Subcommand)]
 enum RuleCommand {
-    /// List all event pipeline rules with status and priority.
-    List,
+    /// List rules. Shows all types by default (event_pipeline, sigma, yara, atr).
+    ///
+    /// Examples:
+    ///   innerwarden rule list
+    ///   innerwarden rule list --type sigma
+    ///   innerwarden rule list --type event_pipeline
+    List {
+        /// Filter by rule type: event_pipeline, sigma, yara, atr
+        #[arg(long, short = 't')]
+        r#type: Option<String>,
+    },
 
     /// Disable a rule by ID (adds `disabled: true` to the YAML file).
     Disable {
@@ -2545,7 +2554,9 @@ fn main() -> Result<()> {
         } => commands::capability::cmd_disable(&cli, &registry, capability, yes),
         Command::List => commands::core::cmd_list(&cli, &registry),
         Command::Rule { ref command } => match command {
-            RuleCommand::List => commands::rule::cmd_rule_list(&cli.data_dir, &cli.sensor_config),
+            RuleCommand::List { ref r#type } => {
+                commands::rule::cmd_rule_list_all(&cli.sensor_config, r#type.as_deref())
+            }
             RuleCommand::Disable { ref id } => {
                 commands::rule::cmd_rule_disable(&cli.data_dir, &cli.sensor_config, id)
             }
