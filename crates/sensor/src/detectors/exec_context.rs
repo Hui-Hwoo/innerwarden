@@ -105,6 +105,15 @@ fn boot_window_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Test-only visibility into `boot_window_active`. Anchors in
+/// `boot::build_detectors::tests` use this to assert that constructing a
+/// DetectorSet does not silently set `SENSOR_START` and flip every
+/// subsequent classification into the 60 s boot-window benign branch.
+#[cfg(test)]
+pub(crate) fn boot_window_active_for_test() -> bool {
+    boot_window_active()
+}
+
 fn interactive_shells() -> &'static HashSet<&'static str> {
     static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| {

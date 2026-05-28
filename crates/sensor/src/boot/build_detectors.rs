@@ -200,15 +200,16 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
         );
     }
 
-    // Initialize test external IPs so is_internal_ip() respects overrides.
-    detectors::init_test_external_ips(dynamic_allowlist.test_external_ips.clone());
-
-    // Initialize host self-awareness (own IPs, listening ports).
-    detectors::init_host_inventory();
-
-    // Spec 050-PR0: anchor the sensor-start instant so the
-    // exec_context classifier can detect the 60 s boot window.
-    detectors::exec_context::init_sensor_start();
+    // Per-process global static state (test_external_ips, OWN_IPS,
+    // OWN_LISTENING_PORTS, SENSOR_START) is initialised by
+    // `init_global_static_state_for_production` BEFORE this function in
+    // production boot (sensor::run). Spec 055 follow-up (2026-05-28):
+    // hoisting the init out of build_detector_set fixed a test isolation
+    // bug where any test that constructed a DetectorSet would set
+    // SENSOR_START and silently flip every subsequent exec_context::classify
+    // call into the 60 s boot window — breaking discovery_anomaly +
+    // allowlists tests in PR #861 and any future test that hits the
+    // same surface. See `tests::build_detector_set_does_not_init_globals`.
 
     // Load blocked IPs from agent feedback file.
     let blocked_ips = load_blocked_ips(data_dir);
@@ -699,11 +700,60 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
     }
 }
 
-// No anchor tests added with this PR: `Config` has no `Default` impl
-// and constructing a fully-populated config from a TOML literal would
-// be brittle (every detector schema change would need an edit here).
-// The pre-existing 1413 sensor tests cover every detector's behaviour
-// individually, which is the right level for regression coverage.
-// A follow-up PR can introduce `Config::test_default()` or similar
-// helper to enable the "enabled.then(...) contract" anchor in this
-// module.
+/// Initialise process-wide static state that `build_detector_set` USED to
+/// set as a side effect. Production callers (`sensor::run`) must call this
+/// BEFORE constructing the DetectorSet so the runtime classifier sees the
+/// expected `OWN_IPS` / `TEST_EXTERNAL_IPS` / `SENSOR_START` values.
+///
+/// Tests that just need a `DetectorSet` value for behaviour assertions
+/// should NOT call this — the `OnceLock`s would survive into subsequent
+/// tests in the same binary and silently flip `exec_context::classify` into
+/// the 60 s `BootOrMotd` branch, which breaks `discovery_anomaly` and
+/// `allowlists` regression tests that rely on a virgin classifier.
+pub(crate) fn init_global_static_state_for_production(data_dir: &std::path::Path) {
+    let allowlist_path = std::path::Path::new("/etc/innerwarden/allowlist.toml");
+    let dynamic_allowlist = detectors::allowlists::DynamicAllowlist::load(allowlist_path);
+    let _ = data_dir; // reserved for future per-host overrides; keeps the
+                      // production caller's call site stable.
+
+    // Initialize test external IPs so is_internal_ip() respects overrides.
+    detectors::init_test_external_ips(dynamic_allowlist.test_external_ips.clone());
+
+    // Initialize host self-awareness (own IPs, listening ports).
+    detectors::init_host_inventory();
+
+    // Spec 050-PR0: anchor the sensor-start instant so the
+    // exec_context classifier can detect the 60 s boot window.
+    detectors::exec_context::init_sensor_start();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the test isolation bug discovered in PR #861 (codex
+    /// coverage push): any test that called `build_detector_set` would
+    /// silently call `init_sensor_start`, set `SENSOR_START`, and from then
+    /// on every test in the same binary would see `boot_window_active() ==
+    /// true` for 60 s of wall-clock. `discovery_anomaly` + `allowlists`
+    /// tests that depend on `exec_context::classify` NOT returning
+    /// `BootOrMotd` started failing in test order with that PR.
+    ///
+    /// The fix hoists the global-state init into
+    /// `init_global_static_state_for_production`; this test pins that
+    /// `build_detector_set` itself stays globals-free. If anyone re-adds an
+    /// `init_*` call inside the constructor this test fails before the
+    /// detector tests start mysteriously red.
+    #[test]
+    fn build_detector_set_does_not_init_globals() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::config::Config::test_default();
+        let _ds = build_detector_set(&cfg, tmp.path());
+        assert!(
+            !crate::detectors::exec_context::boot_window_active_for_test(),
+            "build_detector_set must not call init_sensor_start; \
+             SENSOR_START leaked into the global OnceLock and the 60 s boot \
+             window is now active for every subsequent test in this binary"
+        );
+    }
+}

@@ -133,6 +133,12 @@ pub(crate) async fn boot_init(cfg: Config) -> Result<SensorContext> {
     // Bundled into SharedCursors in PR-F1 (#810); adopted here in PR-F2.
     let cursors = boot::cursors::SharedCursors::new();
 
+    // Initialise process-wide static state (OWN_IPS, TEST_EXTERNAL_IPS,
+    // SENSOR_START) BEFORE constructing the DetectorSet. Hoisted out of
+    // build_detector_set on 2026-05-28 because the side-effecting init was
+    // breaking test isolation across the sensor binary's test suite.
+    boot::build_detectors::init_global_static_state_for_production(&data_dir);
+
     // Build the full DetectorSet (every per-detector cfg.enabled.then(...)
     // block + dynamic allowlist load + blocked-IP feedback file). Moved
     // to crates/sensor/src/boot/build_detectors.rs in PR5b1 (2026-05-25).
