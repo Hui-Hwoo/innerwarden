@@ -80,14 +80,16 @@ coverage:
 
     patch:
       default:
-        # New code on a PR should land ≥70% covered, with a 15 percentage-
-        # point slack to absorb refactor PRs that move orchestration
-        # wiring (boot.rs, main.rs) which cannot be unit-tested without
-        # spinning up the full agent harness. Effective fail point is 55%.
-        # For feature PRs adding real logic, 15pp is slack — Codecov still
-        # surfaces the drop in the comment even when the gate passes.
-        target: 70%
-        threshold: 15%
+        # New code on a PR should land ≥85% covered (operator policy
+        # raised 2026-05-28 from the previous 70 %). 10 percentage-point
+        # slack to absorb refactor PRs that move orchestration wiring
+        # (boot.rs, main.rs) — those paths are excluded below anyway,
+        # but small carryover from extracted helpers benefits from
+        # headroom. Effective fail point is 75 %. For feature PRs
+        # adding real logic, hit 85 % or above and Codecov surfaces any
+        # drop in the PR comment regardless.
+        target: 85%
+        threshold: 10%
         if_ci_failed: error
         informational: false
         # Exclude orchestration paths from the default patch gate.
