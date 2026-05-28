@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
@@ -14,6 +14,9 @@ pub struct RuleFile {
     #[serde(default)]
     #[allow(dead_code)]
     pub metadata: Option<FileMetadata>,
+    #[serde(default)]
+    pub lists: HashMap<String, Vec<String>>,
+    #[serde(default)]
     pub rules: Vec<RawRule>,
 }
 
@@ -30,7 +33,7 @@ pub struct FileMetadata {
     pub source_motivation: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawRule {
     pub id: String,
@@ -55,7 +58,7 @@ pub struct RawRule {
     pub suppress: Option<SuppressConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuppressConfig {
     pub detector: String,
@@ -78,7 +81,7 @@ pub enum ActionKind {
     SuppressResponse,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatchPredicates {
     #[serde(default)]
@@ -113,7 +116,7 @@ pub struct MatchPredicates {
     pub pid_score_min: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScoreIncrementConfig {
     pub score: u32,
@@ -406,6 +409,44 @@ pub fn validate_suppress_rule(raw: &RawRule) -> Result<(String, Vec<String>), St
         ));
     }
     Ok((sc.detector.clone(), sc.values.clone()))
+}
+
+pub fn expand_list_refs(values: &mut Option<Vec<String>>, lists: &HashMap<String, Vec<String>>) {
+    let Some(vals) = values.as_mut() else { return };
+    let mut expanded = Vec::new();
+    for v in vals.drain(..) {
+        if let Some(name) = v.strip_prefix('$') {
+            if let Some(list) = lists.get(name) {
+                expanded.extend(list.iter().cloned());
+            } else {
+                tracing::warn!("event_pipeline: unknown list reference ${name}");
+                expanded.push(v);
+            }
+        } else {
+            expanded.push(v);
+        }
+    }
+    *vals = expanded;
+}
+
+pub fn expand_all_list_refs(raw: &mut RawRule, lists: &HashMap<String, Vec<String>>) {
+    if let Some(ref mut mp) = raw.match_preds {
+        expand_list_refs(&mut mp.source_in, lists);
+        expand_list_refs(&mut mp.kind_in, lists);
+        expand_list_refs(&mut mp.comm_in, lists);
+        expand_list_refs(&mut mp.comm_glob, lists);
+        expand_list_refs(&mut mp.path_in, lists);
+        expand_list_refs(&mut mp.path_glob, lists);
+        expand_list_refs(&mut mp.path_prefix, lists);
+        expand_list_refs(&mut mp.parent_comm_in, lists);
+    }
+    if let Some(ref mut suppress) = raw.suppress {
+        let mut vals = Some(suppress.values.clone());
+        expand_list_refs(&mut vals, lists);
+        if let Some(v) = vals {
+            suppress.values = v;
+        }
+    }
 }
 
 fn has_glob_chars(s: &str) -> bool {

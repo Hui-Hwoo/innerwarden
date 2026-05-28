@@ -1,0 +1,82 @@
+version: 1
+metadata:
+  description: >-
+    Named lists shared across rules. Reference with $list_name
+    in any comm_in, path_glob, or other list predicate.
+
+lists:
+  web_servers:
+    - nginx
+    - apache2
+    - httpd
+    - caddy
+    - php-fpm
+    - php-fpm7.4
+    - php-fpm8.0
+    - php-fpm8.1
+    - php-fpm8.2
+    - php-fpm8.3
+  databases:
+    - mysqld
+    - mariadbd
+    - postgres
+  log_daemons:
+    - journald
+    - systemd-journald
+    - systemd-resolved
+    - logrotate
+    - rsyslogd
+  service_daemons:
+    - nginx
+    - apache2
+    - httpd
+    - caddy
+    - php-fpm
+    - php-fpm7.4
+    - php-fpm8.0
+    - php-fpm8.1
+    - php-fpm8.2
+    - php-fpm8.3
+    - mysqld
+    - mariadbd
+    - postgres
+    - journald
+    - systemd-journald
+    - systemd-resolved
+    - logrotate
+    - rsyslogd
+    - crowdsec
+    - cscli
+  package_managers:
+    - dpkg
+    - dpkg-preconfigu
+    - dpkg-reconfigur
+    - dpkg-divert
+    - apt
+    - apt-get
+    - apt-cache
+    - apt-key
+    - apt-listchanges
+    - apt-auto-remova
+    - apt-add-reposit
+    - apt.systemd.dai
+    - aptitude
+    - unattended-upgr
+    - needrestart
+    - rpm
+    - yum
+    - dnf
+    - dnf-automatic
+    - snap
+    - snapd
+    - pip
+    - pip3
+    - npm
+    - gem
+    - conda
+    - uv
+    - cargo
+    - rustup
+    - go
+
+rules: []

@@ -3,9 +3,7 @@ metadata:
   author: innerwarden built-in
   description: >
     Drop file read/write events from package managers during their
-    normal operation. Mirrors the comm list from
-    detectors/allowlists.rs::PACKAGE_MANAGERS. Operators who want
-    apt/dpkg/snap activity visible can disable this rule.
+    normal operation. Uses $package_managers named list from 00-lists.yml.
 
 rules:
   - id: drop-package-manager-file-ops
@@ -16,35 +14,6 @@ rules:
         - file.read_access
         - file.write_access
       comm_in:
-        - dpkg
-        - dpkg-preconfigu
-        - dpkg-reconfigur
-        - dpkg-divert
-        - apt
-        - apt-get
-        - apt-cache
-        - apt-key
-        - apt-listchanges
-        - apt-auto-remova
-        - apt-add-reposit
-        - apt.systemd.dai
-        - aptitude
-        - unattended-upgr
-        - needrestart
-        - rpm
-        - yum
-        - dnf
-        - dnf-automatic
-        - snap
-        - snapd
-        - pip
-        - pip3
-        - npm
-        - gem
-        - conda
-        - uv
-        - cargo
-        - rustup
-        - go
+        - $package_managers
     action: drop
     drop_reason: package-manager-activity

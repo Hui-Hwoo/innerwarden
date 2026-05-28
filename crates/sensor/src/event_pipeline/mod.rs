@@ -23,10 +23,12 @@ use tracing::{info, warn};
 use std::collections::HashSet;
 
 use types::{
-    compile_rule, validate_suppress_rule, ActionKind, CompiledAction, CompiledRule, RuleFile,
+    compile_rule, expand_all_list_refs, validate_suppress_rule, ActionKind, CompiledAction,
+    CompiledRule, RuleFile,
 };
 
 pub const BUILTIN_PACKS: &[(&str, &str)] = &[
+    ("00-lists.yml", include_str!("builtin/00-lists.yml")),
     (
         "00-defensive-allowlist.yml",
         include_str!("builtin/00-defensive-allowlist.yml"),
@@ -251,8 +253,10 @@ impl EventPipeline {
         let mut rules_by_id: HashMap<String, CompiledRule> = HashMap::new();
         let mut suppressions = IncidentSuppressionSet::new();
 
+        let mut global_lists: HashMap<String, Vec<String>> = HashMap::new();
+
         for (name, yaml) in BUILTIN_PACKS {
-            match load_rules_from_yaml(yaml, name) {
+            match load_rules_from_yaml(yaml, name, &global_lists) {
                 Ok(loaded) => {
                     for rule in loaded.event_rules {
                         rules_by_id.insert(rule.id.clone(), rule);
@@ -260,13 +264,16 @@ impl EventPipeline {
                     for (detector, values) in loaded.suppressions {
                         suppressions.add(detector, values);
                     }
+                    for (k, v) in loaded.lists {
+                        global_lists.entry(k).or_insert(v);
+                    }
                 }
                 Err(e) => warn!("event_pipeline: built-in pack {name} failed to load: {e}"),
             }
         }
 
         if self.rules_dir.is_dir() {
-            match load_rules_from_dir(&self.rules_dir) {
+            match load_rules_from_dir(&self.rules_dir, &global_lists) {
                 Ok(loaded) => {
                     for rule in loaded.event_rules {
                         rules_by_id.insert(rule.id.clone(), rule);
@@ -464,9 +471,14 @@ fn bump(counters: &mut HashMap<String, RuleCounters>, id: &str, kind: Counter) {
 struct LoadedRules {
     event_rules: Vec<CompiledRule>,
     suppressions: Vec<(String, Vec<String>)>,
+    lists: HashMap<String, Vec<String>>,
 }
 
-fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<LoadedRules, String> {
+fn load_rules_from_yaml(
+    yaml: &str,
+    source_name: &str,
+    global_lists: &HashMap<String, Vec<String>>,
+) -> Result<LoadedRules, String> {
     let rf: RuleFile =
         serde_yaml::from_str(yaml).map_err(|e| format!("{source_name}: YAML parse error: {e}"))?;
 
@@ -475,6 +487,11 @@ fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<LoadedRules, St
             "{source_name}: unsupported schema version {} (expected 1)",
             rf.version
         ));
+    }
+
+    let mut all_lists = global_lists.clone();
+    for (k, v) in &rf.lists {
+        all_lists.entry(k.clone()).or_insert_with(|| v.clone());
     }
 
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -491,15 +508,19 @@ fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<LoadedRules, St
                 continue;
             }
         }
+
+        let mut raw = raw.clone();
+        expand_all_list_refs(&mut raw, &all_lists);
+
         if raw.action == ActionKind::SuppressIncident {
-            match validate_suppress_rule(raw) {
+            match validate_suppress_rule(&raw) {
                 Ok((detector, values)) => suppressions.push((detector, values)),
                 Err(e) => warn!(source = source_name, "event_pipeline: {e}"),
             }
         } else if raw.action == ActionKind::SuppressResponse {
             // Agent-side rules; sensor skips them silently.
         } else {
-            match compile_rule(raw) {
+            match compile_rule(&raw) {
                 Ok(rule) => event_rules.push(rule),
                 Err(e) => warn!(source = source_name, "event_pipeline: {e}"),
             }
@@ -508,10 +529,14 @@ fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<LoadedRules, St
     Ok(LoadedRules {
         event_rules,
         suppressions,
+        lists: rf.lists,
     })
 }
 
-fn load_rules_from_dir(dir: &Path) -> Result<LoadedRules, String> {
+fn load_rules_from_dir(
+    dir: &Path,
+    global_lists: &HashMap<String, Vec<String>>,
+) -> Result<LoadedRules, String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("read_dir {}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -528,7 +553,9 @@ fn load_rules_from_dir(dir: &Path) -> Result<LoadedRules, String> {
     let mut all = LoadedRules {
         event_rules: Vec::new(),
         suppressions: Vec::new(),
+        lists: HashMap::new(),
     };
+    let mut dir_lists = global_lists.clone();
     for entry in entries {
         let path = entry.path();
         let name = path
@@ -537,10 +564,13 @@ fn load_rules_from_dir(dir: &Path) -> Result<LoadedRules, String> {
             .to_string_lossy()
             .to_string();
         match std::fs::read_to_string(&path) {
-            Ok(yaml) => match load_rules_from_yaml(&yaml, &name) {
+            Ok(yaml) => match load_rules_from_yaml(&yaml, &name, &dir_lists) {
                 Ok(loaded) => {
                     all.event_rules.extend(loaded.event_rules);
                     all.suppressions.extend(loaded.suppressions);
+                    for (k, v) in &loaded.lists {
+                        dir_lists.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
                 }
                 Err(e) => warn!("event_pipeline: {e}"),
             },
