@@ -77,6 +77,7 @@ mod cloudflare_attribution;
 mod config;
 mod correlation;
 mod correlation_engine;
+mod correlation_engine_yaml;
 mod correlation_response;
 mod crowdsec;
 mod dashboard;

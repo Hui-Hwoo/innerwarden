@@ -876,6 +876,11 @@ fn classify_layer(source: &str, kind: &str) -> Layer {
 // Built-in rules
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+pub fn builtin_rules_for_test() -> Vec<CorrelationRule> {
+    builtin_rules()
+}
+
 fn builtin_rules() -> Vec<CorrelationRule> {
     vec![
         // CL-001: Firmware → Privilege Escalation → Rootkit Module
