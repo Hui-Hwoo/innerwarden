@@ -13,6 +13,21 @@ const CORRELATION_BUILTIN_YAML: &str =
 
 const CORRELATION_RULES_DIR: &str = "/etc/innerwarden/rules/correlation";
 
+// Spec 056 Phase 1: same cross-crate embed pattern for SOC playbooks. CTL
+// only displays metadata + trigger/step counts; the agent owns execution.
+const PLAYBOOK_BUILTIN_DATA_EXFIL: &str =
+    include_str!("../../../agent/src/playbook_engine/builtin/00-data-exfil-default.yml");
+const PLAYBOOK_BUILTIN_CRED_STUFF: &str =
+    include_str!("../../../agent/src/playbook_engine/builtin/00-credential-stuffing-default.yml");
+const PLAYBOOK_BUILTINS: &[(&str, &str)] = &[
+    ("00-data-exfil-default.yml", PLAYBOOK_BUILTIN_DATA_EXFIL),
+    (
+        "00-credential-stuffing-default.yml",
+        PLAYBOOK_BUILTIN_CRED_STUFF,
+    ),
+];
+const PLAYBOOK_RULES_DIR: &str = "/etc/innerwarden/rules/playbooks";
+
 pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Result<()> {
     let rules_base = PathBuf::from("/etc/innerwarden/rules");
 
@@ -22,6 +37,7 @@ pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Res
         ("yara", "YARA"),
         ("atr", "ATR"),
         ("correlation", "Correlation"),
+        ("playbooks", "Playbooks"),
     ];
 
     let mut total = 0u32;
@@ -78,6 +94,34 @@ pub fn cmd_rule_list_all(sensor_config: &Path, type_filter: Option<&str>) -> Res
                         status,
                         truncate(&rule.source_file, 22),
                         rule.name,
+                    );
+                }
+                if !errors.is_empty() {
+                    println!("  Errors:");
+                    for (file, err) in &errors {
+                        println!("    {file}: {err}");
+                    }
+                }
+                total += rules.len() as u32;
+                println!();
+            }
+        } else if *subdir == "playbooks" {
+            let (rules, errors) = load_all_playbooks(Path::new(PLAYBOOK_RULES_DIR));
+            if !rules.is_empty() || !errors.is_empty() {
+                println!(
+                    "{label} ({} playbooks, {} errors):",
+                    rules.len(),
+                    errors.len()
+                );
+                println!(
+                    "  {:<32} {:<8} {:<7} {:<8} SOURCE",
+                    "PLAYBOOK ID", "TRIGGS", "STEPS", "STATUS",
+                );
+                for pb in &rules {
+                    let status = if pb.disabled { "disabled" } else { "active" };
+                    println!(
+                        "  {:<32} {:<8} {:<7} {:<8} {}",
+                        pb.id, pb.trigger_count, pb.step_count, status, pb.source_file,
                     );
                 }
                 if !errors.is_empty() {
@@ -917,6 +961,111 @@ fn resolve_rules_dir(data_dir: &Path, sensor_config: &Path) -> PathBuf {
     PathBuf::from("/etc/innerwarden/rules/event_pipeline")
 }
 
+// ===== Spec 056 Phase 1: playbook listing =====
+
+struct PlaybookInfo {
+    id: String,
+    trigger_count: usize,
+    step_count: usize,
+    disabled: bool,
+    source_file: String,
+}
+
+fn load_all_playbooks(rules_dir: &Path) -> (Vec<PlaybookInfo>, Vec<(String, String)>) {
+    let mut by_id: HashMap<String, PlaybookInfo> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+
+    for (name, yaml) in PLAYBOOK_BUILTINS {
+        let source = format!("{name} (built-in)");
+        match parse_playbook_yaml(yaml, &source) {
+            Ok(pb) => {
+                order.push(pb.id.clone());
+                by_id.insert(pb.id.clone(), pb);
+            }
+            Err(e) => errors.push((source, e)),
+        }
+    }
+
+    if rules_dir.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(rules_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                (name.ends_with(".yml") || name.ends_with(".yaml"))
+                    && e.file_type().is_ok_and(|t| t.is_file())
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match std::fs::read_to_string(&path) {
+                Ok(yaml) => match parse_playbook_yaml(&yaml, &name) {
+                    Ok(pb) => {
+                        if !by_id.contains_key(&pb.id) {
+                            order.push(pb.id.clone());
+                        }
+                        by_id.insert(pb.id.clone(), pb);
+                    }
+                    Err(e) => errors.push((name, e)),
+                },
+                Err(e) => errors.push((name, e.to_string())),
+            }
+        }
+    }
+
+    let rules = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect();
+    (rules, errors)
+}
+
+fn parse_playbook_yaml(yaml: &str, source: &str) -> Result<PlaybookInfo, String> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("YAML parse error: {e}"))?;
+
+    let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    if version != 1 {
+        return Err(format!("unsupported version {version}"));
+    }
+
+    let id = doc
+        .get("metadata")
+        .and_then(|m| m.get("id"))
+        .and_then(|v| v.as_str())
+        .ok_or("missing metadata.id")?
+        .to_string();
+    let triggers = doc
+        .get("triggers")
+        .and_then(|v| v.as_sequence())
+        .ok_or("missing triggers")?;
+    let steps = doc
+        .get("steps")
+        .and_then(|v| v.as_sequence())
+        .ok_or("missing steps")?;
+    let disabled = doc
+        .get("disabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    Ok(PlaybookInfo {
+        id,
+        trigger_count: triggers.len(),
+        step_count: steps.len(),
+        disabled,
+        source_file: source.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,5 +1456,120 @@ rules:
         assert!(yaml.contains("cargo"));
         // Should appear in one rule, not two
         assert_eq!(yaml.matches("id: migrated-process-allowlist").count(), 1);
+    }
+
+    // ===== Spec 056 Phase 1: playbook listing =====
+
+    #[test]
+    fn ctl_parses_each_embedded_playbook() {
+        // Schema-compat anchor: every embedded playbook must be parseable
+        // by the CTL's minimal parser. If the agent module ever changes
+        // the schema in a way that breaks the listing (e.g. drops
+        // `triggers` for a different shape), CTL fails here BEFORE
+        // operators get a broken `rule list --type playbooks` output.
+        for (name, yaml) in PLAYBOOK_BUILTINS {
+            let pb = parse_playbook_yaml(yaml, name)
+                .unwrap_or_else(|e| panic!("built-in {name} must parse: {e}"));
+            assert!(!pb.id.is_empty(), "{name}: id must be non-empty");
+            assert!(pb.trigger_count >= 1, "{name}: must declare >= 1 trigger");
+            assert!(pb.step_count >= 1, "{name}: must declare >= 1 step");
+        }
+    }
+
+    #[test]
+    fn load_all_playbooks_returns_embedded_when_dir_missing() {
+        let nonexistent = PathBuf::from("/tmp/iw-pb-no-such-dir-xyz-789");
+        let (pbs, errors) = load_all_playbooks(&nonexistent);
+        assert_eq!(pbs.len(), PLAYBOOK_BUILTINS.len());
+        assert!(errors.is_empty());
+        // Source file label is operator-readable.
+        assert!(
+            pbs.iter().all(|p| p.source_file.contains("built-in")),
+            "every embedded entry must carry the (built-in) label"
+        );
+    }
+
+    #[test]
+    fn load_all_playbooks_override_by_id_keeps_count_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+metadata:
+  id: pb-data-exfil-default
+  name: "Operator override"
+triggers:
+  - chain_id: "CL-002"
+steps:
+  - id: noop
+    skill: wait
+    args: {ms: 1}
+"#;
+        std::fs::write(dir.path().join("10-override.yml"), yaml).unwrap();
+        let (pbs, errors) = load_all_playbooks(dir.path());
+        assert!(errors.is_empty());
+        assert_eq!(pbs.len(), PLAYBOOK_BUILTINS.len());
+        let overridden = pbs
+            .iter()
+            .find(|p| p.id == "pb-data-exfil-default")
+            .unwrap();
+        assert_eq!(overridden.source_file, "10-override.yml");
+        assert_eq!(overridden.step_count, 1);
+    }
+
+    #[test]
+    fn load_all_playbooks_new_id_is_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+metadata:
+  id: pb-operator-custom
+  name: "Operator custom"
+triggers:
+  - chain_id: "CL-003"
+  - chain_id: "CL-004"
+steps:
+  - id: a
+    skill: wait
+    args: {ms: 1}
+  - id: b
+    skill: wait
+    args: {ms: 2}
+  - id: c
+    skill: wait
+    args: {ms: 3}
+"#;
+        std::fs::write(dir.path().join("20-custom.yml"), yaml).unwrap();
+        let (pbs, _) = load_all_playbooks(dir.path());
+        let custom = pbs.iter().find(|p| p.id == "pb-operator-custom").unwrap();
+        assert_eq!(custom.trigger_count, 2);
+        assert_eq!(custom.step_count, 3);
+    }
+
+    #[test]
+    fn parse_playbook_rejects_missing_triggers() {
+        let yaml = r#"
+version: 1
+metadata: {id: pb-bad, name: x}
+steps:
+  - id: a
+    skill: wait
+    args: {ms: 1}
+"#;
+        assert!(parse_playbook_yaml(yaml, "t").is_err());
+    }
+
+    #[test]
+    fn parse_playbook_rejects_wrong_version() {
+        let yaml = r#"
+version: 99
+metadata: {id: pb-bad, name: x}
+triggers:
+  - chain_id: "CL-002"
+steps:
+  - id: a
+    skill: wait
+    args: {ms: 1}
+"#;
+        assert!(parse_playbook_yaml(yaml, "t").is_err());
     }
 }

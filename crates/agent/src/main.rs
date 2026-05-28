@@ -149,6 +149,7 @@ mod notification_pipeline;
 mod observation_verify;
 mod orphan_recovery;
 mod pcap_capture;
+mod playbook_engine;
 mod posture;
 mod process;
 mod process_health;

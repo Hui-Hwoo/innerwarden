@@ -1,0 +1,59 @@
+version: 1
+metadata:
+  id: pb-data-exfil-default
+  name: "Data exfiltration default response"
+  description: >-
+    Deterministic SOC response for CL-002 (Recon to Exfiltration) and CL-008
+    (Data Exfiltration eBPF sequence). Tarpits the source IP at the firewall,
+    pages on-call, captures a 5-minute pcap, and opens a JIRA ticket. AI
+    triage runs AFTER this playbook and sees the playbook outcome as
+    context, so it adds enrichment instead of duplicating response.
+
+triggers:
+  - chain_id: "CL-002"
+  - chain_id: "CL-008"
+  - kind_glob: "kill_chain_detected_DATA_EXFIL*"
+
+conditions:
+  # Skip cloud provider safelist + operator trusted_ips. Skill_gate would
+  # refuse the block-ip step anyway, but evaluating the condition first
+  # avoids logging a refused gate attempt for every cloud-provider sweep.
+  ip_not_in: ["$cloud_safelist", "$trusted_ips"]
+  asset_tags: ["env=prod"]
+  sample_rate: 1.0
+
+steps:
+  - id: tarpit
+    skill: block_ip_xdp
+    args:
+      ttl_secs: 3600
+    retry:
+      count: 3
+      backoff: exponential
+      base_ms: 200
+    on_error: continue
+
+  - id: page_oncall
+    skill: route_alert
+    args:
+      destination: pagerduty
+      severity_override: critical
+      dedup_key_template: "iw:{rule_id}:{primary_ip}"
+    on_error: continue
+
+  - id: snapshot_pcap
+    skill: capture_pcap
+    args:
+      duration_secs: 300
+      target_ip: "{trigger.primary_ip}"
+    timeout_secs: 30
+    on_error: continue
+
+  - id: open_jira_ticket
+    skill: open_ticket
+    args:
+      system: jira
+      project: SOC
+      title_template: "InnerWarden: {trigger.chain_name} from {trigger.primary_ip}"
+      labels: ["innerwarden", "critical", "{trigger.chain_id}"]
+    on_error: continue

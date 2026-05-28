@@ -168,11 +168,11 @@ enum Command {
         command: Option<SystemCommand>,
     },
 
-    /// Manage detection rules (event_pipeline, sigma, yara, atr, correlation).
+    /// Manage detection rules (event_pipeline, sigma, yara, atr, correlation, playbooks).
     ///
     /// Rules are YAML files under /etc/innerwarden/rules/, hot-reloaded every
     /// 60s. Cross-layer correlation rule IDs (CL-NNN) route to the correlation
-    /// subdir automatically.
+    /// subdir automatically. SOC playbook IDs (pb-*) live under playbooks/.
     ///
     /// Examples:
     ///   innerwarden rule list
@@ -1032,14 +1032,15 @@ enum IntegrateCommand {
 #[derive(Subcommand)]
 enum RuleCommand {
     /// List rules. Shows all types by default
-    /// (event_pipeline, sigma, yara, atr, correlation).
+    /// (event_pipeline, sigma, yara, atr, correlation, playbooks).
     ///
     /// Examples:
     ///   innerwarden rule list
     ///   innerwarden rule list --type sigma
     ///   innerwarden rule list --type correlation
+    ///   innerwarden rule list --type playbooks
     List {
-        /// Filter by rule type: event_pipeline, sigma, yara, atr, correlation
+        /// Filter by rule type: event_pipeline, sigma, yara, atr, correlation, playbooks
         #[arg(long, short = 't')]
         r#type: Option<String>,
     },
