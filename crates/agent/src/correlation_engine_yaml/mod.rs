@@ -49,10 +49,10 @@ struct RawStage {
     entity_must_match: bool,
 }
 
-// Public narrow-surface API kept for tests + potential external callers.
-// Production loads via `load_rules_dir` which threads accumulated lists across
-// files; this convenience wrapper is for "give me rules from this YAML string".
-#[allow(dead_code)]
+// Production callers (via `correlation_engine::builtin_rules`, the post-Spec-055-Phase-5
+// thin wrapper used by `Engine::new` and the `from_yaml_dir` fallback path) +
+// tests + the byte-anchor on rule count all flow through here. The YAML file
+// 00-builtin.yml is the single source of truth for the 68 CL-rules.
 pub fn load_builtin() -> Result<Vec<CorrelationRule>, String> {
     parse_rules(BUILTIN_YAML, "00-builtin.yml")
 }
@@ -279,7 +279,6 @@ fn parse_layer(s: &str) -> Option<Layer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::correlation_engine::builtin_rules_for_test;
 
     #[test]
     fn builtin_yaml_parses_to_68_rules() {
@@ -288,55 +287,22 @@ mod tests {
     }
 
     #[test]
-    fn yaml_rules_match_hardcoded_byte_for_byte() {
-        let yaml_rules = load_builtin().unwrap();
-        let hardcoded = builtin_rules_for_test();
-
-        assert_eq!(
-            yaml_rules.len(),
-            hardcoded.len(),
-            "rule count mismatch: yaml={} hardcoded={}",
-            yaml_rules.len(),
-            hardcoded.len()
-        );
-
-        for (y, h) in yaml_rules.iter().zip(hardcoded.iter()) {
-            assert_eq!(y.id, h.id, "id mismatch at {}", y.id);
-            assert_eq!(y.name, h.name, "name mismatch at {}", y.id);
-            assert_eq!(y.window_secs, h.window_secs, "window_secs at {}", y.id);
+    fn builtin_yaml_covers_expected_cl_id_set() {
+        // After Spec 055 Phase 5 removed the hardcoded `builtin_rules()` literal,
+        // the YAML is the single source of truth. This anchor catches accidental
+        // rule deletions / renames that the rule-count test alone wouldn't.
+        let rules = load_builtin().unwrap();
+        let ids: std::collections::HashSet<String> = rules.iter().map(|r| r.id.clone()).collect();
+        // Spot-check a handful from each CL-NNN range (CL-001..CL-047 + CL-051..CL-071,
+        // gaps at CL-048/49/50). If the YAML drops one of these, the test fails.
+        for required in &[
+            "CL-001", "CL-008", "CL-010", "CL-024", "CL-041", "CL-043", "CL-047", "CL-051",
+            "CL-060", "CL-071",
+        ] {
             assert!(
-                (y.min_confidence - h.min_confidence).abs() < f32::EPSILON,
-                "min_confidence at {}: yaml={} hardcoded={}",
-                y.id,
-                y.min_confidence,
-                h.min_confidence
+                ids.contains(*required),
+                "00-builtin.yml lost CL-rule {required}; this is a YAML edit regression"
             );
-            assert_eq!(
-                format!("{:?}", y.severity),
-                format!("{:?}", h.severity),
-                "severity at {}",
-                y.id
-            );
-            assert_eq!(y.stages.len(), h.stages.len(), "stage count at {}", y.id);
-            for (i, (ys, hs)) in y.stages.iter().zip(h.stages.iter()).enumerate() {
-                assert_eq!(
-                    format!("{:?}", ys.layer),
-                    format!("{:?}", hs.layer),
-                    "layer at {} stage {}",
-                    y.id,
-                    i
-                );
-                assert_eq!(
-                    ys.kind_patterns, hs.kind_patterns,
-                    "kind_patterns at {} stage {}",
-                    y.id, i
-                );
-                assert_eq!(
-                    ys.entity_must_match, hs.entity_must_match,
-                    "entity_must_match at {} stage {}",
-                    y.id, i
-                );
-            }
         }
     }
 
