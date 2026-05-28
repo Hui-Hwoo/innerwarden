@@ -5,6 +5,40 @@ metadata:
     Built-in cross-layer correlation rules (CL-001 to CL-071).
     Auto-generated from correlation_engine.rs builtin_rules().
 
+# Named lists for correlation kind_patterns (Spec 055 Phase 4).
+# Reference with $name in any `kind_patterns` array. Lists declared here
+# are available to operator-supplied YAML files in the rules dir.
+# First-defined-wins: built-in lists below take precedence over operator overrides.
+lists:
+  exfil_kinds:
+    - data_exfiltration
+    - outbound_anomaly
+    - dns_tunneling
+    - lateral_egress_scp_rsync
+    - lateral_egress_ssh
+    - data_exfil_ebpf
+    - data_exfil_cmd
+  recon_kinds:
+    - port_scan
+    - nmap_scan
+    - wordlist_scan
+    - discovery_anomaly
+    - discovery_burst
+    - web_scan
+    - user_agent_scanner
+  persistence_kinds:
+    - pam_module_change
+    - startup_script_persistence
+    - systemd_persistence
+    - crontab_persistence
+    - ssh_key_injection
+  c2_kinds:
+    - c2_callback
+    - c2_web_tunnel
+    - c2_protocol_tunneling
+    - c2_non_standard_port
+    - dns_c2
+
 rules:
   - id: "CL-001"
     name: "Firmware to Rootkit Chain"

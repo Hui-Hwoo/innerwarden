@@ -8,6 +8,8 @@
 //! and hot-reload via mtime tracking. Phases 3-5 add CLI integration, named
 //! lists, and finally remove the hardcoded literals.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 use crate::correlation_engine::{CorrelationRule, Layer, RuleStage};
@@ -19,6 +21,8 @@ pub const BUILTIN_YAML: &str = include_str!("builtin/00-builtin.yml");
 struct RuleFile {
     #[allow(dead_code)]
     version: u32,
+    #[serde(default)]
+    lists: HashMap<String, Vec<String>>,
     #[serde(default)]
     rules: Vec<RawRule>,
 }
@@ -45,6 +49,10 @@ struct RawStage {
     entity_must_match: bool,
 }
 
+// Public narrow-surface API kept for tests + potential external callers.
+// Production loads via `load_rules_dir` which threads accumulated lists across
+// files; this convenience wrapper is for "give me rules from this YAML string".
+#[allow(dead_code)]
 pub fn load_builtin() -> Result<Vec<CorrelationRule>, String> {
     parse_rules(BUILTIN_YAML, "00-builtin.yml")
 }
@@ -53,13 +61,22 @@ pub fn load_builtin() -> Result<Vec<CorrelationRule>, String> {
 /// Built-in rules are always loaded first. On-disk rules with the same
 /// `id` override the built-in; new ids are added. Files are read in
 /// lexicographic order.
+///
+/// Named lists (`lists:` section in any file) accumulate across files with
+/// first-defined-wins semantics — built-in lists from 00-builtin.yml take
+/// precedence over operator-supplied files. References (`$list_name`) in
+/// `kind_patterns` are expanded against the accumulated list set per file.
 pub fn load_rules_dir(dir: &std::path::Path) -> Result<Vec<CorrelationRule>, String> {
-    use std::collections::HashMap;
-
     let mut by_id: HashMap<String, CorrelationRule> = HashMap::new();
+    let mut global_lists: HashMap<String, Vec<String>> = HashMap::new();
 
-    // Always load built-in first
-    for rule in load_builtin()? {
+    // Always load built-in first. Its lists become the baseline for any
+    // on-disk file that references $exfil_kinds / $recon_kinds / etc.
+    let builtin = parse_file(BUILTIN_YAML, "00-builtin.yml", &global_lists)?;
+    for (k, v) in builtin.lists {
+        global_lists.entry(k).or_insert(v);
+    }
+    for rule in builtin.rules {
         by_id.insert(rule.id.clone(), rule);
     }
 
@@ -84,9 +101,12 @@ pub fn load_rules_dir(dir: &std::path::Path) -> Result<Vec<CorrelationRule>, Str
                 .to_string_lossy()
                 .to_string();
             match std::fs::read_to_string(&path) {
-                Ok(yaml) => match parse_rules(&yaml, &name) {
-                    Ok(rules) => {
-                        for rule in rules {
+                Ok(yaml) => match parse_file(&yaml, &name, &global_lists) {
+                    Ok(parsed) => {
+                        for (k, v) in parsed.lists {
+                            global_lists.entry(k).or_insert(v);
+                        }
+                        for rule in parsed.rules {
                             by_id.insert(rule.id.clone(), rule);
                         }
                     }
@@ -126,9 +146,40 @@ pub fn dir_max_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
     max
 }
 
+/// Simple API: parse a single YAML string. Lists declared inline in the file
+/// expand within the rules in that file; external lists are not visible
+/// (use `parse_file` / `load_rules_dir` for cross-file expansion).
+#[allow(dead_code)]
 pub fn parse_rules(yaml: &str, source: &str) -> Result<Vec<CorrelationRule>, String> {
+    parse_file(yaml, source, &HashMap::new()).map(|p| p.rules)
+}
+
+/// Output of parsing one YAML file: compiled rules + lists declared in this file.
+/// The loader (`load_rules_dir`) accumulates lists across files for cross-file
+/// references; individual callers (tests, the simple `parse_rules` wrapper) can
+/// discard the lists.
+struct ParsedFile {
+    rules: Vec<CorrelationRule>,
+    lists: HashMap<String, Vec<String>>,
+}
+
+fn parse_file(
+    yaml: &str,
+    source: &str,
+    external_lists: &HashMap<String, Vec<String>>,
+) -> Result<ParsedFile, String> {
     let rf: RuleFile =
         serde_yaml::from_str(yaml).map_err(|e| format!("{source}: YAML parse error: {e}"))?;
+
+    // Merge external lists with this file's lists. First-defined-wins:
+    // the external set wins ties (callers pass earlier-file lists in as
+    // external; the loader puts 00-builtin.yml's lists in external first).
+    let mut effective_lists = external_lists.clone();
+    for (k, v) in &rf.lists {
+        effective_lists
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
 
     let mut compiled = Vec::new();
     for raw in rf.rules {
@@ -150,9 +201,10 @@ pub fn parse_rules(yaml: &str, source: &str) -> Result<Vec<CorrelationRule>, Str
                     })?),
                     None => None,
                 };
+            let kind_patterns = expand_list_refs(s.kind_patterns, &effective_lists, &raw.id);
             stages.push(RuleStage {
                 layer,
-                kind_patterns: s.kind_patterns,
+                kind_patterns,
                 entity_must_match: s.entity_must_match,
             });
         }
@@ -165,7 +217,39 @@ pub fn parse_rules(yaml: &str, source: &str) -> Result<Vec<CorrelationRule>, Str
             severity,
         });
     }
-    Ok(compiled)
+    Ok(ParsedFile {
+        rules: compiled,
+        lists: rf.lists,
+    })
+}
+
+// Expands `$name` references in a kind_patterns vec. Unknown lists are kept
+// as literal `$name` strings and a WARN is logged so the rule still loads
+// (consistent with event_pipeline's behaviour from PR #842).
+fn expand_list_refs(
+    patterns: Vec<String>,
+    lists: &HashMap<String, Vec<String>>,
+    rule_id: &str,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        if let Some(name) = p.strip_prefix('$') {
+            match lists.get(name) {
+                Some(expanded) => out.extend(expanded.iter().cloned()),
+                None => {
+                    tracing::warn!(
+                        rule = %rule_id,
+                        list = %name,
+                        "correlation_engine_yaml: unknown list reference ${name} kept as literal"
+                    );
+                    out.push(p);
+                }
+            }
+        } else {
+            out.push(p);
+        }
+    }
+    out
 }
 
 fn parse_severity(s: &str) -> Option<Severity> {
@@ -290,5 +374,210 @@ rules:
 "#;
         let rules = parse_rules(yaml, "test").unwrap();
         assert_eq!(rules.len(), 0);
+    }
+
+    // ===== Spec 055 Phase 4: named lists in kind_patterns =====
+
+    #[test]
+    fn inline_list_reference_expands_within_file() {
+        let yaml = r#"
+version: 1
+lists:
+  recon:
+    - port_scan
+    - nmap_scan
+    - wordlist_scan
+rules:
+  - id: "TEST-RECON"
+    name: "recon test"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages:
+      - kind_patterns: ["$recon"]
+        entity_must_match: false
+"#;
+        let rules = parse_rules(yaml, "test").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].stages[0].kind_patterns,
+            vec![
+                "port_scan".to_string(),
+                "nmap_scan".to_string(),
+                "wordlist_scan".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_reference_and_literal_can_coexist() {
+        let yaml = r#"
+version: 1
+lists:
+  exfil:
+    - data_exfiltration
+    - outbound_anomaly
+rules:
+  - id: "TEST-MIXED"
+    name: "mixed"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages:
+      - kind_patterns: ["$exfil", "dns_tunneling"]
+        entity_must_match: false
+"#;
+        let rules = parse_rules(yaml, "test").unwrap();
+        let kp = &rules[0].stages[0].kind_patterns;
+        assert_eq!(
+            kp,
+            &vec![
+                "data_exfiltration".to_string(),
+                "outbound_anomaly".to_string(),
+                "dns_tunneling".to_string(),
+            ],
+            "list reference should expand inline preserving order; literal stays put"
+        );
+    }
+
+    #[test]
+    fn unknown_list_reference_kept_as_literal() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: "TEST-UNKNOWN"
+    name: "unknown list"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages:
+      - kind_patterns: ["$does_not_exist", "fallback_kind"]
+        entity_must_match: false
+"#;
+        let rules = parse_rules(yaml, "test").unwrap();
+        // Unknown $does_not_exist stays as a literal "$does_not_exist" — the
+        // agent's matcher will simply never match an event with that literal
+        // kind. We log a warn but never crash the load.
+        assert_eq!(
+            rules[0].stages[0].kind_patterns,
+            vec!["$does_not_exist".to_string(), "fallback_kind".to_string()]
+        );
+    }
+
+    #[test]
+    fn builtin_lists_define_the_four_spec_names() {
+        // Anchor that spec 055 Phase 4's four named lists exist in 00-builtin.yml
+        // so operator-supplied YAML files can reference them without redefining.
+        let rf: RuleFile = serde_yaml::from_str(BUILTIN_YAML).unwrap();
+        for name in &[
+            "exfil_kinds",
+            "recon_kinds",
+            "persistence_kinds",
+            "c2_kinds",
+        ] {
+            assert!(
+                rf.lists.contains_key(*name),
+                "00-builtin.yml must define `{name}` for operator-authored rules to reference",
+            );
+            assert!(
+                !rf.lists.get(*name).unwrap().is_empty(),
+                "list `{name}` in 00-builtin.yml must not be empty",
+            );
+        }
+    }
+
+    #[test]
+    fn external_list_expands_in_operator_file() {
+        // Simulates a load_rules_dir flow: operator file references a list
+        // defined in 00-builtin.yml (passed in as external_lists), with no
+        // local `lists:` section.
+        let mut external = HashMap::new();
+        external.insert(
+            "exfil".to_string(),
+            vec!["data_exfiltration".to_string(), "dns_tunneling".to_string()],
+        );
+
+        let yaml = r#"
+version: 1
+rules:
+  - id: "OP-1"
+    name: "operator rule"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages:
+      - kind_patterns: ["$exfil"]
+        entity_must_match: false
+"#;
+        let parsed = parse_file(yaml, "10-operator.yml", &external).unwrap();
+        assert_eq!(
+            parsed.rules[0].stages[0].kind_patterns,
+            vec!["data_exfiltration".to_string(), "dns_tunneling".to_string()]
+        );
+    }
+
+    #[test]
+    fn cross_file_list_first_defined_wins() {
+        // External (acts as the earlier file's lists) defines `exfil` with 2 items.
+        // The current file redefines `exfil` with 99 items. First definition wins,
+        // so the rule expands to the external set.
+        let mut external = HashMap::new();
+        external.insert(
+            "exfil".to_string(),
+            vec!["original_a".to_string(), "original_b".to_string()],
+        );
+        let yaml = r#"
+version: 1
+lists:
+  exfil:
+    - override_x
+    - override_y
+    - override_z
+rules:
+  - id: "OP-2"
+    name: "redef"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages:
+      - kind_patterns: ["$exfil"]
+        entity_must_match: false
+"#;
+        let parsed = parse_file(yaml, "20-operator.yml", &external).unwrap();
+        assert_eq!(
+            parsed.rules[0].stages[0].kind_patterns,
+            vec!["original_a".to_string(), "original_b".to_string()],
+            "earlier file's list definition must win"
+        );
+    }
+
+    #[test]
+    fn load_rules_dir_makes_builtin_lists_available_to_disk_files() {
+        // End-to-end: operator drops a file that references $exfil_kinds; the
+        // 00-builtin.yml lists must be in scope.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: "CL-OP-001"
+    name: "operator exfil chain"
+    severity: high
+    window_secs: 300
+    min_confidence: 0.7
+    stages:
+      - kind_patterns: ["$exfil_kinds"]
+        entity_must_match: false
+"#;
+        std::fs::write(dir.path().join("50-operator.yml"), yaml).unwrap();
+        let rules = load_rules_dir(dir.path()).unwrap();
+        let op_rule = rules.iter().find(|r| r.id == "CL-OP-001").unwrap();
+        assert!(
+            op_rule.stages[0]
+                .kind_patterns
+                .contains(&"data_exfiltration".to_string()),
+            "operator file should see exfil_kinds expanded; got: {:?}",
+            op_rule.stages[0].kind_patterns
+        );
+        assert!(op_rule.stages[0].kind_patterns.len() >= 5);
     }
 }
