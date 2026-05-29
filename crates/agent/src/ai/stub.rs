@@ -150,6 +150,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         decide_for_incident(&ctx)
     }
@@ -200,6 +201,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         let d = decide_for_incident(&ctx);
         assert!(matches!(d.action, AiAction::BlockIp { .. }));

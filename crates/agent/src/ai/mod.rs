@@ -172,6 +172,28 @@ pub struct DecisionContext<'a> {
     /// 53% → 73% action accuracy when the LLM consumes the subgraph
     /// directly instead of re-deriving structure from prose.
     pub graph_subgraph: Option<serde_json::Value>,
+    /// Spec 056 Phase 4: one-line summary of any deterministic SOC
+    /// playbook that already executed for this incident (from
+    /// [`crate::playbook_engine::executor::PlaybookOutcome::summary`]).
+    /// Surfaced in the LLM prompt so the AI ENRICHES rather than
+    /// duplicates the playbook's actions (spec 056 invariant #5: AI sees
+    /// playbook output, never the inverse). `None` when no playbook fired,
+    /// in which case the prompt is identical to the pre-Phase-4 behaviour.
+    pub playbook_outcome: Option<String>,
+}
+
+/// Render the playbook-outcome prompt block for the LLM providers. Empty
+/// when no playbook ran, so the prompt is byte-identical to pre-Phase-4.
+/// Shared by every `build_prompt` so the wording (and the "do not
+/// duplicate" instruction) stays consistent across providers.
+pub(crate) fn playbook_prompt_section(outcome: &Option<String>) -> String {
+    match outcome {
+        Some(summary) if !summary.is_empty() => format!(
+            "\nDETERMINISTIC PLAYBOOK ALREADY EXECUTED (do NOT repeat these \
+             actions; add enrichment or longer-term response only):\n{summary}\n"
+        ),
+        _ => String::new(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -689,6 +711,20 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use innerwarden_core::{entities::EntityRef, event::Severity, incident::Incident};
+
+    #[test]
+    fn playbook_prompt_section_none_and_empty_are_blank() {
+        assert_eq!(playbook_prompt_section(&None), "");
+        assert_eq!(playbook_prompt_section(&Some(String::new())), "");
+    }
+
+    #[test]
+    fn playbook_prompt_section_wraps_summary_with_no_duplicate_instruction() {
+        let s = playbook_prompt_section(&Some("playbook pb: 1 success".to_string()));
+        assert!(s.contains("DETERMINISTIC PLAYBOOK ALREADY EXECUTED"));
+        assert!(s.contains("do NOT repeat"));
+        assert!(s.contains("playbook pb: 1 success"));
+    }
 
     fn make_incident(severity: Severity, ip: &str) -> Incident {
         Incident {

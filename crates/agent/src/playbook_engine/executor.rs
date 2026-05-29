@@ -157,6 +157,23 @@ impl PlaybookOutcome {
     }
 }
 
+/// Spec 056 Phase 4: join the matched playbooks' one-line summaries into a
+/// single AI-context string. `None` when no playbook fired, so the AI
+/// prompt stays byte-identical to the pre-Phase-4 path. Pure so the
+/// both-branches behaviour is unit-tested without the incident loop.
+pub(crate) fn summarize_outcomes(outcomes: &[PlaybookOutcome]) -> Option<String> {
+    if outcomes.is_empty() {
+        return None;
+    }
+    Some(
+        outcomes
+            .iter()
+            .map(|o| o.summary())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Step dispatch abstraction (so tests can mock skills)
 // ---------------------------------------------------------------------------
@@ -1736,6 +1753,30 @@ mod tests {
         let s = out.summary();
         assert!(s.contains("pb (aborted)"), "got: {s}");
         assert!(s.contains("1 success") && s.contains("1 failed") && s.contains("1 refused"));
+    }
+
+    #[test]
+    fn summarize_outcomes_none_when_empty_else_joined() {
+        assert_eq!(summarize_outcomes(&[]), None);
+        let mk = |id: &str| PlaybookOutcome {
+            playbook_id: id.to_string(),
+            steps: vec![StepOutcome {
+                step_id: "s".to_string(),
+                skill: "x".to_string(),
+                status: StepStatus::Success,
+                attempts: 1,
+                message: String::new(),
+            }],
+            aborted: false,
+            commands: Vec::new(),
+        };
+        let joined = summarize_outcomes(&[mk("pb-a"), mk("pb-b")]).unwrap();
+        assert!(joined.contains("pb-a"), "got: {joined}");
+        assert!(joined.contains("pb-b"), "got: {joined}");
+        assert!(
+            joined.contains("; "),
+            "summaries joined with '; ': {joined}"
+        );
     }
 
     #[test]

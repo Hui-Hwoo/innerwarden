@@ -286,6 +286,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         let err = p.decide(&ctx).await.unwrap_err().to_string();
         assert!(

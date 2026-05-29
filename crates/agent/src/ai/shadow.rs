@@ -323,6 +323,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         let d = sp.decide(&ctx).await.unwrap();
         assert!(matches!(d.action, AiAction::Ignore { .. }));
@@ -366,6 +367,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         let _ = sp.decide(&ctx).await.unwrap();
         let logged = std::fs::read_to_string(tmp.path()).unwrap();
@@ -409,6 +411,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         assert!(sp.decide(&ctx).await.is_err());
 
@@ -575,6 +578,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         let _ = sp.decide(&ctx).await.unwrap();
 
@@ -623,6 +627,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         let d = sp.decide(&ctx).await.unwrap();
         assert!(matches!(d.action, AiAction::Ignore { .. }));
@@ -710,6 +715,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
 
         // 5 calls is plenty to make any deterministic-bug stand out.
@@ -765,6 +771,7 @@ mod tests {
             ip_geo: None,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         };
         for _ in 0..3 {
             let _ = sp.decide(&ctx).await.unwrap();

@@ -380,6 +380,9 @@ async fn promote_escalated_to_decision(
         ip_geo: None,
         graph_context: None,
         graph_subgraph,
+        // Narrative-verification Decide path runs outside the incident
+        // playbook flow; no playbook outcome to surface.
+        playbook_outcome: None,
     };
 
     tracing::info!(

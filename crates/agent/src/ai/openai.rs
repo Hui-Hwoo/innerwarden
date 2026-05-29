@@ -326,13 +326,15 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
             .unwrap_or_default()
     };
 
+    let playbook_section = crate::ai::playbook_prompt_section(&ctx.playbook_outcome);
+
     format!(
         r#"Analyze this security incident and decide on a response.
 
 INCIDENT:
 {incident_json}
 {reputation_line}{geo_line}
-{graph_section}RECENT EVENTS FROM THE SAME ENTITY (last {count}):
+{graph_section}{playbook_section}RECENT EVENTS FROM THE SAME ENTITY (last {count}):
 {events_json}
 
 TEMPORALLY CORRELATED INCIDENTS (last {related_count}, grouped by pivot ip/user/detector):
@@ -349,6 +351,7 @@ Select the best skill and return a JSON decision."#,
         reputation_line = reputation_line,
         geo_line = geo_line,
         graph_section = graph_section,
+        playbook_section = playbook_section,
         events_json = events_json,
         count = ctx.recent_events.len(),
         related_incidents_json = related_incidents_json,
@@ -734,6 +737,7 @@ mod tests {
             ip_geo: None,
             graph_context,
             graph_subgraph,
+            playbook_outcome: None,
         }
     }
 
@@ -781,5 +785,27 @@ mod tests {
         let prompt = build_prompt(&ctx);
         assert!(!prompt.contains("GRAPH_SUBGRAPH"));
         assert!(!prompt.contains("ATTACK CONTEXT"));
+    }
+
+    #[test]
+    fn build_prompt_includes_playbook_outcome_when_present() {
+        let inc = spec025_incident();
+        let mut ctx = spec025_ctx(&inc, None, None);
+        ctx.playbook_outcome = Some("playbook pb-exfil: 1 success, 1 queued".to_string());
+        let prompt = build_prompt(&ctx);
+        assert!(
+            prompt.contains("DETERMINISTIC PLAYBOOK ALREADY EXECUTED"),
+            "playbook section header missing"
+        );
+        assert!(prompt.contains("playbook pb-exfil: 1 success, 1 queued"));
+        assert!(prompt.contains("do NOT repeat"));
+    }
+
+    #[test]
+    fn build_prompt_omits_playbook_section_when_absent() {
+        let inc = spec025_incident();
+        let ctx = spec025_ctx(&inc, None, None); // playbook_outcome None
+        let prompt = build_prompt(&ctx);
+        assert!(!prompt.contains("DETERMINISTIC PLAYBOOK"));
     }
 }

@@ -607,6 +607,12 @@ pub(crate) async fn process_incidents(
             &notification_thresholds,
         )
         .await;
+        // Spec 056 Phase 4: surface what the deterministic playbook already
+        // did to the AI router as context, so the AI enriches rather than
+        // duplicates it (invariant #5: AI sees playbook output, never the
+        // inverse). `None` when nothing fired -> prompt identical to before.
+        let playbook_ai_context =
+            crate::playbook_engine::executor::summarize_outcomes(&playbook_outcomes);
 
         // Build graph context: attack narrative from knowledge graph neighborhood.
         // Phase 015: prefer the Incident node as center (richest context after 014-D
@@ -662,6 +668,7 @@ pub(crate) async fn process_incidents(
             ip_geo: ip_geo_early.clone(),
             graph_context,
             graph_subgraph,
+            playbook_outcome: playbook_ai_context,
         };
 
         state.telemetry.observe_ai_sent();

@@ -617,6 +617,7 @@ mod tests {
             ip_geo,
             graph_context: None,
             graph_subgraph: None,
+            playbook_outcome: None,
         }
     }
 
