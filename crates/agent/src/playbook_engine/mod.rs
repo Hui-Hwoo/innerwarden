@@ -40,6 +40,7 @@
 
 pub(crate) mod commands;
 pub mod executor;
+pub(crate) mod replay;
 mod virtual_skills;
 
 use std::collections::{HashMap, HashSet};

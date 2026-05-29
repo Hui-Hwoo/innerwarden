@@ -224,6 +224,13 @@ struct Cli {
     #[arg(long)]
     report: bool,
 
+    /// Replay a captured incidents JSONL file through the SOC playbooks in
+    /// dry-run and print a report of what they WOULD do (no skills fire, no
+    /// audit written), then exit. Validates playbooks against real incident
+    /// history without waiting for live traffic.
+    #[arg(long, value_name = "INCIDENTS_JSONL")]
+    playbook_replay: Option<PathBuf>,
+
     /// Output directory for generated reports (default: same as --data-dir)
     #[arg(long)]
     report_dir: Option<PathBuf>,
@@ -753,7 +760,75 @@ async fn main() -> Result<()> {
         return run_validate_config_only(cli);
     }
 
+    // --playbook-replay: offline batch validation of playbooks against a
+    // captured incidents JSONL. Dry-run only, prints a report, exits.
+    if cli.playbook_replay.is_some() {
+        return run_playbook_replay(cli).await;
+    }
+
     loops::boot::run_agent(cli).await
+}
+
+/// Implements `--playbook-replay <file>`: load playbooks (built-ins +
+/// operator dir), run every incident in the JSONL through them in dry-run,
+/// and print a [`playbook_engine::replay::ReplayReport`]. No skills fire,
+/// no audit is written.
+async fn run_playbook_replay(cli: Cli) -> Result<()> {
+    let path = cli
+        .playbook_replay
+        .clone()
+        .expect("guarded by is_some() at call site");
+    let cfg = match &cli.config {
+        Some(p) => config::load(p)?,
+        None => config::AgentConfig::default(),
+    };
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("read incidents file {}: {e}", path.display()))?;
+    let mut incidents = Vec::new();
+    let mut skipped = 0usize;
+    for line in content.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<innerwarden_core::incident::Incident>(l) {
+            Ok(inc) => incidents.push(inc),
+            Err(_) => skipped += 1,
+        }
+    }
+
+    // Faithful matching: `$cloud_safelist` conditions consult the static
+    // cloud ranges, which are lazily populated by this init (the live agent
+    // does it at boot).
+    crate::cloud_safelist::init();
+
+    let rules_dir = std::path::Path::new(&cfg.playbooks.rules_dir);
+    let playbooks = playbook_engine::load_dir(rules_dir).unwrap_or_else(|e| {
+        eprintln!("warn: could not load operator playbooks ({e}); using built-ins only");
+        playbook_engine::load_builtins().unwrap_or_default()
+    });
+    let registry = crate::skills::SkillRegistry::default_builtin();
+
+    let report = playbook_engine::replay::replay_incidents(
+        &playbooks,
+        &registry,
+        &cfg.allowlist.trusted_ips,
+        &[], // asset_tags: spec 058 will populate; empty mirrors live path
+        &incidents,
+    )
+    .await;
+
+    if skipped > 0 {
+        println!("(skipped {skipped} unparseable line(s))\n");
+    }
+    println!(
+        "Loaded {} playbook(s) from built-ins + {}\n",
+        playbooks.len(),
+        cfg.playbooks.rules_dir
+    );
+    print!("{}", report.render());
+    Ok(())
 }
 
 /// Implements `--validate-config-only`. Lives in main.rs (not boot.rs) so the
