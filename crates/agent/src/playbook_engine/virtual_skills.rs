@@ -20,15 +20,17 @@
 //!   ran on the args before dispatch, so secrets arrive resolved.
 //!
 //! The three state-coupled skills (`route_alert`, `capture_pcap`,
-//! `set_tag`) still return `Deferred` here; Phase 3b wires them once the
-//! executor can reach the agent's notification / pcap / attacker-intel
-//! subsystems.
+//! `set_tag`) are wired in Phase 3b: they cannot touch `&mut AgentState`
+//! from here, so they enqueue a [`PlaybookCommand`] and return
+//! [`StepStatus::Queued`]; the incident loop drains the commands against
+//! the notification / pcap / attacker-intel subsystems after the run.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use tracing::{info, warn};
 
+use super::commands::PlaybookCommand;
 use super::executor::{RegistryStepExecutor, StepRunResult, StepStatus};
 use crate::{skill_gate, skills};
 
@@ -46,6 +48,7 @@ impl RegistryStepExecutor<'_> {
     pub(super) async fn dispatch_virtual(
         &self,
         skill: &str,
+        step_id: &str,
         args: &serde_yaml::Value,
         primary_ip: Option<&str>,
     ) -> StepRunResult {
@@ -54,15 +57,90 @@ impl RegistryStepExecutor<'_> {
             "emit_metric" => run_emit_metric(args),
             "block_subnet" => self.run_block_subnet(args, primary_ip).await,
             "open_ticket" => run_open_ticket(args).await,
-            // Phase 3b: needs &mut AgentState subsystems.
-            "route_alert" | "capture_pcap" | "set_tag" => StepRunResult {
-                status: StepStatus::Deferred,
-                message: format!("virtual skill '{skill}' lands in Phase 3b"),
-            },
+            // Phase 3b: enqueue a command for the incident loop to drain
+            // against &mut AgentState after the playbook finishes.
+            "route_alert" => self.queue_route_alert(step_id, args),
+            "capture_pcap" => self.queue_capture_pcap(step_id, args, primary_ip),
+            "set_tag" => self.queue_set_tag(step_id, args, primary_ip),
             other => StepRunResult {
                 status: StepStatus::Failed,
                 message: format!("unknown virtual skill '{other}'"),
             },
+        }
+    }
+
+    /// `route_alert`: queue a notification re-dispatch. `destination` and
+    /// `severity_override` are advisory until per-rule routing (spec 059);
+    /// the drain routes through the operator's existing channels.
+    fn queue_route_alert(&self, step_id: &str, args: &serde_yaml::Value) -> StepRunResult {
+        let destination = str_arg(args, "destination").map(str::to_string);
+        let severity_override = str_arg(args, "severity_override").map(str::to_string);
+        self.enqueue_command(PlaybookCommand::RouteAlert {
+            step_id: step_id.to_string(),
+            destination: destination.clone(),
+            severity_override,
+        });
+        StepRunResult {
+            status: StepStatus::Queued,
+            message: format!(
+                "route_alert queued{}",
+                destination
+                    .map(|d| format!(" (destination={d})"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
+    /// `capture_pcap`: queue a selective packet capture for an IP.
+    fn queue_capture_pcap(
+        &self,
+        step_id: &str,
+        args: &serde_yaml::Value,
+        primary_ip: Option<&str>,
+    ) -> StepRunResult {
+        let Some(target_ip) = str_arg(args, "target_ip").or(primary_ip) else {
+            return StepRunResult {
+                status: StepStatus::Failed,
+                message: "capture_pcap: no target IP in incident or args".to_string(),
+            };
+        };
+        self.enqueue_command(PlaybookCommand::CapturePcap {
+            step_id: step_id.to_string(),
+            target_ip: target_ip.to_string(),
+        });
+        StepRunResult {
+            status: StepStatus::Queued,
+            message: format!("capture_pcap queued for {target_ip}"),
+        }
+    }
+
+    /// `set_tag`: queue an attacker-profile tag for an IP.
+    fn queue_set_tag(
+        &self,
+        step_id: &str,
+        args: &serde_yaml::Value,
+        primary_ip: Option<&str>,
+    ) -> StepRunResult {
+        let Some(tag) = str_arg(args, "tag") else {
+            return StepRunResult {
+                status: StepStatus::Failed,
+                message: "set_tag: missing 'tag' argument".to_string(),
+            };
+        };
+        let Some(target_ip) = str_arg(args, "target_ip").or(primary_ip) else {
+            return StepRunResult {
+                status: StepStatus::Failed,
+                message: "set_tag: no target IP in incident or args".to_string(),
+            };
+        };
+        self.enqueue_command(PlaybookCommand::SetTag {
+            step_id: step_id.to_string(),
+            target_ip: target_ip.to_string(),
+            tag: tag.to_string(),
+        });
+        StepRunResult {
+            status: StepStatus::Queued,
+            message: format!("set_tag '{tag}' queued for {target_ip}"),
         }
     }
 
@@ -858,6 +936,7 @@ mod tests {
             base_incident: crate::tests::test_incident(ip),
             honeypot: skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
+            command_sink: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -960,7 +1039,7 @@ mod tests {
             serde_yaml::Value::Number(1.into()),
         );
         assert_eq!(
-            exec.dispatch_virtual("wait", &serde_yaml::Value::Mapping(w), None)
+            exec.dispatch_virtual("wait", "s", &serde_yaml::Value::Mapping(w), None)
                 .await
                 .status,
             StepStatus::Success
@@ -973,7 +1052,7 @@ mod tests {
             serde_yaml::Value::String("test.dispatch.metric".to_string()),
         );
         assert_eq!(
-            exec.dispatch_virtual("emit_metric", &serde_yaml::Value::Mapping(em), None)
+            exec.dispatch_virtual("emit_metric", "s", &serde_yaml::Value::Mapping(em), None)
                 .await
                 .status,
             StepStatus::Success
@@ -981,24 +1060,15 @@ mod tests {
 
         // block_subnet
         assert_eq!(
-            exec.dispatch_virtual("block_subnet", &subnet_args(32), Some("198.51.100.5"))
+            exec.dispatch_virtual("block_subnet", "s", &subnet_args(32), Some("198.51.100.5"))
                 .await
                 .status,
             StepStatus::Success
         );
 
-        // Phase 3b skills -> Deferred
-        for s in ["route_alert", "capture_pcap", "set_tag"] {
-            let r = exec
-                .dispatch_virtual(s, &serde_yaml::Value::Null, None)
-                .await;
-            assert_eq!(r.status, StepStatus::Deferred, "{s} should defer");
-            assert!(r.message.contains("Phase 3b"), "got: {}", r.message);
-        }
-
         // unknown virtual skill -> Failed
         let r = exec
-            .dispatch_virtual("nope", &serde_yaml::Value::Null, None)
+            .dispatch_virtual("nope", "s", &serde_yaml::Value::Null, None)
             .await;
         assert_eq!(r.status, StepStatus::Failed);
         assert!(
@@ -1006,5 +1076,94 @@ mod tests {
             "got: {}",
             r.message
         );
+    }
+
+    // ---- Phase 3b: queue commands (route_alert / capture_pcap / set_tag) -
+
+    #[tokio::test]
+    async fn route_alert_queues_command() {
+        let reg = skills::SkillRegistry::default_builtin();
+        let exec = exec_with(&reg, &[], "198.51.100.5");
+        let args = yaml(&[("destination", "pagerduty")]);
+        let r = exec
+            .dispatch_virtual("route_alert", "alert", &args, None)
+            .await;
+        assert_eq!(r.status, StepStatus::Queued, "got: {}", r.message);
+        let cmds = exec.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(
+            &cmds[0],
+            PlaybookCommand::RouteAlert { step_id, destination, .. }
+                if step_id == "alert" && destination.as_deref() == Some("pagerduty")
+        ));
+    }
+
+    #[tokio::test]
+    async fn capture_pcap_queues_with_primary_ip_fallback() {
+        let reg = skills::SkillRegistry::default_builtin();
+        let exec = exec_with(&reg, &[], "198.51.100.5");
+        // no target_ip arg -> falls back to primary_ip
+        let r = exec
+            .dispatch_virtual(
+                "capture_pcap",
+                "pcap",
+                &serde_yaml::Value::Null,
+                Some("9.9.9.9"),
+            )
+            .await;
+        assert_eq!(r.status, StepStatus::Queued, "got: {}", r.message);
+        let cmds = exec.drain_commands();
+        assert!(matches!(
+            &cmds[0],
+            PlaybookCommand::CapturePcap { target_ip, .. } if target_ip == "9.9.9.9"
+        ));
+    }
+
+    #[tokio::test]
+    async fn capture_pcap_without_ip_fails_and_queues_nothing() {
+        let reg = skills::SkillRegistry::default_builtin();
+        let exec = exec_with(&reg, &[], "198.51.100.5");
+        let r = exec
+            .dispatch_virtual("capture_pcap", "pcap", &serde_yaml::Value::Null, None)
+            .await;
+        assert_eq!(r.status, StepStatus::Failed);
+        assert!(exec.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_tag_queues_command() {
+        let reg = skills::SkillRegistry::default_builtin();
+        let exec = exec_with(&reg, &[], "198.51.100.5");
+        let args = yaml(&[("tag", "confirmed_c2"), ("target_ip", "5.5.5.5")]);
+        let r = exec.dispatch_virtual("set_tag", "tag", &args, None).await;
+        assert_eq!(r.status, StepStatus::Queued, "got: {}", r.message);
+        let cmds = exec.drain_commands();
+        assert!(matches!(
+            &cmds[0],
+            PlaybookCommand::SetTag { target_ip, tag, .. }
+                if target_ip == "5.5.5.5" && tag == "confirmed_c2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_tag_without_tag_fails() {
+        let reg = skills::SkillRegistry::default_builtin();
+        let exec = exec_with(&reg, &[], "198.51.100.5");
+        let r = exec
+            .dispatch_virtual("set_tag", "tag", &serde_yaml::Value::Null, Some("9.9.9.9"))
+            .await;
+        assert_eq!(r.status, StepStatus::Failed);
+        assert!(r.message.contains("missing 'tag'"), "got: {}", r.message);
+        assert!(exec.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_tag_without_ip_fails() {
+        let reg = skills::SkillRegistry::default_builtin();
+        let exec = exec_with(&reg, &[], "198.51.100.5");
+        let args = yaml(&[("tag", "c2")]);
+        let r = exec.dispatch_virtual("set_tag", "tag", &args, None).await;
+        assert_eq!(r.status, StepStatus::Failed);
+        assert!(r.message.contains("no target IP"), "got: {}", r.message);
     }
 }

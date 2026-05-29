@@ -80,6 +80,14 @@ pub struct AttackerProfile {
     // ── Composite risk score ──
     pub risk_score: u8, // 0–100
 
+    // ── Operator / playbook tags ──
+    /// Free-form tags applied by the SOC playbook `set_tag` virtual skill
+    /// (spec 056 Phase 3b) so downstream rules can pivot on a marked IP
+    /// (e.g. `confirmed_c2`, `repeat_offender`). `#[serde(default)]` keeps
+    /// pre-3b profiles in SQLite deserializing without a migration.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
     // ── Metadata ──
     pub profile_version: u8,
     pub updated_at: DateTime<Utc>,
@@ -182,9 +190,32 @@ pub fn new_profile(ip: &str, ts: DateTime<Utc>) -> AttackerProfile {
         mesh_peer_confirmations: 0,
         mesh_signals_received: 0,
         risk_score: 0,
+        tags: Vec::new(),
         profile_version: PROFILE_VERSION,
         updated_at: ts,
     }
+}
+
+/// Apply an operator/playbook tag to the profile for `ip`, creating the
+/// profile if it does not exist yet. Tags are deduplicated and the
+/// profile's `updated_at` is bumped. Returns `true` if the tag was newly
+/// added (i.e. not already present). Backing the SOC playbook `set_tag`
+/// virtual skill (spec 056 Phase 3b).
+pub fn tag_ip(
+    profiles: &mut HashMap<String, AttackerProfile>,
+    ip: &str,
+    tag: &str,
+    ts: DateTime<Utc>,
+) -> bool {
+    let profile = profiles
+        .entry(ip.to_string())
+        .or_insert_with(|| new_profile(ip, ts));
+    if profile.tags.iter().any(|t| t == tag) {
+        return false;
+    }
+    profile.tags.push(tag.to_string());
+    profile.updated_at = ts;
+    true
 }
 
 /// Update profile from a new incident.
@@ -1017,6 +1048,47 @@ mod tests {
         assert_eq!(p.risk_score, 0);
         assert_eq!(p.visit_count, 0);
         assert_eq!(p.dna.pattern_class, "unknown");
+        assert!(p.tags.is_empty());
+    }
+
+    #[test]
+    fn tag_ip_adds_dedups_and_creates() {
+        let mut profiles: HashMap<String, AttackerProfile> = HashMap::new();
+        let ts = Utc::now();
+        // creates the profile on first tag
+        assert!(tag_ip(&mut profiles, "9.9.9.9", "confirmed_c2", ts));
+        assert_eq!(profiles["9.9.9.9"].tags, vec!["confirmed_c2".to_string()]);
+        // second distinct tag appends
+        assert!(tag_ip(&mut profiles, "9.9.9.9", "repeat_offender", ts));
+        assert_eq!(profiles["9.9.9.9"].tags.len(), 2);
+        // duplicate tag is a no-op and returns false
+        assert!(!tag_ip(&mut profiles, "9.9.9.9", "confirmed_c2", ts));
+        assert_eq!(profiles["9.9.9.9"].tags.len(), 2);
+    }
+
+    #[test]
+    fn attacker_profile_deserializes_without_tags_field() {
+        // Pre-3b profiles persisted in SQLite have no `tags` key; serde
+        // default must fill it rather than fail the read.
+        let json = serde_json::json!({
+            "ip": "1.1.1.1",
+            "geo": null, "abuseipdb_score": null, "crowdsec_listed": false, "is_tor": false,
+            "first_seen": "2026-01-01T00:00:00Z", "last_seen": "2026-01-01T00:00:00Z",
+            "visit_count": 0, "visit_dates": [], "total_days_active": 0,
+            "detectors_triggered": [], "mitre_techniques": [], "max_severity": "info",
+            "total_incidents": 0, "total_events": 0, "total_decisions": 0, "total_blocks": 0,
+            "total_honeypot_diversions": 0, "total_monitors": 0, "honeypot_sessions": 0,
+            "credentials_attempted": [], "commands_executed": [],
+            "iocs": {"ips": [], "domains": [], "urls": [], "categories": []},
+            "dna": {"hash": "", "hour_distribution": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                    "target_users": [], "target_ports": [], "tool_signatures": [],
+                    "inter_visit_intervals": [], "pattern_class": "unknown"},
+            "shield_blocks": 0, "shield_escalation_hits": 0, "shield_last_blocked": null,
+            "mesh_peer_confirmations": 0, "mesh_signals_received": 0, "risk_score": 0,
+            "profile_version": PROFILE_VERSION, "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let p: AttackerProfile = serde_json::from_value(json).expect("must deserialize");
+        assert!(p.tags.is_empty());
     }
 
     #[test]

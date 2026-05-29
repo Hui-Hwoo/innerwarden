@@ -38,6 +38,7 @@
 //! the module level keeps the API discoverable while Phase 2 catches up.
 #![allow(dead_code)]
 
+pub(crate) mod commands;
 pub mod executor;
 mod virtual_skills;
 

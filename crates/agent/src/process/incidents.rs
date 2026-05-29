@@ -583,7 +583,7 @@ pub(crate) async fn process_incidents(
         // the helper, so this call is a cheap no-op until an operator opts in.
         // Matching playbooks execute through the same skill_gate floor the AI
         // path uses; the AI router sees the outcome as context (Phase 4).
-        let _playbook_outcomes = crate::playbook_engine::executor::run_for_incident_if_enabled(
+        let playbook_outcomes = crate::playbook_engine::executor::run_for_incident_if_enabled(
             incident,
             cfg,
             data_dir,
@@ -591,6 +591,20 @@ pub(crate) async fn process_incidents(
             super::post_decision::honeypot_runtime(cfg),
             state.ai_router.any_llm(),
             state.sqlite_store.clone(),
+        )
+        .await;
+        // Spec 056 Phase 3b: drain the side effects the playbook queued
+        // (route_alert / capture_pcap / set_tag) against `&mut AgentState`
+        // here, where the loop holds the state the executor could not. The
+        // borrow of `state` inside the run call above has been released by
+        // the time this runs.
+        drain_playbook_commands(
+            &playbook_outcomes,
+            incident,
+            data_dir,
+            cfg,
+            state,
+            &notification_thresholds,
         )
         .await;
 
@@ -790,6 +804,94 @@ pub(crate) async fn process_incidents(
     handled
 }
 
+/// Spec 056 Phase 3b: drain the side effects queued by a playbook run.
+///
+/// The executor (`RegistryStepExecutor`) is intentionally decoupled from
+/// `AgentState` so it stays unit-testable and `dispatch` can be `&self`.
+/// The three state-coupled virtual skills (`route_alert`, `capture_pcap`,
+/// `set_tag`) therefore enqueue a [`crate::playbook_engine::commands::PlaybookCommand`]
+/// instead of acting inline; this drain runs them here, where the loop
+/// holds `&mut AgentState`. Effects are fire-and-forget: failures are
+/// `warn!`-only (matching the notification convention) and never abort the
+/// incident tick. The "queued" audit row was already written by the
+/// executor; this logs the realised result.
+async fn drain_playbook_commands(
+    outcomes: &[crate::playbook_engine::executor::PlaybookOutcome],
+    incident: &innerwarden_core::incident::Incident,
+    data_dir: &Path,
+    cfg: &config::AgentConfig,
+    state: &mut AgentState,
+    thresholds: &incident_notifications::NotificationThresholds,
+) {
+    use crate::playbook_engine::commands::PlaybookCommand;
+    for outcome in outcomes {
+        for cmd in &outcome.commands {
+            match cmd {
+                PlaybookCommand::RouteAlert {
+                    step_id,
+                    destination,
+                    severity_override,
+                } => {
+                    // Per-rule routing (destination / severity_override) is
+                    // spec 059; until then route through the operator's
+                    // configured channels, logging the requested hints.
+                    info!(
+                        playbook = %outcome.playbook_id,
+                        step = %step_id,
+                        destination = destination.as_deref().unwrap_or("default"),
+                        severity_override = severity_override.as_deref().unwrap_or(""),
+                        "playbook route_alert: dispatching notifications"
+                    );
+                    incident_notifications::dispatch_incident_notifications(
+                        incident, data_dir, cfg, state, thresholds,
+                    )
+                    .await;
+                }
+                PlaybookCommand::CapturePcap { step_id, target_ip } => {
+                    match state
+                        .pcap_capture
+                        .try_capture(target_ip, &incident.incident_id)
+                    {
+                        Some(res) => info!(
+                            playbook = %outcome.playbook_id,
+                            step = %step_id,
+                            ip = %target_ip,
+                            path = %res.pcap_path.display(),
+                            "playbook capture_pcap: started"
+                        ),
+                        None => warn!(
+                            playbook = %outcome.playbook_id,
+                            step = %step_id,
+                            ip = %target_ip,
+                            "playbook capture_pcap: not started (cooldown / max concurrent / tcpdump unavailable)"
+                        ),
+                    }
+                }
+                PlaybookCommand::SetTag {
+                    step_id,
+                    target_ip,
+                    tag,
+                } => {
+                    let added = crate::attacker_intel::tag_ip(
+                        &mut state.attacker_profiles,
+                        target_ip,
+                        tag,
+                        chrono::Utc::now(),
+                    );
+                    info!(
+                        playbook = %outcome.playbook_id,
+                        step = %step_id,
+                        ip = %target_ip,
+                        tag = %tag,
+                        added,
+                        "playbook set_tag: applied (persisted on next intel consolidation)"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Spec 043 Phase 7 wiring — generic KG-based FP suppression. Runs
 /// AFTER the targeted self-traffic-FP and CDN-noise paths so those
 /// keep their narrow audit-trail reasons. This is the catch-all:
@@ -948,6 +1050,62 @@ mod tests {
             process_incidents(dir.path(), &mut cursor, &cfg, &mut state, &advisory_cache()).await;
 
         assert_eq!(handled, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_playbook_commands_applies_set_tag_and_handles_pcap_and_alert() {
+        use crate::playbook_engine::commands::PlaybookCommand;
+        use crate::playbook_engine::executor::PlaybookOutcome;
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+        let incident = crate::tests::test_incident("9.9.9.9");
+        let thresholds = incident_notifications::compute_notification_thresholds(&cfg, &state);
+
+        let outcome = PlaybookOutcome {
+            playbook_id: "pb-test".to_string(),
+            steps: vec![],
+            aborted: false,
+            commands: vec![
+                PlaybookCommand::SetTag {
+                    step_id: "tag".to_string(),
+                    target_ip: "9.9.9.9".to_string(),
+                    tag: "confirmed_c2".to_string(),
+                },
+                // Internal IP -> try_capture returns None before spawning
+                // tcpdump, exercising the warn branch deterministically.
+                PlaybookCommand::CapturePcap {
+                    step_id: "pcap".to_string(),
+                    target_ip: "10.0.0.5".to_string(),
+                },
+                // No notification clients configured in the test state ->
+                // dispatch is a safe no-op.
+                PlaybookCommand::RouteAlert {
+                    step_id: "alert".to_string(),
+                    destination: Some("pagerduty".to_string()),
+                    severity_override: None,
+                },
+            ],
+        };
+
+        drain_playbook_commands(
+            std::slice::from_ref(&outcome),
+            &incident,
+            dir.path(),
+            &cfg,
+            &mut state,
+            &thresholds,
+        )
+        .await;
+
+        // set_tag landed in the in-memory attacker profile map.
+        let tags = state
+            .attacker_profiles
+            .get("9.9.9.9")
+            .map(|p| p.tags.clone())
+            .unwrap_or_default();
+        assert_eq!(tags, vec!["confirmed_c2".to_string()]);
     }
 
     #[tokio::test]

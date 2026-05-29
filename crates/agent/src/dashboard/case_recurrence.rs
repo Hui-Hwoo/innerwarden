@@ -215,6 +215,7 @@ mod tests {
             mesh_peer_confirmations: 0,
             mesh_signals_received: 0,
             risk_score: 0,
+            tags: Vec::new(),
             profile_version: 1,
             updated_at: Utc::now(),
         }

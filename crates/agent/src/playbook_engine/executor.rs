@@ -28,9 +28,12 @@
 //! Virtual skills wrap existing agent capabilities behind a uniform skill
 //! surface (see [`super::virtual_skills`]). Phase 3a implements the four
 //! that need nothing beyond what [`RegistryStepExecutor`] already carries
-//! (`wait`, `emit_metric`, `block_subnet`, `open_ticket`). The three that
-//! need `&mut AgentState` subsystems (`route_alert`, `capture_pcap`,
-//! `set_tag`) still return [`StepStatus::Deferred`] until Phase 3b.
+//! (`wait`, `emit_metric`, `block_subnet`, `open_ticket`). Phase 3b adds
+//! the three that touch `&mut AgentState` subsystems (`route_alert`,
+//! `capture_pcap`, `set_tag`): they enqueue a
+//! [`super::commands::PlaybookCommand`] and return [`StepStatus::Queued`];
+//! the incident loop drains the commands against `AgentState` after the
+//! run (the "command channel" design).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -70,8 +73,14 @@ pub enum StepStatus {
     Refused,
     /// The step's post-trigger `condition` evaluated false.
     Skipped,
-    /// Virtual skill not implemented until Phase 3.
+    /// Virtual skill not implemented yet (the Phase-3b skills before their
+    /// drain wiring; nothing currently returns this in prod).
     Deferred,
+    /// Phase-3b virtual skill: the side effect was accepted and a
+    /// [`super::commands::PlaybookCommand`] was queued for the incident
+    /// loop to execute against `&mut AgentState` after the playbook
+    /// finishes. Not retriable, not a failure.
+    Queued,
 }
 
 impl StepStatus {
@@ -82,6 +91,7 @@ impl StepStatus {
             StepStatus::Refused => "refused",
             StepStatus::Skipped => "skipped",
             StepStatus::Deferred => "deferred",
+            StepStatus::Queued => "queued",
         }
     }
 
@@ -113,6 +123,11 @@ pub struct PlaybookOutcome {
     pub steps: Vec<StepOutcome>,
     /// `true` if an `on_error: abort` step failed and halted the run.
     pub aborted: bool,
+    /// Phase-3b side effects queued during the run, drained by the
+    /// incident loop against `&mut AgentState` after the playbook finishes.
+    /// Empty for the mock executor + every Phase-2/3a-only run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) commands: Vec<super::commands::PlaybookCommand>,
 }
 
 impl PlaybookOutcome {
@@ -125,6 +140,7 @@ impl PlaybookOutcome {
             ("refused", StepStatus::Refused),
             ("skipped", StepStatus::Skipped),
             ("deferred", StepStatus::Deferred),
+            ("queued", StepStatus::Queued),
         ]
         .iter()
         .filter_map(|(label, st)| {
@@ -156,6 +172,9 @@ pub struct StepRunResult {
 /// A single resolved skill invocation handed to a [`StepExecutor`].
 pub struct DispatchCall<'a> {
     pub skill: &'a str,
+    /// Owning step id, carried so a Phase-3b virtual skill can stamp the
+    /// queued [`super::commands::PlaybookCommand`] for audit / logging.
+    pub step_id: &'a str,
     /// Args after `{trigger.X}` / `{prev.id.field}` interpolation.
     pub args: &'a serde_yaml::Value,
     pub primary_ip: Option<&'a str>,
@@ -201,6 +220,25 @@ pub struct RegistryStepExecutor<'a> {
     pub base_incident: Incident,
     pub honeypot: skills::HoneypotRuntimeConfig,
     pub ai_provider: Option<Arc<dyn ai::AiProvider>>,
+    /// Phase-3b command collector. `dispatch` is `&self` and parallel
+    /// steps run concurrently, so the sink is an interior-mutable
+    /// `Mutex<Vec<_>>`. Drained by [`Self::drain_commands`] after the run.
+    pub(crate) command_sink: std::sync::Mutex<Vec<super::commands::PlaybookCommand>>,
+}
+
+impl RegistryStepExecutor<'_> {
+    /// Queue a Phase-3b side effect for post-run draining.
+    pub(crate) fn enqueue_command(&self, cmd: super::commands::PlaybookCommand) {
+        self.command_sink
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(cmd);
+    }
+
+    /// Take every queued command, leaving the sink empty.
+    pub(crate) fn drain_commands(&self) -> Vec<super::commands::PlaybookCommand> {
+        std::mem::take(&mut self.command_sink.lock().unwrap_or_else(|p| p.into_inner()))
+    }
 }
 
 impl StepExecutor for RegistryStepExecutor<'_> {
@@ -213,7 +251,7 @@ impl StepExecutor for RegistryStepExecutor<'_> {
 
             if is_virtual_skill(skill) {
                 return self
-                    .dispatch_virtual(skill, call.args, call.primary_ip)
+                    .dispatch_virtual(skill, call.step_id, call.args, call.primary_ip)
                     .await;
             }
 
@@ -711,6 +749,10 @@ pub async fn execute(
         playbook_id: pb_id.to_string(),
         steps: outcomes,
         aborted,
+        // Populated by `run_for_incident` from the concrete executor's
+        // command sink; `execute` is generic over `&dyn StepExecutor` and
+        // cannot reach it, so the mock-executor path leaves this empty.
+        commands: Vec::new(),
     }
 }
 
@@ -754,6 +796,7 @@ async fn run_leaf(
         attempt += 1;
         let call = DispatchCall {
             skill: &leaf.skill,
+            step_id: leaf.id.as_str(),
             args: &args,
             primary_ip: tctx.primary_ip.as_deref(),
             primary_user: tctx.primary_user.as_deref(),
@@ -1079,17 +1122,22 @@ pub(crate) async fn run_for_incident(
             base_incident: incident.clone(),
             honeypot: honeypot.clone(),
             ai_provider: ai_provider.clone(),
+            command_sink: std::sync::Mutex::new(Vec::new()),
         };
         let audit = FileAudit {
             data_dir: data_dir.to_path_buf(),
             store: store.clone(),
             dry_run,
         };
-        let outcome = execute(pb, incident, &exec, &audit).await;
+        let mut outcome = execute(pb, incident, &exec, &audit).await;
+        // Phase 3b: lift the queued side effects onto the outcome so the
+        // incident loop can drain them against `&mut AgentState`.
+        outcome.commands = exec.drain_commands();
         info!(
             playbook = pb.metadata.id.as_str(),
             steps = outcome.steps.len(),
             aborted = outcome.aborted,
+            commands = outcome.commands.len(),
             "playbook executed for incident"
         );
         outcomes.push(outcome);
@@ -1433,6 +1481,7 @@ mod tests {
             base_incident: crate::tests::test_incident("203.0.113.7"),
             honeypot: skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
+            command_sink: std::sync::Mutex::new(Vec::new()),
         };
         let mut l = leaf("tarpit", "block_ip_xdp");
         let mut args = serde_yaml::Mapping::new();
@@ -1470,6 +1519,7 @@ mod tests {
             base_incident: crate::tests::test_incident("198.51.100.9"),
             honeypot: skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
+            command_sink: std::sync::Mutex::new(Vec::new()),
         };
         let l = leaf("tarpit", "block_ip_ufw");
         let pb = playbook("pb", vec![Step::Leaf(l)]);
@@ -1486,7 +1536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn virtual_skill_is_deferred() {
+    async fn virtual_skill_3b_is_queued() {
         let registry = skills::SkillRegistry::default_builtin();
         let exec = RegistryStepExecutor {
             registry: &registry,
@@ -1497,6 +1547,7 @@ mod tests {
             base_incident: crate::tests::test_incident("198.51.100.9"),
             honeypot: skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
+            command_sink: std::sync::Mutex::new(Vec::new()),
         };
         let pb = playbook("pb", vec![Step::Leaf(leaf("p", "route_alert"))]);
         let audit = CollectAudit::default();
@@ -1507,7 +1558,10 @@ mod tests {
             &audit,
         )
         .await;
-        assert_eq!(out.steps[0].status, StepStatus::Deferred);
+        // Phase 3b: the step is Queued and a command lands in the sink for
+        // the incident loop to drain (execute() does not drain it itself).
+        assert_eq!(out.steps[0].status, StepStatus::Queued);
+        assert_eq!(exec.drain_commands().len(), 1);
     }
 
     // ---- matching -------------------------------------------------------
@@ -1677,6 +1731,7 @@ mod tests {
                 mk("c", StepStatus::Refused),
             ],
             aborted: true,
+            commands: Vec::new(),
         };
         let s = out.summary();
         assert!(s.contains("pb (aborted)"), "got: {s}");
@@ -1690,6 +1745,7 @@ mod tests {
         assert_eq!(StepStatus::Refused.as_str(), "refused");
         assert_eq!(StepStatus::Skipped.as_str(), "skipped");
         assert_eq!(StepStatus::Deferred.as_str(), "deferred");
+        assert_eq!(StepStatus::Queued.as_str(), "queued");
     }
 
     fn registry_exec<'a>(
@@ -1706,6 +1762,7 @@ mod tests {
             base_incident: crate::tests::test_incident(ip),
             honeypot: skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
+            command_sink: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1740,6 +1797,7 @@ mod tests {
             base_incident: inc.clone(),
             honeypot: skills::HoneypotRuntimeConfig::default(),
             ai_provider: None,
+            command_sink: std::sync::Mutex::new(Vec::new()),
         };
         let pb = playbook("pb", vec![Step::Leaf(leaf("a", "block_ip_xdp"))]);
         let audit = CollectAudit::default();
