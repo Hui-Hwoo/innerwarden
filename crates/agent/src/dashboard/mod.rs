@@ -28,6 +28,7 @@ mod helpers;
 mod intelligence;
 mod investigation;
 mod live_feed;
+mod playbooks;
 mod push;
 mod sensors;
 mod sse;
@@ -732,6 +733,7 @@ pub async fn serve(
         .route("/api/campaigns", get(api_campaigns))
         .route("/api/correlation-chains", get(api_correlation_chains))
         .route("/api/baseline-status", get(api_baseline_status))
+        .route("/api/playbooks", get(playbooks::api_playbooks))
         .route("/api/graph/stats", get(api_graph_stats))
         .route("/api/graph/view", get(api_graph_view))
         .route("/api/graph/neighborhood", get(api_graph_neighborhood))
