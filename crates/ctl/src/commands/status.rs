@@ -130,15 +130,15 @@ pub(crate) fn cmd_status_global(
     } else {
         println!("  ○ AI analysis     disabled");
     }
-    if responder_enabled {
-        let mode = if dry_run {
-            "dry-run (observe only)"
-        } else {
-            "live (executing actions)"
-        };
-        println!("  ● Responder       active  ({mode})");
-    } else {
-        println!("  ○ Responder       disabled");
+    // Single source of truth for "is the agent actually acting?": the
+    // posture headline + CTA are shared with the agent boot log and the
+    // installer, so the operator reads the same sentence everywhere.
+    let posture =
+        innerwarden_core::policy::EnforcementPosture::from_responder(responder_enabled, dry_run);
+    let indicator = if posture.is_enforcing() { "●" } else { "○" };
+    println!("  {indicator} Responder       {}", posture.headline());
+    if let Some(cta) = posture.cta() {
+        println!("      {cta}");
     }
 
     println!("\nCapabilities");
@@ -657,6 +657,34 @@ mod tests {
 
         let registry = CapabilityRegistry::default_all();
         cmd_status_global(&cli, &registry, &modules_dir).expect("global status should render");
+    }
+
+    #[test]
+    fn cmd_status_global_renders_monitor_only_posture_when_responder_disabled() {
+        // Exercises the non-enforcing branch (responder disabled -> the
+        // posture CTA line is printed), the default a fresh install ships.
+        let temp = TempDir::new().expect("tempdir");
+        let cli = test_cli(&temp);
+        let data_dir = temp.path().join("status-data");
+        write_file(
+            &cli.agent_config,
+            &format!(
+                "[output]\ndata_dir = \"{}\"\n[ai]\nenabled = false\nprovider = \"ollama\"\n[responder]\nenabled = false\ndry_run = true\n",
+                data_dir.display()
+            ),
+        );
+        write_file(
+            &cli.sensor_config,
+            "[collectors.exec_audit]\nenabled = true\n",
+        );
+        let modules_dir = temp.path().join("modules");
+        std::fs::create_dir_all(&modules_dir).expect("modules dir");
+
+        let registry = CapabilityRegistry::default_all();
+        // Asserts the disabled-responder path renders without panicking; the
+        // posture wording itself is unit-tested in innerwarden_core.
+        cmd_status_global(&cli, &registry, &modules_dir)
+            .expect("global status should render in monitor-only mode");
     }
 
     #[test]

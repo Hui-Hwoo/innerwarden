@@ -1,6 +1,9 @@
 use crate::incident::Incident;
 use crate::signal::Signal;
 
+pub mod enforcement;
+pub use enforcement::EnforcementPosture;
+
 #[derive(Debug, Default)]
 pub struct PolicyDecision {
     pub ignore: bool,

@@ -515,6 +515,25 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     );
     info!(router = %ai_router.describe(), "AI router ready");
 
+    // Enforcement posture: make "is this agent actually defending the host,
+    // or only watching?" explicit in the boot log. A fresh install ships
+    // monitor-only by design; operators tailing journald should not have to
+    // reverse-engineer that from two scattered `[responder]` flags.
+    let posture = innerwarden_core::policy::EnforcementPosture::from_responder(
+        cfg.responder.enabled,
+        cfg.responder.dry_run,
+    );
+    if posture.is_enforcing() {
+        info!(posture = posture.tag(), "{}", posture.headline());
+    } else {
+        warn!(
+            posture = posture.tag(),
+            "{} {}",
+            posture.headline(),
+            posture.cta().unwrap_or("")
+        );
+    }
+
     // Fleet (MSSP multi-host) — spec 038 Phase 1. The state cache is
     // pre-seeded with the configured host roster so the very first
     // `/api/fleet/hosts` call after boot returns the shape, not an

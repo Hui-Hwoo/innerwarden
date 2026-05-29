@@ -912,10 +912,12 @@ enabled = ${AI_ENABLED}
 provider = "${AI_PROVIDER}"
 model = "${AI_MODEL}"
 context_events = 20
-# confidence_threshold: minimum confidence for auto-execution (0.0–1.0).
-# 1.01 means AI runs and logs decisions but never auto-executes - safe for trial.
-# Lower to 0.8 when you are ready to enable autonomous response.
-confidence_threshold = 1.01
+# confidence_threshold: minimum AI confidence (0.0-1.0) for auto-execution.
+# Trial safety comes from `[responder] enabled = false` below, NOT from this
+# value. The agent clamps any threshold > 1.0 back to the 0.85 default on load
+# (a >1.0 "never executes" sentinel once silently disabled ALL autonomous
+# response, because AI confidence is always in [0.0, 1.0]).
+confidence_threshold = 0.85
 incident_poll_secs = 2
 # base_url = "http://localhost:11434"  # Ollama only - override endpoint
 
@@ -1302,3 +1304,16 @@ else
   vlog "No TTY detected (headless install) - skipping interactive setup."
   vlog "Run 'sudo innerwarden setup' later to configure AI provider / notifications."
 fi
+
+# Make the enforcement posture explicit. The agent ships safe-by-default
+# (responder disabled), so it WATCHES but does not block. Operators kept
+# missing this and wondered why "the self-defending agent" never acted.
+# This wording mirrors EnforcementPosture::cta() in crates/core so the CLI,
+# the boot log, and this installer all say the same thing.
+echo ""
+echo "  InnerWarden is running in MONITOR-ONLY mode: it watches and alerts,"
+echo "  but takes NO action on threats yet (the safe default)."
+echo "  To enable autonomous response, set \`[responder] enabled = true\`"
+echo "  (and \`dry_run = false\`) in ${AGENT_CONFIG} and restart innerwarden-agent."
+echo "  Check posture any time with: innerwarden get status"
+echo ""
