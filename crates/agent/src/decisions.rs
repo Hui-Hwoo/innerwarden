@@ -251,6 +251,22 @@ fn open_or_create(data_dir: &Path, date: &str) -> Result<File> {
         .with_context(|| format!("failed to open {}", path.display()))
 }
 
+/// Count decision entries in `decisions-<date>.jsonl` (one per line). The
+/// CANONICAL "how many decisions did the agent make on <date>" — used by
+/// the daily briefing. Reads the persisted log, so it is restart-robust,
+/// unlike `bot_helpers::graph_count(kg, "decisions")` which counts
+/// in-memory KG Incident nodes that still carry an attached decision and
+/// collapses toward 0 after a reboot (the KG is rebuilt from incidents,
+/// not decisions). Missing file -> 0. (NUMBER_CONSISTENCY: "decisions
+/// made today".)
+pub fn count_decisions_for_date(data_dir: &Path, date: &str) -> usize {
+    let path = data_dir.join(format!("decisions-{date}.jsonl"));
+    match std::fs::read_to_string(&path) {
+        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
+        Err(_) => 0,
+    }
+}
+
 /// Standalone hash-chained append for code paths that don't own a `DecisionWriter`
 /// (e.g. the always-on honeypot task). Routes through [`append_chained_locked`]
 /// so it shares the file-level flock with `DecisionWriter::write`.
@@ -541,6 +557,20 @@ pub fn build_entry(
 mod tests {
     use super::*;
     use crate::ai::AiAction;
+
+    #[test]
+    fn count_decisions_for_date_counts_lines_and_handles_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file -> 0 (not an error).
+        assert_eq!(count_decisions_for_date(dir.path(), "2026-05-13"), 0);
+        // Three non-empty lines (+ a blank line that must not count).
+        std::fs::write(
+            dir.path().join("decisions-2026-05-13.jsonl"),
+            "{\"a\":1}\n{\"a\":2}\n\n{\"a\":3}\n",
+        )
+        .unwrap();
+        assert_eq!(count_decisions_for_date(dir.path(), "2026-05-13"), 3);
+    }
 
     #[test]
     fn test_build_entry_block_ip() {

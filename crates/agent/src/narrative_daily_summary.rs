@@ -4,7 +4,7 @@ use std::path::Path;
 use chrono::Timelike as _;
 use tracing::{info, warn};
 
-use crate::{bot_helpers, config, narrative, telegram, AgentState};
+use crate::{config, narrative, telegram, AgentState};
 
 /// Regenerate daily markdown summary and send Telegram digest when due.
 pub(crate) async fn maybe_write_daily_summary_and_digest(
@@ -66,7 +66,7 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                     let already_sent = state.last_daily_summary_telegram == Some(today_naive);
                     if !already_sent && now_local.hour() >= u32::from(hour) {
                         if let Some(tg) = state.telegram_client.clone() {
-                            let text = build_daily_digest_text(cfg, state);
+                            let text = build_daily_digest_text(cfg, state, data_dir, today);
                             match tg.send_text_message(&text).await {
                                 Ok(()) => {
                                     state.last_daily_summary_telegram = Some(today_naive);
@@ -91,7 +91,12 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
     }
 }
 
-fn build_daily_digest_text(cfg: &config::AgentConfig, state: &mut AgentState) -> String {
+fn build_daily_digest_text(
+    cfg: &config::AgentConfig,
+    state: &mut AgentState,
+    data_dir: &Path,
+    today: &str,
+) -> String {
     let is_simple = cfg.telegram.is_simple_profile();
     // Count incidents by severity and top detector.
     let mut incidents_today: u32 = 0;
@@ -115,7 +120,13 @@ fn build_daily_digest_text(cfg: &config::AgentConfig, state: &mut AgentState) ->
         }
         *detector_counts.entry(det.to_string()).or_insert(0) += 1;
     }
-    let blocks_today = bot_helpers::graph_count(&state.knowledge_graph, "decisions") as u32;
+    // "Autonomous decisions" = the count of decisions the agent actually
+    // recorded today, read from the canonical hash-chained decisions log
+    // (NUMBER_CONSISTENCY: "decisions made today"). Previously this read
+    // `graph_count(kg, "decisions")` — an in-memory KG count that collapses
+    // toward 0 after a restart (and showed "Made 0 autonomous decisions"
+    // in prod while the log held 726). The log is restart-robust.
+    let decisions_today = crate::decisions::count_decisions_for_date(data_dir, today) as u32;
     let (top_detector, top_count) = detector_counts
         .iter()
         .max_by_key(|(_, c)| *c)
@@ -127,7 +138,7 @@ fn build_daily_digest_text(cfg: &config::AgentConfig, state: &mut AgentState) ->
     deferred.sort_by(|a, b| b.1.cmp(&a.1));
     telegram::format_daily_digest_enriched(
         incidents_today,
-        blocks_today,
+        decisions_today,
         critical_count,
         high_count,
         top_detector,
@@ -210,13 +221,37 @@ mod tests {
             .telegram_deferred
             .insert("ssh_bruteforce".to_string(), 2);
 
-        let text = build_daily_digest_text(&cfg, &mut state);
+        let text = build_daily_digest_text(&cfg, &mut state, dir.path(), "2026-05-13");
 
         assert!(text.contains("Incidents: 2"));
         assert!(text.contains("Critical: 1 | High: 1"));
         assert!(text.contains("Deferred:"));
         assert!(text.contains("port_scan=4"));
         assert!(state.telegram_deferred.is_empty());
+    }
+
+    #[test]
+    fn digest_autonomous_decisions_reads_canonical_log_not_kg() {
+        // Regression for the 2026-05-29 operator report: the briefing showed
+        // "Made 0 autonomous decisions" while decisions-<date>.jsonl held 726
+        // (the number was read from the restart-fragile KG, not the log).
+        let dir = TempDir::new().expect("tempdir");
+        let mut cfg = cfg_with_narrative();
+        cfg.telegram.user_profile = "simple".to_string(); // enriched briefing
+        let mut state = crate::tests::triage_test_state(dir.path());
+        // Five real decisions persisted for the day; the KG stays empty.
+        let line = r#"{"ts":"2026-05-13T00:00:00Z","incident_id":"i","host":"h","ai_provider":"x","action_type":"block_ip","confidence":1.0,"auto_executed":true,"dry_run":false,"reason":"r","estimated_threat":"high","execution_result":"ok"}"#;
+        std::fs::write(
+            dir.path().join("decisions-2026-05-13.jsonl"),
+            format!("{line}\n{line}\n{line}\n{line}\n{line}\n"),
+        )
+        .unwrap();
+
+        let text = build_daily_digest_text(&cfg, &mut state, dir.path(), "2026-05-13");
+        assert!(
+            text.contains("Made <b>5</b> autonomous decisions"),
+            "briefing must reflect the 5 decisions in the log, got: {text}"
+        );
     }
 }
 
