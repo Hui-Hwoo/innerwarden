@@ -185,6 +185,15 @@ enum Command {
         command: RuleCommand,
     },
 
+    /// SOC playbook tools (spec 056).
+    ///
+    /// Examples:
+    ///   innerwarden playbook test pb-data-exfil-default --incident-file last.jsonl
+    Playbook {
+        #[command(subcommand)]
+        command: PlaybookCommand,
+    },
+
     /// Module management commands
     Module {
         #[command(subcommand)]
@@ -1081,6 +1090,37 @@ enum RuleCommand {
         /// Write output to file instead of stdout
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaybookCommand {
+    /// Dry-run a playbook against a captured incident (no skills fire, no
+    /// audit written). Talks to the running agent's dashboard API.
+    ///
+    /// Examples:
+    ///   innerwarden playbook test pb-data-exfil-default --incident-file last.jsonl
+    ///   innerwarden playbook test pb-x -f inc.json --url http://10.0.0.5:8787 --user admin --password s3cret
+    Test {
+        /// Playbook ID (e.g. pb-data-exfil-default)
+        id: String,
+
+        /// Path to a captured incident: a JSON object or a line copied
+        /// from incidents-<date>.jsonl (first non-empty line is used).
+        #[arg(long, short = 'f')]
+        incident_file: PathBuf,
+
+        /// Dashboard base URL (default http://127.0.0.1:8787).
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Basic-auth user (or INNERWARDEN_DASHBOARD_USER).
+        #[arg(long)]
+        user: Option<String>,
+
+        /// Basic-auth password (or INNERWARDEN_DASHBOARD_PASSWORD).
+        #[arg(long)]
+        password: Option<String>,
     },
 }
 
@@ -2580,6 +2620,21 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 ref input,
                 ref output,
             } => commands::rule::cmd_migrate_allowlist(input, output.as_deref()),
+        },
+        Command::Playbook { ref command } => match command {
+            PlaybookCommand::Test {
+                ref id,
+                ref incident_file,
+                ref url,
+                ref user,
+                ref password,
+            } => commands::playbook::cmd_playbook_test(
+                id,
+                incident_file,
+                url.as_deref(),
+                user.as_deref(),
+                password.as_deref(),
+            ),
         },
         Command::Module { ref command } => dispatch_module(&cli, command),
         Command::Agent { ref command } => commands::agent::cmd_agent(&cli, command.as_ref()),
