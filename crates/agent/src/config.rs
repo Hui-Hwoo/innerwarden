@@ -2217,6 +2217,15 @@ pub struct PlaybooksConfig {
     /// `/etc/innerwarden/rules/playbooks`.
     #[serde(default = "default_playbooks_dir")]
     pub rules_dir: String,
+    /// Shadow mode. When true (and `enabled`), matching playbooks run for
+    /// their audit trail ONLY — skills never fire and Phase-3b side effects
+    /// (route_alert / capture_pcap / set_tag) are logged but not performed —
+    /// REGARDLESS of `[responder] dry_run`. Lets an operator validate new
+    /// playbooks on a live host (where the AI/decision path keeps blocking
+    /// for real) without the unproven playbook engine touching anything.
+    /// Default `false`.
+    #[serde(default)]
+    pub shadow: bool,
 }
 
 fn default_playbooks_dir() -> String {
@@ -2228,6 +2237,7 @@ impl Default for PlaybooksConfig {
         Self {
             enabled: false,
             rules_dir: default_playbooks_dir(),
+            shadow: false,
         }
     }
 }

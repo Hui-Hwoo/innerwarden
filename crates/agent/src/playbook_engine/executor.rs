@@ -1088,6 +1088,11 @@ pub(crate) async fn run_for_incident_if_enabled(
     if !cfg.playbooks.enabled {
         return Vec::new();
     }
+    // Shadow mode forces dry_run even when the responder is live-blocking,
+    // so a new playbook can be validated on a real host without firing
+    // skills. The Phase-3b command drain is separately suppressed in shadow
+    // (see `process::incidents::drain_playbook_commands`).
+    let dry_run = cfg.responder.dry_run || cfg.playbooks.shadow;
     run_for_incident(
         incident,
         Path::new(&cfg.playbooks.rules_dir),
@@ -1095,7 +1100,7 @@ pub(crate) async fn run_for_incident_if_enabled(
         registry,
         &cfg.allowlist.trusted_ips,
         &[], // asset_tags: spec 058 server-profiles will populate this
-        cfg.responder.dry_run,
+        dry_run,
         honeypot,
         ai_provider,
         store,
@@ -2175,6 +2180,50 @@ mod tests {
             some.iter()
                 .any(|o| o.playbook_id == "pb-credential-stuffing-default"),
             "expected credential builtin to run: {some:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_forces_dry_run_even_when_responder_is_live() {
+        // Responder is LIVE (dry_run=false) but shadow=true must force the
+        // executor into dry_run, so the credential builtin's block_ip_xdp
+        // step reports dry-run Success instead of a real (failing, no XDP
+        // map in test) firewall attempt. This is the safety property that
+        // lets shadow validation run on a live-blocking host.
+        let reg = skills::SkillRegistry::default_builtin();
+        let dir = tempfile::tempdir().unwrap();
+        let inc = crate::tests::test_incident("198.51.100.42");
+        let mut cfg: crate::config::AgentConfig = toml::from_str("").unwrap();
+        cfg.responder.dry_run = false; // live
+        cfg.playbooks.enabled = true;
+        cfg.playbooks.shadow = true; // but shadow
+        cfg.playbooks.rules_dir = dir.path().join("no-such").to_string_lossy().to_string();
+
+        let out = run_for_incident_if_enabled(
+            &inc,
+            &cfg,
+            dir.path(),
+            &reg,
+            skills::HoneypotRuntimeConfig::default(),
+            None,
+            None,
+        )
+        .await;
+        let cred = out
+            .iter()
+            .find(|o| o.playbook_id == "pb-credential-stuffing-default")
+            .expect("credential builtin ran");
+        let block = cred
+            .steps
+            .iter()
+            .find(|s| s.step_id == "block_long")
+            .expect("block step present");
+        assert_eq!(
+            block.status,
+            StepStatus::Success,
+            "shadow must dry-run the block (got {:?}: {})",
+            block.status,
+            block.message
         );
     }
 

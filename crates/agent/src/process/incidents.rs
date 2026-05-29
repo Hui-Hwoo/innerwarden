@@ -831,8 +831,18 @@ async fn drain_playbook_commands(
     thresholds: &incident_notifications::NotificationThresholds,
 ) {
     use crate::playbook_engine::commands::PlaybookCommand;
+    // Shadow mode: observe + log what the queued side effects WOULD do, but
+    // never actually notify / capture / tag. Pairs with the executor's
+    // forced dry_run so a shadow run touches nothing on a live host.
+    let shadow = cfg.playbooks.shadow;
     for outcome in outcomes {
         for cmd in &outcome.commands {
+            if shadow {
+                // Single-line log: a multi-line tracing macro splits across
+                // physical lines that tarpaulin mis-attributes as uncovered.
+                info!(command = %cmd.kind(), "playbook shadow: side effect suppressed");
+                continue;
+            }
             match cmd {
                 PlaybookCommand::RouteAlert {
                     step_id,
@@ -1113,6 +1123,46 @@ mod tests {
             .map(|p| p.tags.clone())
             .unwrap_or_default();
         assert_eq!(tags, vec!["confirmed_c2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drain_playbook_commands_shadow_suppresses_side_effects() {
+        use crate::playbook_engine::commands::PlaybookCommand;
+        use crate::playbook_engine::executor::PlaybookOutcome;
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.playbooks.shadow = true; // shadow: log-only, no real effects
+        let incident = crate::tests::test_incident("9.9.9.9");
+        let thresholds = incident_notifications::compute_notification_thresholds(&cfg, &state);
+
+        let outcome = PlaybookOutcome {
+            playbook_id: "pb-test".to_string(),
+            steps: vec![],
+            aborted: false,
+            commands: vec![PlaybookCommand::SetTag {
+                step_id: "tag".to_string(),
+                target_ip: "9.9.9.9".to_string(),
+                tag: "confirmed_c2".to_string(),
+            }],
+        };
+
+        drain_playbook_commands(
+            std::slice::from_ref(&outcome),
+            &incident,
+            dir.path(),
+            &cfg,
+            &mut state,
+            &thresholds,
+        )
+        .await;
+
+        // Shadow: the tag must NOT have been applied to the profile map.
+        assert!(
+            state.attacker_profiles.get("9.9.9.9").is_none(),
+            "shadow mode must not mutate attacker profiles"
+        );
     }
 
     #[tokio::test]
