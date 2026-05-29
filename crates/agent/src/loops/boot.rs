@@ -476,6 +476,21 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     // so the `enabled / build-err / disabled` paths are unit-tested
     // without spinning up the rest of the agent.
     let ai_provider = build_primary_provider(&cfg.ai, &cfg.responder.block_backend);
+    // Anti-silent guard (readiness audit B5/B1 theme): a role section
+    // that names a provider but resolves inactive only happens when the
+    // operator set `enabled = false` explicitly. That is a footgun - the
+    // configured (and possibly downloaded) model is NOT used. Say so
+    // loudly instead of letting Decide quietly run on the fallback.
+    for (role, role_cfg) in [("ai.warden", &cfg.ai.classifier), ("ai.llm", &cfg.ai.llm)] {
+        if role_cfg.is_provider_set_but_disabled() {
+            warn!(
+                role,
+                provider = %role_cfg.provider,
+                "[{role}] has provider configured but `enabled = false` - this slot is NOT used; \
+                 remove `enabled = false` (or set it true) to activate the configured provider"
+            );
+        }
+    }
     let ai_router = ai::router::build_from_config(
         ai_provider.as_ref().map(Arc::clone),
         &cfg.ai.classifier,

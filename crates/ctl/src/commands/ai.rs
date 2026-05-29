@@ -615,7 +615,18 @@ pub(crate) fn cmd_install_classifier(
 /// agent's provider resolver picks the on-device Decide head on its next
 /// restart. Shared by `install-warden --configure` (headless / install.sh)
 /// and the interactive setup wizard so the two paths can never drift.
+///
+/// Emits `enabled = true` explicitly. The agent now also infers an
+/// omitted `enabled` from a non-empty `provider`
+/// (`RoleProviderConfig::is_active`), but writing the flag keeps the
+/// generated `agent.toml` self-documenting and immune to any future
+/// change in that inference. Pre-2026-05-29 this helper wrote only
+/// `provider` + `base_url`; the section then parsed with
+/// `enabled = false` and the on-device model - already downloaded and
+/// SHA-verified on disk - was silently never loaded (release-blocker
+/// B1 in the readiness audit).
 pub(crate) fn write_warden_config(agent_config: &std::path::Path, base_url: &str) -> Result<()> {
+    crate::config_editor::write_bool(agent_config, "ai.warden", "enabled", true)?;
     crate::config_editor::write_str(agent_config, "ai.warden", "provider", "local_warden")?;
     crate::config_editor::write_str(agent_config, "ai.warden", "base_url", base_url)?;
     Ok(())
@@ -655,10 +666,10 @@ fn cmd_install_classifier_with_target(
     println!("  Size:    ~{} MB", variant.approx_size_mb);
     println!();
     println!("Local Warden Model replaces the (now removed) AlphaZero defender brain.");
-    println!("The agent's `local_warden` provider activates automatically when");
-    println!("`agent.toml` has `[ai.warden].provider = \"local_warden\"` and");
-    println!("`base_url = \"{target_dir}\"`. Run `innerwarden configure ai`");
-    println!("after install to wire the slot if you have not already.");
+    println!("With `--configure` this writes `[ai.warden]` (enabled = true, provider =");
+    println!("\"local_warden\", base_url = \"{target_dir}\") so the agent loads the");
+    println!("on-device Decide head on its next restart. Without `--configure`, run");
+    println!("`innerwarden configure ai` after install to wire the slot.");
     println!();
 
     if expected_sha.starts_with("TBD") {
@@ -1320,6 +1331,13 @@ mod tests {
             agent_toml.contains("provider = \"local_warden\""),
             "agent.toml must select local_warden, got: {agent_toml}"
         );
+        // Release-blocker B1: the section MUST carry `enabled = true`,
+        // otherwise the agent parses the slot as disabled and the model
+        // is downloaded but never loaded.
+        assert!(
+            agent_toml.contains("enabled = true"),
+            "agent.toml [ai.warden] must enable the slot, got: {agent_toml}"
+        );
         assert!(agent_toml.contains(target.to_str().unwrap()));
     }
 
@@ -1330,6 +1348,10 @@ mod tests {
         write_warden_config(&agent_toml, "/var/lib/innerwarden/models/classifier")
             .expect("write [ai.warden]");
         let content = std::fs::read_to_string(&agent_toml).expect("read agent.toml");
+        assert!(
+            content.contains("enabled = true"),
+            "must enable the slot: {content}"
+        );
         assert!(content.contains("provider = \"local_warden\""));
         assert!(content.contains("/var/lib/innerwarden/models/classifier"));
     }

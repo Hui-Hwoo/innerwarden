@@ -1091,10 +1091,26 @@ pub struct AiConfig {
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RoleProviderConfig {
-    /// If false (default), this role is not configured separately
-    /// and the boot path falls back to the primary `[ai]` block.
+    /// Whether this role provides its own provider, as a tri-state:
+    ///
+    /// - `Some(true)`  - explicitly on; build the per-role provider.
+    /// - `Some(false)` - explicitly off; fall back to the primary
+    ///   `[ai]` block even if a `provider` is configured here.
+    /// - `None` (the default, i.e. the key is omitted) - INFER from
+    ///   `provider`: active when `provider` is non-empty, inactive
+    ///   otherwise.
+    ///
+    /// The inference closes a release-blocking footgun: `install.sh`
+    /// / `innerwarden setup` write `[ai.warden] provider = "local_warden"`
+    /// to wire the on-device model, but pre-2026-05-29 the writer did
+    /// NOT emit `enabled = true`, so the section parsed with
+    /// `enabled = false` and the model - already downloaded and
+    /// SHA-verified on disk - was silently never loaded. A section
+    /// that names a provider should USE that provider unless the
+    /// operator explicitly disables it. Read via [`Self::is_active`];
+    /// never branch on this field directly.
     #[serde(default)]
-    pub enabled: bool,
+    pub enabled: Option<bool>,
 
     /// Provider name. Same set of valid values as `[ai].provider`
     /// (openai, anthropic, ollama, azure_openai, local_warden /
@@ -1124,6 +1140,23 @@ pub struct RoleProviderConfig {
 }
 
 impl RoleProviderConfig {
+    /// Whether this role should build its own provider. Resolves the
+    /// tri-state `enabled` against `provider` (see the field docs):
+    /// an omitted `enabled` with a configured `provider` is active,
+    /// matching operator intent and the install/wizard write path.
+    pub fn is_active(&self) -> bool {
+        self.enabled
+            .unwrap_or_else(|| !self.provider.trim().is_empty())
+    }
+
+    /// True when a `provider` is configured but the role is inactive
+    /// because `enabled = false` was set explicitly. The boot path
+    /// surfaces this as a loud warning so a deliberately-disabled (or
+    /// accidentally-disabled) on-device model is never silent.
+    pub fn is_provider_set_but_disabled(&self) -> bool {
+        !self.provider.trim().is_empty() && !self.is_active()
+    }
+
     /// Project this role config into a full `AiConfig` shell suitable
     /// for handing to `ai::build_provider`. Reuses the defaults from
     /// `AiConfig::default()` for all knobs that are not per-role
@@ -1135,7 +1168,7 @@ impl RoleProviderConfig {
     /// slot pick it up.
     pub fn to_ai_config(&self) -> AiConfig {
         AiConfig {
-            enabled: self.enabled,
+            enabled: self.is_active(),
             provider: self.provider.clone(),
             api_key: self.api_key.clone(),
             model: self.model.clone(),
@@ -4185,7 +4218,11 @@ detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
     #[test]
     fn role_provider_config_default_is_disabled() {
         let r = RoleProviderConfig::default();
-        assert!(!r.enabled);
+        assert!(
+            r.enabled.is_none(),
+            "default leaves enabled unset (inferred)"
+        );
+        assert!(!r.is_active(), "no provider configured -> inactive");
         assert!(r.provider.is_empty());
         assert!(r.api_key.is_empty());
         assert!(r.model.is_empty());
@@ -4198,8 +4235,8 @@ detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
     #[test]
     fn ai_config_default_has_disabled_per_role_blocks() {
         let cfg = AiConfig::default();
-        assert!(!cfg.classifier.enabled);
-        assert!(!cfg.llm.enabled);
+        assert!(!cfg.classifier.is_active());
+        assert!(!cfg.llm.is_active());
     }
 
     // Spec 029 PR-C: to_ai_config maps the per-role fields into a
@@ -4208,7 +4245,7 @@ detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
     #[test]
     fn role_provider_to_ai_config_maps_fields() {
         let role = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "azure_openai".into(),
             api_key: "explicit".into(),
             model: "gpt-5.4-mini".into(),
@@ -4233,7 +4270,7 @@ detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
     #[test]
     fn role_provider_to_ai_config_preserves_empty_api_key() {
         let role = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "openai".into(),
             api_key: String::new(),
             ..Default::default()
@@ -4271,14 +4308,14 @@ api_version = "2024-12-01-preview"
         assert!(cfg.ai.enabled);
         assert_eq!(cfg.ai.provider, "stub");
 
-        assert!(cfg.ai.classifier.enabled);
+        assert!(cfg.ai.classifier.is_active());
         assert_eq!(cfg.ai.classifier.provider, "local_warden");
         assert_eq!(
             cfg.ai.classifier.base_url,
             "/var/lib/innerwarden/models/warden"
         );
 
-        assert!(cfg.ai.llm.enabled);
+        assert!(cfg.ai.llm.is_active());
         assert_eq!(cfg.ai.llm.provider, "azure_openai");
         assert_eq!(cfg.ai.llm.model, "gpt-5.4-mini");
         assert_eq!(cfg.ai.llm.api_version, "2024-12-01-preview");
@@ -4305,10 +4342,66 @@ base_url = "/var/lib/innerwarden/models/classifier"
         .unwrap();
         let cfg = load(tmp.path()).unwrap();
         assert!(
-            cfg.ai.classifier.enabled,
+            cfg.ai.classifier.is_active(),
             "legacy [ai.classifier] section must still deserialize"
         );
         assert_eq!(cfg.ai.classifier.provider, "local_classifier");
+    }
+
+    // Release-blocker B1 regression (2026-05-29): `install.sh` /
+    // `innerwarden setup` write `[ai.warden] provider = "local_warden"`
+    // WITHOUT `enabled = true`. Before the tri-state `is_active()` the
+    // section parsed with `enabled = false`, so the on-device model -
+    // downloaded and SHA-verified on disk - was silently never loaded
+    // and every fresh install ran Decide on the (often unconfigured)
+    // cloud fallback. A warden section that names a provider must be
+    // active even when `enabled` is omitted.
+    #[test]
+    fn warden_section_with_provider_but_no_enabled_is_active() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai.warden]
+provider = "local_warden"
+base_url = "/var/lib/innerwarden/models/classifier"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert!(
+            cfg.ai.classifier.enabled.is_none(),
+            "the install path does not write the enabled key"
+        );
+        assert!(
+            cfg.ai.classifier.is_active(),
+            "a [ai.warden] with a provider configured MUST activate the on-device model"
+        );
+        assert!(!cfg.ai.classifier.is_provider_set_but_disabled());
+    }
+
+    // Counterpart: an explicit `enabled = false` is respected even when
+    // a provider is configured (operator deliberately parked the model),
+    // and the boot path flags it as provider-set-but-disabled so the
+    // skip is loud, never silent.
+    #[test]
+    fn warden_section_explicitly_disabled_with_provider_stays_inactive() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai.warden]
+enabled = false
+provider = "local_warden"
+base_url = "/var/lib/innerwarden/models/classifier"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.ai.classifier.enabled, Some(false));
+        assert!(!cfg.ai.classifier.is_active());
+        assert!(
+            cfg.ai.classifier.is_provider_set_but_disabled(),
+            "boot path must be able to warn about a disabled-but-configured slot"
+        );
     }
 
     // Spec 029 PR-C: legacy `[ai]` only config is still parsed with
@@ -4329,8 +4422,8 @@ model = "legacy"
         assert_eq!(cfg.ai.provider, "stub");
         // Per-role blocks default to disabled so the boot path falls
         // back to the primary [ai] provider for both slots.
-        assert!(!cfg.ai.classifier.enabled);
-        assert!(!cfg.ai.llm.enabled);
+        assert!(!cfg.ai.classifier.is_active());
+        assert!(!cfg.ai.llm.is_active());
     }
 
     // ── Wave 9e anchors (2026-05-04) — strict schema gate ─────────────────

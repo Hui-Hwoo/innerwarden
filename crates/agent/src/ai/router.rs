@@ -225,11 +225,13 @@ impl AiRouter {
 /// is unit-testable without spinning up the whole agent.
 ///
 /// Contract:
-/// - If `role_cfg.enabled` is true, build a fresh provider from that
-///   config and put it in the slot. If the build fails, fall back to
-///   `primary` and call `on_slot_fallback` so the caller can log.
-/// - If `role_cfg.enabled` is false, use `primary` for the slot
-///   (back-compat with pre-029 configs).
+/// - If `role_cfg.is_active()` (see `RoleProviderConfig::is_active`:
+///   `enabled = true`, or `enabled` omitted with a non-empty
+///   `provider`), build a fresh provider from that config and put it
+///   in the slot. If the build fails, fall back to `primary` and call
+///   `on_slot_fallback` so the caller can log.
+/// - Otherwise use `primary` for the slot (back-compat with pre-029
+///   configs, and explicit `enabled = false`).
 /// - Same logic for both classifier and llm roles.
 /// - If both resulting slots are empty, return `AiRouter::disabled()`
 ///   instead of the `EmptyRouter` error so the agent can run in
@@ -258,12 +260,12 @@ pub fn build_from_config(
     // `provider_for`); otherwise Decide falls back to the llm slot.
     // Pass the shadow config to whichever slot will answer Decide so
     // the `differs from` guard compares against the right provider.
-    let classifier_shadow = if classifier_cfg.enabled {
+    let classifier_shadow = if classifier_cfg.is_active() {
         shadow_cfg
     } else {
         None
     };
-    let llm_shadow = if !classifier_cfg.enabled && llm_cfg.enabled {
+    let llm_shadow = if !classifier_cfg.is_active() && llm_cfg.is_active() {
         shadow_cfg
     } else {
         None
@@ -308,7 +310,7 @@ fn resolve_slot(
     on_configured: &mut impl FnMut(&'static str, &str),
     on_fallback: &mut impl FnMut(&'static str, &str, &anyhow::Error),
 ) -> Option<Arc<dyn AiProvider>> {
-    if !role_cfg.enabled {
+    if !role_cfg.is_active() {
         return primary.as_ref().map(Arc::clone);
     }
     let ai_cfg = role_cfg.to_ai_config();
@@ -715,7 +717,7 @@ mod tests {
     fn build_from_config_classifier_enabled_builds_dedicated_provider() {
         let primary = arc("primary-llm", AiCapabilities::ALL);
         let classifier_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "stub".into(),
             ..Default::default()
         };
@@ -756,6 +758,58 @@ mod tests {
         assert!(fallbacks.lock().unwrap().is_empty());
     }
 
+    // Release-blocker B1 regression (2026-05-29): the install/wizard
+    // path writes `[ai.warden] provider = "..."` with `enabled` OMITTED
+    // (parses to `enabled: None`). The classifier slot MUST still be
+    // built from that section - otherwise the on-device model is dead
+    // and Decide silently falls back to `primary`. Same evidence as the
+    // `is_active()` config test, exercised through the router build.
+    #[test]
+    fn build_from_config_classifier_provider_without_enabled_builds_dedicated_provider() {
+        let primary = arc("primary-llm", AiCapabilities::ALL);
+        let classifier_cfg = RoleProviderConfig {
+            enabled: None, // install path never writes the key
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let llm_cfg = RoleProviderConfig::default();
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+
+        let r = build_from_config(
+            Some(Arc::clone(&primary)),
+            &classifier_cfg,
+            &llm_cfg,
+            None,
+            0.85_f32,
+            "ufw",
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+
+        // The stub provider — NOT the primary — answers Decide.
+        assert_eq!(
+            r.decider().unwrap().name(),
+            "stub",
+            "a provider-set warden slot must serve Decide even with enabled omitted"
+        );
+        let configured = configured.lock().unwrap().clone();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].0, "classifier");
+        assert!(fallbacks.lock().unwrap().is_empty());
+    }
+
     // Spec 029 PR-C.1: llm enabled + successful build. Dedicated
     // provider in the llm slot; classifier slot still primary.
     #[test]
@@ -763,7 +817,7 @@ mod tests {
         let primary = arc("primary-classifier", AiCapabilities::ALL);
         let classifier_cfg = RoleProviderConfig::default();
         let llm_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "stub".into(),
             ..Default::default()
         };
@@ -807,13 +861,13 @@ mod tests {
     fn build_from_config_both_roles_enabled() {
         let primary = arc("primary", AiCapabilities::ALL);
         let classifier_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "stub".into(),
             model: "classifier-model".into(),
             ..Default::default()
         };
         let llm_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "stub".into(),
             model: "llm-model".into(),
             ..Default::default()
@@ -862,7 +916,7 @@ mod tests {
     fn build_from_config_per_role_build_failure_falls_back() {
         let primary = arc("primary", AiCapabilities::ALL);
         let classifier_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "nonexistent-provider".into(),
             // base_url empty — unknown providers without base_url fail
             // per SEC-017.
@@ -949,7 +1003,7 @@ mod tests {
     #[test]
     fn build_from_config_failure_with_no_primary_leaves_slot_empty() {
         let classifier_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "nonexistent-provider".into(),
             ..Default::default()
         };
@@ -995,7 +1049,7 @@ mod tests {
         // Stub classifier + stub shadow with a different model. The
         // router should wrap the classifier slot with a ShadowProvider.
         let classifier_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "stub".into(),
             model: "clf-model".into(),
             ..Default::default()
@@ -1042,7 +1096,7 @@ mod tests {
         // Classifier config == shadow config. Router must log a fallback
         // (shadow build rejected) but keep the classifier slot usable.
         let classifier_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "stub".into(),
             ..Default::default()
         };
@@ -1091,7 +1145,7 @@ mod tests {
         // No classifier, only llm. Decide falls back to llm, so shadow
         // attaches there.
         let llm_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "stub".into(),
             model: "llm-model".into(),
             ..Default::default()
@@ -1135,7 +1189,7 @@ mod tests {
     fn shadow_disabled_does_not_wrap() {
         use crate::config::ShadowConfig;
         let classifier_cfg = RoleProviderConfig {
-            enabled: true,
+            enabled: Some(true),
             provider: "stub".into(),
             ..Default::default()
         };
