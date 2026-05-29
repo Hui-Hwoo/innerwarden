@@ -615,6 +615,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             None => dashboard::TwoFactorSettings::default(),
         };
 
+        // Spec 056 Phase 5b: inputs for the playbook-test simulate
+        // endpoint. asset_tags stays empty to mirror the live incident
+        // path (populated by spec 058 server-profiles later).
+        let dashboard_playbook_sim = dashboard::PlaybookSimContext {
+            rules_dir: std::path::PathBuf::from(&cfg.playbooks.rules_dir),
+            trusted_ips: cfg.allowlist.trusted_ips.clone(),
+            asset_tags: Vec::new(),
+        };
+
         // 2026-05-18 fix: write the discovery hint file to
         // /run/innerwarden/ BEFORE spawning the dashboard task, so
         // any AI agent process on the box (OpenClaw, Codex CLI, n8n,
@@ -672,6 +681,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 tls_key,
                 insecure_no_tls,
                 dashboard_two_factor,
+                dashboard_playbook_sim,
             )
             .await
             {

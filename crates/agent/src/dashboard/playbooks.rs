@@ -167,6 +167,100 @@ pub(super) async fn api_playbooks(State(state): State<DashboardState>) -> Json<s
     Json(build_playbooks_payload(&records))
 }
 
+// ---------------------------------------------------------------------------
+// POST /api/playbook/test - dry-run simulate (spec 056 Phase 5b)
+// ---------------------------------------------------------------------------
+
+use crate::playbook_engine::{self, executor};
+
+#[derive(serde::Deserialize)]
+pub(super) struct PlaybookTestRequest {
+    playbook_id: String,
+    incident: innerwarden_core::incident::Incident,
+}
+
+/// No-op audit: a simulate must NOT write to `decisions.jsonl` /
+/// `playbook_steps-*.jsonl`, so the executor's audit calls go nowhere.
+struct NoopAudit;
+impl executor::PlaybookAudit for NoopAudit {
+    fn record(&self, _rec: executor::PlaybookStepRecord<'_>) {}
+}
+
+/// `POST /api/playbook/test` - run one playbook against a captured
+/// incident in dry-run, WITHOUT firing skills or writing audit. Reuses
+/// the exact executor + matcher the live incident loop uses (zero drift),
+/// so the CLI (`innerwarden playbook test`), the dashboard, and the future
+/// Active Defense LLM all simulate through one path.
+pub(super) async fn api_playbook_test(
+    State(state): State<DashboardState>,
+    Json(req): Json<PlaybookTestRequest>,
+) -> Json<serde_json::Value> {
+    let sim = &state.playbook_sim;
+
+    // Same loading the live path uses: built-ins + operator dir, operator
+    // overrides by id. Empty/absent rules_dir -> built-ins only.
+    let playbooks = match playbook_engine::load_dir(&sim.rules_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": "failed to load playbooks",
+                "detail": e.to_string(),
+            }));
+        }
+    };
+
+    let Some(pb) = playbooks
+        .iter()
+        .find(|p| p.metadata.id.as_str() == req.playbook_id)
+    else {
+        return Json(serde_json::json!({
+            "error": "unknown playbook",
+            "playbook_id": req.playbook_id,
+            "available": playbooks
+                .iter()
+                .map(|p| p.metadata.id.as_str())
+                .collect::<Vec<_>>(),
+        }));
+    };
+
+    let tctx = executor::TriggerCtx::from_incident(&req.incident);
+    let matched =
+        executor::matches_incident(pb, &req.incident, &tctx, &sim.trusted_ips, &sim.asset_tags);
+    if !matched {
+        return Json(serde_json::json!({
+            "playbook_id": req.playbook_id,
+            "matched": false,
+        }));
+    }
+
+    // dry_run = true: block-ip skills report success without touching the
+    // firewall; Phase-3b virtual skills enqueue commands we surface but
+    // never drain. ai_provider None: a simulate needs no LLM.
+    let registry = crate::skills::SkillRegistry::default_builtin();
+    let exec = executor::RegistryStepExecutor {
+        registry: &registry,
+        trusted_ips: &sim.trusted_ips,
+        dry_run: true,
+        host: req.incident.host.clone(),
+        data_dir: state.data_dir.clone(),
+        base_incident: req.incident.clone(),
+        honeypot: crate::skills::HoneypotRuntimeConfig::default(),
+        ai_provider: None,
+        command_sink: std::sync::Mutex::new(Vec::new()),
+    };
+    let audit = NoopAudit;
+    let mut outcome = executor::execute(pb, &req.incident, &exec, &audit).await;
+    outcome.commands = exec.drain_commands();
+
+    Json(serde_json::json!({
+        "playbook_id": req.playbook_id,
+        "matched": true,
+        "dry_run": true,
+        "summary": outcome.summary(),
+        "outcome": serde_json::to_value(&outcome).unwrap_or_default(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +319,64 @@ mod tests {
         let v = build_playbooks_payload(&records);
         assert_eq!(v["recent"].as_array().unwrap().len(), 100);
         assert_eq!(v["total_steps"], 150);
+    }
+
+    // ---- POST /api/playbook/test (simulate) ----------------------------
+
+    fn sim_state(dir: &std::path::Path) -> DashboardState {
+        crate::dashboard::state::test_dashboard_state(dir)
+    }
+
+    #[tokio::test]
+    async fn simulate_unknown_playbook_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = sim_state(dir.path());
+        let req = PlaybookTestRequest {
+            playbook_id: "pb-does-not-exist".to_string(),
+            incident: crate::tests::test_incident("198.51.100.42"),
+        };
+        let Json(v) = api_playbook_test(State(state), Json(req)).await;
+        assert_eq!(v["error"], "unknown playbook");
+        assert!(v["available"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    async fn simulate_matched_credential_builtin_runs_dry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = sim_state(dir.path());
+        // ssh_bruteforce rule_id + clean IP arms the credential built-in.
+        let req = PlaybookTestRequest {
+            playbook_id: "pb-credential-stuffing-default".to_string(),
+            incident: crate::tests::test_incident("198.51.100.42"),
+        };
+        let Json(v) = api_playbook_test(State(state), Json(req)).await;
+        assert_eq!(v["matched"], true, "got: {v}");
+        assert_eq!(v["dry_run"], true);
+        assert!(v["summary"].as_str().unwrap().contains("playbook"));
+        assert!(v["outcome"]["steps"].as_array().is_some());
+        // A simulate must NOT write audit logs.
+        let wrote_logs = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("playbook_steps-") || n.starts_with("decisions-")
+            });
+        assert!(!wrote_logs, "simulate must not write audit logs");
+    }
+
+    #[tokio::test]
+    async fn simulate_not_matched_reports_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = sim_state(dir.path());
+        // data-exfil built-in triggers on CL-002 + needs env=prod asset
+        // tag; a plain ssh_bruteforce incident matches neither.
+        let req = PlaybookTestRequest {
+            playbook_id: "pb-data-exfil-default".to_string(),
+            incident: crate::tests::test_incident("198.51.100.42"),
+        };
+        let Json(v) = api_playbook_test(State(state), Json(req)).await;
+        assert_eq!(v["matched"], false, "got: {v}");
     }
 
     #[test]

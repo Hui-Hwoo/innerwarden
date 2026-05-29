@@ -2238,6 +2238,7 @@ enabled = false
             sqlite_store,
             fleet_state: None,
             two_factor: std::sync::Arc::new(crate::dashboard::TwoFactorSettings::default()),
+            playbook_sim: std::sync::Arc::new(crate::dashboard::PlaybookSimContext::default()),
         }
     }
 

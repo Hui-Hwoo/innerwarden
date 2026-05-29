@@ -3,6 +3,7 @@ pub(crate) mod types;
 
 // Re-export types used by other modules in the crate.
 pub use auth::generate_password_hash_interactive;
+pub(crate) use state::PlaybookSimContext;
 pub use state::{AgentGuardAlert, DashboardActionConfig, DeepSecuritySnapshot, TwoFactorSettings};
 pub use types::AdvisoryEntry;
 
@@ -422,6 +423,7 @@ pub async fn serve(
     tls_key: Option<String>,
     insecure_no_tls: bool,
     two_factor: state::TwoFactorSettings,
+    playbook_sim: state::PlaybookSimContext,
 ) -> Result<()> {
     // SEC-005: Reject non-loopback bind without authentication.
     let is_loopback_bind = is_loopback_address(&bind);
@@ -539,6 +541,7 @@ pub async fn serve(
         sqlite_store,
         fleet_state,
         two_factor: Arc::new(two_factor),
+        playbook_sim: Arc::new(playbook_sim),
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -734,6 +737,7 @@ pub async fn serve(
         .route("/api/correlation-chains", get(api_correlation_chains))
         .route("/api/baseline-status", get(api_baseline_status))
         .route("/api/playbooks", get(playbooks::api_playbooks))
+        .route("/api/playbook/test", post(playbooks::api_playbook_test))
         .route("/api/graph/stats", get(api_graph_stats))
         .route("/api/graph/view", get(api_graph_view))
         .route("/api/graph/neighborhood", get(api_graph_neighborhood))
@@ -7109,6 +7113,7 @@ mod tests {
             None,
             true,
             state::TwoFactorSettings::default(),
+            state::PlaybookSimContext::default(),
         )
         .await;
 

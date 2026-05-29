@@ -210,6 +210,27 @@ pub(crate) struct DashboardState {
     /// 2FA gate is bypassed; otherwise `totp_secret` is verified
     /// against the operator-supplied code.
     pub(super) two_factor: Arc<TwoFactorSettings>,
+    /// Spec 056 Phase 5b: config the `POST /api/playbook/test` simulate
+    /// handler needs to faithfully reproduce a real playbook run (rules
+    /// dir + the same safety-floor inputs `matches_incident` uses). Kept
+    /// as a small clone so the simulate endpoint does not pull the whole
+    /// `AgentConfig` into `DashboardState`.
+    pub(super) playbook_sim: Arc<PlaybookSimContext>,
+}
+
+/// Inputs the playbook-test simulate endpoint feeds into the executor so
+/// a dry-run matches what the live incident loop would do.
+#[derive(Clone, Default)]
+pub(crate) struct PlaybookSimContext {
+    /// Operator playbook dir (`cfg.playbooks.rules_dir`). Built-ins are
+    /// always loaded on top; empty path -> built-ins only.
+    pub(crate) rules_dir: std::path::PathBuf,
+    /// `cfg.allowlist.trusted_ips` — the same list the block-ip floor and
+    /// `ip_not_in: ["$trusted_ips"]` conditions consult.
+    pub(crate) trusted_ips: Vec<String>,
+    /// Host asset tags for `conditions.asset_tags`. Empty until spec 058
+    /// server-profiles populates it (mirrors the live path today).
+    pub(crate) asset_tags: Vec<String>,
 }
 
 /// PR #420 Wave 3: thin clone of the operator's 2FA config used by
@@ -333,6 +354,7 @@ pub(super) fn test_dashboard_state(data_dir: &std::path::Path) -> DashboardState
         sqlite_store: None,
         fleet_state: None,
         two_factor: Arc::new(TwoFactorSettings::default()),
+        playbook_sim: Arc::new(PlaybookSimContext::default()),
     }
 }
 
