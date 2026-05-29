@@ -814,7 +814,7 @@ async fn run_playbook_replay(cli: Cli) -> Result<()> {
         &playbooks,
         &registry,
         &cfg.allowlist.trusted_ips,
-        &[], // asset_tags: spec 058 will populate; empty mirrors live path
+        &cfg.agent.tags, // host asset tags ([agent] tags), mirrors live path
         &incidents,
     )
     .await;

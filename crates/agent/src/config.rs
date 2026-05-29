@@ -31,6 +31,12 @@ pub struct AgentConfig {
     /// opts in with `[playbooks] enabled = true`.
     #[serde(default)]
     pub playbooks: PlaybooksConfig,
+    /// Spec 058 (minimal slice): host identity / asset tags. Consumed by
+    /// playbook `conditions.asset_tags` (spec 056) so an operator can scope
+    /// a playbook to a host role; the full server-profile system layers on
+    /// top of these tags later.
+    #[serde(default)]
+    pub agent: AgentSection,
     #[serde(default)]
     pub telegram: TelegramConfig,
     /// Data retention settings. Historic prod deploys labelled this section
@@ -2242,6 +2248,20 @@ impl Default for PlaybooksConfig {
     }
 }
 
+/// `[agent]` section: per-host identity. Today it carries asset `tags`
+/// (e.g. `["env=prod", "role=web"]`) that playbook `conditions.asset_tags`
+/// match against, letting an operator scope a playbook to a host role.
+/// Spec 058's server profiles will add `profile = "<id>"` here and select
+/// via these same tags. Empty `tags` = a playbook with no `asset_tags`
+/// condition still fires; one WITH an `asset_tags` condition stays inert
+/// until the host is tagged.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSection {
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Web Push
 // ---------------------------------------------------------------------------
@@ -4440,6 +4460,21 @@ enabled = true
     }
 
     #[test]
+    fn agent_section_tags_parse_and_default_empty() {
+        // Spec 058 minimal slice: host asset tags drive playbook
+        // `conditions.asset_tags`.
+        let cfg: AgentConfig = toml::from_str("[agent]\ntags = [\"env=prod\", \"role=web\"]\n")
+            .expect("[agent] tags must parse");
+        assert_eq!(
+            cfg.agent.tags,
+            vec!["env=prod".to_string(), "role=web".to_string()]
+        );
+        // Absent section -> empty tags (no asset_tags gate on any playbook).
+        let empty: AgentConfig = toml::from_str("").expect("empty config valid");
+        assert!(empty.agent.tags.is_empty());
+    }
+
+    #[test]
     fn every_top_level_section_is_documented_with_an_inner_struct() {
         // Lock the set of top-level sections so a future contributor cannot
         // remove a section silently (which would make every operator's
@@ -4457,6 +4492,7 @@ enabled = true
             "honeypot",
             "responder",
             "telegram",
+            "agent",
             "data",
             // "data_retention" is intentionally NOT here: toml refuses to
             // parse the same field twice via aliases. The alias is exercised

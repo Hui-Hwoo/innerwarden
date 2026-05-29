@@ -1099,7 +1099,7 @@ pub(crate) async fn run_for_incident_if_enabled(
         data_dir,
         registry,
         &cfg.allowlist.trusted_ips,
-        &[], // asset_tags: spec 058 server-profiles will populate this
+        &cfg.agent.tags, // host asset tags ([agent] tags) for asset_tags conditions
         dry_run,
         honeypot,
         ai_provider,
@@ -2197,6 +2197,73 @@ mod tests {
             some.iter()
                 .any(|o| o.playbook_id == "pb-credential-stuffing-default"),
             "expected credential builtin to run: {some:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_tags_thread_into_playbook_asset_tags_condition() {
+        // Spec 058 minimal slice: `[agent] tags` reach a playbook's
+        // `conditions.asset_tags` through `run_for_incident_if_enabled`.
+        let reg = skills::SkillRegistry::default_builtin();
+        let dir = tempfile::tempdir().unwrap();
+        // Operator playbook that only fires on hosts tagged role=web.
+        std::fs::write(
+            dir.path().join("50-web-only.yml"),
+            r#"
+version: 1
+metadata:
+  id: pb-web-only-test
+  name: "web-only"
+triggers:
+  - rule_id: "ssh_bruteforce"
+conditions:
+  asset_tags: ["role=web"]
+  sample_rate: 1.0
+steps:
+  - id: noop
+    skill: wait
+    args: {ms: 1}
+"#,
+        )
+        .unwrap();
+        let inc = crate::tests::test_incident("198.51.100.42"); // rule_id ssh_bruteforce
+        let mut cfg: crate::config::AgentConfig = toml::from_str("").unwrap();
+        cfg.responder.dry_run = true;
+        cfg.playbooks.enabled = true;
+        cfg.playbooks.rules_dir = dir.path().to_string_lossy().to_string();
+
+        // Untagged host -> the web-only playbook does NOT fire.
+        cfg.agent.tags = vec![];
+        let untagged = run_for_incident_if_enabled(
+            &inc,
+            &cfg,
+            dir.path(),
+            &reg,
+            skills::HoneypotRuntimeConfig::default(),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !untagged.iter().any(|o| o.playbook_id == "pb-web-only-test"),
+            "web-only playbook must not fire on an untagged host"
+        );
+
+        // Host tagged role=web -> it fires.
+        cfg.agent.tags = vec!["role=web".to_string()];
+        let tagged = run_for_incident_if_enabled(
+            &inc,
+            &cfg,
+            dir.path(),
+            &reg,
+            skills::HoneypotRuntimeConfig::default(),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            tagged.iter().any(|o| o.playbook_id == "pb-web-only-test"),
+            "web-only playbook must fire once the host carries role=web"
         );
     }
 

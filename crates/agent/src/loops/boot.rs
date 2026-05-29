@@ -616,12 +616,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         };
 
         // Spec 056 Phase 5b: inputs for the playbook-test simulate
-        // endpoint. asset_tags stays empty to mirror the live incident
-        // path (populated by spec 058 server-profiles later).
+        // endpoint. asset_tags mirror the live incident path = the host's
+        // `[agent] tags` (spec 058 minimal slice).
         let dashboard_playbook_sim = dashboard::PlaybookSimContext {
             rules_dir: std::path::PathBuf::from(&cfg.playbooks.rules_dir),
             trusted_ips: cfg.allowlist.trusted_ips.clone(),
-            asset_tags: Vec::new(),
+            asset_tags: cfg.agent.tags.clone(),
         };
 
         // 2026-05-18 fix: write the discovery hint file to
