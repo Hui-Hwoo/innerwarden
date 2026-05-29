@@ -31,7 +31,9 @@ pub(crate) fn build_agent_context(
         .format("%Y-%m-%d")
         .to_string();
     let incident_count = bot_helpers::graph_count(kg, "incidents");
-    let decision_count = bot_helpers::graph_count(kg, "decisions");
+    // Canonical decisions-today count (restart-robust); the KG decision
+    // count resets on reboot. See NUMBER_CONSISTENCY "decisions made today".
+    let decision_count = crate::decisions::count_decisions_for_date(data_dir, &today);
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
         .unwrap_or_else(|_| "unknown".to_string());
@@ -259,7 +261,20 @@ mod tests {
         });
         let kg = std::sync::Arc::new(std::sync::RwLock::new(graph));
 
-        let context = build_agent_context(&cfg, std::path::Path::new("/tmp/innerwarden"), &kg);
+        // "actions taken" now reads the canonical decisions log (not the KG
+        // node count), so seed one decision for today's date.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        std::fs::write(
+            dir.path().join(format!("decisions-{today}.jsonl")),
+            "{\"action_type\":\"block_ip\"}\n",
+        )
+        .expect("write decisions log");
+
+        let context = build_agent_context(&cfg, dir.path(), &kg);
 
         assert!(context.contains("INNERWARDEN SYSTEM STATE"));
         assert!(context.contains("Mode: 🟢 GUARD"));

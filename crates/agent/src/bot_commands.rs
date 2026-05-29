@@ -38,12 +38,14 @@ pub(crate) async fn handle_telegram_bot_command(
         if cfg.telegram.bot.enabled {
             if cfg.telegram.is_simple_profile() {
                 // Simple profile: semaphore status
-                let _today = chrono::Local::now()
+                let today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
+                // Canonical decisions-today count (restart-robust), not the
+                // KG node count that resets on reboot. See NUMBER_CONSISTENCY.
                 let decision_count =
-                    bot_helpers::graph_count(&state.knowledge_graph, "decisions") as u64;
+                    crate::decisions::count_decisions_for_date(data_dir, &today) as u64;
 
                 // Check for recent critical/high incidents from narrative accumulator
                 let now_utc = chrono::Utc::now();
@@ -104,12 +106,14 @@ pub(crate) async fn handle_telegram_bot_command(
                 tg_reply(state, text);
             } else {
                 // Technical profile: full status
-                let _today = chrono::Local::now()
+                let today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
                 let incident_count = bot_helpers::graph_count(&state.knowledge_graph, "incidents");
-                let decision_count = bot_helpers::graph_count(&state.knowledge_graph, "decisions");
+                // Canonical decisions-today count (restart-robust), not the
+                // KG node count that resets on reboot. See NUMBER_CONSISTENCY.
+                let decision_count = crate::decisions::count_decisions_for_date(data_dir, &today);
                 let mode = guardian_mode(cfg);
                 let mode_label = mode.label();
                 let mode_desc = mode.description();
@@ -500,12 +504,14 @@ pub(crate) async fn handle_telegram_bot_command(
         info!(operator = %result.operator_name, "Telegram /start command received");
         if cfg.telegram.bot.enabled {
             if let Some(ref tg) = state.telegram_client {
-                let _today = chrono::Local::now()
+                let today = chrono::Local::now()
                     .date_naive()
                     .format("%Y-%m-%d")
                     .to_string();
                 let incident_count = bot_helpers::graph_count(&state.knowledge_graph, "incidents");
-                let decision_count = bot_helpers::graph_count(&state.knowledge_graph, "decisions");
+                // Canonical decisions-today count (restart-robust), not the
+                // KG node count that resets on reboot. See NUMBER_CONSISTENCY.
+                let decision_count = crate::decisions::count_decisions_for_date(data_dir, &today);
                 let mode = guardian_mode(cfg);
                 let host = std::env::var("HOSTNAME")
                     .or_else(|_| {
