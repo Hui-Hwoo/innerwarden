@@ -10,7 +10,7 @@ use crate::knowledge_graph::KnowledgeGraph;
 use crate::observation_verify::{self, ScoreBreakdown, VerificationResult};
 use crate::AgentState;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Item queued for AI verification (score 40-69). Phase C consumes these.
 #[derive(Debug)]
@@ -681,18 +681,39 @@ pub(crate) async fn ai_verify_ambiguous(
     cfg: &crate::config::AgentConfig,
     state: &mut AgentState,
 ) {
-    if items.is_empty() || !cfg.observation.ai_verification {
+    if items.is_empty() {
         return;
     }
+
+    // Spec 062 Phase 1 (no-orphan-leak): every ambiguous item MUST end with a
+    // decision. The pre-062 code returned early here when AI verification was
+    // off or no Classify provider existed, leaving the items UNDECIDED — they
+    // then sat in the graph until orphan-recovery auto-dismissed them ~1h later
+    // (prod 2026-05-30: 1637 such silent dismissals, the LLM never decided).
+    // The deterministic fallback is `needs_review`: a visible, audited decision
+    // that a human (or a later LLM pass) resolves, instead of a silent orphan.
+    //
+    // This `resolved` set tracks which incident_ids the LLM actually decided;
+    // anything left unresolved at the end falls to `mark_needs_review`. That
+    // makes the path correct WITH an LLM (LLM decides, no needs_review) and
+    // WITHOUT one (everything → needs_review), per the LLM-optional invariant.
+    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Spec 029 PR-C.2: ai_verify_ambiguous uses the LLM chat() API to
     // group-score N OBSERVING incidents in a single prompt. Maps to
     // the Classify capability (structured input → short structured
-    // label per incident).
-    let Some(ai) = state
-        .ai_router
-        .provider_for(crate::ai::Capability::Classify)
-    else {
+    // label per incident). When verification is disabled or no Classify
+    // provider is configured (the common no-LLM install), skip straight
+    // to the needs_review fallback so nothing leaks.
+    let ai_opt = if cfg.observation.ai_verification {
+        state
+            .ai_router
+            .provider_for(crate::ai::Capability::Classify)
+    } else {
+        None
+    };
+    let Some(ai) = ai_opt else {
+        mark_needs_review(&items, state, "no AI verifier configured");
         return;
     };
 
@@ -772,6 +793,7 @@ pub(crate) async fn ai_verify_ambiguous(
                         chrono::Utc::now(),
                     );
                     ai_dismissed += 1;
+                    resolved.insert(item.incident_id.clone());
                 }
                 observation_verify::AiVerdictKind::Suspicious => {
                     graph.ingest_decision(
@@ -784,6 +806,7 @@ pub(crate) async fn ai_verify_ambiguous(
                         chrono::Utc::now(),
                     );
                     ai_escalated += 1;
+                    resolved.insert(item.incident_id.clone());
                 }
             }
         }
@@ -797,6 +820,112 @@ pub(crate) async fn ai_verify_ambiguous(
             );
         }
     }
+
+    // Spec 062 Phase 1: any ambiguous item the LLM did NOT decide (batch error,
+    // missing verdict, unparseable response, index out of range) must not be
+    // left undecided to leak into orphan-recovery. Fall it to needs_review.
+    let unresolved = partition_unresolved(items, &resolved);
+    if !unresolved.is_empty() {
+        mark_needs_review(&unresolved, state, "AI verifier returned no verdict");
+    }
+}
+
+/// Pure: the ambiguous items NOT in `resolved` (i.e. the LLM produced no
+/// verdict for them). Extracted from `ai_verify_ambiguous` so the
+/// "nothing leaks" partition is unit-testable without a live LLM.
+fn partition_unresolved(
+    items: Vec<AmbiguousItem>,
+    resolved: &std::collections::HashSet<String>,
+) -> Vec<AmbiguousItem> {
+    items
+        .into_iter()
+        .filter(|it| !resolved.contains(&it.incident_id))
+        .collect()
+}
+
+/// Pure: build the `needs_review` decision row for one ambiguous item.
+/// Extracted so the row shape (action_type, awaiting_human, layer,
+/// target_ip-from-evidence) is unit-testable without an AgentState or
+/// a DecisionWriter.
+fn needs_review_entry(
+    item: &AmbiguousItem,
+    why: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::decisions::DecisionEntry {
+    crate::decisions::DecisionEntry {
+        ts: now,
+        incident_id: item.incident_id.clone(),
+        host: String::new(),
+        ai_provider: "needs-review".to_string(),
+        action_type: "needs_review".to_string(),
+        target_ip: item
+            .evidence
+            .get("dst_ip")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        target_user: None,
+        skill_id: None,
+        confidence: 0.0,
+        auto_executed: false,
+        dry_run: false,
+        reason: format!(
+            "Ambiguous incident (behaviour score {}) needs human review: {why}. \
+             No automated layer reached a confident decision.",
+            item.score
+        ),
+        estimated_threat: "unknown".to_string(),
+        execution_result: "awaiting_human".to_string(),
+        prev_hash: None,
+        decision_layer: Some("observation_verifier".to_string()),
+    }
+}
+
+/// Spec 062 Phase 1 — record an explicit `needs_review` decision for ambiguous
+/// incidents that no automated layer resolved.
+///
+/// This is the deterministic floor that makes the pipeline LLM-OPTIONAL: with
+/// no LLM (or on any LLM failure) the incident gets a visible, audited
+/// `needs_review` decision instead of silently rotting until orphan-recovery
+/// dismisses it. Because the row IS a decision, `find_orphan_incidents`
+/// (which joins on the absence of any decision) no longer treats it as an
+/// orphan — the 1637/3-day silent-dismiss leak is closed at the source.
+///
+/// `needs_review` is terminal-pending: it carries `auto_executed = false`
+/// (no action was taken) and `execution_result = "awaiting_human"`. Phase 2
+/// adds the severity-gated timeout + notification clock on top of these rows.
+fn mark_needs_review(items: &[AmbiguousItem], state: &mut AgentState, why: &str) {
+    let now = chrono::Utc::now();
+    for item in items {
+        // Graph label so the dashboard's graph-derived views update in place.
+        {
+            let mut graph = state.knowledge_graph.write().unwrap();
+            graph.ingest_decision(
+                &item.incident_id,
+                "needs_review",
+                None,
+                0.0,
+                &format!("needs human review (score {}): {why}", item.score),
+                false,
+                now,
+            );
+        }
+        // Audited decision row (JSONL + SQLite mirror) so the incident is no
+        // longer decisionless and the operator can see it pending.
+        if let Some(writer) = state.decision_writer.as_mut() {
+            let entry = needs_review_entry(item, why, now);
+            if let Err(e) = writer.write(&entry) {
+                warn!(
+                    incident_id = %item.incident_id,
+                    error = %e,
+                    "needs_review: failed to write decision row"
+                );
+            }
+        }
+    }
+    info!(
+        count = items.len(),
+        why, "observation-verify: marked ambiguous incidents needs_review (no silent orphan)"
+    );
 }
 
 /// Build a host profile string from the agent's environment profile.
@@ -1826,7 +1955,7 @@ mod tests {
     // with the classifier declining Classify), the function must
     // return early without panicking.
     #[tokio::test]
-    async fn ai_verify_ambiguous_noop_when_router_has_no_classify_provider() {
+    async fn ai_verify_ambiguous_writes_needs_review_when_router_has_no_classify_provider() {
         use crate::config::AgentConfig;
         use crate::tests::triage_test_state;
 
@@ -1842,19 +1971,130 @@ mod tests {
         let mut cfg = AgentConfig::default();
         cfg.observation.ai_verification = true;
 
-        // One ambiguous item forces the early-return branch we care
-        // about (otherwise the function returns on the empty-items
-        // check above it).
         let items = vec![AmbiguousItem {
             incident_id: "proto_anomaly:SshVersionAnomaly:198.51.100.99:t".into(),
             score: 55,
-            evidence: serde_json::json!({}),
+            evidence: serde_json::json!({"dst_ip": "198.51.100.99"}),
             detector: "proto_anomaly".into(),
             title: "t".into(),
         }];
 
-        // No panic, no mutation of decision_writer state, graph stays
-        // untouched.
+        // Spec 062 Phase 1: with no Classify provider the item must NOT be
+        // left undecided (the pre-062 silent leak) — it must get an explicit
+        // needs_review decision row in the audit trail.
         ai_verify_ambiguous(items, &cfg, &mut state).await;
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let jsonl = tmp.path().join(format!("decisions-{today}.jsonl"));
+        let body = std::fs::read_to_string(&jsonl).unwrap_or_default();
+        assert!(
+            body.contains("\"action_type\":\"needs_review\"") && body.contains("198.51.100.99"),
+            "no-Classify-provider must produce a needs_review decision, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_verify_ambiguous_empty_items_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let cfg = crate::config::AgentConfig::default();
+        ai_verify_ambiguous(Vec::new(), &cfg, &mut state).await;
+        // No panic = pass.
+    }
+
+    #[tokio::test]
+    async fn ai_verify_ambiguous_off_verification_still_floors_to_needs_review() {
+        // ai_verification = false must NOT mean "silently drop"; the
+        // deterministic floor (needs_review) still applies so nothing leaks.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let items = vec![AmbiguousItem {
+            incident_id: "obs-disabled-1".into(),
+            score: 55,
+            evidence: serde_json::json!({"detector": "test"}),
+            detector: "test".into(),
+            title: "t".into(),
+        }];
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.observation.ai_verification = false;
+        ai_verify_ambiguous(items, &cfg, &mut state).await;
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let jsonl = tmp.path().join(format!("decisions-{today}.jsonl"));
+        let body = std::fs::read_to_string(&jsonl).unwrap_or_default();
+        assert!(
+            body.contains("needs_review") && body.contains("obs-disabled-1"),
+            "ai_verification=off must still floor to needs_review, got: {body}"
+        );
+    }
+
+    #[test]
+    fn partition_unresolved_keeps_only_items_without_a_verdict() {
+        let mk = |id: &str| AmbiguousItem {
+            incident_id: id.into(),
+            score: 50,
+            evidence: serde_json::json!({}),
+            detector: "d".into(),
+            title: "t".into(),
+        };
+        let items = vec![mk("a"), mk("b"), mk("c")];
+        let mut resolved = std::collections::HashSet::new();
+        resolved.insert("b".to_string()); // LLM decided b
+        let left = partition_unresolved(items, &resolved);
+        let ids: Vec<&str> = left.iter().map(|i| i.incident_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"], "only items without a verdict remain");
+    }
+
+    #[test]
+    fn partition_unresolved_empty_when_all_resolved() {
+        let items = vec![AmbiguousItem {
+            incident_id: "x".into(),
+            score: 50,
+            evidence: serde_json::json!({}),
+            detector: "d".into(),
+            title: "t".into(),
+        }];
+        let mut resolved = std::collections::HashSet::new();
+        resolved.insert("x".to_string());
+        assert!(partition_unresolved(items, &resolved).is_empty());
+    }
+
+    #[test]
+    fn needs_review_entry_has_correct_shape_and_target_ip() {
+        let item = AmbiguousItem {
+            incident_id: "inc-9".into(),
+            score: 57,
+            evidence: serde_json::json!({"dst_ip": "203.0.113.42"}),
+            detector: "proto_anomaly".into(),
+            title: "t".into(),
+        };
+        let e = needs_review_entry(&item, "no AI verifier configured", chrono::Utc::now());
+        assert_eq!(e.action_type, "needs_review");
+        assert_eq!(e.ai_provider, "needs-review");
+        assert!(!e.auto_executed, "needs_review takes no action");
+        assert_eq!(e.execution_result, "awaiting_human");
+        assert_eq!(e.estimated_threat, "unknown");
+        assert_eq!(e.decision_layer.as_deref(), Some("observation_verifier"));
+        assert_eq!(e.target_ip.as_deref(), Some("203.0.113.42"));
+        assert!(e.reason.contains("57") && e.reason.contains("human review"));
+    }
+
+    #[test]
+    fn needs_review_entry_target_ip_none_when_evidence_has_no_dst_ip() {
+        let item = AmbiguousItem {
+            incident_id: "inc-10".into(),
+            score: 50,
+            evidence: serde_json::json!({"detector": "x"}),
+            detector: "x".into(),
+            title: "t".into(),
+        };
+        let e = needs_review_entry(&item, "why", chrono::Utc::now());
+        assert!(e.target_ip.is_none());
     }
 }
