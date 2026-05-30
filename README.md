@@ -19,10 +19,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 [![codecov](https://codecov.io/gh/InnerWarden/innerwarden/branch/main/graph/badge.svg)](https://codecov.io/gh/InnerWarden/innerwarden)
 [![CI](https://github.com/InnerWarden/innerwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/InnerWarden/innerwarden/actions/workflows/ci.yml)
 [![Security](https://github.com/InnerWarden/innerwarden/actions/workflows/security.yml/badge.svg)](https://github.com/InnerWarden/innerwarden/actions/workflows/security.yml)
-[![Release](https://img.shields.io/github/v/release/InnerWarden/innerwarden?label=release&color=blue)](https://github.com/InnerWarden/innerwarden/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/InnerWarden/innerwarden)](https://github.com/InnerWarden/innerwarden/stargazers)
-[![Last Commit](https://img.shields.io/github/last-commit/InnerWarden/innerwarden)](https://github.com/InnerWarden/innerwarden/commits/main)
 
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 ![eBPF Programs](https://img.shields.io/badge/eBPF%20programs-44%20loaded-blueviolet)
@@ -734,7 +731,7 @@ Pre-built binaries: `x86_64` and `aarch64` for both platforms.
 ## Build and test
 
 ```bash
-make test       # 6632 tests across the workspace
+make test       # 8076 tests across the workspace
 make build      # debug build (sensor + agent + ctl)
 make replay-qa  # end-to-end integration test
 ```
