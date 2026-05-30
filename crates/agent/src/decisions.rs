@@ -267,6 +267,39 @@ pub fn count_decisions_for_date(data_dir: &Path, date: &str) -> usize {
     }
 }
 
+/// Count `block_ip` decisions in `decisions-<date>.jsonl` whose timestamp
+/// falls in the SAME UTC hour as `now`. Restart-robust (reads the persisted
+/// log). Used by the baseline silence detector to tell a benign `auth_log`
+/// drop (scanners dropped at the firewall, so they never reach `sshd`) apart
+/// from a real compromise that muzzles auth logging.
+///
+/// Both the file date and the hour filter derive from `now` (UTC). On a
+/// UTC-clocked host (prod) this matches the `chrono::Local` date the writer
+/// uses; on an off-UTC host the counts could be off only for incidents in the
+/// hour straddling local midnight — acceptable for a benign/real heuristic.
+pub fn count_block_ips_in_current_hour(
+    data_dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let date = now.format("%Y-%m-%d").to_string();
+    let path = data_dir.join(format!("decisions-{date}.jsonl"));
+    let hour_prefix = now.format("%Y-%m-%dT%H").to_string();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| {
+            v.get("action_type").and_then(|a| a.as_str()) == Some("block_ip")
+                && v.get("ts")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|ts| ts.starts_with(&hour_prefix))
+        })
+        .count()
+}
+
 /// Standalone hash-chained append for code paths that don't own a `DecisionWriter`
 /// (e.g. the always-on honeypot task). Routes through [`append_chained_locked`]
 /// so it shares the file-level flock with `DecisionWriter::write`.
@@ -570,6 +603,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count_decisions_for_date(dir.path(), "2026-05-13"), 3);
+    }
+
+    #[test]
+    fn count_block_ips_in_current_hour_filters_action_and_hour() {
+        use chrono::Timelike;
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        // Pick a clearly-different hour for the negative case.
+        let other_hour = (now.hour() + 12) % 24;
+        let date = now.format("%Y-%m-%d");
+        let cur = now.format("%Y-%m-%dT%H");
+        let lines = format!(
+            "{{\"action_type\":\"block_ip\",\"ts\":\"{cur}:05:00Z\"}}\n\
+             {{\"action_type\":\"block_ip\",\"ts\":\"{cur}:30:00Z\"}}\n\
+             {{\"action_type\":\"dismiss\",\"ts\":\"{cur}:31:00Z\"}}\n\
+             {{\"action_type\":\"block_ip\",\"ts\":\"{date}T{other_hour:02}:00:00Z\"}}\n"
+        );
+        std::fs::write(dir.path().join(format!("decisions-{date}.jsonl")), lines).unwrap();
+
+        // 2 block_ip in the current hour; the dismiss and the other-hour
+        // block_ip are excluded.
+        assert_eq!(count_block_ips_in_current_hour(dir.path(), now), 2);
+        // Missing file -> 0.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(count_block_ips_in_current_hour(empty.path(), now), 0);
     }
 
     #[test]

@@ -2361,7 +2361,17 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
                         // ── Baseline rate anomaly check + save ──
                         {
-                            let rate_anomalies = state.baseline.check_rate_anomalies();
+                            // Disambiguate auth_log silence: a drop that
+                            // coincides with active firewall blocking is the
+                            // agent dropping scanners before sshd logs them
+                            // (benign), not silence-as-compromise.
+                            let blocks_this_hour =
+                                crate::decisions::count_block_ips_in_current_hour(
+                                    &cli.data_dir,
+                                    chrono::Utc::now(),
+                                );
+                            let rate_anomalies =
+                                state.baseline.check_rate_anomalies(blocks_this_hour);
                             for anomaly in &rate_anomalies {
                                 info!(
                                     anomaly_type = ?anomaly.anomaly_type,

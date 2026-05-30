@@ -35,6 +35,17 @@ const MIN_RATE_BASELINE: f32 = 5.0;
 const SILENCE_THRESHOLD: f32 = 0.20;
 /// Rate spike threshold (300% increase).
 const SPIKE_THRESHOLD: f32 = 3.0;
+/// Sources whose silence is routinely *caused* by the agent's own firewall
+/// blocking rather than by a compromise. SSH-bruteforce volume lands in
+/// `auth_log`; once the agent has dropped the scanner IPs at the firewall
+/// (UFW/XDP) those connection attempts never reach `sshd`, so `auth_log`
+/// goes quiet. That quiet is the firewall WORKING, not silence-as-compromise.
+const AUTH_SUPPRESSIBLE_SOURCES: &[&str] = &["auth_log"];
+/// Minimum firewall blocks in the current hour before an `auth_log` rate drop
+/// is attributed to benign suppression. Below this floor a drop is treated as
+/// a genuine (High) silence anomaly — a real compromise that muzzles auth
+/// logging would not be accompanied by a burst of fresh blocks.
+const BLOCK_SUPPRESSION_FLOOR: usize = 10;
 /// Maximum process lineages to track.
 const MAX_LINEAGES: usize = 5_000;
 /// Maximum outbound destinations per process.
@@ -414,7 +425,14 @@ impl BaselineStore {
     ///
     /// Returns anomalies for sources whose event rate significantly deviates
     /// from the baseline for the current hour.
-    pub fn check_rate_anomalies(&self) -> Vec<AnomalyReport> {
+    ///
+    /// `firewall_blocks_this_hour` is the count of `block_ip` decisions in the
+    /// current hour. It disambiguates a silence anomaly on an auth source: a
+    /// drop in `auth_log` volume that coincides with a burst of fresh firewall
+    /// blocks is the agent SUCCESSFULLY dropping scanners before they reach
+    /// `sshd` (benign), not auth logging being muzzled by an intruder. See
+    /// `AUTH_SUPPRESSIBLE_SOURCES` / `BLOCK_SUPPRESSION_FLOOR`.
+    pub fn check_rate_anomalies(&self, firewall_blocks_this_hour: usize) -> Vec<AnomalyReport> {
         if !self.mature {
             return Vec::new();
         }
@@ -434,20 +452,44 @@ impl BaselineStore {
 
                 // Silence detection: rate dropped >80%
                 if ratio < SILENCE_THRESHOLD && current < expected - MIN_RATE_BASELINE {
+                    // Benign-suppression carve-out: an `auth_log` drop that
+                    // coincides with a burst of fresh firewall blocks is the
+                    // agent dropping scanners before they reach `sshd`, not
+                    // silence-as-compromise. Downgrade + annotate instead of
+                    // firing High. A drop with NO blocking this hour still
+                    // fires High — that is the dangerous case.
+                    let benign_suppression = AUTH_SUPPRESSIBLE_SOURCES
+                        .iter()
+                        .any(|s| *s == source.as_ref())
+                        && firewall_blocks_this_hour >= BLOCK_SUPPRESSION_FLOOR;
+
+                    let (severity, confidence, suffix) = if benign_suppression {
+                        (
+                            Severity::Info,
+                            0.3,
+                            format!(
+                                " — likely firewall suppression ({firewall_blocks_this_hour} blocks this hour), not a real silence"
+                            ),
+                        )
+                    } else {
+                        (Severity::High, 0.7, String::new()) // Silence is dangerous
+                    };
+
                     anomalies.push(AnomalyReport {
                         anomaly_type: AnomalyType::EventRateDrop,
                         description: format!(
-                            "Event rate for '{}' dropped {:.0}% vs baseline ({} vs {:.0} expected at {}:00)",
+                            "Event rate for '{}' dropped {:.0}% vs baseline ({} vs {:.0} expected at {}:00){}",
                             source,
                             (1.0 - ratio) * 100.0,
                             count,
                             expected,
-                            hour
+                            hour,
+                            suffix
                         ),
                         expected: format!("{:.0} events", expected),
                         observed: format!("{} events", count),
-                        confidence: 0.7,
-                        severity: Severity::High, // Silence is dangerous
+                        confidence,
+                        severity,
                     });
                 }
 
@@ -1068,13 +1110,89 @@ mod tests {
         store.current_hour = hour as u8;
         store.current_hour_counts.insert("auth_log".into(), 5);
 
-        let anomalies = store.check_rate_anomalies();
+        // No firewall blocking this hour -> a genuine silence -> High.
+        let anomalies = store.check_rate_anomalies(0);
         assert_eq!(anomalies.len(), 1);
         assert!(matches!(
             anomalies[0].anomaly_type,
             AnomalyType::EventRateDrop
         ));
         assert_eq!(anomalies[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn rate_anomaly_silence_benign_when_firewall_blocking() {
+        let mut store = BaselineStore::new();
+        store.mature = true;
+        store.training_days = 7;
+        let hour = Utc::now().hour() as usize;
+        store.event_rate_by_hour.insert("auth_log".into(), {
+            let mut arr = [0.0f32; 24];
+            arr[hour] = 100.0;
+            arr
+        });
+        store.current_hour = hour as u8;
+        store.current_hour_counts.insert("auth_log".into(), 5);
+
+        // 50 fresh blocks this hour -> the drop is the firewall dropping
+        // scanners before sshd logs them, not silence-as-compromise.
+        let anomalies = store.check_rate_anomalies(50);
+        assert_eq!(anomalies.len(), 1);
+        assert!(matches!(
+            anomalies[0].anomaly_type,
+            AnomalyType::EventRateDrop
+        ));
+        assert_eq!(
+            anomalies[0].severity,
+            Severity::Info,
+            "auth_log drop + active blocking -> downgraded to Info"
+        );
+        assert!(anomalies[0].description.contains("firewall suppression"));
+        assert!(anomalies[0].description.contains("50 blocks"));
+    }
+
+    #[test]
+    fn rate_anomaly_silence_high_when_blocks_below_floor() {
+        let mut store = BaselineStore::new();
+        store.mature = true;
+        store.training_days = 7;
+        let hour = Utc::now().hour() as usize;
+        store.event_rate_by_hour.insert("auth_log".into(), {
+            let mut arr = [0.0f32; 24];
+            arr[hour] = 100.0;
+            arr
+        });
+        store.current_hour = hour as u8;
+        store.current_hour_counts.insert("auth_log".into(), 5);
+
+        // 3 blocks (< BLOCK_SUPPRESSION_FLOOR) cannot explain the silence.
+        let anomalies = store.check_rate_anomalies(3);
+        assert_eq!(anomalies[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn rate_anomaly_silence_high_for_non_auth_source_despite_blocking() {
+        let mut store = BaselineStore::new();
+        store.mature = true;
+        store.training_days = 7;
+        let hour = Utc::now().hour() as usize;
+        // journald is NOT in AUTH_SUPPRESSIBLE_SOURCES — its silence is not
+        // explained by firewall blocking, so the carve-out must not apply.
+        store.event_rate_by_hour.insert("journald".into(), {
+            let mut arr = [0.0f32; 24];
+            arr[hour] = 100.0;
+            arr
+        });
+        store.current_hour = hour as u8;
+        store.current_hour_counts.insert("journald".into(), 5);
+
+        let anomalies = store.check_rate_anomalies(500);
+        assert_eq!(anomalies.len(), 1);
+        assert_eq!(
+            anomalies[0].severity,
+            Severity::High,
+            "non-auth source silence stays High even with blocking"
+        );
     }
 
     #[test]
@@ -1091,7 +1209,7 @@ mod tests {
         store.current_hour = hour as u8;
         store.current_hour_counts.insert("auth_log".into(), 50); // 5x spike
 
-        let anomalies = store.check_rate_anomalies();
+        let anomalies = store.check_rate_anomalies(0);
         assert_eq!(anomalies.len(), 1);
         assert!(matches!(
             anomalies[0].anomaly_type,
