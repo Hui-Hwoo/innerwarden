@@ -1228,6 +1228,21 @@ pub(crate) async fn process_narrative_tick(
         state.last_orphan_recovery = std::time::Instant::now();
     }
 
+    // Spec 062 Phase 2 — needs_review timeout sweep. Every 10 minutes,
+    // auto-resolve low/medium needs_review items that sat past the grace
+    // window with no human action (honest `auto_resolved_timeout` dismiss).
+    // High/critical are NEVER auto-dismissed here — they stay visible.
+    if state.last_needs_review_timeout.elapsed().as_secs() >= 600 {
+        let resolved = crate::needs_review_timeout::run_sweep(state, data_dir);
+        if resolved > 0 {
+            info!(
+                resolved,
+                "needs_review_timeout: auto-resolved low/medium review items past grace window"
+            );
+        }
+        state.last_needs_review_timeout = std::time::Instant::now();
+    }
+
     // Feed events through threat DNA engine (behavioral fingerprinting + anomaly detection).
     if cfg.dna.enabled {
         dna_inline::process_events(

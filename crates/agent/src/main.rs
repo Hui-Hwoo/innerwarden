@@ -137,6 +137,7 @@ mod narrative_autofp;
 mod narrative_daily_summary;
 mod narrative_incident_ingest;
 mod narrative_observation_verify;
+mod needs_review_timeout;
 #[allow(
     dead_code,
     unused_imports,
@@ -617,6 +618,8 @@ struct AgentState {
     /// "Stuck" bucket. Without this the dashboard accumulates
     /// dead-weight stuck count forever.
     last_orphan_recovery: std::time::Instant,
+    /// Spec 062 Phase 2 — last needs_review-timeout sweep tick.
+    last_needs_review_timeout: std::time::Instant,
     /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
     /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
     dynamic_trusted_ips: Vec<String>,

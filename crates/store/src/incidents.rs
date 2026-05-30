@@ -196,6 +196,55 @@ impl Store {
         }
         Ok(results)
     }
+
+    /// Spec 062 Phase 2: find incidents whose MOST RECENT decision is still
+    /// `needs_review` and that decision is older than `before_ts` — i.e. a
+    /// human never acted on it within the grace window.
+    ///
+    /// Returns `(incident_id, severity, needs_review_ts, data_json)`.
+    ///
+    /// The "most recent decision" subquery is what makes this safe: if a human
+    /// (or a later automated layer) already resolved the incident with a
+    /// block/dismiss/ignore after the needs_review row, that incident's latest
+    /// decision is no longer `needs_review` and it is correctly excluded. So
+    /// the timeout sweep only ever touches genuinely-unresolved review items.
+    /// The caller applies the severity gate (Low/Medium may auto-resolve;
+    /// High/Critical must never auto-dismiss).
+    pub fn find_timed_out_needs_review(
+        &self,
+        before_ts: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT i.incident_id, i.severity, d.ts, i.data \
+             FROM incidents i \
+             JOIN decisions d ON d.incident_id = i.incident_id \
+             WHERE d.id = ( \
+                 SELECT d2.id FROM decisions d2 \
+                 WHERE d2.incident_id = i.incident_id \
+                 ORDER BY d2.ts DESC, d2.id DESC LIMIT 1 \
+             ) \
+             AND d.action_type = 'needs_review' \
+             AND d.ts < ?1 \
+             AND i.is_allowlisted = 0 \
+             ORDER BY d.ts ASC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![before_ts, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
 }
 
 /// Extension trait for optional query results.

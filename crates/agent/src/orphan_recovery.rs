@@ -152,7 +152,7 @@ pub(crate) fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
 /// Extract the first IP entity from the incident's JSON `data` blob.
 /// Returns `None` when the JSON is malformed or has no IP entity (the
 /// dismiss decision is still written without a target IP).
-fn extract_target_ip(incident_data_json: &str) -> Option<String> {
+pub(crate) fn extract_target_ip(incident_data_json: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(incident_data_json).ok()?;
     let entities = parsed.get("entities")?.as_array()?;
     for entity in entities {

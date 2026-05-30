@@ -1287,6 +1287,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // post-boot so it doesn't race with the in-flight incident
         // processing right after a restart.
         last_orphan_recovery: std::time::Instant::now() - std::time::Duration::from_secs(5 * 60),
+        last_needs_review_timeout: std::time::Instant::now()
+            - std::time::Duration::from_secs(5 * 60),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
         dynamic_trusted_ips: Vec::new(),
         dynamic_trusted_users: Vec::new(),
