@@ -324,6 +324,27 @@ pub fn telegram_summary(posture: &HostPosture) -> String {
     s
 }
 
+/// Compact, single-line host posture for the AI decide() prompt (spec 067
+/// Phase 2b). The downgrade engine already uses posture to demote severity
+/// (an `ssh_bruteforce` against a `PasswordAuthentication=no` host is Low, not
+/// High); feeding the same facts to the LLM lets its reasoning match that
+/// outcome instead of over-reacting. SSHD-only for now (the most decision-
+/// relevant surface); `None` when the sshd probe did not succeed.
+pub fn ai_context_line(p: &HostPosture) -> Option<String> {
+    if !matches!(p.sshd.probe_state, sshd::ProbeState::Ok) {
+        return None;
+    }
+    let max_tries = p
+        .sshd
+        .max_auth_tries
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    Some(format!(
+        "sshd: PasswordAuthentication={:?}, PermitRootLogin={:?}, MaxAuthTries={max_tries}",
+        p.sshd.password_authentication, p.sshd.permit_root_login,
+    ))
+}
+
 /// Take a fresh snapshot, log a one-line summary, and persist. Called
 /// at boot (Phase 2 wiring) and from the slow loop refresh tick (Phase
 /// 2.2). Errors are logged but not propagated — posture is best-effort.

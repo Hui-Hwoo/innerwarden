@@ -311,6 +311,7 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
         .unwrap_or_default();
 
     let dshield_line = crate::ai::dshield_prompt_section(&ctx.ip_dshield);
+    let posture_line = crate::ai::posture_prompt_section(&ctx.host_posture);
 
     // Spec 025: prefer the structured JSON subgraph when available —
     // qwen2.5:3b gained +20 pp action accuracy on the ai-grounding
@@ -335,7 +336,7 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
 
 INCIDENT:
 {incident_json}
-{reputation_line}{geo_line}{dshield_line}
+{reputation_line}{geo_line}{dshield_line}{posture_line}
 {graph_section}{playbook_section}RECENT EVENTS FROM THE SAME ENTITY (last {count}):
 {events_json}
 
@@ -353,6 +354,7 @@ Select the best skill and return a JSON decision."#,
         reputation_line = reputation_line,
         geo_line = geo_line,
         dshield_line = dshield_line,
+        posture_line = posture_line,
         graph_section = graph_section,
         playbook_section = playbook_section,
         events_json = events_json,
@@ -739,6 +741,7 @@ mod tests {
             ip_reputation: None,
             ip_geo: None,
             ip_dshield: None,
+            host_posture: None,
             graph_context,
             graph_subgraph,
             playbook_outcome: None,
@@ -833,5 +836,25 @@ mod tests {
         let ctx = spec025_ctx(&inc, None, None); // ip_dshield None
         let prompt = build_prompt(&ctx);
         assert!(!prompt.contains("DSHIELD"));
+    }
+
+    #[test]
+    fn build_prompt_includes_host_posture_when_present() {
+        // Spec 067 Phase 2b: host posture reaches the LLM prompt.
+        let inc = spec025_incident();
+        let mut ctx = spec025_ctx(&inc, None, None);
+        ctx.host_posture =
+            Some("sshd: PasswordAuthentication=No, PermitRootLogin=No, MaxAuthTries=3".to_string());
+        let prompt = build_prompt(&ctx);
+        assert!(prompt.contains("HOST POSTURE"), "posture header missing");
+        assert!(prompt.contains("PasswordAuthentication=No"));
+    }
+
+    #[test]
+    fn build_prompt_omits_host_posture_when_absent() {
+        let inc = spec025_incident();
+        let ctx = spec025_ctx(&inc, None, None); // host_posture None
+        let prompt = build_prompt(&ctx);
+        assert!(!prompt.contains("HOST POSTURE"));
     }
 }

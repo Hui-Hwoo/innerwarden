@@ -691,3 +691,27 @@ impl SshdToggle {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ai_context_line (spec 067 Phase 2b)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_context_line_renders_sshd_facts_when_probe_ok() {
+    let mut p = HostPosture::default();
+    p.sshd.probe_state = ProbeState::Ok;
+    p.sshd.password_authentication = SshdToggle::No;
+    p.sshd.permit_root_login = SshdToggle::No;
+    p.sshd.max_auth_tries = Some(3);
+    let line = ai_context_line(&p).expect("should render when sshd probe is Ok");
+    assert!(line.contains("PasswordAuthentication=No"));
+    assert!(line.contains("PermitRootLogin=No"));
+    assert!(line.contains("MaxAuthTries=3"));
+}
+
+#[test]
+fn ai_context_line_none_when_probe_not_ok() {
+    // Default posture has `probe_state = Pending` → no usable posture line.
+    let p = HostPosture::default();
+    assert!(ai_context_line(&p).is_none());
+}

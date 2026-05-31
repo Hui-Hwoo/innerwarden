@@ -616,6 +616,7 @@ mod tests {
             ip_reputation,
             ip_geo,
             ip_dshield: None,
+            host_posture: None,
             graph_context: None,
             graph_subgraph: None,
             playbook_outcome: None,

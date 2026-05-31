@@ -702,6 +702,7 @@ pub(crate) async fn process_incidents(
             ip_reputation: ip_reputation.clone(),
             ip_geo: ip_geo_early.clone(),
             ip_dshield,
+            host_posture: crate::posture::ai_context_line(&state.host_posture),
             graph_context,
             graph_subgraph,
             playbook_outcome: playbook_ai_context,
