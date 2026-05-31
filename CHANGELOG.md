@@ -9,6 +9,51 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-05-31
+
+**Headline:** Operator-in-the-loop, end to end. Spec 056 ships the **SOC playbook engine** (declarative response sequences, virtual skills, shadow mode, dashboard API, `innerwarden playbook test`, bundled Log4Shell playbook). Spec 062 closes the real **Autonomy Gap**: ambiguous incidents now route to an explicit `needs_review` floor with severity-gated honest timeouts, Telegram inline Block/Ignore/Dismiss buttons, learned suppression, an optional LLM second opinion, and a warden retrain label channel + mesh corroboration — every path has a deterministic fallback when no LLM is present. Spec 066 stops already-blocked IPs from churning the decide/re-block/orphan loop. Plus: the OSS `innerwarden-supervisor` now ships in the install path, a `firewalld` block backend for RHEL/Rocky/Fedora, DShield (SANS ISC) read-only IP reputation enrichment, `[agent]` host asset tags (spec 058), Local Warden auto-provisioning on install, and two offline harnesses (`--playbook-replay`, `--backtest-anomaly`).
+
+### Added — Spec 056 SOC playbooks
+
+- **Playbook loader + schema + executor** (#864, #865). Declarative response sequences in `/etc/innerwarden/rules/playbooks/`, run with precedence before the auto-handle gate (#878). Two built-in playbooks ship embedded.
+- **Stateless + state-coupled virtual skills** (#866, #867). Playbook steps map to virtual skills resolved against config; outcomes feed back as AI context (#868).
+- **Dashboard + CLI surface** (#869, #870, #871). `GET /api/playbooks`, `POST /api/playbook/test` simulate endpoint, and `innerwarden playbook test`.
+- **Shadow mode + offline replay** (#874, #875). `[playbooks] shadow` validates on-host without acting; `--playbook-replay` re-runs recorded incidents through the executor offline.
+- **Bundled Log4Shell playbook** (#872). `cve-2021-44228` JNDI-in-HTTP response sequence shipped built-in (spec 056 phase 6).
+
+### Added — Spec 062 decision review + human escalation + learning
+
+- **`needs_review` floor for ambiguous incidents** (#890). Incidents the Local Warden is not confident about, that no deterministic gate resolves, route to `needs_review` instead of leaking silently to the orphan-recovery sweep. Closes the still-open Autonomy Gap proven in production on 2026-05-30.
+- **Severity-gated honest timeout** (#891). Low/Medium auto-resolve with an honest note after notify; High/Critical re-notify and **never** silently auto-dismiss. Timeout counts only after a notification actually succeeds.
+- **Telegram inline action buttons** (#896-class). Operators Block / Ignore / Dismiss a `needs_review` incident directly from the alert, mirroring the honeypot operator-in-the-loop pattern.
+- **Learned suppression** (#892). Weight-aware, LLM-optional: trivial repeated noise is suppressed without asking; high-impact actions confirm with a human.
+- **LLM second-opinion escalation + `needs_human` veto** (#893). An optional LLM verification step that can escalate to a human, never a dependency.
+- **Warden retrain label channel + mesh corroboration** (#897, #898). Human and learned decisions feed a retrain label channel; mesh peers corroborate suppression signals.
+
+### Added — platform
+
+- **OSS `innerwarden-supervisor`** (#883). The crash-recovery supervisor (rate-limited restart, HTTP `/metrics` health probe, Telegram alerts, `RestartHook`) now ships in the OSS install path. The proprietary watchdog wraps it with stealth + integrity gating; OSS users get auto-restart on its own. Health probe defaults to HTTPS since the agent serves TLS (#886-class).
+- **`firewalld` block-ip backend** (#884-class). Sixth block backend, for RHEL / Rocky / Fedora hosts.
+- **DShield (SANS ISC) read-only IP reputation enrichment** (#899). Keyless, mirrors the AbuseIPDB enrichment path; backfills incident context.
+- **`[agent]` host asset tags** (#882-class, spec 058 minimal slice). Operator-supplied host tags flow into incident context.
+- **Local Warden auto-provisioning on install** (#873, #882). Fresh installs (including headless) provision the on-device ONNX classifier and activate `[ai.warden]` automatically.
+- **Offline anomaly backtest harness** (#904). `--backtest-anomaly` trains a fresh autoencoder before a cutoff and scores held-out events (no leakage) to measure decision separation and guard-dog novelty concentration; optional first-ever-entity novelty features.
+
+### Changed
+
+- **Coverage patch floor raised 70% → 85%** (#863) with a 10pp slack window.
+- **Daily briefing reads canonical decision-count surfaces** (#879, #880, and the FP-exclusion fix): agent-dismissed false positives no longer inflate the "real compromises" / "autonomous decisions" counts.
+- **eBPF unavailability surfaced in collector health** instead of failing silently (#881-class).
+- **SOC playbooks run with precedence** before the auto-handle gate (#878).
+
+### Fixed
+
+- **Spec 066 — already-blocked-IP churn guard** (#905). An IP with a live (TTL-valid) firewall block no longer re-fires the decide/re-block path or leaks fresh incidents to orphan-recovery. Recon/protocol/auth-brute detectors short-circuit on an already-blocked IP (active-harm detectors still surface); the canonical block path skips redundant re-blocks. Field-validated on two production deployments.
+- **`imds_ssrf` legitimacy by non-forgeable exe-path** (#900, #901), not a spoofable process name; trusts `systemd-resolved` and root-owned vendor dirs.
+- **`dns_tunneling` trusts cloud-internal VCN DNS** with hardened dot-boundary suffix matching (#902).
+- **`proto_anomaly` stops flagging external scanners on web ports** as anomalies (#889).
+- **`baseline` silence false positive** when an auth_log drop is caused by log rotation, not a real silence (#888-class).
+
 ## [0.14.5] - 2026-05-28
 
 **Headline:** Three specs closed in two days. Spec 053 ships the event pipeline DSL (declarative filter / sample / promote in the sensor, hot-reloaded YAML). Spec 054 unifies all rule paths under `/etc/innerwarden/rules/{event_pipeline,sigma,yara,atr,correlation}/` and deprecates `allowlist.toml`. Spec 055 migrates the 68 cross-layer correlation rules from a 1770-line Rust literal to YAML in five small phases, also shipped today. Net: rules are operator-editable and hot-reloadable across the entire detection stack, with `innerwarden rule list/disable/enable` covering all five rule types.

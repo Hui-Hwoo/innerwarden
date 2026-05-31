@@ -31,7 +31,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![Memory](https://img.shields.io/badge/memory-~250MB%20(full%20stack)-green)
 ![AI Optional](https://img.shields.io/badge/AI-optional-lightgrey)
 ![Storage](https://img.shields.io/badge/storage-SQLite%20WAL-blue)
-![Graph](https://img.shields.io/badge/knowledge%20graph-11%20types%2C%2050%20relations-purple)
+![Graph](https://img.shields.io/badge/knowledge%20graph-11%20types%2C%2053%20relations-purple)
 
 ---
 
@@ -130,8 +130,8 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 │   ┌───────────────────────────────────────────────────────────┐   │
 │   │              Knowledge Graph (in-memory)                  │   │
 │   │  11 node types (Process, IP, File, User, Domain, ...)     │   │
-│   │  50 relation types | 27 graph detectors | 10 graph rules  │   │
-│   │  Autoencoder anomaly scoring (58 features)                │   │
+│   │  53 relation types | 28 graph detectors | 10 graph rules  │   │
+│   │  Autoencoder anomaly scoring (65 features)                │   │
 │   └────────────────────────┬──────────────────────────────────┘   │
 │                            ▼                                      │
 │     ┌──────────────────────────────────────────────┐              │
@@ -204,7 +204,7 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 ## What it does
 
 1. **Watches**: 29 collectors across all layers — eBPF syscall tracing (53 kernel programs including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, CloudTrail
-2. **Detects**: 78 stateful detectors + 8 YARA malware rules + 8 built-in Sigma rules + 208 community Sigma rules identify brute-force, credential stuffing, port scans, C2 callbacks (including tunnels via ngrok/cloudflared/bore, non-standard ports, and DNS/ICMP/SSH-forward protocol tunneling), privilege escalation (non-baseline SUID exec, dangerous-capability abuse), container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID, plus scp/rsync staged-egress), timestomping, log tampering, discovery bursts (nmap, wordlist scanners, argv-driven anomaly), collection patterns (clipboard, screen capture, password-protected archives), persistence (PAM module tampering, RC scripts, systemd units, cron, SSH keys), defense evasion (auditd disable, SELinux/AppArmor disable), data destruction (rm -rf user data, disk wipe, mkfs/luksFormat on running volumes), symlink/hardlink hijack of sensitive files, service-account interactive shells (foothold signal), and more. **90+ MITRE ATT&CK techniques covered** across 14 tactics.
+2. **Detects**: 79 stateful detectors + 8 YARA malware rules + 9 built-in Sigma rules + 208 community Sigma rules identify brute-force, credential stuffing, port scans, C2 callbacks (including tunnels via ngrok/cloudflared/bore, non-standard ports, and DNS/ICMP/SSH-forward protocol tunneling), privilege escalation (non-baseline SUID exec, dangerous-capability abuse), container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID, plus scp/rsync staged-egress), timestomping, log tampering, discovery bursts (nmap, wordlist scanners, argv-driven anomaly), collection patterns (clipboard, screen capture, password-protected archives), persistence (PAM module tampering, RC scripts, systemd units, cron, SSH keys), defense evasion (auditd disable, SELinux/AppArmor disable), data destruction (rm -rf user data, disk wipe, mkfs/luksFormat on running volumes), symlink/hardlink hijack of sensitive files, service-account interactive shells (foothold signal), and more. **90+ MITRE ATT&CK techniques covered** across 14 tactics.
 3. **Correlates**: 68 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
 4. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
 5. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
@@ -243,7 +243,8 @@ When a threat is confirmed, Inner Warden picks the right tool.
 | Skill | What it does |
 |-------|-------------|
 | **Block IP (XDP)** | Wire-speed drop at the network driver, 10M+ packets/sec, zero CPU overhead |
-| **Block IP (firewall)** | Deny via ufw, iptables, nftables, or pf (macOS). Persists across reboots. |
+| **Block IP (firewall)** | Deny via ufw, iptables, nftables, firewalld (RHEL/Rocky/Fedora), or pf (macOS). Persists across reboots. |
+| **SOC playbook** | Run an operator-authored response sequence (declarative steps, virtual skills) with precedence before the auto-handle gate. Shadow mode validates on-host without acting; `innerwarden playbook test` simulates. Log4Shell playbook ships built-in. |
 | **Suspend sudo** | Revokes sudo for a user via sudoers drop-in. Auto-expires after TTL. |
 | **Kill process** | Terminates all processes for a compromised user. TTL-bounded. |
 | **Block container** | Pauses a Docker container. Auto-unpauses after TTL. |
@@ -270,11 +271,15 @@ With `[honeypot] interaction = "llm_shell"` (the default is a low-interaction `b
 - Masquerades as `SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6` so scanners don't fingerprint the listener.
 - Drops the trapped payload commands + IOCs into the dashboard's Honeypot tab, paginated and engaged-only by default.
 
+### Decision review &amp; human escalation (v0.15.0)
+
+The real Autonomy Gap: an incident the Local Warden is not confident about, that no deterministic gate resolves, used to leak silently to an orphan-recovery sweep that auto-dismissed it ~1h later. v0.15.0 replaces that leak with an explicit, honest loop — trivial noise is suppressed without asking; anything weighty routes to **`needs_review`**, notifies the operator (Telegram with inline **Block / Ignore / Dismiss** buttons), and on timeout auto-resolves Low/Medium with an honest note while High/Critical re-notify and **never** silently auto-dismiss. Every human decision feeds a warden retrain label channel; mesh peers corroborate suppression. Every path has a deterministic fallback — the LLM is an enhancement, never a dependency. An already-blocked IP no longer churns the decide/re-block loop (spec 066). Read `innerwarden get decisions`; configure under `[observation]` / `[responder]`.
+
 ---
 
 ## What it detects
 
-78 stateful detectors + 8 YARA rules + 8 built-in Sigma rules + 208 community Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across all 14 Linux tactics.** Highlights:
+79 stateful detectors + 8 YARA rules + 9 built-in Sigma rules + 208 community Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across all 14 Linux tactics.** Highlights:
 
 | Detector | Threat | MITRE |
 |----------|--------|-------|
@@ -352,7 +357,7 @@ innerwarden config mesh add-peer https://peer-server:8790
 
 Container-aware via cgroup ID. Zero performance overhead.
 
-**Agent**: reads incidents from SQLite or Redis Streams. Fast loop (2s): algorithm gate → enrichment (AbuseIPDB, GeoIP, CrowdSec, threat feeds) → VirusTotal hash check on YARA matches → AI triage → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (68 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → monthly report generation → narrative summary.
+**Agent**: reads incidents from SQLite or Redis Streams. Fast loop (2s): algorithm gate → already-blocked / needs-review routing → enrichment (AbuseIPDB, GeoIP, CrowdSec, DShield, threat feeds) → VirusTotal hash check on YARA matches → SOC playbooks → AI triage → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (68 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → decision-review timeout sweep → monthly report generation → narrative summary. Auto-restart is handled by the OSS `innerwarden-supervisor` (rate-limited, `/metrics` health probe, Telegram alerts).
 
 Two Rust daemons. No external dependencies. ~250 MB RAM with all features active (sensor + agent + satellite modules, single SQLite database). Dashboard with 9 views: Sensors HUD, Threats investigation, Report, Health, Honeypot, Compliance (ISO 27001), Intelligence (Profiles, Campaigns, Chains, Baseline), Monthly Report. Live SSE feed, MITRE ATT&CK mapping, 20 integration cards. Sleeps after 15 min of inactivity.
 
@@ -439,6 +444,7 @@ Enable what you need.
 | `slack-notify` | Incident notifications | Slack webhook |
 | `cloudflare-integration` | L7 DDoS / botnet IPs | Block at Cloudflare edge |
 | `abuseipdb-enrichment` | IP reputation context | Enriched AI prompt |
+| `dshield-enrichment` | SANS ISC IP reputation (keyless, read-only) | Enriched AI prompt |
 | `geoip-enrichment` | Country/ISP geolocation | Enriched AI prompt |
 | `fail2ban-integration` | Sync active fail2ban bans | Block enforcement |
 | `crowdsec-integration` | CrowdSec community intel | Block enforcement (experimental) |
