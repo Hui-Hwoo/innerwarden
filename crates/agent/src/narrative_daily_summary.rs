@@ -1,10 +1,52 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use chrono::Timelike as _;
 use tracing::{info, warn};
 
 use crate::{config, narrative, telegram, AgentState};
+
+/// Incident IDs the agent auto-resolved as benign today, read from the
+/// canonical decisions log. Spec 044 honesty fix (2026-05-31): the daily
+/// digest's "real compromises" / "high-severity threats" counts iterate
+/// incidents by posture-adjusted severity but, before this, ignored the
+/// *decision* — so an incident the agent had already DISMISSED as a false
+/// positive (the host's own `imds_ssrf` metadata polling, `dns_tunneling` to
+/// its own VCN DNS, `kill_chain` apt/wget DATA_EXFIL — all dismissed but still
+/// Critical/High by raw severity) was counted as a "real compromise". That
+/// inflated the headline and buried any genuine breach in the noise.
+///
+/// A `dismiss` or `ignore` decision means the agent judged the incident
+/// benign; those are excluded from the threat counts (they already feed the
+/// separate "auto-resolved" line). Incidents with no decision yet, or with a
+/// real action (block/monitor/honeypot/needs_review), are NOT excluded — a
+/// genuinely pending or actioned threat must still be counted.
+///
+/// This is the SAFE, comprehensive FP fix: it changes no detector and can
+/// never hide a real attack — it only declines to call "compromise" what the
+/// agent itself already decided was not one.
+fn auto_resolved_incident_ids(data_dir: &Path, today: &str) -> HashSet<String> {
+    let path = data_dir.join(format!("decisions-{today}.jsonl"));
+    let mut ids = HashSet::new();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return ids;
+    };
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let action = v.get("action_type").and_then(|a| a.as_str()).unwrap_or("");
+        if action == "dismiss" || action == "ignore" {
+            if let Some(id) = v.get("incident_id").and_then(|i| i.as_str()) {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
+}
 
 /// Regenerate daily markdown summary and send Telegram digest when due.
 pub(crate) async fn maybe_write_daily_summary_and_digest(
@@ -98,6 +140,10 @@ fn build_daily_digest_text(
     today: &str,
 ) -> String {
     let is_simple = cfg.telegram.is_simple_profile();
+    // Incidents the agent already dismissed/ignored as benign — excluded from
+    // the "real compromises" / "high-severity" threat counts so a false
+    // positive the agent auto-resolved is not reported as a compromise.
+    let auto_resolved = auto_resolved_incident_ids(data_dir, today);
     // Count incidents by severity and top detector.
     let mut incidents_today: u32 = 0;
     let mut critical_count: u32 = 0;
@@ -106,6 +152,12 @@ fn build_daily_digest_text(
     for inc in &state.narrative_acc.incidents {
         incidents_today += 1;
         let det = telegram::extract_detector_pub(&inc.incident_id);
+        *detector_counts.entry(det.to_string()).or_insert(0) += 1;
+        // A dismissed/ignored incident is, by the agent's own decision, not a
+        // threat — it feeds the "auto-resolved" line, not "real compromises".
+        if auto_resolved.contains(&inc.incident_id) {
+            continue;
+        }
         // Effective severity: posture-aware downgrade (spec 044 Phase 3).
         let (effective, _reason) =
             crate::posture::downgrade::effective_severity(inc, det, &state.host_posture);
@@ -118,7 +170,6 @@ fn build_daily_digest_text(
             }
             _ => {}
         }
-        *detector_counts.entry(det.to_string()).or_insert(0) += 1;
     }
     // "Autonomous decisions" = the count of decisions the agent actually
     // recorded today, read from the canonical hash-chained decisions log
@@ -228,6 +279,43 @@ mod tests {
         assert!(text.contains("Deferred:"));
         assert!(text.contains("port_scan=4"));
         assert!(state.telegram_deferred.is_empty());
+    }
+
+    #[test]
+    fn digest_excludes_dismissed_incidents_from_threat_counts() {
+        // Honesty fix (2026-05-31): an incident the agent DISMISSED as a false
+        // positive (e.g. imds_ssrf / dns_tunneling / kill_chain self-traffic)
+        // must NOT inflate "real compromises" / "high-severity" even though its
+        // raw severity is Critical/High. It still counts toward total incidents
+        // (and the auto-resolved line), just not the threat headline.
+        let dir = TempDir::new().expect("tempdir");
+        let mut cfg = cfg_with_narrative();
+        cfg.telegram.user_profile = "technical".to_string();
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        let mut dismissed_crit = crate::tests::test_incident_with_kind("203.0.113.30", "imds_ssrf");
+        dismissed_crit.severity = innerwarden_core::event::Severity::Critical;
+        let mut real_crit = crate::tests::test_incident_with_kind("203.0.113.31", "reverse_shell");
+        real_crit.severity = innerwarden_core::event::Severity::Critical;
+        let dismissed_id = dismissed_crit.incident_id.clone();
+        state
+            .narrative_acc
+            .ingest_incidents(&[dismissed_crit, real_crit]);
+
+        // The agent dismissed the imds_ssrf one as a false positive.
+        let line = format!(
+            r#"{{"ts":"2026-05-13T00:00:00Z","incident_id":"{dismissed_id}","host":"h","ai_provider":"orphan-recovery","action_type":"dismiss","confidence":1.0,"auto_executed":true,"dry_run":false,"reason":"fp","estimated_threat":"none","execution_result":"dismissed"}}"#
+        );
+        std::fs::write(dir.path().join("decisions-2026-05-13.jsonl"), line).unwrap();
+
+        let text = build_daily_digest_text(&cfg, &mut state, dir.path(), "2026-05-13");
+
+        // 2 incidents seen, but only the non-dismissed Critical is a compromise.
+        assert!(text.contains("Incidents: 2"), "total incidents unchanged");
+        assert!(
+            text.contains("Critical: 1 | High: 0"),
+            "dismissed Critical must be excluded from the threat count: {text}"
+        );
     }
 
     #[test]
