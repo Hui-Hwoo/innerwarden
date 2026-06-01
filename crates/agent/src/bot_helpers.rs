@@ -376,6 +376,35 @@ pub(crate) fn ask_context_deep(
                 }
                 if let Some(ip_id) = graph.find_by_ip(ip) {
                     let mut lines: Vec<String> = Vec::new();
+                    // Spec 067 Phase 3: when the operator names an IP ("why did
+                    // you block 1.2.3.4?"), surface THAT IP's incident +
+                    // decision + the reason behind it, not just the subgraph
+                    // edges. Incidents link to the IP via `TriggeredBy`, so the
+                    // incoming edge's source is the incident node.
+                    for edge in graph.incoming_edges(ip_id).iter() {
+                        if edge.relation != Relation::TriggeredBy {
+                            continue;
+                        }
+                        if let Some(Node::Incident {
+                            severity,
+                            detector,
+                            title,
+                            decision,
+                            decision_reason,
+                            ..
+                        }) = graph.get_node(edge.from)
+                        {
+                            let mut l = format!("  incident [{severity}] {detector}: {title}");
+                            if let Some(d) = decision {
+                                l.push_str(&format!(" -> decided: {d}"));
+                            }
+                            if let Some(r) = decision_reason {
+                                let why: String = r.chars().take(200).collect();
+                                l.push_str(&format!(" | why: {why}"));
+                            }
+                            lines.push(l);
+                        }
+                    }
                     for edge in graph.outgoing_edges(ip_id).iter().take(8) {
                         if let Some(other) = graph.get_node(edge.to) {
                             lines.push(format!("  -[{:?}]-> {}", edge.relation, node_label(other)));
@@ -1690,6 +1719,56 @@ mod tests {
         assert!(
             out.contains("Port(22/tcp)"),
             "expected subgraph to render the connected Port node; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn ask_context_deep_explains_decision_for_mentioned_ip() {
+        // Spec 067 Phase 3: "why did you block X?" pulls THAT IP's incident +
+        // decision + reason, not just the subgraph edges.
+        use knowledge_graph::types::{Edge, Node, Relation};
+        let now = chrono::Utc::now();
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            knowledge_graph::KnowledgeGraph::new(),
+        ));
+        {
+            let mut g = kg.write().unwrap();
+            let ip_id = g.add_node(make_ip_node(
+                "45.148.10.99",
+                90,
+                vec!["blocklist".to_string()],
+            ));
+            let inc = g.add_node(Node::Incident {
+                incident_id: "threat_intel:45.148.10.99:1".to_string(),
+                detector: "threat_intel".to_string(),
+                severity: "high".to_string(),
+                title: "Known malicious IP".to_string(),
+                summary: "IP on threat feed".to_string(),
+                ts: now,
+                mitre_ids: vec![],
+                decision: Some("block_ip".to_string()),
+                confidence: Some(0.99),
+                decision_reason: Some("AbuseIPDB 100/100 plus threat feed".to_string()),
+                decision_target: Some("45.148.10.99".to_string()),
+                auto_executed: true,
+                is_allowlisted: false,
+                false_positive: false,
+                fp_reporter: None,
+                fp_reported_at: None,
+                research_only: false,
+            });
+            g.add_edge(Edge::new(inc, ip_id, Relation::TriggeredBy, now));
+        }
+
+        let out = ask_context_deep(&kg, "why did you block 45.148.10.99?", 8000);
+        assert!(
+            out.contains("Known malicious IP"),
+            "incident title; got:\n{out}"
+        );
+        assert!(out.contains("decided: block_ip"), "decision; got:\n{out}");
+        assert!(
+            out.contains("why: AbuseIPDB 100/100 plus threat feed"),
+            "decision reason; got:\n{out}"
         );
     }
 
