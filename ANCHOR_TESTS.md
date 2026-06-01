@@ -143,25 +143,25 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 ### Config file permission fix (Wave 8d)
 
-- `crates/agent/src/config.rs::tests::perm_fix_command_does_chown_before_chmod` — the operator-facing fix command for over-permissive `agent.toml` MUST do `chown innerwarden:innerwarden` BEFORE `chmod 600`. Pinned because the previous WARN ("consider chmod 600") led the operator straight into a broken-restart trap on 2026-05-04: chmod 600 on a root-owned file with the agent running as a non-root service user makes the config unreadable on the next start. Reversing the order in this string is the bug we are guarding against.
+- `crates/agent/src/config/mod.rs::tests::perm_fix_command_does_chown_before_chmod` — the operator-facing fix command for over-permissive `agent.toml` MUST do `chown innerwarden:innerwarden` BEFORE `chmod 600`. Pinned because the previous WARN ("consider chmod 600") led the operator straight into a broken-restart trap on 2026-05-04: chmod 600 on a root-owned file with the agent running as a non-root service user makes the config unreadable on the next start. Reversing the order in this string is the bug we are guarding against.
 
-- `crates/agent/src/config.rs::tests::perm_fix_command_handles_paths_without_shell_injection` — the path is operator-controlled (passed via `--config`), so the fix-suggestion string must not contain backticks, `$()`, or extra `&&` chains beyond the one we put there. Anti-regression for accidentally interpolating shell metacharacters into a copy-pasteable command.
+- `crates/agent/src/config/mod.rs::tests::perm_fix_command_handles_paths_without_shell_injection` — the path is operator-controlled (passed via `--config`), so the fix-suggestion string must not contain backticks, `$()`, or extra `&&` chains beyond the one we put there. Anti-regression for accidentally interpolating shell metacharacters into a copy-pasteable command.
 
 ### Config schema strictness (Wave 9e — silent-TOML-drift gate)
 
-- `crates/agent/src/config.rs::tests::data_retention_alias_resolves_to_data_section` — operators with the legacy `[data_retention]` section name keep working: the `#[serde(alias = "data_retention")]` on `AgentConfig::data` resolves the section into `cfg.data` so `filestore_max_size_mb`, `events_keep_days`, and the rest are actually applied. Pinned the 2026-05-04 audit AUDIT-002: prod's `[data_retention] filestore_max_size_mb = 1024` had been a silent no-op because the section name did not match the field; removing the alias would brick every existing prod config on the next deploy.
+- `crates/agent/src/config/mod.rs::tests::data_retention_alias_resolves_to_data_section` — operators with the legacy `[data_retention]` section name keep working: the `#[serde(alias = "data_retention")]` on `AgentConfig::data` resolves the section into `cfg.data` so `filestore_max_size_mb`, `events_keep_days`, and the rest are actually applied. Pinned the 2026-05-04 audit AUDIT-002: prod's `[data_retention] filestore_max_size_mb = 1024` had been a silent no-op because the section name did not match the field; removing the alias would brick every existing prod config on the next deploy.
 
-- `crates/agent/src/config.rs::tests::data_section_canonical_name_works_too` — the canonical `[data]` section name (which matches the `pub data` field) parses as expected. Pairs with the alias test so future readers see both forms exercised in the same module.
+- `crates/agent/src/config/mod.rs::tests::data_section_canonical_name_works_too` — the canonical `[data]` section name (which matches the `pub data` field) parses as expected. Pairs with the alias test so future readers see both forms exercised in the same module.
 
-- `crates/agent/src/config.rs::tests::unknown_top_level_section_fails_loudly` — `#[serde(deny_unknown_fields)]` on `AgentConfig` rejects sections like `[bogus_section]` with a clear error. Anchor against accidentally lifting the deny gate, which would re-introduce the AUDIT-002 silent-drift class for top-level sections.
+- `crates/agent/src/config/mod.rs::tests::unknown_top_level_section_fails_loudly` — `#[serde(deny_unknown_fields)]` on `AgentConfig` rejects sections like `[bogus_section]` with a clear error. Anchor against accidentally lifting the deny gate, which would re-introduce the AUDIT-002 silent-drift class for top-level sections.
 
-- `crates/agent/src/config.rs::tests::unknown_inner_key_fails_loudly_in_data_section` — the strict gate also fires on inner-key typos like `keep_dayss` under `[data]`. This is the EXACT failure shape AUDIT-002 surfaced (prod's `[data_retention] keep_days = 7` was using a key that does not exist on `DataRetentionConfig`).
+- `crates/agent/src/config/mod.rs::tests::unknown_inner_key_fails_loudly_in_data_section` — the strict gate also fires on inner-key typos like `keep_dayss` under `[data]`. This is the EXACT failure shape AUDIT-002 surfaced (prod's `[data_retention] keep_days = 7` was using a key that does not exist on `DataRetentionConfig`).
 
-- `crates/agent/src/config.rs::tests::legacy_data_retention_with_unknown_inner_key_also_fails_loudly` — the alias does NOT bypass the inner-struct strictness. A legacy `[data_retention]` block with bogus keys still hard-fails, so operators get told about each typo on the deploy that matters and can fix them in one go.
+- `crates/agent/src/config/mod.rs::tests::legacy_data_retention_with_unknown_inner_key_also_fails_loudly` — the alias does NOT bypass the inner-struct strictness. A legacy `[data_retention]` block with bogus keys still hard-fails, so operators get told about each typo on the deploy that matters and can fix them in one go.
 
-- `crates/agent/src/config.rs::tests::empty_config_uses_defaults_cleanly` — an empty TOML still deserialises to `AgentConfig::default()`. Anti-regression for adding `deny_unknown_fields` somewhere that breaks Default.
+- `crates/agent/src/config/mod.rs::tests::empty_config_uses_defaults_cleanly` — an empty TOML still deserialises to `AgentConfig::default()`. Anti-regression for adding `deny_unknown_fields` somewhere that breaks Default.
 
-- `crates/agent/src/config.rs::tests::every_top_level_section_is_documented_with_an_inner_struct` — locks the canonical set of top-level sections. Adding a new section is fine; renaming or removing one fails this test, forcing the contributor to either pair the rename with a `serde(alias)` (back-compat for existing prod agent.toml files) or document the breaking change.
+- `crates/agent/src/config/mod.rs::tests::every_top_level_section_is_documented_with_an_inner_struct` — locks the canonical set of top-level sections. Adding a new section is fine; renaming or removing one fails this test, forcing the contributor to either pair the rename with a `serde(alias)` (back-compat for existing prod agent.toml files) or document the breaking change.
 
 ### Sensor log discipline (Wave 9f — AUDIT-010 anchor)
 
