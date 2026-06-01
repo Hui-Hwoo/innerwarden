@@ -100,35 +100,7 @@ pub(crate) fn build_agent_context(
          Slack notifications: {slack_status}\n\
          Cloudflare edge blocking: {cloudflare_status}\n\
          \n\
-         === AVAILABLE CAPABILITIES (innerwarden enable/disable <id>) ===\n\
-         - ai: AI-powered incident analysis (params: provider=openai|anthropic|ollama, model=...)\n\
-         - block-ip: Firewall blocking of attacking IPs (params: backend=ufw|iptables|nftables|pf)\n\
-         - sudo-protection: Detect sudo abuse + auto-suspend attacker privileges\n\
-         - shell-audit: Audit shell command execution (privacy gate required)\n\
-         - search-protection: Protect search/API endpoints from scraping bots\n\
-         \n\
-         === AVAILABLE SKILLS (agent execution layer) ===\n\
-         Open tier: block-ip-ufw, block-ip-iptables, block-ip-nftables, block-ip-pf, suspend-user-sudo, rate-limit-nginx\n\
-         Premium tier: monitor-ip (packet capture), honeypot (attacker trap)\n\
-         \n\
-         === CLI REFERENCE ===\n\
-         innerwarden enable <capability>         # activate a capability\n\
-         innerwarden disable <capability>        # deactivate a capability\n\
-         innerwarden status                      # full system overview\n\
-         innerwarden doctor                      # health check with fix hints\n\
-         innerwarden scan                        # detect installed tools, recommend modules\n\
-         innerwarden list                        # list all capabilities with status\n\
-         innerwarden configure responder         # set GUARD/WATCH/DRY-RUN mode\n\
-         innerwarden notify telegram             # setup Telegram bot\n\
-         innerwarden notify slack                # setup Slack webhook\n\
-         innerwarden integrate abuseipdb         # IP reputation enrichment\n\
-         innerwarden integrate geoip             # GeoIP enrichment (free)\n\
-         innerwarden block <ip> --reason <r>     # manual IP block\n\
-         innerwarden unblock <ip>                # remove IP block\n\
-         innerwarden incidents --days 7          # list recent incidents\n\
-         innerwarden decisions --days 7          # list recent decisions\n\
-         innerwarden report                      # show operational report\n\
-         innerwarden tune                        # auto-tune detector thresholds\n\
+         Capabilities are managed with `innerwarden enable/disable <id>`; `innerwarden status` shows the full overview. (The live server pulse follows below.)\n\
          ",
         host = host,
         version = env!("CARGO_PKG_VERSION"),
@@ -136,6 +108,42 @@ pub(crate) fn build_agent_context(
         mode_desc = mode.description(),
         data_dir = data_dir.display(),
     )
+}
+
+/// The live server "pulse" injected into the chat context (spec 067 Phase 4)
+/// so the AI answers with the authority of something that lives on the box, not
+/// a config recital. Carries the host's actual defensive posture and who is
+/// attacking right now. Empty when there is nothing live to report.
+pub(crate) fn live_server_context(
+    posture: &crate::posture::HostPosture,
+    attacker_profiles: &std::collections::HashMap<String, crate::attacker_intel::AttackerProfile>,
+) -> String {
+    let mut body = String::new();
+    if let Some(p) = crate::posture::ai_context_line(posture) {
+        body.push_str(&format!("Host posture: {p}\n"));
+    }
+    let mut atk: Vec<(&str, u8)> = attacker_profiles
+        .iter()
+        .map(|(ip, p)| (ip.as_str(), p.risk_score))
+        .filter(|(_, r)| *r > 0)
+        .collect();
+    atk.sort_by(|a, b| b.1.cmp(&a.1));
+    let top: Vec<String> = atk
+        .iter()
+        .take(5)
+        .map(|(ip, r)| format!("{ip} (risk {r})"))
+        .collect();
+    if !top.is_empty() {
+        body.push_str(&format!(
+            "Top attackers tracked right now: {}\n",
+            top.join(", ")
+        ));
+    }
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("=== LIVE SERVER PULSE ===\n{}", body.trim_end())
+    }
 }
 
 /// Merge a persona string, the runtime snapshot, recent incidents, and recent
@@ -364,5 +372,40 @@ mod tests {
         assert!(context.contains("GeoIP enrichment: DISABLED"));
         assert!(context.contains("Slack notifications: DISABLED"));
         assert!(context.contains("Cloudflare edge blocking: DISABLED"));
+    }
+
+    #[test]
+    fn live_server_context_carries_posture_and_top_attackers_sorted() {
+        use crate::posture::{sshd, HostPosture};
+        let mut p = HostPosture::default();
+        p.sshd.probe_state = sshd::ProbeState::Ok;
+        p.sshd.password_authentication = sshd::SshdToggle::No;
+
+        let mut profiles = std::collections::HashMap::new();
+        let mut hi = crate::attacker_intel::new_profile("45.148.10.99", chrono::Utc::now());
+        hi.risk_score = 90;
+        profiles.insert("45.148.10.99".to_string(), hi);
+        let mut lo = crate::attacker_intel::new_profile("1.2.3.4", chrono::Utc::now());
+        lo.risk_score = 50;
+        profiles.insert("1.2.3.4".to_string(), lo);
+
+        let ctx = live_server_context(&p, &profiles);
+        assert!(ctx.contains("LIVE SERVER PULSE"));
+        assert!(
+            ctx.contains("PasswordAuthentication=No"),
+            "posture must be carried"
+        );
+        assert!(ctx.contains("45.148.10.99 (risk 90)"));
+        let pos_hi = ctx.find("45.148.10.99").unwrap();
+        let pos_lo = ctx.find("1.2.3.4").unwrap();
+        assert!(pos_hi < pos_lo, "higher-risk attacker listed first");
+    }
+
+    #[test]
+    fn live_server_context_empty_when_nothing_live() {
+        // Default posture probe is Pending and no attackers tracked.
+        let p = crate::posture::HostPosture::default();
+        let profiles = std::collections::HashMap::new();
+        assert!(live_server_context(&p, &profiles).is_empty());
     }
 }

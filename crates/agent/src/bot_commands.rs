@@ -638,7 +638,20 @@ pub(crate) async fn handle_telegram_bot_command(
             // operator's question text mentions. Pre-Phase-2 the answer was
             // operator-reported "muito basico" because the LLM had no signal
             // beyond manchetes. Hard 8000-char cap protects LLM cost / latency.
-            let agent_ctx = build_agent_context(cfg, data_dir, &state.knowledge_graph);
+            // Spec 067 Phase 4: append the live server pulse (posture + who is
+            // attacking now) so the AI answers like it lives on the box.
+            let agent_ctx = {
+                let base = build_agent_context(cfg, data_dir, &state.knowledge_graph);
+                let pulse = crate::agent_context::live_server_context(
+                    &state.host_posture,
+                    &state.attacker_profiles,
+                );
+                if pulse.is_empty() {
+                    base
+                } else {
+                    format!("{base}\n{pulse}")
+                }
+            };
             let deep_ctx = bot_helpers::ask_context_deep(&state.knowledge_graph, &question, 8000);
             let system_prompt = crate::agent_context::compose_system_prompt(
                 &cfg.telegram.bot.personality,
