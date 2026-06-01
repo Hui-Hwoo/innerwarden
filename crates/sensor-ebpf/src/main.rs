@@ -35,9 +35,12 @@ use aya_ebpf::{
     EbpfContext,
 };
 
-// Dispatcher-specific imports (conditionally compiled)
+// Spec 069: raw_tracepoint + RawTracePointContext are now used by always-on
+// non-syscall handlers (e.g. sched_process_exit), not just the dispatcher path,
+// so they must be imported unconditionally. ProgramArray stays dispatcher-only.
+use aya_ebpf::{macros::raw_tracepoint, programs::RawTracePointContext};
 #[cfg(feature = "dispatcher")]
-use aya_ebpf::{macros::raw_tracepoint, maps::ProgramArray, programs::RawTracePointContext};
+use aya_ebpf::maps::ProgramArray;
 use aya_log_ebpf::info;
 use innerwarden_ebpf_types::{
     AcceptEvent, AcpiEvalEvent, BpfLoadEvent, CloneEvent, ConnectEvent, DupEvent, ExecveEvent,
@@ -1655,8 +1658,15 @@ fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, i64> {
 //   - Short-lived processes that exited normally (not rootkits)
 //   - Long-running processes that disappeared from /proc (real rootkits)
 
-#[tracepoint]
-pub fn innerwarden_process_exit(ctx: TracePointContext) -> u32 {
+// Spec 069: attach via raw_tracepoint (BPF_RAW_TRACEPOINT_OPEN) instead of the
+// perf-tracepoint path. On kernel 7.0 / Ubuntu 26.04 with perf_event_paranoid=4
+// the perf PERF_TYPE_TRACEPOINT attach is not satisfied by CAP_PERFMON alone, so
+// the typed `#[tracepoint]` programs fail to attach under the non-root sensor.
+// raw-tracepoint open is gated only by CAP_BPF+CAP_PERFMON and bypasses that path.
+// The handler ignores tracepoint args (uses bpf_get_current_*), so the conversion
+// is a pure context-type change with no logic difference.
+#[raw_tracepoint(tracepoint = "sched_process_exit")]
+pub fn innerwarden_process_exit(ctx: RawTracePointContext) -> u32 {
     match try_process_exit(&ctx) {
         Ok(()) => 0,
         Err(_) => 0,
@@ -1664,7 +1674,7 @@ pub fn innerwarden_process_exit(ctx: TracePointContext) -> u32 {
 }
 
 #[inline(always)]
-fn try_process_exit(_ctx: &TracePointContext) -> Result<(), i64> {
+fn try_process_exit(_ctx: &RawTracePointContext) -> Result<(), i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = pid_tgid as u32;
 

@@ -1441,14 +1441,20 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
         }
     }
 
-    // Attach sched_process_exit tracepoint (rootkit lifecycle tracking - non-critical)
-    if let Some(prog) = bpf.program_mut("innerwarden_process_exit") {
-        if let Ok(tp) = TryInto::<&mut TracePoint>::try_into(prog) {
-            if tp.load().is_ok() {
-                if let Err(e) = tp.attach("sched", "sched_process_exit") {
-                    warn!(error = %e, "innerwarden_process_exit: failed to attach");
-                } else {
-                    info!("eBPF: innerwarden_process_exit → sched_process_exit (rootkit lifecycle) ✅");
+    // Attach sched_process_exit via raw_tracepoint (rootkit lifecycle tracking -
+    // non-critical). Spec 069: raw_tp attach (BPF_RAW_TRACEPOINT_OPEN) is gated by
+    // CAP_BPF+CAP_PERFMON and works under the non-root sensor on kernel 7.0, where
+    // the perf-tracepoint attach path fails with perf_event_paranoid=4.
+    {
+        use aya::programs::RawTracePoint;
+        if let Some(prog) = bpf.program_mut("innerwarden_process_exit") {
+            if let Ok(rtp) = TryInto::<&mut RawTracePoint>::try_into(prog) {
+                if rtp.load().is_ok() {
+                    if let Err(e) = rtp.attach("sched_process_exit") {
+                        warn!(error = %e, "innerwarden_process_exit: failed to attach");
+                    } else {
+                        info!("eBPF: innerwarden_process_exit → sched_process_exit (raw_tp) ✅");
+                    }
                 }
             }
         }
