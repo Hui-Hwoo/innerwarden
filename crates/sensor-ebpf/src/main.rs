@@ -2553,47 +2553,16 @@ fn try_prctl(ctx: &TracePointContext) -> Result<(), i64> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tracepoint: sys_enter_accept4 - incoming connection accepted
-// ---------------------------------------------------------------------------
-
-#[tracepoint]
-pub fn innerwarden_accept(ctx: TracePointContext) -> u32 {
-    match try_accept(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 0,
-    }
-}
-
-#[inline(always)]
-fn try_accept(_ctx: &TracePointContext) -> Result<(), i64> {
-    if is_comm_allowed(17) || is_cgroup_allowed() {
-        return Ok(());
-    }
-    let pid = bpf_get_current_pid_tgid() as u32;
-    if is_rate_limited(pid) {
-        return Ok(());
-    }
-    let uid = bpf_get_current_uid_gid() as u32;
-    let ts = unsafe { bpf_ktime_get_ns() };
-    let mut entry = match EVENTS.reserve::<AcceptEvent>(0) {
-        Some(e) => e,
-        None => return Ok(()),
-    };
-    let event = unsafe { &mut *entry.as_mut_ptr() };
-    event.kind = SyscallKind::Accept as u32;
-    event.pid = pid;
-    event.uid = uid;
-    event._pad = 0;
-    event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    event.ts_ns = ts;
-    if let Ok(comm) = bpf_get_current_comm() {
-        event.comm[..comm.len().min(MAX_COMM_LEN)]
-            .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
-    }
-    entry.submit(0);
-    Ok(())
-}
+// Spec 069 #4: the legacy `innerwarden_accept` sys_enter_accept4 tracepoint was
+// removed here — it was a compiled-but-NEVER-ATTACHED duplicate of the live
+// `dispatch_accept` kprobe below (the loader attaches only the kprobe), so it
+// emitted nothing yet bloated the object and risked a double-emit if anyone
+// wired it up. The spec 069 #4 audit (adversarially verified) confirmed every
+// high-volume syscall handler already discards in-kernel — per-PID rate limit
+// (`is_rate_limited`) + comm/cgroup allowlists + path/IP narrowing (openat to
+// /etc|/root|/home credential-aware, unlink/rename to sensitive prefixes,
+// connect to external AF_INET, dup onto std{in,out,err}) — so no over-broad
+// emit or userspace-late-sampling remained to push down into eBPF.
 
 // ---------------------------------------------------------------------------
 // Per-syscall kprobe handlers (spec 069 Phase 2)
