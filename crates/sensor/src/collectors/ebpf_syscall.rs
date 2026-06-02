@@ -18,9 +18,13 @@ use tracing::{info, warn};
 /// Built with: cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release
 /// When the feature `ebpf-embedded` is enabled, the bytecode is baked into the binary
 /// via include_bytes! - no separate file needed. `innerwarden upgrade` updates everything.
+///
+/// Spec 069 #3: the object is included from `OUT_DIR` (copied there by
+/// `build.rs`), not directly from the sensor-ebpf target dir. Cargo tracks
+/// `OUT_DIR` includes for rebuild, so a freshly-built `.o` re-embeds
+/// automatically — no more manual `touch` of this file to dodge a stale object.
 #[cfg(feature = "ebpf-embedded")]
-const EBPF_BYTECODE_EMBEDDED: &[u8] =
-    include_bytes!("../../../sensor-ebpf/target/bpfel-unknown-none/release/innerwarden-ebpf");
+const EBPF_BYTECODE_EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/innerwarden-ebpf"));
 
 /// Fallback paths for when bytecode is NOT embedded (dev mode or separate deploy).
 const EBPF_OBJ_PATH: &str = "/usr/local/lib/innerwarden/innerwarden-ebpf";
