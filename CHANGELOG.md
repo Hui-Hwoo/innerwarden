@@ -9,6 +9,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-06-02
+
+Headline: **spec 069 — full kernel-7.0 eBPF syscall capture + 6 hardening
+follow-ups** (no silent event drops under load, kernel-exploit detection,
+reliable object embedding, dead-code removal, and a BTF offset self-check).
+Sensor pipeline hardening; no new detectors/collectors.
+
 ### Fixed
 - **Kernel 7.0 syscall argument capture (spec 069 Phase 2).** On kernel 7.0 /
   Ubuntu 26.04 with `perf_event_paranoid=4`, the non-root sensor's syscall
@@ -25,6 +32,38 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   telemetry, and per-PID rate limits on the high-frequency `dup`/`prctl`
   handlers. Fail-open: a wrapper symbol that does not resolve is skipped with a
   warning, never aborting sensor startup.
+- **No silent event drops under load (spec 069 #1).** The eBPF ring reader was
+  coupled to the single synchronous detector consumer through a bounded channel;
+  when the consumer lagged, the kernel ring overflowed and dropped the next
+  event — blindly, uncounted, attack events included. The reader now emits
+  **non-blocking across three lanes** (priority security events / a compact
+  emergency-overflow signal / bulk telemetry); the kernel-ring drain never
+  blocks; a brownout sheds bulk telemetry to protect the priority lane; and
+  every drop is counted and logged. An attacker can no longer bury a
+  kill / ptrace / credential read behind a syscall flood.
+- **Reliable eBPF object embedding (spec 069 #3).** The embedded eBPF object now
+  re-embeds automatically when rebuilt (build-script copy into `OUT_DIR` +
+  `rerun-if-changed`), eliminating a stale-object foot-gun.
+
+### Added
+- **Kernel-exploit syscall detection (spec 069 #2).** Direct `ptrace` injection,
+  RWX `mprotect` (shellcode staging), `memfd_create` (fileless execution), and
+  in-container `mount` (namespace escape) now raise incidents — previously they
+  were logged but never escalated to the AI triage / response path. Layered
+  false-positive containment: a curated cross-server default allowlist, a
+  per-server `allowlist.toml`, per-detector suppression, then the agent's
+  baseline learning + AI triage.
+- **pt_regs offset self-check (spec 069 #6).** At startup the sensor validates
+  the eBPF object's hardcoded `pt_regs` syscall-argument offsets against the
+  running kernel's BTF and warns loudly on mismatch — turning a future-kernel
+  layout change from a silent mis-read into a visible diagnostic.
+
+### Changed
+- **eBPF filter audit + dead-code removal (spec 069 #4, #5).** An adversarial
+  audit confirmed every high-volume syscall handler already discards in-kernel
+  (per-PID rate limit + comm/cgroup allowlist + path/IP narrowing), so no
+  over-broad emit remained. Removed the dead spec-053 tail-call dispatcher and a
+  dead duplicate `accept` tracepoint, both orphaned by the kprobe migration.
 
 ## [0.15.1] - 2026-06-01
 
