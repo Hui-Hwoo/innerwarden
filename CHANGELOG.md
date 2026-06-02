@@ -9,6 +9,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Kernel 7.0 syscall argument capture (spec 069 Phase 2).** On kernel 7.0 /
+  Ubuntu 26.04 with `perf_event_paranoid=4`, the non-root sensor's syscall
+  probes could not capture arguments: the prior `sys_enter` raw_tracepoint
+  approach fired on every syscall and flooded the event ring buffer, dropping
+  events before userspace saw them. Each per-syscall handler is now a **kprobe on
+  the architecture syscall entry wrapper** (`__x64_sys_<name>` / `__arm64_sys_<name>`),
+  which fires only on its target syscall and reads arguments from the wrapper's
+  `pt_regs` via fully-inline reads. Validated live on kernel 7.0 x86_64
+  (`kill(pid,sig)`, `openat` of `/etc/shadow`/`/etc/passwd`/ssh config all read
+  exactly). Includes: per-PID memoisation of container-id resolution (was a
+  `/proc` read per event on the ring-drain hot path), `openat` always-emitting
+  genuine credential-file reads while rate-limiting broad `/etc`,`/home`,`/root`
+  telemetry, and per-PID rate limits on the high-frequency `dup`/`prctl`
+  handlers. Fail-open: a wrapper symbol that does not resolve is skipped with a
+  warning, never aborting sensor startup.
+
 ## [0.15.1] - 2026-06-01
 
 **Headline:** Spec 067 — AI context completeness. The two AI surfaces are now fully grounded. The autonomous `decide()` brain reasons over DShield (SANS ISC) telemetry, host posture, and the operator's prior decisions for the same incident shape (so it stops re-surfacing settled noise and stops over-reacting to attacks the host config already refuses). The operator-facing chat answers like the warden that lives on the box: "why did you block 1.2.3.4?" pulls that IP's incident + decision + the real reason; "how's my server?" returns a live pulse (posture + top attackers + what is unusual versus baseline) with an answer-style guide that forbids vague filler. Plus a security fix: the Telegram bot now drops inbound commands from any chat that is not the configured operator.

@@ -32,7 +32,6 @@ use aya_ebpf::{
     macros::{kprobe, kretprobe, lsm, map, tracepoint, xdp},
     maps::{HashMap, LruHashMap, RingBuf},
     programs::{LsmContext, ProbeContext, RetProbeContext, TracePointContext, XdpContext},
-    EbpfContext,
 };
 
 // Spec 069: raw_tracepoint + RawTracePointContext are now used by always-on
@@ -56,7 +55,7 @@ use innerwarden_ebpf_types::{
 // ---------------------------------------------------------------------------
 
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0); // 1 MB ring buffer (expanded for 13 hooks)
+static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0); // 4 MB ring buffer (spec 069: kprobe syscall handlers produce real events; absorb bursts)
 
 // ---------------------------------------------------------------------------
 // XDP blocklist - IPv4 addresses to drop at wire speed
@@ -275,6 +274,9 @@ static SYSCALL_ENABLED: HashMap<u32, u32> = HashMap::with_max_entries(512, 0);
 
 /// Read a raw tracepoint argument.
 /// For raw_tracepoint/sys_enter: args[0] = pt_regs*, args[1] = syscall_nr.
+/// Spec 069: only the optional `dispatcher` tail-call program reads raw args
+/// now. The per-syscall handlers became kprobes on the architecture syscall
+/// wrappers (see the `syscall_arg!` macro), so this is gated to that feature.
 #[cfg(feature = "dispatcher")]
 #[inline(always)]
 unsafe fn raw_arg(ctx: &RawTracePointContext, n: usize) -> u64 {
@@ -283,20 +285,108 @@ unsafe fn raw_arg(ctx: &RawTracePointContext, n: usize) -> u64 {
     core::ptr::read_volatile(args_ptr.add(n))
 }
 
-/// Read a syscall argument from pt_regs (architecture-specific).
-/// `arg_idx`: 0-5 for the 6 syscall arguments.
-#[cfg(feature = "dispatcher")]
-#[inline(always)]
-unsafe fn read_syscall_arg(ctx: &RawTracePointContext, arg_idx: usize) -> Result<u64, i64> {
-    // args[0] = pt_regs pointer
-    let regs_ptr = raw_arg(ctx, 0) as *const u8;
+/// Read a syscall argument from `pt_regs` for a `raw_tracepoint/sys_enter`
+/// program. `arg_idx`: 0-5 for the 6 syscall arguments.
+///
+/// Spec 069: reads via aya's `PtRegs`, whose `arg::<T>` is specialized per
+/// `bpf_target_arch` (x86_64 uses di/si/dx/r10/r8/r9, aarch64 uses
+/// regs[0..5], etc.). Because the eBPF object is built on the deploy host,
+/// `bpf_target_arch` matches the host and the offsets are correct on both
+/// Oracle (aarch64) and Hetzner (x86_64). The previous hand-rolled
+/// `arg_idx * 8` math was only correct for aarch64 and was a latent x86_64
+/// bug (never hit because the dispatcher path was disabled).
+/// pt_regs byte offset of syscall argument `arg_idx` (0-5), per architecture.
+/// Returned via a `match` (not a `.rodata` array indexed at runtime) so it
+/// constant-folds in the BPF program — a runtime index into a rodata array was
+/// observed to mis-read for arg_idx >= 1 on the BPF target.
+#[cfg(iw_arch_x86_64)]
+const fn syscall_arg_offset(arg_idx: usize) -> usize {
+    // rdi, rsi, rdx, r10, r8, r9
+    match arg_idx {
+        0 => 112,
+        1 => 104,
+        2 => 96,
+        3 => 56,
+        4 => 72,
+        _ => 64,
+    }
+}
+#[cfg(iw_arch_aarch64)]
+const fn syscall_arg_offset(arg_idx: usize) -> usize {
+    // x0..x5
+    if arg_idx > 5 {
+        5 * 8
+    } else {
+        arg_idx * 8
+    }
+}
 
-    // BPF compiles for bpfel-unknown-none - use aarch64 layout (our production target).
-    // aarch64: regs[0..30] at offset 0, each u64 (8 bytes).
-    // x86_64 would need different offsets (di=112, si=104, etc.)
-    // but we compile per-target anyway so this is fine.
-    let offset = arg_idx * 8;
-    bpf_probe_read_kernel(regs_ptr.add(offset) as *const u64)
+// Spec 069: read syscall arguments from a kprobe on the architecture syscall
+// wrapper (`__x64_sys_<name>` / `__arm64_sys_<name>`), which takes a single
+// `struct pt_regs *`. These are MACROS, not functions, because on the BPF
+// target every function-call boundary in this read path silently returned
+// garbage (so every arg-filtered handler — kill/openat/connect/... — dropped
+// all its events). Three gotchas, all fixed only by fully-inline expansion,
+// validated live on kernel 7.0 x86_64 (kill(pid,sig) round-trips exactly):
+//   1. The context arg `ctx.arg::<u64>(0)` (the wrapper's pt_regs pointer) must
+//      be read on the program's OWNED context, inline — not through a borrowed
+//      `&ProbeContext` passed to a helper.
+//   2. The pt_regs dereference `bpf_probe_read_kernel(regs + off)` must be
+//      inline in the handler, not behind a fn call that takes `regs`.
+//   3. The register offset must be a compile-time literal — a runtime
+//      `syscall_arg_offset(idx)` mis-reads. `$n` is a literal and the offset is
+//      taken in an inline-`const`, so it folds. The wrapper offsets are
+//      FRED-safe.
+
+/// Read syscall argument `$n` (0-5) inline from a kprobe handler's OWNED `ctx`.
+/// Yields `Result<u64, i64>`. Use inside an `unsafe` block.
+///
+/// The register offset is selected by a per-arg MACRO ARM (`__sc_off!`) so it
+/// expands to a literal at the call site. (`bpf_probe_read_kernel(regs.add(N))`
+/// only reads correctly on the BPF target when `N` is a literal; a `const fn`
+/// offset behind a value mis-reads.)
+macro_rules! syscall_arg {
+    ($ctx:expr, $n:tt) => {{
+        let __regs = ($ctx).arg::<u64>(0).unwrap_or(0) as *const u8;
+        if __regs.is_null() {
+            Err(1i64)
+        } else {
+            bpf_probe_read_kernel(__regs.add(__sc_off!($n)) as *const u64)
+        }
+    }};
+}
+
+/// Read syscall argument `$n` (0-5) inline from an already-resolved entry
+/// `pt_regs` pointer (obtained once via `ctx.arg::<u64>(0)` on the owned
+/// context). Yields `Result<u64, i64>`. Use inside an `unsafe` block.
+macro_rules! syscall_arg_at {
+    ($regs:expr, $n:tt) => {
+        bpf_probe_read_kernel(($regs).add(__sc_off!($n)) as *const u64)
+    };
+}
+
+// Per-arg pt_regs byte offset as a LITERAL (expands at the call site). Two
+// arch-specific definitions selected by build-host cfg. Literals are required:
+// a runtime/const-fn offset value mis-reads on the BPF target.
+#[cfg(iw_arch_x86_64)]
+macro_rules! __sc_off {
+    // rdi, rsi, rdx, r10, r8, r9
+    (0) => { 112 };
+    (1) => { 104 };
+    (2) => { 96 };
+    (3) => { 56 };
+    (4) => { 72 };
+    (5) => { 64 };
+}
+#[cfg(iw_arch_aarch64)]
+macro_rules! __sc_off {
+    // x0..x5
+    (0) => { 0 };
+    (1) => { 8 };
+    (2) => { 16 };
+    (3) => { 24 };
+    (4) => { 32 };
+    (5) => { 40 };
 }
 
 /// Main dispatcher - fires on every syscall entry.
@@ -2598,28 +2688,29 @@ fn try_accept(_ctx: &TracePointContext) -> Result<(), i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Dispatcher tail call handlers (feature = "dispatcher")
+// Per-syscall kprobe handlers (spec 069 Phase 2)
 // ---------------------------------------------------------------------------
 //
-// These are the raw_tracepoint versions of each handler, used as tail call
-// targets from the dispatcher. They read syscall arguments from pt_regs
-// instead of typed tracepoint fields.
-//
-// Each handler must be the same program type as the dispatcher (raw_tracepoint)
-// to be used as a tail call target.
-
-#[cfg(feature = "dispatcher")]
-#[raw_tracepoint(tracepoint = "sys_enter")]
-pub fn dispatch_execve(ctx: RawTracePointContext) -> u32 {
-    match try_dispatch_execve(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 0,
-    }
+// Each handler is a kprobe on the architecture syscall ENTRY WRAPPER
+// (`__x64_sys_<name>` / `__arm64_sys_<name>`, chosen by the loader). A kprobe
+// fires only on its target syscall, so a handler no longer self-filters on a
+// syscall number — the old `SYS_*` number tables were deleted with the
+// `sys_enter` raw_tracepoint dispatch they served. Args are read from the
+// wrapper's `struct pt_regs *` via the `syscall_arg!` / `syscall_arg_at!`
+// macros (see their docs). kprobe attach works under the non-root sensor
+// (perf_event_paranoid=4 + CAP_PERFMON) on kernel 7.0.
+#[kprobe]
+pub fn dispatch_execve(ctx: ProbeContext) -> u32 {
+    // Resolve the syscall entry pt_regs pointer on the OWNED context (a borrowed
+    // context mis-reads on BPF — see the `syscall_arg!` macro note), then hand
+    // the raw pointer to the handler.
+    let regs = ctx.arg::<u64>(0).unwrap_or(0) as *const u8;
+    let _ = try_dispatch_execve(regs);
+    0
 }
 
-#[cfg(feature = "dispatcher")]
 #[inline(always)]
-fn try_dispatch_execve(ctx: &RawTracePointContext) -> Result<(), i64> {
+fn try_dispatch_execve(regs: *const u8) -> Result<(), i64> {
     if is_comm_allowed(0) || is_cgroup_allowed() {
         return Ok(());
     }
@@ -2628,7 +2719,12 @@ fn try_dispatch_execve(ctx: &RawTracePointContext) -> Result<(), i64> {
         return Ok(());
     }
 
-    let filename_ptr: *const u8 = unsafe { read_syscall_arg(ctx, 0)? as *const u8 };
+    let filename_ptr: *const u8 = unsafe { syscall_arg_at!(regs, 0)? as *const u8 };
+    // Skip if the filename pointer read failed or is null — avoids emitting a
+    // bogus exec event with an empty command line.
+    if filename_ptr.is_null() {
+        return Ok(());
+    }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let uid_gid = bpf_get_current_uid_gid();
     let uid = uid_gid as u32;
@@ -2661,22 +2757,19 @@ fn try_dispatch_execve(ctx: &RawTracePointContext) -> Result<(), i64> {
     Ok(())
 }
 
-#[cfg(feature = "dispatcher")]
-#[raw_tracepoint(tracepoint = "sys_enter")]
-pub fn dispatch_connect(ctx: RawTracePointContext) -> u32 {
-    match try_dispatch_connect(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 0,
-    }
+#[kprobe]
+pub fn dispatch_connect(ctx: ProbeContext) -> u32 {
+    let regs = ctx.arg::<u64>(0).unwrap_or(0) as *const u8;
+    let _ = try_dispatch_connect(regs);
+    0
 }
 
-#[cfg(feature = "dispatcher")]
 #[inline(always)]
-fn try_dispatch_connect(ctx: &RawTracePointContext) -> Result<(), i64> {
+fn try_dispatch_connect(regs: *const u8) -> Result<(), i64> {
     if is_comm_allowed(1) || is_cgroup_allowed() {
         return Ok(());
     }
-    let addr_ptr: *const u8 = unsafe { read_syscall_arg(ctx, 1)? as *const u8 };
+    let addr_ptr: *const u8 = unsafe { syscall_arg_at!(regs, 1)? as *const u8 };
     let sa_buf = unsafe {
         bpf_probe_read_user(addr_ptr as *const [u8; 8]).unwrap_or([0u8; 8])
     };
@@ -2718,19 +2811,18 @@ fn try_dispatch_connect(ctx: &RawTracePointContext) -> Result<(), i64> {
     Ok(())
 }
 
-// Simpler handlers - most only read 0-2 args, trivial to convert.
+// Simpler handlers - most only read 0-2 args.
 // ptrace, setuid, bind, mount, memfd_create, init_module, dup, listen, mprotect,
 // clone, unlink, rename, kill, prctl, accept - each follows the same pattern:
-// read args via read_syscall_arg() instead of ctx.read_at().
+// read args from the entry pt_regs via the `syscall_arg!` macro.
 
-#[cfg(feature = "dispatcher")]
-#[raw_tracepoint(tracepoint = "sys_enter")]
-pub fn dispatch_ptrace(ctx: RawTracePointContext) -> u32 {
+#[kprobe]
+pub fn dispatch_ptrace(ctx: ProbeContext) -> u32 {
     if is_comm_allowed(3) || is_cgroup_allowed() {
         return 0;
     }
-    let request = unsafe { read_syscall_arg(&ctx, 0).unwrap_or(0) };
-    let target_pid = unsafe { read_syscall_arg(&ctx, 1).unwrap_or(0) };
+    let request = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) };
+    let target_pid = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) };
     if request != PTRACE_ATTACH
         && request != PTRACE_SEIZE
         && request != PTRACE_POKETEXT
@@ -2759,13 +2851,12 @@ pub fn dispatch_ptrace(ctx: RawTracePointContext) -> u32 {
     0
 }
 
-#[cfg(feature = "dispatcher")]
-#[raw_tracepoint(tracepoint = "sys_enter")]
-pub fn dispatch_setuid(ctx: RawTracePointContext) -> u32 {
+#[kprobe]
+pub fn dispatch_setuid(ctx: ProbeContext) -> u32 {
     if is_comm_allowed(4) {
         return 0;
     }
-    let target_uid = unsafe { read_syscall_arg(&ctx, 0).unwrap_or(u64::MAX) } as u32;
+    let target_uid = unsafe { syscall_arg!(ctx, 0).unwrap_or(u64::MAX) } as u32;
     let current_uid = bpf_get_current_uid_gid() as u32;
     if current_uid == 0 || target_uid != 0 {
         return 0;
@@ -2790,15 +2881,14 @@ pub fn dispatch_setuid(ctx: RawTracePointContext) -> u32 {
     0
 }
 
-#[cfg(feature = "dispatcher")]
-#[raw_tracepoint(tracepoint = "sys_enter")]
-pub fn dispatch_mprotect(ctx: RawTracePointContext) -> u32 {
+#[kprobe]
+pub fn dispatch_mprotect(ctx: ProbeContext) -> u32 {
     if is_comm_allowed(11) || is_cgroup_allowed() {
         return 0;
     }
-    let addr = unsafe { read_syscall_arg(&ctx, 0).unwrap_or(0) };
-    let len = unsafe { read_syscall_arg(&ctx, 1).unwrap_or(0) };
-    let prot = unsafe { read_syscall_arg(&ctx, 2).unwrap_or(0) };
+    let addr = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) };
+    let len = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) };
+    let prot = unsafe { syscall_arg!(ctx, 2).unwrap_or(0) };
     if prot & PROT_EXEC == 0 {
         return 0;
     }
@@ -2827,14 +2917,14 @@ pub fn dispatch_mprotect(ctx: RawTracePointContext) -> u32 {
     0
 }
 
-#[cfg(feature = "dispatcher")]
-#[raw_tracepoint(tracepoint = "sys_enter")]
-pub fn dispatch_kill(ctx: RawTracePointContext) -> u32 {
+#[kprobe]
+pub fn dispatch_kill(ctx: ProbeContext) -> u32 {
     if is_comm_allowed(15) {
         return 0;
     }
-    let target_pid = unsafe { read_syscall_arg(&ctx, 0).unwrap_or(0) } as u32;
-    let signal = unsafe { read_syscall_arg(&ctx, 1).unwrap_or(0) } as u32;
+    // kill(pid, sig): pid=arg0, sig=arg1
+    let target_pid = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) } as u32;
+    let signal = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) } as u32;
     if signal != 9 && signal != 15 && signal != 19 {
         return 0;
     }
@@ -2859,10 +2949,540 @@ pub fn dispatch_kill(ctx: RawTracePointContext) -> u32 {
     0
 }
 
-// For the remaining dispatcher handlers (bind, mount, memfd_create, init_module,
-// dup, listen, clone, unlink, rename, prctl, accept, openat), the pattern is
-// identical - read args via read_syscall_arg and emit to ring buffer.
-// Userspace wires them into SYSCALL_DISPATCH at the correct syscall numbers.
+// Spec 069: kprobe handlers for the remaining syscalls. Each reads args from
+// the entry pt_regs via the `syscall_arg!` macro (syscall-ABI position) and
+// mirrors the logic of its typed `innerwarden_*` counterpart.
+
+#[kprobe]
+pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
+    // openat(dfd, filename, flags, mode): filename=arg1, flags=arg2
+    let Ok(filename_ptr) = (unsafe { syscall_arg!(ctx, 1) }) else {
+        return 0;
+    };
+    let mut filename_buf = [0u8; 256];
+    unsafe {
+        let _ = bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut filename_buf);
+    }
+    let f = &filename_buf;
+    let etc = f[0] == b'/' && f[1] == b'e' && f[2] == b't' && f[3] == b'c' && f[4] == b'/';
+    // High-value credential files under /etc: shadow, passwd, sudoers, gshadow,
+    // ssh/ssl. These ALWAYS emit (an attacker reading them must never be lost to
+    // rate-limiting). Matched on the two bytes after "/etc/".
+    let is_credential = etc
+        && ((f[5] == b's' && f[6] == b'h')   // shadow
+            || (f[5] == b'p' && f[6] == b'a') // passwd
+            || (f[5] == b's' && f[6] == b'u') // sudoers
+            || (f[5] == b'g' && f[6] == b's') // gshadow
+            || (f[5] == b's' && f[6] == b's')); // ssh / ssl
+    // Broader sensitive telemetry: any /etc, /root, /home read. High volume on a
+    // live host, so rate-limited below (the kprobe now reads filenames correctly
+    // and would otherwise flood the ring buffer).
+    let is_sensitive = etc
+        || (f[0] == b'/' && f[1] == b'r' && f[2] == b'o' && f[3] == b'o' && f[4] == b't')
+        || (f[0] == b'/' && f[1] == b'h' && f[2] == b'o' && f[3] == b'm' && f[4] == b'e');
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if is_sensitive {
+        chain_flag(pid, CHAIN_SENSITIVE_READ);
+    }
+    if is_comm_allowed(2) || is_cgroup_allowed() {
+        return 0;
+    }
+    if !is_sensitive {
+        return 0;
+    }
+    // Always surface credential-file reads; rate-limit the broad remainder.
+    if !is_credential && is_rate_limited(pid) {
+        return 0;
+    }
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    let flags = unsafe { syscall_arg!(ctx, 2).unwrap_or(0) } as u32;
+    if let Some(mut entry) = EVENTS.reserve::<innerwarden_ebpf_types::FileOpenEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = innerwarden_ebpf_types::SyscallKind::FileOpen as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.ppid = 0;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.filename = filename_buf;
+        event.flags = flags;
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_bind(ctx: ProbeContext) -> u32 {
+    // bind(fd, addr, addrlen): addr=arg1
+    let Ok(addr_ptr) = (unsafe { syscall_arg!(ctx, 1) }) else {
+        return 0;
+    };
+    let sa_buf =
+        unsafe { bpf_probe_read_user(addr_ptr as *const [u8; 8]).unwrap_or([0u8; 8]) };
+    let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
+    if family != 2 {
+        return 0;
+    }
+    let port = u16::from_be_bytes([sa_buf[2], sa_buf[3]]);
+    let addr = u32::from_be_bytes([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
+    if port == 0 {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    chain_flag(pid, CHAIN_BIND);
+    if is_comm_allowed(5) || is_cgroup_allowed() {
+        return 0;
+    }
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<SocketBindEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::SocketBind as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.protocol = 0;
+        event.family = family;
+        event.port = port;
+        event._pad = 0;
+        event.addr = addr;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_mount(ctx: ProbeContext) -> u32 {
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if is_rate_limited(pid) {
+        return 0;
+    }
+    // mount(dev, dir, type, flags, data): dev=arg0, dir=arg1, type=arg2, flags=arg3
+    let source_ptr = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) };
+    let target_ptr = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) };
+    let type_ptr = unsafe { syscall_arg!(ctx, 2).unwrap_or(0) };
+    let flags = unsafe { syscall_arg!(ctx, 3).unwrap_or(0) };
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<MountEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Mount as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.flags = flags as u32;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        event.source = [0u8; MAX_FILENAME_LEN];
+        event.target = [0u8; MAX_FILENAME_LEN];
+        event.fs_type = [0u8; 32];
+        unsafe {
+            let _ = bpf_probe_read_user_str_bytes(source_ptr as *const u8, &mut event.source);
+            let _ = bpf_probe_read_user_str_bytes(target_ptr as *const u8, &mut event.target);
+            let _ = bpf_probe_read_user_str_bytes(type_ptr as *const u8, &mut event.fs_type);
+        }
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_memfd_create(ctx: ProbeContext) -> u32 {
+    if is_comm_allowed(7) {
+        return 0;
+    }
+    // memfd_create(name, flags): name=arg0, flags=arg1
+    let name_ptr = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) };
+    let flags = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) } as u32;
+    let pid = bpf_get_current_pid_tgid() as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<MemfdCreateEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::MemfdCreate as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.flags = flags;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        event.name = [0u8; MAX_FILENAME_LEN];
+        unsafe {
+            let _ = bpf_probe_read_user_str_bytes(name_ptr as *const u8, &mut event.name);
+        }
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_init_module(_ctx: ProbeContext) -> u32 {
+    let pid = bpf_get_current_pid_tgid() as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<ModuleLoadEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::InitModule as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.syscall_nr = 0;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_dup(ctx: ProbeContext) -> u32 {
+    // dup2/dup3(oldfd, newfd, ...): oldfd=arg0, newfd=arg1
+    let oldfd = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) } as u32;
+    let newfd = unsafe { syscall_arg!(ctx, 1).unwrap_or(u64::MAX) } as u32;
+    if newfd > 2 {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    match newfd {
+        0 => chain_flag(pid, CHAIN_DUP_STDIN),
+        1 => chain_flag(pid, CHAIN_DUP_STDOUT),
+        2 => chain_flag(pid, CHAIN_DUP_STDERR),
+        _ => {}
+    }
+    if is_comm_allowed(9) || is_cgroup_allowed() {
+        return 0;
+    }
+    // Spec 069: dup2/dup3 onto stdio is common in normal shells; rate-limit per
+    // PID so it can't flood the ring on a busy host (the chain flags above are
+    // still set every time for kill-chain correlation).
+    if is_rate_limited(pid) {
+        return 0;
+    }
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<DupEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Dup as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.oldfd = oldfd;
+        event.newfd = newfd;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_listen(ctx: ProbeContext) -> u32 {
+    // listen(fd, backlog): backlog=arg1
+    let backlog = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) } as u32;
+    let pid = bpf_get_current_pid_tgid() as u32;
+    chain_flag(pid, CHAIN_LISTEN);
+    if is_comm_allowed(10) || is_cgroup_allowed() {
+        return 0;
+    }
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<ListenEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Listen as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.backlog = backlog;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_clone(ctx: ProbeContext) -> u32 {
+    if is_comm_allowed(12) || is_cgroup_allowed() {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if is_rate_limited(pid) {
+        return 0;
+    }
+    // clone(clone_flags, ...): clone_flags=arg0
+    let clone_flags = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) };
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<CloneEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Clone as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.clone_flags = clone_flags;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_unlink(ctx: ProbeContext) -> u32 {
+    if is_comm_allowed(13) || is_cgroup_allowed() {
+        return 0;
+    }
+    // unlinkat(dfd, pathname, flag): pathname=arg1
+    let Ok(path_ptr) = (unsafe { syscall_arg!(ctx, 1) }) else {
+        return 0;
+    };
+    let mut path_buf = [0u8; 64];
+    unsafe {
+        let _ = bpf_probe_read_user_str_bytes(path_ptr as *const u8, &mut path_buf);
+    }
+    let f = &path_buf;
+    let is_sensitive = (f[0] == b'/'
+        && f[1] == b'v'
+        && f[2] == b'a'
+        && f[3] == b'r'
+        && f[4] == b'/'
+        && f[5] == b'l'
+        && f[6] == b'o'
+        && f[7] == b'g')
+        || (f[0] == b'/' && f[1] == b'e' && f[2] == b't' && f[3] == b'c' && f[4] == b'/')
+        || (f[0] == b'/' && f[1] == b'r' && f[2] == b'o' && f[3] == b'o' && f[4] == b't');
+    if !is_sensitive {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<UnlinkEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Unlink as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event._pad = 0;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        event.filename = [0u8; MAX_FILENAME_LEN];
+        unsafe {
+            let _ = bpf_probe_read_user_str_bytes(path_ptr as *const u8, &mut event.filename);
+        }
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_rename(ctx: ProbeContext) -> u32 {
+    if is_comm_allowed(14) || is_cgroup_allowed() {
+        return 0;
+    }
+    // renameat2(olddfd, oldname, newdfd, newname, flags): oldname=arg1, newname=arg3
+    let Ok(oldname_ptr) = (unsafe { syscall_arg!(ctx, 1) }) else {
+        return 0;
+    };
+    let Ok(newname_ptr) = (unsafe { syscall_arg!(ctx, 3) }) else {
+        return 0;
+    };
+    let mut buf = [0u8; 16];
+    unsafe {
+        let _ = bpf_probe_read_user_str_bytes(newname_ptr as *const u8, &mut buf);
+    }
+    let f = &buf;
+    let is_sensitive = (f[0] == b'/' && f[1] == b'e' && f[2] == b't' && f[3] == b'c' && f[4] == b'/')
+        || (f[0] == b'/' && f[1] == b'u' && f[2] == b's' && f[3] == b'r')
+        || (f[0] == b'/' && f[1] == b'b' && f[2] == b'i' && f[3] == b'n');
+    if !is_sensitive {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<RenameEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Rename as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event._pad = 0;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        event.oldname = [0u8; MAX_FILENAME_LEN];
+        event.newname = [0u8; MAX_FILENAME_LEN];
+        unsafe {
+            let _ = bpf_probe_read_user_str_bytes(oldname_ptr as *const u8, &mut event.oldname);
+            let _ = bpf_probe_read_user_str_bytes(newname_ptr as *const u8, &mut event.newname);
+        }
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_prctl(ctx: ProbeContext) -> u32 {
+    if is_comm_allowed(16) {
+        return 0;
+    }
+    // prctl(option, arg2, ...): option=arg0, arg2=arg1
+    let option = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) };
+    let arg2 = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) };
+    if option != PR_SET_NAME && option != PR_SET_NO_NEW_PRIVS {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    // Spec 069: PR_SET_NAME fires on routine thread naming; rate-limit per PID
+    // so it can't flood the ring on a busy host.
+    if is_rate_limited(pid) {
+        return 0;
+    }
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<PrctlEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Prctl as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event.option = option as u32;
+        event.arg2 = arg2;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[kprobe]
+pub fn dispatch_accept(_ctx: ProbeContext) -> u32 {
+    if is_comm_allowed(17) || is_cgroup_allowed() {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if is_rate_limited(pid) {
+        return 0;
+    }
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<AcceptEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Accept as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event._pad = 0;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[cfg(iw_arch_x86_64)]
+#[kprobe]
+pub fn dispatch_ioperm(ctx: ProbeContext) -> u32 {
+    // ioperm(from, num, turn_on): from=arg0, num=arg1, turn_on=arg2
+    let from = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) };
+    let num = unsafe { syscall_arg!(ctx, 1).unwrap_or(0) };
+    let turn_on = unsafe { syscall_arg!(ctx, 2).unwrap_or(0) };
+    if turn_on != 1 {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<IopermEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Ioperm as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event._pad = 0;
+        event.port_from = from;
+        event.port_num = num;
+        event.turn_on = turn_on;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        event.comm = [0u8; MAX_COMM_LEN];
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
+
+#[cfg(iw_arch_x86_64)]
+#[kprobe]
+pub fn dispatch_iopl(ctx: ProbeContext) -> u32 {
+    // iopl(level): level=arg0
+    let level = unsafe { syscall_arg!(ctx, 0).unwrap_or(0) };
+    if level == 0 {
+        return 0;
+    }
+    let pid = bpf_get_current_pid_tgid() as u32;
+    let uid = bpf_get_current_uid_gid() as u32;
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Some(mut entry) = EVENTS.reserve::<IoplEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::Iopl as u32;
+        event.pid = pid;
+        event.uid = uid;
+        event._pad = 0;
+        event.level = level;
+        event.cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        event.ts_ns = ts;
+        event.comm = [0u8; MAX_COMM_LEN];
+        if let Ok(comm) = bpf_get_current_comm() {
+            event.comm[..comm.len().min(MAX_COMM_LEN)]
+                .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+        }
+        entry.submit(0);
+    }
+    0
+}
 
 // ---------------------------------------------------------------------------
 // EXPERIMENTAL: EFI Runtime Services monitoring — firmware behavioral baseline
@@ -3295,6 +3915,7 @@ fn try_acpi_eval(ctx: &ProbeContext) -> Result<(), i64> {
     entry.submit(0);
     Ok(())
 }
+
 
 /// LSM hook on bpf — monitors all BPF syscall operations.
 /// Detects unauthorized eBPF program loading (VoidLink rootkit defense).

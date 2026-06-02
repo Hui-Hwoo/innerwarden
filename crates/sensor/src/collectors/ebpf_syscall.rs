@@ -175,9 +175,48 @@ fn resolve_ppid_kernel_first(kernel_ppid: u32, pid: u32) -> u32 {
 }
 
 /// Extract container ID from /proc/<pid>/cgroup. Returns None for host processes.
+/// Resolve a PID's container id, memoised per PID.
+///
+/// Spec 069: the eBPF ring reader calls this for ~15 event kinds, once per
+/// event. Without the cache it was a synchronous `/proc/<pid>/cgroup` read on
+/// the hot path of the async ring-drain loop — the dominant per-event cost. On
+/// a busy host the kprobe syscall handlers (now that they read args correctly)
+/// produce events faster than that blocking read could drain them, so events
+/// surfaced tens of seconds late. Memoising collapses repeated lookups for the
+/// same PID to a map hit. Pid reuse can briefly serve a stale id; acceptable for
+/// container attribution and bounded by an 8192-entry cap.
 fn resolve_container_id(pid: u32) -> Option<String> {
-    let path = format!("/proc/{pid}/cgroup");
-    let content = std::fs::read_to_string(&path).ok()?;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    const CACHE_CAP: usize = 8192;
+    static CACHE: OnceLock<Mutex<HashMap<u32, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Recover from a poisoned lock rather than branching on the error so the
+    // happy path stays single-expression.
+    {
+        let map = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = map.get(&pid) {
+            return v.clone();
+        }
+    }
+    let result = resolve_container_id_uncached(pid);
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= CACHE_CAP {
+        map.clear();
+    }
+    map.insert(pid, result.clone());
+    result
+}
+
+fn resolve_container_id_uncached(pid: u32) -> Option<String> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    parse_container_id_from_cgroup(&content)
+}
+
+/// Parse a 12-char container id out of `/proc/<pid>/cgroup` contents. Pure
+/// (no I/O) so the Docker/Podman/k8s formats are unit-testable without a real
+/// container.
+fn parse_container_id_from_cgroup(content: &str) -> Option<String> {
     for line in content.lines() {
         // Docker: 0::/docker/<container_id>
         // Podman: 0::/libpod-<container_id>.scope
@@ -1235,8 +1274,69 @@ fn populate_kernel_filters(bpf: &mut aya::Ebpf) {
     }
 }
 
-/// Attach a typed tracepoint program - helper to eliminate repetition.
-/// Returns true if the program was found, loaded, and attached successfully.
+/// Architecture syscall entry-wrapper symbol for a bare syscall name.
+/// On x86_64 the SYSCALL_DEFINE macro generates `__x64_sys_<name>`, on aarch64
+/// `__arm64_sys_<name>`. The wrapper takes a single `struct pt_regs *`, from
+/// which the eBPF handler reads the real syscall arguments. Evaluated for the
+/// build/deploy host arch (the eBPF object is built on the same host).
+///
+/// Pure string logic (no `aya`), so it is not behind the `ebpf` feature and is
+/// unit-testable; `allow(dead_code)` covers the non-`ebpf` build where only the
+/// feature-gated `attach_syscall_kprobe` (and tests) call it.
+#[allow(dead_code)]
+fn syscall_wrapper_symbol(syscall: &str) -> String {
+    #[cfg(target_arch = "aarch64")]
+    let prefix = "__arm64_sys_";
+    #[cfg(not(target_arch = "aarch64"))]
+    let prefix = "__x64_sys_";
+    format!("{prefix}{syscall}")
+}
+
+/// Spec 069: attach a syscall handler as a kprobe on the architecture syscall
+/// ENTRY WRAPPER (`__x64_sys_<name>` / `__arm64_sys_<name>`). A kprobe fires
+/// ONLY on its target syscall, so it reads the correct pt_regs and does not
+/// flood the EVENTS ring buffer the way a `sys_enter` raw_tracepoint did (that
+/// fired on every syscall, starving `RingBuf::reserve` so events never
+/// surfaced — the spec-069 Phase 2 root cause). Fail-open: a missing program,
+/// failed load, or unresolved symbol logs a warning and is skipped, never
+/// aborting sensor startup. `syscalls` lists the candidate wrapper names (more
+/// than one for syscalls with several entry points, e.g. dup2/dup3); each that
+/// resolves is attached to the same program.
+#[cfg(feature = "ebpf")]
+fn attach_syscall_kprobe(bpf: &mut aya::Ebpf, prog_name: &str, syscalls: &[&str]) {
+    use aya::programs::KProbe;
+
+    let Some(prog) = bpf.program_mut(prog_name) else {
+        warn!("{prog_name}: kprobe program not found in bytecode");
+        return;
+    };
+    let kp: &mut KProbe = match prog.try_into() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "{prog_name}: not a KProbe program");
+            return;
+        }
+    };
+    if let Err(e) = kp.load() {
+        warn!(error = %e, "{prog_name}: kprobe load (verifier) failed");
+        return;
+    }
+    let mut attached = 0usize;
+    for sc in syscalls {
+        let sym = syscall_wrapper_symbol(sc);
+        match kp.attach(sym.as_str(), 0) {
+            Ok(_) => {
+                info!("eBPF: {prog_name} → {sym} (kprobe) ✅");
+                attached += 1;
+            }
+            Err(e) => warn!(error = %e, "{prog_name}: kprobe attach to {sym} failed"),
+        }
+    }
+    if attached == 0 {
+        warn!("{prog_name}: no syscall wrapper symbol resolved - syscall not monitored");
+    }
+}
+
 #[cfg(feature = "ebpf")]
 fn attach_tp(bpf: &mut aya::Ebpf, name: &str, category: &str, tp_name: &str) -> bool {
     use aya::programs::TracePoint;
@@ -1325,104 +1425,41 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
     // bug is root-caused. Doing this means we burn one tracepoint slot per
     // monitored syscall (still well within kernel limits) but events finally
     // start flowing.
+    // Spec 069 Phase 2: each syscall handler is a kprobe on the architecture
+    // syscall ENTRY WRAPPER (`__x64_sys_<name>` / `__arm64_sys_<name>`), reading
+    // args from the wrapper's `struct pt_regs *`. Validated on kernel 7.0
+    // x86_64 (kill(pid,sig) round-trips exactly). This replaced the previous
+    // `sys_enter` raw_tracepoint dispatch, which fired on EVERY syscall and
+    // flooded the EVENTS ring buffer, starving `reserve()` so events never
+    // surfaced. Each attach is fail-open (missing symbol → warn + skip).
     {
-        // Core tracepoints (execve, connect, openat)
-        attach_tp(
-            &mut bpf,
-            "innerwarden_execve",
-            "syscalls",
-            "sys_enter_execve",
-        );
-        attach_tp(
-            &mut bpf,
-            "innerwarden_connect",
-            "syscalls",
-            "sys_enter_connect",
-        );
-        attach_tp(
-            &mut bpf,
-            "innerwarden_openat",
-            "syscalls",
-            "sys_enter_openat",
-        );
-
-        // v2 syscall handlers (non-critical - each is independent)
-        attach_tp(
-            &mut bpf,
-            "innerwarden_ptrace",
-            "syscalls",
-            "sys_enter_ptrace",
-        );
-        attach_tp(
-            &mut bpf,
-            "innerwarden_setuid",
-            "syscalls",
-            "sys_enter_setuid",
-        );
-        attach_tp(&mut bpf, "innerwarden_bind", "syscalls", "sys_enter_bind");
-        attach_tp(&mut bpf, "innerwarden_mount", "syscalls", "sys_enter_mount");
-        attach_tp(
-            &mut bpf,
-            "innerwarden_memfd_create",
-            "syscalls",
-            "sys_enter_memfd_create",
-        );
-        attach_tp(
-            &mut bpf,
-            "innerwarden_init_module",
-            "syscalls",
-            "sys_enter_init_module",
-        );
-        // dup2 doesn't exist on aarch64 — try dup2, fall back to dup3.
-        // Load the program once, then try attach with fallback.
+        attach_syscall_kprobe(&mut bpf, "dispatch_execve", &["execve"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_connect", &["connect"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_openat", &["openat"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_ptrace", &["ptrace"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_setuid", &["setuid"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_bind", &["bind"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_mount", &["mount"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_memfd_create", &["memfd_create"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_init_module", &["init_module"]);
+        // dup2 is x86_64-only; dup3 exists on both arches. Attach both candidates;
+        // the absent one fails-open on aarch64.
+        attach_syscall_kprobe(&mut bpf, "dispatch_dup", &["dup3", "dup2"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_listen", &["listen"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_mprotect", &["mprotect"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_clone", &["clone"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_unlink", &["unlinkat"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_rename", &["renameat2"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_kill", &["kill"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_prctl", &["prctl"]);
+        attach_syscall_kprobe(&mut bpf, "dispatch_accept", &["accept4"]);
+        // ioperm/iopl are x86_64-only (absent from the aarch64 bytecode →
+        // fail-open skip there).
+        #[cfg(target_arch = "x86_64")]
         {
-            use aya::programs::TracePoint;
-            if let Some(prog) = bpf.program_mut("innerwarden_dup") {
-                if let Ok(tp) = TryInto::<&mut TracePoint>::try_into(prog) {
-                    let _ = tp.load(); // load once
-                    if tp.attach("syscalls", "sys_enter_dup2").is_ok() {
-                        info!("eBPF: innerwarden_dup → sys_enter_dup2 ✅");
-                    } else if tp.attach("syscalls", "sys_enter_dup3").is_ok() {
-                        info!("eBPF: innerwarden_dup → sys_enter_dup3 ✅ (aarch64 fallback)");
-                    } else {
-                        warn!("innerwarden_dup: failed to attach to dup2 or dup3");
-                    }
-                }
-            }
+            attach_syscall_kprobe(&mut bpf, "dispatch_ioperm", &["ioperm"]);
+            attach_syscall_kprobe(&mut bpf, "dispatch_iopl", &["iopl"]);
         }
-        attach_tp(
-            &mut bpf,
-            "innerwarden_listen",
-            "syscalls",
-            "sys_enter_listen",
-        );
-        attach_tp(
-            &mut bpf,
-            "innerwarden_mprotect",
-            "syscalls",
-            "sys_enter_mprotect",
-        );
-        attach_tp(&mut bpf, "innerwarden_clone", "syscalls", "sys_enter_clone");
-        attach_tp(
-            &mut bpf,
-            "innerwarden_unlink",
-            "syscalls",
-            "sys_enter_unlinkat",
-        );
-        attach_tp(
-            &mut bpf,
-            "innerwarden_rename",
-            "syscalls",
-            "sys_enter_renameat2",
-        );
-        attach_tp(&mut bpf, "innerwarden_kill", "syscalls", "sys_enter_kill");
-        attach_tp(&mut bpf, "innerwarden_prctl", "syscalls", "sys_enter_prctl");
-        attach_tp(
-            &mut bpf,
-            "innerwarden_accept",
-            "syscalls",
-            "sys_enter_accept4",
-        );
     }
 
     // --- Always attach non-tracepoint programs individually ---
@@ -1521,15 +1558,8 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
             }
         }
     }
-    // I/O port access (ioperm syscall — x86 only, harmless no-op on ARM)
-    attach_tp(
-        &mut bpf,
-        "innerwarden_ioperm",
-        "syscalls",
-        "sys_enter_ioperm",
-    );
-    // I/O privilege level (iopl syscall — x86 only)
-    attach_tp(&mut bpf, "innerwarden_iopl", "syscalls", "sys_enter_iopl");
+    // I/O port access (ioperm/iopl) is attached as a kprobe in the spec-069
+    // syscall block above (x86_64-only).
     // ACPI method evaluation (kprobe — available on any system with ACPI)
     if let Some(prog) = bpf.program_mut("innerwarden_acpi_eval") {
         use aya::programs::KProbe;
@@ -2535,7 +2565,9 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                     let uid = read_u32!(data, 8..12);
                     let target_pid = read_u32!(data, 12..16);
                     let signal = read_u32!(data, 16..20);
-                    let comm = bytes_to_string(&data[28..92]);
+                    // KillEvent: signal(16..20) then 4 bytes pad to 8-align
+                    // cgroup_id(24..32); comm starts at offset 32.
+                    let comm = bytes_to_string(&data[32..96]);
                     let sig_name = match signal {
                         9 => "SIGKILL",
                         15 => "SIGTERM",
@@ -3035,6 +3067,51 @@ pub async fn run(_tx: mpsc::Sender<Event>, _host: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Spec 069: the syscall handlers attach as kprobes on the architecture
+    // syscall ENTRY WRAPPER. The symbol must match the build-host arch.
+    #[test]
+    fn syscall_wrapper_symbol_uses_arch_prefix() {
+        let sym = syscall_wrapper_symbol("kill");
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(sym, "__arm64_sys_kill");
+        } else {
+            assert_eq!(sym, "__x64_sys_kill");
+        }
+        // The bare name is always the suffix regardless of arch.
+        assert!(syscall_wrapper_symbol("openat").ends_with("sys_openat"));
+    }
+
+    // Spec 069: resolve_container_id is memoised; a second lookup for the same
+    // PID must return the same value (PID 0 has no container → None, cached).
+    #[test]
+    fn resolve_container_id_is_memoised() {
+        let first = resolve_container_id(0);
+        let second = resolve_container_id(0);
+        assert_eq!(first, second);
+        assert_eq!(first, None);
+    }
+
+    // Spec 069: the cgroup parser is pure; cover Docker/Podman/k8s + no-match.
+    #[test]
+    fn parse_container_id_from_cgroup_formats() {
+        assert_eq!(
+            parse_container_id_from_cgroup("0::/docker/abcdef0123456789aa"),
+            Some("abcdef012345".to_string())
+        );
+        assert_eq!(
+            parse_container_id_from_cgroup("0::/libpod-fedcba9876543210bb.scope"),
+            Some("fedcba987654".to_string())
+        );
+        assert_eq!(
+            parse_container_id_from_cgroup("0::/kubepods/besteffort/pod1234/0011223344556677"),
+            Some("001122334455".to_string())
+        );
+        // Short ids and unrelated lines yield nothing.
+        assert_eq!(parse_container_id_from_cgroup("0::/docker/short"), None);
+        assert_eq!(parse_container_id_from_cgroup("0::/user.slice"), None);
+        assert_eq!(parse_container_id_from_cgroup("0::/"), None);
+    }
 
     #[test]
     fn execve_event_maps_to_shell_command_exec() {

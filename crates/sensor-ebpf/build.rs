@@ -21,6 +21,19 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    // Spec 069: expose the build-host arch as a cfg so the eBPF syscall-number
+    // constants (main.rs) can select x86_64 vs aarch64. The eBPF object is built
+    // ON the deploy host, so the build-host arch IS the target arch.
+    // `CARGO_CFG_TARGET_ARCH` is "bpf" here and useless; `std::env::consts::ARCH`
+    // is the host the build script runs on, which is what we want.
+    println!("cargo:rustc-check-cfg=cfg(iw_arch_x86_64)");
+    println!("cargo:rustc-check-cfg=cfg(iw_arch_aarch64)");
+    match std::env::consts::ARCH {
+        "x86_64" => println!("cargo:rustc-cfg=iw_arch_x86_64"),
+        "aarch64" => println!("cargo:rustc-cfg=iw_arch_aarch64"),
+        _ => {}
+    }
+
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
     // The shim only needs to participate when we're cross-compiling
