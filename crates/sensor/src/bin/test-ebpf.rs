@@ -74,7 +74,7 @@ fn missing_ebpf_feature_message() -> &'static str {
 #[cfg(feature = "ebpf")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use aya::maps::RingBuf;
-    use aya::programs::TracePoint;
+    use aya::programs::KProbe;
     use aya::Ebpf;
 
     println!("Inner Warden eBPF test loader\n");
@@ -96,17 +96,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // Attach execve tracepoint
-    let execve: &mut TracePoint = bpf.program_mut("innerwarden_execve").unwrap().try_into()?;
+    // Attach the execve kprobe. Spec 069 Phase 2 replaced the
+    // `sys_enter_execve` tracepoint with a kprobe on the x86_64 syscall
+    // entry wrapper; on aarch64 the symbol is `__arm64_sys_execve`.
+    let execve: &mut KProbe = bpf.program_mut("dispatch_execve").unwrap().try_into()?;
     execve.load()?;
-    execve.attach("syscalls", "sys_enter_execve")?;
-    println!("✅ innerwarden_execve → sys_enter_execve");
+    execve.attach("__x64_sys_execve", 0)?;
+    println!("✅ dispatch_execve → __x64_sys_execve");
 
-    // Attach connect tracepoint
-    let connect: &mut TracePoint = bpf.program_mut("innerwarden_connect").unwrap().try_into()?;
+    // Attach the connect kprobe.
+    let connect: &mut KProbe = bpf.program_mut("dispatch_connect").unwrap().try_into()?;
     connect.load()?;
-    connect.attach("syscalls", "sys_enter_connect")?;
-    println!("✅ innerwarden_connect → sys_enter_connect");
+    connect.attach("__x64_sys_connect", 0)?;
+    println!("✅ dispatch_connect → __x64_sys_connect");
 
     // Read ring buffer
     println!("\nListening for events (5 seconds)...\n");
