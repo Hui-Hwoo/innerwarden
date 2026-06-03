@@ -9,6 +9,51 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-06-03
+
+### Added
+- **Defense-evasion detection: killing a security tool.** A process that sends
+  a killing/freezing signal (SIGKILL/SIGTERM/SIGSTOP, plus SIGHUP/INT/QUIT/ABRT/
+  USR1/USR2 and real-time signals) to a security/monitoring daemon (auditd,
+  falco, tetragon, osquery, OSSEC/Wazuh, CrowdStrike/SentinelOne/Carbon Black,
+  InnerWarden's own components, …) now raises a Critical incident
+  (T1562.001 Impair Defenses). Layered false-positive containment: a default
+  allowlist of service/process managers (systemd-shutdown, logrotate, dpkg/rpm/
+  apt, container runtimes, supervisord/monit, the watchdog), a **PID-1
+  anti-spoof** check for `systemd`/`init` (a `prctl(PR_SET_NAME)` rename does not
+  buy a pass), plus the per-server allowlist and AI triage downstream.
+
+### Fixed
+- **DATA_EXFIL false-positive flood from world-readable reads.** The
+  data-exfiltration kill chain treated `/etc/passwd` (read by virtually every
+  process via glibc nss) and the whole `.ssh/` directory as sensitive reads, so
+  any download tool (apt, curl, rustup) that read one and connected to a CDN /
+  mirror produced a Critical false positive. The sensitive-read set is now tight
+  — shadow/gshadow/sudoers, private keys (`.ssh/id_*`, `authorized_keys`),
+  dotenv secrets, and explicit cloud/cluster credentials (`.aws/credentials`,
+  `.docker/config.json`, gcloud/azure, `.kube/config`, k8s service-account
+  token, `.netrc`) — in **both** the userspace kill-chain tracker and the
+  in-kernel eBPF chain. Real exfil detection (shadow / keys / cloud-creds +
+  outbound) is unchanged.
+- **block_ip responses lost across the UTC midnight boundary.** A block_ip
+  decision recorded shortly before midnight (still within its 1h TTL, but under
+  yesterday's date partition) was silently dropped from the active-response set
+  on any agent restart in the first hour after UTC midnight — the kernel block
+  stayed up while the dashboard believed it was gone. Hydration now queries
+  yesterday + today.
+- **Spurious macOS release-CI failure.** A one-shot HTTP test server closed the
+  socket before the client finished sending the request, intermittently failing
+  the macOS build job.
+
+### Changed
+- **Removed ~1,250 lines of dead eBPF.** 20 legacy `sys_enter` tracepoint
+  handlers superseded by the spec-069 kprobes were compiled into the object but
+  never attached by the loader; removed. The loaded program set is unchanged.
+- **Quieter logs.** The per-event diagnostic log (one INFO line per event,
+  millions per day on a busy host) was demoted to `trace`.
+- Dependency bumps: tokio 1.52.3, tikv-jemallocator 0.7, aes-gcm 0.11.0-rc.4,
+  rpassword 7.5.4, toml_edit 0.25.12, plus 5 GitHub Actions.
+
 ## [0.15.4] - 2026-06-03
 
 ### Fixed
