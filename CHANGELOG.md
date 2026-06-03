@@ -9,6 +9,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-06-03
+
+### Fixed
+- **aarch64 release binaries had broken syscall-arg capture (spec 069,
+  critical).** The eBPF object bakes in arch-specific `pt_regs` syscall-argument
+  offsets, selected by `sensor-ebpf/build.rs` from the build-host arch. The
+  release builds **both** architectures on a single x86_64 runner from **one**
+  shared object, so the aarch64 sensor embedded x86_64 offsets and read syscall
+  args at the wrong registers — silently dropping every arg-filtering handler
+  (`kill`/`openat`/`connect`/`setuid`/`ptrace`/`execve`) on aarch64 in
+  0.15.1–0.15.3. (Non-arg handlers — exit/accept/mount/memfd — were unaffected,
+  which is why it went unnoticed; #6's BTF self-check can't catch it because
+  aarch64's `regs[]` is nested.) `build.rs` now honours an `IW_EBPF_DEPLOY_ARCH`
+  override, and `release.yml` rebuilds the object per deploy arch (x86_64 then
+  aarch64) so each binary embeds matching offsets. From-source builds
+  (`deploy-prod.sh`, where build-host == deploy-host) were always correct.
+
 ## [0.15.3] - 2026-06-03
 
 ### Fixed

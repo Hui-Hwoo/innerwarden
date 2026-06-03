@@ -62,14 +62,11 @@ jobs:
           rustup toolchain install nightly --component rust-src
           cargo +nightly install bpf-linker --locked
 
-      - name: Build eBPF bytecode
-        run: |
-          cd crates/sensor-ebpf
-          RUSTFLAGS="" cargo +nightly build \
-            --target bpfel-unknown-none \
-            -Z build-std=core \
-            --release
-          ls -la target/bpfel-unknown-none/release/innerwarden-ebpf
+      # Spec 069: the eBPF object is rebuilt PER DEPLOY ARCH inside each build
+      # step below (via `IW_EBPF_DEPLOY_ARCH`), NOT once here. Both arches build
+      # on this x86_64 runner and the object bakes in arch-specific `pt_regs`
+      # syscall-arg offsets — a single shared object gave the aarch64 binary
+      # x86_64 offsets and silently broke aarch64 syscall-arg capture (0.15.1-3).
 
       # ── Build x86_64 ───────────────────────────────────────────────────────
       #
@@ -88,6 +85,10 @@ jobs:
       # binary feature-parity guard.
       - name: Build (x86_64-unknown-linux-gnu)
         run: |
+          # Spec 069: rebuild the eBPF object with x86_64 pt_regs offsets, then
+          # embed it into the x86_64 sensor (build.rs reads IW_EBPF_DEPLOY_ARCH).
+          (cd crates/sensor-ebpf && IW_EBPF_DEPLOY_ARCH=x86_64 RUSTFLAGS="" \
+            cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release)
           # Sensor with embedded eBPF bytecode
           cargo zigbuild --release \
             --target x86_64-unknown-linux-gnu \
@@ -118,6 +119,11 @@ jobs:
       # ── Build aarch64 ──────────────────────────────────────────────────────
       - name: Build (aarch64-unknown-linux-gnu)
         run: |
+          # Spec 069: rebuild the eBPF object with aarch64 pt_regs offsets so the
+          # aarch64 sensor embeds CORRECT offsets (the runner is x86_64). The env
+          # change re-runs build.rs; #3's OUT_DIR re-embed picks up the new object.
+          (cd crates/sensor-ebpf && IW_EBPF_DEPLOY_ARCH=aarch64 RUSTFLAGS="" \
+            cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release)
           # Sensor with embedded eBPF bytecode
           cargo zigbuild --release \
             --target aarch64-unknown-linux-gnu \

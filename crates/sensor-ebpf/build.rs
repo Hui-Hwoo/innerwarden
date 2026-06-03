@@ -21,17 +21,29 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // Spec 069: expose the build-host arch as a cfg so the eBPF syscall-number
-    // constants (main.rs) can select x86_64 vs aarch64. The eBPF object is built
-    // ON the deploy host, so the build-host arch IS the target arch.
-    // `CARGO_CFG_TARGET_ARCH` is "bpf" here and useless; `std::env::consts::ARCH`
-    // is the host the build script runs on, which is what we want.
+    // Spec 069: select the eBPF syscall-arg `pt_regs` offsets (the `__sc_off!`
+    // macro in main.rs) for the DEPLOY arch. The object is built for the
+    // arch-neutral `bpfel` target, so `CARGO_CFG_TARGET_ARCH` is "bpf" and
+    // useless. The deploy arch is normally the build-host arch
+    // (`std::env::consts::ARCH`) — correct for from-source builds where
+    // build-host == deploy-host.
+    //
+    // CROSS builds MUST override via `IW_EBPF_DEPLOY_ARCH`: the release builds
+    // BOTH x86_64 and aarch64 sensors on a single x86_64 runner, so without the
+    // override the aarch64 binary embedded an x86_64-offset object and read
+    // syscall args at the wrong `pt_regs` offsets — silently breaking aarch64
+    // kill/openat/connect/setuid/ptrace/execve capture in 0.15.1-0.15.3.
+    println!("cargo:rerun-if-env-changed=IW_EBPF_DEPLOY_ARCH");
     println!("cargo:rustc-check-cfg=cfg(iw_arch_x86_64)");
     println!("cargo:rustc-check-cfg=cfg(iw_arch_aarch64)");
-    match std::env::consts::ARCH {
+    let deploy_arch =
+        std::env::var("IW_EBPF_DEPLOY_ARCH").unwrap_or_else(|_| std::env::consts::ARCH.to_string());
+    match deploy_arch.as_str() {
         "x86_64" => println!("cargo:rustc-cfg=iw_arch_x86_64"),
         "aarch64" => println!("cargo:rustc-cfg=iw_arch_aarch64"),
-        _ => {}
+        other => println!(
+            "cargo:warning=IW_EBPF_DEPLOY_ARCH='{other}' unsupported; eBPF syscall-arg offsets not configured"
+        ),
     }
 
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
