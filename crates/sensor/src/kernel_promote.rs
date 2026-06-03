@@ -33,6 +33,7 @@
 use innerwarden_core::event::{Event, Severity};
 use innerwarden_core::incident::Incident;
 
+use crate::collectors::ebpf_syscall::is_killing_signal;
 use crate::detectors::allowlists::DynamicAllowlist;
 
 /// Debuggers legitimately `ptrace` other processes.
@@ -110,6 +111,109 @@ const MEMFD_LEGIT: &[&str] = &[
     "Xwayland",
 ];
 
+/// Security / monitoring daemons whose death is a defense-evasion signal:
+/// sending a killing signal to one of these is `T1562.001 Impair Defenses:
+/// Disable or Modify Tools`, the classic move that precedes the rest of an
+/// intrusion. InnerWarden's own components are listed as defense-in-depth
+/// (the watchdog is the authoritative backstop for the sensor/agent, but a
+/// kill of any of them is still worth an incident).
+///
+/// Names are matched **truncated to 15 chars** (`comm_in`) because
+/// `/proc/<pid>/comm` and `bpf_get_current_comm()` are limited to
+/// `TASK_COMM_LEN` (16) => 15 chars, so `innerwarden-watchdog` is reported
+/// as `innerwarden-wat`. The readable form is kept here for clarity.
+const SECURITY_TOOLS: &[&str] = &[
+    // InnerWarden
+    "innerwarden",
+    "innerwarden-sensor",
+    "innerwarden-agent",
+    "innerwarden-watchdog",
+    "innerwarden-supervisor",
+    "innerwarden-shield",
+    // Host IDS / audit / FIM
+    "auditd",
+    "falco",
+    "tetragon",
+    "osqueryd",
+    "ossec-analysisd",
+    "ossec-syscheckd",
+    "ossec-logcollector",
+    "wazuh-agentd",
+    "wazuh-modulesd",
+    "wazuh-logcollector",
+    "aide",
+    "tripwire",
+    "samhain",
+    "sandfly",
+    // Network IDS
+    "suricata",
+    "snort",
+    "zeek",
+    // AV / EDR
+    "clamd",
+    "clamav",
+    "freshclam",
+    "falcon-sensor",
+    "falcond",
+    "sentinelone",
+    "sentineld",
+    "s1-agent",
+    "cbagentd",
+    "cbdaemon",
+    "cb-enterprise",
+    // Blockers / SIEM shippers
+    "fail2ban-server",
+    "crowdsec",
+    "filebeat",
+    "auditbeat",
+    "splunkd",
+];
+
+/// Init senders whose comm is forgeable but whose identity is anchored to
+/// **PID 1** — the allowlist match is only honoured when the sender really is
+/// PID 1, so a process that renamed itself to `systemd`/`init` via
+/// `prctl(PR_SET_NAME)` does NOT get a free pass. `systemctl restart auditd`
+/// is delivered by systemd (PID 1), so the real case still passes.
+const PID1_SENDERS: &[&str] = &["systemd", "init"];
+
+/// Process/service managers that legitimately deliver killing signals to
+/// daemons (the FP vector for `systemctl restart auditd`-style activity, plus
+/// package upgrades, log rotation, and container lifecycle). This default
+/// allowlist is the FIRST FP layer; bespoke watchdogs / process-managers
+/// belong in the per-server `allowlist.toml` (`kind = kernel_kill`), NOT here.
+/// Never add shells (`sh`/`bash`) — they are forgeable and attacker-controlled.
+/// Matched truncated to 15 like the tool list.
+const KILL_SIGNAL_SENDERS: &[&str] = &[
+    "systemd-shutdown",
+    "shutdown",
+    "innerwarden-watchdog",
+    "innerwarden-supervisor",
+    "supervisord",
+    "monit",
+    "logrotate",
+    "dpkg",
+    "rpm",
+    "apt",
+    "containerd",
+    "dockerd",
+    "docker",
+    "podman",
+    "runc",
+    "crun",
+];
+
+/// Compare a (possibly `TASK_COMM_LEN`-truncated) comm base name against a
+/// readable name, truncating the readable name the same way the kernel does.
+/// All comparison names are ASCII, so byte-slicing at 15 is char-safe.
+fn comm_matches(comm_base: &str, name: &str) -> bool {
+    comm_base == &name[..name.len().min(15)]
+}
+
+/// True when `comm_base` matches any name in `list` under `comm_matches`.
+fn comm_in(comm_base: &str, list: &[&str]) -> bool {
+    list.iter().any(|n| comm_matches(comm_base, n))
+}
+
 /// PTRACE request ops that read/write/control another process — the
 /// injection / credential-dump surface. PEEK (read) ops are deliberately
 /// excluded as too noisy; ATTACH/SEIZE are the entry to any injection.
@@ -134,6 +238,7 @@ pub(crate) fn suppression_name(kind: &str) -> &'static str {
         "memory.mprotect_exec" => "kernel_mprotect",
         "process.memfd_create" => "kernel_memfd",
         "filesystem.mount" => "kernel_mount",
+        "process.signal" => "kernel_kill",
         _ => "kernel_exploit",
     }
 }
@@ -157,10 +262,20 @@ fn build_incident(
     tag: &str,
 ) -> Incident {
     let pid = num(ev, "pid");
+    let target = num(ev, "target_pid");
     Incident {
         ts: ev.ts,
         host: ev.host.clone(),
-        incident_id: format!("kernel:{}:{}:{}", tag, pid, ev.ts.format("%Y-%m-%dT%H:%MZ")),
+        // Include target_pid so a kill-storm (one sender SIGKILLing auditd then
+        // falco in the same minute) does not collapse to a single deduped
+        // incident and hide kills #2..#N. Arms with no target contribute `:0`.
+        incident_id: format!(
+            "kernel:{}:{}:{}:{}",
+            tag,
+            pid,
+            target,
+            ev.ts.format("%Y-%m-%dT%H:%MZ")
+        ),
         severity,
         title,
         summary,
@@ -291,6 +406,60 @@ pub(crate) fn kernel_syscall_incident(
                     "Verify the container is not privileged / lacks CAP_SYS_ADMIN".to_string(),
                 ],
                 "container_mount_escape",
+            ))
+        }
+        "process.signal" => {
+            // Killing/freezing signals matter for defense evasion: SIGKILL(9)/
+            // SIGTERM(15) kill, SIGSTOP(19) freezes, plus the wider set in
+            // `is_killing_signal` (so `kill -ABRT`/`-QUIT`/RT-signal evasions
+            // do not slip through). Must match the resolver's gate.
+            let signal = num(ev, "signal") as u32;
+            if !is_killing_signal(signal) {
+                return None;
+            }
+            let target = num(ev, "target_pid");
+            if target == 0 || target == pid {
+                return None;
+            }
+            // `target_comm` is resolved best-effort at emission (/proc). If the
+            // target already exited (SIGKILL race) we cannot confirm it was a
+            // security tool, so we stay silent rather than alert on every kill
+            // — the watchdog is the authoritative backstop for InnerWarden's
+            // own processes, and a future pid-registry can close the race.
+            let target_comm = text(ev, "target_comm");
+            let target_base = comm_base(target_comm);
+            if target_base.is_empty() || !comm_in(target_base, SECURITY_TOOLS) {
+                return None;
+            }
+            // FP layer: the service manager / IW's own supervisor restarting a
+            // daemon, a tool managing itself (same comm), or an operator-tuned
+            // allowlist entry is legitimate. `systemd`/`init` are honoured only
+            // when the sender really is PID 1 — a comm rename to "systemd" is
+            // not enough (anti-spoof).
+            let sender_is_init = comm_in(base, PID1_SENDERS) && pid == 1;
+            if sender_is_init
+                || comm_in(base, KILL_SIGNAL_SENDERS)
+                || base == target_base
+                || allowlist.is_process_allowed(comm, Some("kernel_kill"))
+            {
+                return None;
+            }
+            let sig_name = text(ev, "signal_name");
+            Some(build_incident(
+                ev,
+                Severity::Critical,
+                format!("Security tool killed: {comm} (PID {pid}) -> {target_comm} (PID {target})"),
+                format!(
+                    "{comm} (PID {pid}) sent {sig_name} to {target_comm} (PID {target}), a \
+                     security/monitoring process. Killing defensive tooling is the Impair Defenses \
+                     move (T1562.001) that clears the way for the rest of an intrusion. The sender is \
+                     not the service manager or a known supervisor.",
+                ),
+                vec![
+                    format!("Confirm whether {target_comm} (PID {target}) is still running; restart it if down"),
+                    format!("Inspect PID {pid} ({comm}) and its parent — why is it signalling a security tool"),
+                ],
+                "defense_evasion_kill",
             ))
         }
         _ => None,
@@ -449,10 +618,166 @@ mod tests {
     }
 
     #[test]
+    fn kill_security_tool_by_non_manager_promotes() {
+        let inc = kernel_syscall_incident(
+            &ev(
+                "process.signal",
+                serde_json::json!({"pid":1000,"target_pid":42,"signal":9,"signal_name":"SIGKILL","target_comm":"auditd","comm":"evil"}),
+            ),
+            &empty_allowlist(),
+        )
+        .expect("non-manager SIGKILL of a security tool must promote");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.tags.contains(&"defense_evasion_kill".to_string()));
+    }
+
+    #[test]
+    fn kill_security_tool_matches_truncated_comm() {
+        // /proc/<pid>/comm truncates innerwarden-watchdog to 15 chars.
+        let inc = kernel_syscall_incident(
+            &ev(
+                "process.signal",
+                serde_json::json!({"pid":7,"target_pid":8,"signal":15,"signal_name":"SIGTERM","target_comm":"innerwarden-wat","comm":"nc"}),
+            ),
+            &empty_allowlist(),
+        );
+        assert!(
+            inc.is_some(),
+            "truncated security-tool comm must still match"
+        );
+    }
+
+    #[test]
+    fn kill_security_tool_benign_cases() {
+        // service manager restarting the daemon (`systemctl restart auditd`)
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":1,"target_pid":8,"signal":15,"signal_name":"SIGTERM","target_comm":"auditd","comm":"systemd"})),
+            &empty_allowlist()
+        )
+        .is_none());
+        // target is not a security tool
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":1,"target_pid":8,"signal":9,"signal_name":"SIGKILL","target_comm":"bash","comm":"evil"})),
+            &empty_allowlist()
+        )
+        .is_none());
+        // non-killing signal (SIGCONT=18) is not defense evasion
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":1,"target_pid":8,"signal":18,"signal_name":"SIGCONT","target_comm":"auditd","comm":"evil"})),
+            &empty_allowlist()
+        )
+        .is_none());
+        // a known service/process manager (logrotate calling kill in postrotate)
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":900,"target_pid":8,"signal":15,"signal_name":"SIGTERM","target_comm":"auditd","comm":"logrotate"})),
+            &empty_allowlist()
+        )
+        .is_none());
+        // target_comm unresolved (lost the SIGKILL race) => stay silent
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":1,"target_pid":8,"signal":9,"signal_name":"SIGKILL","target_comm":"","comm":"evil"})),
+            &empty_allowlist()
+        )
+        .is_none());
+        // self / same process (target == pid)
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":8,"target_pid":8,"signal":9,"signal_name":"SIGKILL","target_comm":"auditd","comm":"auditd"})),
+            &empty_allowlist()
+        )
+        .is_none());
+        // a tool managing itself (sender base == target base)
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":1,"target_pid":8,"signal":15,"signal_name":"SIGTERM","target_comm":"falco","comm":"falco"})),
+            &empty_allowlist()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn kill_security_tool_broadened_signals_promote() {
+        // SIGABRT(6) and a real-time signal (40) must not slip through.
+        for sig in [6u64, 40u64] {
+            assert!(
+                kernel_syscall_incident(
+                    &ev(
+                        "process.signal",
+                        serde_json::json!({"pid":1000,"target_pid":8,"signal":sig,"signal_name":"x","target_comm":"falco","comm":"evil"})
+                    ),
+                    &empty_allowlist()
+                )
+                .is_some(),
+                "signal {sig} at a security tool must promote"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_security_tool_systemd_spoof_promotes_but_real_pid1_is_benign() {
+        // A process that renamed itself "systemd" but is NOT PID 1 is spoofing
+        // the init allowlist -> must still promote.
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":4242,"target_pid":8,"signal":9,"signal_name":"SIGKILL","target_comm":"auditd","comm":"systemd"})),
+            &empty_allowlist()
+        )
+        .is_some());
+        // The real init (PID 1) restarting a unit is benign.
+        assert!(kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":1,"target_pid":8,"signal":15,"signal_name":"SIGTERM","target_comm":"auditd","comm":"systemd"})),
+            &empty_allowlist()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn kill_security_tool_distinct_targets_distinct_incident_ids() {
+        // A kill-storm against two different tools in the same minute must not
+        // collapse into one deduped incident.
+        let a = kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":1000,"target_pid":8,"signal":9,"signal_name":"SIGKILL","target_comm":"auditd","comm":"evil"})),
+            &empty_allowlist(),
+        )
+        .expect("first kill promotes");
+        let b = kernel_syscall_incident(
+            &ev("process.signal", serde_json::json!({"pid":1000,"target_pid":9,"signal":9,"signal_name":"SIGKILL","target_comm":"falco","comm":"evil"})),
+            &empty_allowlist(),
+        )
+        .expect("second kill promotes");
+        assert_ne!(
+            a.incident_id, b.incident_id,
+            "different targets must yield different incident ids"
+        );
+    }
+
+    #[test]
+    fn is_killing_signal_set() {
+        for s in [1u32, 2, 3, 6, 9, 10, 12, 15, 19, 34, 50, 64] {
+            assert!(is_killing_signal(s), "signal {s} must be killing");
+        }
+        for s in [0u32, 4, 5, 7, 8, 11, 13, 17, 18, 23, 28, 33, 65] {
+            assert!(!is_killing_signal(s), "signal {s} must not be killing");
+        }
+    }
+
+    #[test]
+    fn comm_matches_truncates_like_the_kernel() {
+        assert!(comm_matches("innerwarden-wat", "innerwarden-watchdog"));
+        assert!(comm_matches("innerwarden-age", "innerwarden-agent"));
+        assert!(comm_matches("auditd", "auditd"));
+        assert!(comm_matches("falco", "falco"));
+        assert!(!comm_matches("evil", "auditd"));
+        assert!(comm_in("innerwarden-sen", SECURITY_TOOLS));
+        assert!(comm_in("systemd", PID1_SENDERS));
+        assert!(comm_in("logrotate", KILL_SIGNAL_SENDERS));
+        assert!(!comm_in("systemd", KILL_SIGNAL_SENDERS));
+        assert!(!comm_in("evil", SECURITY_TOOLS));
+    }
+
+    #[test]
     fn suppression_name_is_per_kind() {
         assert_eq!(suppression_name("process.ptrace_attach"), "kernel_ptrace");
         assert_eq!(suppression_name("memory.mprotect_exec"), "kernel_mprotect");
         assert_eq!(suppression_name("process.memfd_create"), "kernel_memfd");
         assert_eq!(suppression_name("filesystem.mount"), "kernel_mount");
+        assert_eq!(suppression_name("process.signal"), "kernel_kill");
     }
 }

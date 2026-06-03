@@ -263,6 +263,38 @@ fn read_proc_cmdline(pid: u32, filename: &str) -> Vec<String> {
     }
 }
 
+/// Spec 069 follow-up #2: best-effort resolve the *target* process name for a
+/// `kill()`-class event so `kernel_promote` can flag a process killing a
+/// security tool (T1562.001) without re-resolving `/proc` itself.
+///
+/// Signals that terminate or freeze a daemon at its default disposition, so
+/// directing one at a security tool is the defense-evasion signal:
+/// SIGHUP(1)/SIGINT(2)/SIGQUIT(3)/SIGABRT(6) terminate, SIGKILL(9)/SIGTERM(15)
+/// kill, SIGUSR1(10)/SIGUSR2(12) terminate by default (several tools treat them
+/// as reload/exit), SIGSTOP(19) freezes, and every real-time signal (34..=64)
+/// defaults to terminate. Crash signals (SIGILL/SIGTRAP/SIGSEGV/SIGBUS/SIGFPE)
+/// and benign ones (SIGCHLD/SIGCONT/SIGWINCH/SIGURG) are excluded so the rule
+/// is not noisy. This is the single source of truth shared by the `/proc`
+/// target-comm resolver here and `kernel_promote`'s `process.signal` arm — they
+/// MUST agree or a killing signal arrives with no `target_comm` and slips
+/// through.
+pub(crate) fn is_killing_signal(sig: u32) -> bool {
+    matches!(sig, 1 | 2 | 3 | 6 | 9 | 10 | 12 | 15 | 19) || (34..=64).contains(&sig)
+}
+
+/// Bounded to killing/freezing signals (`is_killing_signal`) so we do not
+/// `/proc`-read for every `kill(pid, 0)` liveness probe or benign
+/// SIGCHLD/SIGCONT. Best-effort: a target that already exited (lost the SIGKILL
+/// race) yields an empty string, in which case the promoter stays silent rather
+/// than guess.
+fn resolve_target_comm(signal: u32, target_pid: u32) -> String {
+    if is_killing_signal(signal) {
+        crate::detectors::exec_context::proc_comm(target_pid).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
 /// Convert a kernel execve event to an Inner Warden Event.
 ///
 /// Reads `/proc/{ppid}/comm` so the 050-PR0 context-aware allowlist
@@ -2578,11 +2610,19 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     // cgroup_id(24..32); comm starts at offset 32.
                     let comm = bytes_to_string(&data[32..96]);
                     let sig_name = match signal {
+                        1 => "SIGHUP",
+                        2 => "SIGINT",
+                        3 => "SIGQUIT",
+                        6 => "SIGABRT",
                         9 => "SIGKILL",
+                        10 => "SIGUSR1",
+                        12 => "SIGUSR2",
                         15 => "SIGTERM",
                         19 => "SIGSTOP",
+                        34..=64 => "SIGRT",
                         _ => "SIG?",
                     };
+                    let target_comm = resolve_target_comm(signal, target_pid);
                     Some(Event {
                         ts: chrono::Utc::now(),
                         host: host.to_string(),
@@ -2592,7 +2632,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         summary: format!(
                             "{comm} (PID {pid}) sending {sig_name} to PID {target_pid}"
                         ),
-                        details: serde_json::json!({"pid": pid, "uid": uid, "target_pid": target_pid, "signal": signal, "signal_name": sig_name, "comm": comm}),
+                        details: serde_json::json!({"pid": pid, "uid": uid, "target_pid": target_pid, "signal": signal, "signal_name": sig_name, "comm": comm, "target_comm": target_comm}),
                         tags: vec!["ebpf".to_string(), "kill_signal".to_string()],
                         entities: vec![],
                     })
@@ -3404,5 +3444,20 @@ mod tests {
             // (they're only built with `cargo +nightly build --target bpfel-unknown-none`)
             let _ = result; // just verify it doesn't panic
         }
+    }
+
+    #[test]
+    fn resolve_target_comm_only_reads_proc_for_killing_signals() {
+        // Non-killing signals never touch /proc => always empty, no I/O.
+        assert_eq!(resolve_target_comm(0, 1), ""); // signal 0 (liveness probe)
+        assert_eq!(resolve_target_comm(17, 1), ""); // SIGCHLD
+        assert_eq!(resolve_target_comm(18, 1), ""); // SIGCONT
+        assert_eq!(resolve_target_comm(28, 1), ""); // SIGWINCH
+                                                    // Killing signals attempt /proc resolution; PID 0 is never a real
+                                                    // target so proc_comm() returns None => empty, deterministically.
+        assert_eq!(resolve_target_comm(9, 0), ""); // SIGKILL
+        assert_eq!(resolve_target_comm(6, 0), ""); // SIGABRT (newly covered)
+        assert_eq!(resolve_target_comm(40, 0), ""); // real-time signal
+        assert_eq!(resolve_target_comm(19, 0), ""); // SIGSTOP
     }
 }
