@@ -21,10 +21,13 @@
 //! The recovery pass closes the loop:
 //! 1. Every 10 minutes, query SQLite for incidents whose `ts` is >1h ago
 //!    and have no `decisions` row joined.
-//! 2. For each, write a `dismiss` decision with
-//!    `ai_provider="orphan-recovery"` and a clear reason explaining the
-//!    sweep took it. The hash chain stays intact (the standard
-//!    `Store::insert_decision` is used) and the audit trail is honest.
+//! 2. For each, write a decision with `ai_provider="orphan-recovery"` and a
+//!    clear reason. **Severity-gated (Spec 062 invariant):** Low/Medium/Info
+//!    orphans are `dismiss`ed (safe noise cleanup); **High/Critical orphans
+//!    are routed to `needs_review`, never silently dismissed** — they stay
+//!    visible/audited and the needs_review timeout sweep leaves High/Critical
+//!    in needs_review forever. The hash chain stays intact (the standard
+//!    `decisions::append_chained` is used) and the audit trail is honest.
 //! 3. The Stuck bucket on the next dashboard tick reflects only NEW
 //!    >1h-old orphans (which themselves get swept within 10 minutes).
 //!
@@ -86,7 +89,8 @@ pub(crate) fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
     let cutoff_iso = cutoff.to_rfc3339();
 
     // Query all orphans via the store crate's typed helper.
-    let orphans: Vec<(String, String, String)> =
+    // (incident_id, severity, ts_iso, data_json)
+    let orphans: Vec<(String, String, String, String)> =
         match store.find_orphan_incidents(&cutoff_iso, ORPHAN_SWEEP_LIMIT) {
             Ok(rs) => rs,
             Err(e) => {
@@ -100,7 +104,7 @@ pub(crate) fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
     }
 
     let mut written = 0usize;
-    for (incident_id, incident_ts_iso, incident_data_json) in orphans {
+    for (incident_id, severity, incident_ts_iso, incident_data_json) in orphans {
         // Extract target_ip from incident JSON entities (best-effort —
         // missing target IP is acceptable, the decision still records).
         let target_ip = extract_target_ip(&incident_data_json);
@@ -108,27 +112,72 @@ pub(crate) fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
             .map(|t| (now - t.with_timezone(&Utc)).num_seconds())
             .unwrap_or(0);
         let age_human = format!("{}h{}m", age_seconds / 3600, (age_seconds % 3600) / 60);
+
+        // Spec 062 invariant: a High/Critical incident that NObody (AI or a
+        // deterministic gate) ever decided must NEVER be silently auto-dismissed
+        // by this cleanup sweep. Route it to `needs_review` instead — a visible,
+        // audited decision. The needs_review timeout sweep leaves High/Critical
+        // in needs_review forever (only Low/Medium auto-close on timeout), so the
+        // operator still sees it. Low/Medium/Info/Debug orphans are safe noise to
+        // dismiss, which is exactly what this sweep exists for.
+        let high_impact = matches!(
+            severity.trim().to_ascii_lowercase().as_str(),
+            "high" | "critical"
+        );
+        let (action_type, execution_result, estimated_threat, reason): (
+            &str,
+            &str,
+            String,
+            String,
+        ) = if high_impact {
+            (
+                "needs_review",
+                "awaiting_human",
+                severity.clone(),
+                format!(
+                    "Orphan-recovery: {severity}-severity incident is {age_human} old with no \
+                         AI decision (deploy orphan or AI provider skip). High/Critical is never \
+                         auto-dismissed — routed to needs_review for the operator (Spec 062 \
+                         invariant)."
+                ),
+            )
+        } else {
+            (
+                "dismiss",
+                "dismissed",
+                "none".to_string(),
+                format!(
+                    "Auto-dismissed by orphan-recovery sweep: {severity}-severity incident is \
+                         {age_human} old with no AI decision. Likely deploy orphan or AI provider \
+                         skip. Operator can re-trigger manual review via Threats list."
+                ),
+            )
+        };
         let entry = DecisionEntry {
             ts: now,
             incident_id: incident_id.clone(),
             host: hostname(),
             ai_provider: ORPHAN_AI_PROVIDER.to_string(),
-            action_type: "dismiss".to_string(),
+            action_type: action_type.to_string(),
             target_ip,
             target_user: None,
             skill_id: None,
             confidence: 1.0,
-            auto_executed: true,
+            // needs_review parks the incident for a human; it is not "executed".
+            auto_executed: !high_impact,
             dry_run: false,
-            reason: format!(
-                "Auto-dismissed by orphan-recovery sweep: incident is {age_human} old with no AI \
-                 decision. Likely deploy orphan or AI provider skip. Operator can re-trigger \
-                 manual review via Threats list."
-            ),
-            estimated_threat: "none".to_string(),
-            execution_result: "dismissed".to_string(),
+            reason,
+            estimated_threat,
+            execution_result: execution_result.to_string(),
             prev_hash: None,
-            decision_layer: Some("auto_rule".to_string()),
+            decision_layer: Some(
+                (if high_impact {
+                    "observation_verifier"
+                } else {
+                    "auto_rule"
+                })
+                .to_string(),
+            ),
         };
         match crate::decisions::append_chained(data_dir, &entry, Some(store)) {
             Ok(()) => written += 1,
@@ -143,7 +192,7 @@ pub(crate) fn run_sweep(state: &mut AgentState, data_dir: &Path) -> usize {
     if written > 0 {
         info!(
             written,
-            "orphan_recovery: swept abandoned incidents into dismiss decisions"
+            "orphan_recovery: swept abandoned incidents (Low/Med -> dismiss, High/Crit -> needs_review)"
         );
     }
     written
@@ -292,13 +341,23 @@ mod tests {
         id: &str,
         ts: chrono::DateTime<chrono::Utc>,
     ) -> innerwarden_core::incident::Incident {
+        // Low severity by default so the orphan-recovery dismiss path (Low/Med)
+        // is the one exercised. High/Critical now routes to needs_review (see
+        // `make_orphan_sev` + the needs_review tests).
+        make_orphan_sev(id, ts, innerwarden_core::event::Severity::Low)
+    }
+
+    fn make_orphan_sev(
+        id: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+        severity: innerwarden_core::event::Severity,
+    ) -> innerwarden_core::incident::Incident {
         use innerwarden_core::entities::EntityRef;
-        use innerwarden_core::event::Severity;
         innerwarden_core::incident::Incident {
             ts,
             host: "h".into(),
             incident_id: id.into(),
-            severity: Severity::High,
+            severity,
             title: "t".into(),
             summary: "s".into(),
             evidence: serde_json::json!({}),
@@ -409,6 +468,68 @@ mod tests {
             .to_string();
         let jsonl = tmp.path().join(format!("decisions-{today}.jsonl"));
         assert!(jsonl.exists(), "decisions JSONL must be written");
+    }
+
+    #[test]
+    fn run_sweep_high_severity_orphan_routes_to_needs_review() {
+        // Spec 062 invariant: a High/Critical orphan must NOT be silently
+        // dismissed — it routes to needs_review (visible, audited, never
+        // auto-closed by the needs_review timeout sweep).
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan_sev(
+                "old:critical-orphan",
+                two_hours_ago,
+                innerwarden_core::event::Severity::Critical,
+            ))
+            .unwrap();
+
+        let written = run_sweep(&mut state, tmp.path());
+        assert_eq!(written, 1);
+
+        let rows = store.decisions_for_incident("old:critical-orphan").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            parsed.get("action_type").and_then(|v| v.as_str()),
+            Some("needs_review"),
+            "High/Critical orphan must route to needs_review, never silent dismiss"
+        );
+        assert_eq!(
+            parsed.get("ai_provider").and_then(|v| v.as_str()),
+            Some(ORPHAN_AI_PROVIDER),
+        );
+        let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            reason.contains("needs_review") && reason.contains("never auto-dismissed"),
+            "reason must explain the needs_review routing: {reason}"
+        );
+    }
+
+    #[test]
+    fn run_sweep_low_severity_orphan_is_dismissed() {
+        // The complement: Low/Medium orphans stay on the dismiss path — that
+        // is what the cleanup sweep is for.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, store) = build_state_with_store(&tmp);
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        store
+            .insert_incident(&make_orphan_sev(
+                "old:low-orphan",
+                two_hours_ago,
+                innerwarden_core::event::Severity::Low,
+            ))
+            .unwrap();
+
+        run_sweep(&mut state, tmp.path());
+        let rows = store.decisions_for_incident("old:low-orphan").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(
+            parsed.get("action_type").and_then(|v| v.as_str()),
+            Some("dismiss"),
+            "Low-severity orphan stays on the dismiss path"
+        );
     }
 
     #[test]
@@ -584,7 +705,7 @@ mod tests {
 
         let cutoff = (now - chrono::Duration::hours(1)).to_rfc3339();
         let orphans = store.find_orphan_incidents(&cutoff, 100).unwrap();
-        let ids: Vec<&str> = orphans.iter().map(|(id, _, _)| id.as_str()).collect();
+        let ids: Vec<&str> = orphans.iter().map(|(id, _, _, _)| id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["old:orphan"],

@@ -162,19 +162,21 @@ impl Store {
     /// dashboard's "Stuck >1h" pending bucket trends down across
     /// ticks instead of accumulating dead-weight forever.
     ///
-    /// Returns up to `limit` rows of `(incident_id, ts_iso, data_json)`
-    /// ordered oldest-first. The agent caller writes the dismiss
-    /// decision via the standard `decisions::append_chained` so the
-    /// hash chain stays intact and the audit log is honest about
-    /// which provider made the call (`ai_provider="orphan-recovery"`).
+    /// Returns up to `limit` rows of `(incident_id, severity, ts_iso,
+    /// data_json)` ordered oldest-first. The agent caller writes the
+    /// recovery decision via the standard `decisions::append_chained` so the
+    /// hash chain stays intact and the audit log is honest about which
+    /// provider made the call (`ai_provider="orphan-recovery"`). The
+    /// `severity` column lets the caller apply the Spec 062 invariant:
+    /// High/Critical orphans route to `needs_review`, never silent dismiss.
     pub fn find_orphan_incidents(
         &self,
         before_ts: &str,
         limit: usize,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<Vec<(String, String, String, String)>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT i.incident_id, i.ts, i.data \
+            "SELECT i.incident_id, i.severity, i.ts, i.data \
              FROM incidents i \
              LEFT JOIN decisions d ON d.incident_id = i.incident_id \
              WHERE d.id IS NULL \
@@ -185,9 +187,10 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![before_ts, limit as i64], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, String>(0)?, // incident_id
+                row.get::<_, String>(1)?, // severity (lowercase)
+                row.get::<_, String>(2)?, // ts_iso
+                row.get::<_, String>(3)?, // data_json
             ))
         })?;
         let mut results = Vec::new();
