@@ -75,6 +75,29 @@ impl KernelModuleLoadDetector {
         false
     }
 
+    /// Kernel/package-update tooling resolves and rebuilds the module set as a
+    /// normal step of an initramfs/depmod regeneration during a kernel package
+    /// upgrade. `modprobe --show-depends` only RESOLVES a module's dependency
+    /// tree (it loads nothing), and `mkinitramfs`/`dracut` run from their build
+    /// temp dir. None of this is an attacker loading a module. The event `comm`
+    /// is frequently `unknown` here (these run fast/early during an apt/dnf
+    /// upgrade), so we key primarily on the universal COMMAND shape, with the
+    /// build-tool `comm` as a secondary signal. This is distro-universal, not
+    /// host-specific.
+    fn is_kernel_update_tooling(command: &str, comm: &str) -> bool {
+        // `--show-depends` is un-forgeable as an evasion: it makes modprobe
+        // RESOLVE deps and print, never load, so an attacker gains nothing by
+        // adding it. The build-tool comm is the secondary signal.
+        if command.contains("--show-depends") {
+            return true;
+        }
+        let base = comm.rsplit('/').next().unwrap_or(comm);
+        matches!(
+            base,
+            "mkinitramfs" | "dracut" | "depmod" | "update-initramf" | "initramfs-tool"
+        )
+    }
+
     /// Check if the command involves loading from a suspicious path.
     fn has_suspicious_path(command: &str) -> bool {
         SUSPICIOUS_PATHS.iter().any(|p| command.contains(p))
@@ -186,6 +209,13 @@ impl KernelModuleLoadDetector {
             .as_str()
             .unwrap_or("unknown")
             .to_string();
+
+        // Suppress routine kernel-package-update module operations (e.g.
+        // `modprobe --show-depends` during update-initramfs). Done after the
+        // allowlist + before the cooldown so it never pollutes the cooldown map.
+        if Self::is_kernel_update_tooling(command, &comm) {
+            return None;
+        }
 
         let now = event.ts;
         let alert_key = format!("kmod:{}:{}", module_name, comm);
@@ -308,6 +338,30 @@ mod tests {
         let inc = inc.unwrap();
         assert_eq!(inc.severity, Severity::High);
         assert!(inc.title.contains("evil_module"));
+    }
+
+    #[test]
+    fn skips_kernel_package_update_module_ops() {
+        let mut det = KernelModuleLoadDetector::new("test", 600);
+        let now = Utc::now();
+        // `modprobe --show-depends` only resolves deps during an initramfs
+        // rebuild; comm is often "unknown" on these. Must not fire.
+        assert!(det
+            .process(&module_event(
+                "modprobe --all --set-version=6.8.0-1054-oracle --ignore-install --quiet --show-depends evil_module",
+                "unknown",
+                0,
+                now,
+            ))
+            .is_none());
+        // build-tool comm (mkinitramfs) also benign.
+        assert!(det
+            .process(&module_event("modprobe evil_module", "mkinitramfs", 1, now))
+            .is_none());
+        // a real out-of-tree load from /tmp still fires Critical.
+        let inc = det.process(&module_event("insmod /tmp/evil.ko", "bash", 1234, now));
+        assert!(inc.is_some());
+        assert_eq!(inc.unwrap().severity, Severity::Critical);
     }
 
     #[test]

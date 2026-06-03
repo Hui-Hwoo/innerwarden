@@ -82,6 +82,7 @@ const RM_BUILD_CACHE_SEGMENTS: &[&str] = &[
     // Rust
     "target",
     ".cargo",
+    ".rustup",
     // Node / JS
     "node_modules",
     ".npm",
@@ -110,6 +111,26 @@ const RM_BUILD_CACHE_SEGMENTS: &[&str] = &[
 fn path_has_build_cache_segment(path: &str) -> bool {
     path.split('/')
         .any(|seg| RM_BUILD_CACHE_SEGMENTS.contains(&seg))
+}
+
+/// Package-manager state/temp dirs are managed by the package tooling, which
+/// routinely `rm -rf`s its own scratch dirs (e.g. dpkg's `/var/lib/dpkg/tmp.ci`
+/// during an upgrade, apt list/cache rebuilds). They live under `/var/lib/`,
+/// which is otherwise a user-data prefix, so they need an explicit exclusion.
+/// Anchored on the package-manager state ROOT so a user dir merely containing
+/// "dpkg"/"apt" elsewhere still fires. Distro-universal, not host-specific.
+/// Deliberately does NOT exclude `/var/lib/mysql`, `/var/lib/postgresql`,
+/// `/var/lib/docker`, etc. — those hold real data and a wipe IS destruction.
+fn is_pkg_manager_state_path(path: &str) -> bool {
+    const PM_PREFIXES: &[&str] = &[
+        "/var/lib/dpkg/",
+        "/var/lib/apt/",
+        "/var/lib/yum/",
+        "/var/lib/dnf/",
+        "/var/lib/pacman/",
+        "/var/lib/rpm/",
+    ];
+    PM_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
 const BLOCK_DEVICE_PREFIXES: &[&str] = &[
@@ -334,6 +355,11 @@ fn detect_rm_rf_user_data(argv: &[String]) -> Option<String> {
         if path_has_build_cache_segment(t) {
             continue;
         }
+        // Package-manager state/temp dirs under /var/lib/ are tool-managed
+        // scratch space, not user data (e.g. `rm -rf /var/lib/dpkg/tmp.ci`).
+        if is_pkg_manager_state_path(t) {
+            continue;
+        }
         if USER_DATA_PATH_PREFIXES.iter().any(|p| t.starts_with(p)) {
             return Some(t.to_string());
         }
@@ -466,6 +492,43 @@ mod tests {
         let ev = exec_event(&["rm", "-rf", "/home/ubuntu/work"], "bash");
         let inc = det.process(&ev).expect("should fire");
         assert_eq!(inc.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn rm_rf_skips_pkg_manager_state_and_toolchain() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // dpkg's own temp cleanup + apt lists rebuild during an upgrade.
+        assert_eq!(
+            detect_rm_rf_user_data(&s(&["rm", "-rf", "--", "/var/lib/dpkg/tmp.ci"])),
+            None
+        );
+        assert_eq!(
+            detect_rm_rf_user_data(&s(&["rm", "-rf", "/var/lib/apt/lists/partial"])),
+            None
+        );
+        // rust toolchain dirs (.rustup was the gap; .cargo already covered).
+        assert_eq!(
+            detect_rm_rf_user_data(&s(&[
+                "rm",
+                "-rf",
+                "/home/ubuntu/.rustup",
+                "/home/ubuntu/.cargo"
+            ])),
+            None
+        );
+        // Real user-data / database wipes still fire.
+        assert_eq!(
+            detect_rm_rf_user_data(&s(&["rm", "-rf", "/var/www/html"])),
+            Some("/var/www/html".to_string())
+        );
+        assert_eq!(
+            detect_rm_rf_user_data(&s(&["rm", "-rf", "/var/lib/mysql"])),
+            Some("/var/lib/mysql".to_string())
+        );
+        assert_eq!(
+            detect_rm_rf_user_data(&s(&["rm", "-rf", "/home/user/documents"])),
+            Some("/home/user/documents".to_string())
+        );
     }
 
     #[test]

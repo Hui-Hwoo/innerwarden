@@ -808,6 +808,16 @@ impl RootkitDetector {
             return None;
         }
 
+        // Kernel-package-update tooling (update-initramfs/mkinitramfs/depmod)
+        // resolves module deps as a normal image-rebuild step on every kernel
+        // upgrade. `modprobe --show-depends` only resolves a dependency tree
+        // (no load) — and it is un-forgeable as an evasion (an attacker adding
+        // it just makes modprobe print and not load). The rmmod/kmod/ldd
+        // mis-parse case is handled by the KMOD_TOOLS guard below.
+        if command.contains("--show-depends") {
+            return None;
+        }
+
         // Extract module name from the command or arguments
         let module_name = self.extract_module_name(event);
         if module_name.is_empty() {
@@ -825,6 +835,18 @@ impl RootkitDetector {
             .replace('-', "_");
 
         if KNOWN_GOOD_MODULES.iter().any(|m| *m == module_base) {
+            return None;
+        }
+
+        // The parsed "module" is itself a loader/tool binary (rmmod, kmod, ldd,
+        // ...), not a .ko — this happens when the build tooling invokes the
+        // multi-call `kmod` binary (e.g. `/var/tmp/mkinitramfs_*/usr/bin/kmod`,
+        // `/sbin/rmmod`). A real module load resolves to an actual module name,
+        // so a tool name here is a mis-parse of routine tooling, not a rootkit.
+        const KMOD_TOOLS: &[&str] = &[
+            "rmmod", "kmod", "ldd", "modprobe", "insmod", "depmod", "lsmod",
+        ];
+        if KMOD_TOOLS.iter().any(|t| *t == module_base) {
             return None;
         }
 
@@ -1460,6 +1482,29 @@ mod tests {
         assert_eq!(inc.severity, Severity::Critical);
         assert!(inc.title.contains("/dev/.hidden"));
         assert!(inc.tags.contains(&"rootkit".to_string()));
+    }
+
+    #[test]
+    fn kmod_op_skips_kernel_update_tooling() {
+        let mut det = RootkitDetector::new("test", 10, 600);
+        let now = Utc::now();
+        // `modprobe --show-depends` resolves deps during an initramfs rebuild,
+        // it does not load. Must not fire as a rootkit.
+        assert!(det
+            .check_kernel_module_op(
+                &exec_event("modprobe", "modprobe --show-depends foo", 1, now),
+                now,
+            )
+            .is_none());
+        // The parsed "module" is itself a loader tool (the kmod multicall
+        // binary the build tooling invokes), not a real .ko => mis-parse, benign.
+        assert!(det
+            .check_kernel_module_op(&exec_event("modprobe", "modprobe rmmod", 1, now), now)
+            .is_none());
+        // A real malicious load from /dev/shm still fires.
+        assert!(det
+            .check_kernel_module_op(&exec_event("insmod", "insmod /dev/shm/x.ko", 1, now), now,)
+            .is_some());
     }
 
     // --- Test 2: Normal file path doesn't trigger ---

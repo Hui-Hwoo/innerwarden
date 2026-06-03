@@ -170,6 +170,31 @@ impl SensitiveWriteDetector {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
+        // Interactive shells append their command history to ~/.bash_history on
+        // exit — universal POSIX behaviour, not log tampering. Suppress ONLY
+        // when a real shell, owned by the writing uid, opens its OWN history
+        // append-only (O_APPEND set, O_TRUNC clear). Truncation (O_TRUNC), a
+        // different user or a non-shell writer, or any other history path still
+        // fire — those are the real anti-forensic moves. Missing flags ->
+        // append_only is false -> the incident still fires (fail-safe).
+        if category == "log_tampering" && filename.ends_with(".bash_history") {
+            const O_APPEND: u64 = 0x400;
+            const O_TRUNC: u64 = 0x200;
+            let flags = event
+                .details
+                .get("flags")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let append_only = (flags & O_APPEND != 0) && (flags & O_TRUNC == 0);
+            let is_shell = matches!(
+                comm,
+                "bash" | "zsh" | "ksh" | "sh" | "dash" | "tcsh" | "fish"
+            );
+            if append_only && is_shell && history_owned_by(uid, filename) {
+                return None;
+            }
+        }
+
         let key = format!("sensitive_write:{category}:{comm}:{filename}");
 
         // Cooldown
@@ -322,6 +347,23 @@ fn is_allowed(comm: &str) -> bool {
         .any(|p| comm == *p || comm.starts_with(p))
 }
 
+/// True iff `filename` is the writing `uid`'s OWN history file:
+/// `/home/<user>/.bash_history` written by a non-root uid, or
+/// `/root/.bash_history` written by root. Any path we cannot attribute returns
+/// false, so the incident fires (fail-safe). Generic `/home`/`/root` layout +
+/// uid ownership, not host-specific.
+fn history_owned_by(uid: u64, filename: &str) -> bool {
+    if let Some(rest) = filename.strip_prefix("/root/") {
+        return uid == 0 && rest == ".bash_history";
+    }
+    if let Some(rest) = filename.strip_prefix("/home/") {
+        // exactly /home/<user>/.bash_history, written by a non-root uid
+        let segs: Vec<&str> = rest.split('/').collect();
+        return segs.len() == 2 && segs[1] == ".bash_history" && uid != 0;
+    }
+    false
+}
+
 fn classify_path(filename: &str) -> Option<(&'static str, Severity)> {
     for p in CREDENTIAL_PATHS {
         if filename.contains(p) {
@@ -408,6 +450,57 @@ mod tests {
         let inc = incident.unwrap();
         assert_eq!(inc.severity, Severity::Critical);
         assert!(inc.tags.contains(&"credentials".to_string()));
+    }
+
+    fn write_event_full(filename: &str, comm: &str, uid: u64, flags: u64) -> Event {
+        let mut e = write_event(filename, comm);
+        e.details["uid"] = serde_json::json!(uid);
+        e.details["flags"] = serde_json::json!(flags);
+        e
+    }
+
+    #[test]
+    fn bash_history_append_by_owner_is_benign_truncate_and_others_fire() {
+        const O_WRONLY: u64 = 0x1;
+        const O_APPEND: u64 = 0x400;
+        const O_TRUNC: u64 = 0x200;
+        let mut det = SensitiveWriteDetector::new("test", 300);
+        // Owner's shell appending its OWN history on logout => benign.
+        assert!(det
+            .process(&write_event_full(
+                "/home/alice/.bash_history",
+                "bash",
+                1000,
+                O_WRONLY | O_APPEND,
+            ))
+            .is_none());
+        // Truncation (O_TRUNC) = wiping history = real anti-forensics => fires.
+        assert!(det
+            .process(&write_event_full(
+                "/home/bob/.bash_history",
+                "bash",
+                1000,
+                O_WRONLY | O_TRUNC,
+            ))
+            .is_some());
+        // Root writing a regular user's history => fires (anti-forensics).
+        assert!(det
+            .process(&write_event_full(
+                "/home/carol/.bash_history",
+                "bash",
+                0,
+                O_WRONLY | O_APPEND,
+            ))
+            .is_some());
+        // Non-shell writer (python/curl) appending history => fires.
+        assert!(det
+            .process(&write_event_full(
+                "/home/dave/.bash_history",
+                "python3",
+                1000,
+                O_WRONLY | O_APPEND,
+            ))
+            .is_some());
     }
 
     #[test]
