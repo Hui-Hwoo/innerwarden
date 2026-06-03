@@ -934,9 +934,46 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("test should set read timeout");
+            // Drain the FULL request — request line, headers, and any
+            // Content-Length body — before responding. A single read()
+            // returns only the first TCP segment; if we write the response
+            // and close (Connection: close) while the client is still
+            // sending the body, macOS resets the connection (RST-on-close
+            // discards unread receive-buffer data) and the client's
+            // send_json() fails with ECONNRESET instead of parsing the
+            // 200. That surfaced as a flake in the release macOS job
+            // (`cmd_agent_connect_with_pid_uses_dashboard_when_reachable`
+            // fell back to the offline queue because the POST "errored").
+            // Reading the whole request lets the client finish sending
+            // before we close, so the fix is deterministic on Linux too.
+            let mut raw = Vec::new();
             let mut buf = [0_u8; 4096];
-            let n = stream.read(&mut buf).expect("test should read request");
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                }
+                // Headers are ASCII, so the lossy view is byte-for-byte.
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(header_end) = text.find("\r\n\r\n") {
+                    let content_len = text
+                        .lines()
+                        .take_while(|l| !l.is_empty())
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if raw.len() - (header_end + 4) >= content_len {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&raw).to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_body.len(),
