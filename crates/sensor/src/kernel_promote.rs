@@ -230,6 +230,35 @@ fn comm_base(comm: &str) -> &str {
     b.trim_matches(|c: char| c == '(' || c == ')')
 }
 
+/// True for kernel threads (kworker, the NMI watchdog, ksoftirqd, migration,
+/// rcu_*, ...). They run with a non-zero cgroup_id, so the eBPF `in_container`
+/// heuristic (cgroup_id != 0) tags them as "in a container" — but a kernel
+/// thread never escapes a container. Their comm is the bracketed /
+/// parenthesised kernel-thread display form (`[kworker/u8:2]`, `(watchdog)`) or
+/// a bare `kworker`. Userspace process comms never start with `[`/`(`.
+fn is_kernel_thread(comm: &str) -> bool {
+    let c = comm.trim();
+    c.starts_with('[')
+        || c.starts_with('(')
+        || c.starts_with("kworker")
+        || matches!(
+            comm_base(c),
+            "watchdog"
+                | "ksoftirqd"
+                | "migration"
+                | "kthreadd"
+                | "rcu_sched"
+                | "rcu_bh"
+                | "kswapd0"
+                | "khugepaged"
+                | "kcompactd0"
+                | "kdevtmpfs"
+                | "kauditd"
+                | "ksmd"
+                | "oom_reaper"
+        )
+}
+
 /// The per-kind detector name used for incident-level suppression
 /// (`is_incident_suppressed`) so operators can tune each independently.
 pub(crate) fn suppression_name(kind: &str) -> &'static str {
@@ -389,17 +418,29 @@ pub(crate) fn kernel_syscall_incident(
             {
                 return None;
             }
+            // FP guard (2026-06-03, prod): the eBPF `in_container` heuristic is
+            // `cgroup_id != 0`, which also matches KERNEL THREADS (kworker, the
+            // NMI watchdog, ...). Their internal mount work carries no readable
+            // source/target/fs. A real escape is a userspace process mounting a
+            // SPECIFIC host path. Skip kernel threads and arg-less mounts — they
+            // fired Critical false positives on prod (`[kworker/u8:2]` /
+            // `(watchdog)` around agent restart windows, empty mount args).
+            let source = text(ev, "source");
+            let target = text(ev, "target");
+            let fs_type = text(ev, "fs_type");
+            if is_kernel_thread(comm)
+                || (source.is_empty() && target.is_empty() && fs_type.is_empty())
+            {
+                return None;
+            }
             Some(build_incident(
                 ev,
                 Severity::Critical,
                 format!("Mount inside container: {comm} (PID {pid})"),
                 format!(
                     "{comm} (PID {pid}) called mount inside a container — mounting the host filesystem or \
-                     a sensitive path is a container/namespace escape primitive (T1611). source={} \
-                     target={} fs={}.",
-                    text(ev, "source"),
-                    text(ev, "target"),
-                    text(ev, "fs_type"),
+                     a sensitive path is a container/namespace escape primitive (T1611). \
+                     source={source} target={target} fs={fs_type}.",
                 ),
                 vec![
                     format!("Identify the container of PID {pid} and what it mounted"),
@@ -606,6 +647,50 @@ mod tests {
             &empty_allowlist()
         )
         .is_none());
+    }
+
+    #[test]
+    fn mount_kernel_thread_and_argless_are_benign() {
+        // Prod FP 2026-06-03: kernel threads (kworker, the NMI watchdog) run
+        // with cgroup_id != 0 so `in_container` is true, but they are not
+        // container escapes; their mount work has empty source/target/fs.
+        for comm in [
+            "[kworker/u8:2]",
+            "(watchdog)",
+            "kworker/0:1H",
+            "ksoftirqd/0",
+        ] {
+            assert!(
+                kernel_syscall_incident(
+                    &ev(
+                        "filesystem.mount",
+                        serde_json::json!({"pid":2712174,"in_container":true,"source":"","target":"","fs_type":"","comm":comm})
+                    ),
+                    &empty_allowlist()
+                )
+                .is_none(),
+                "kernel thread {comm} must not fire container_mount_escape"
+            );
+        }
+        // A userspace process with an arg-less mount is also not actionable.
+        assert!(kernel_syscall_incident(
+            &ev(
+                "filesystem.mount",
+                serde_json::json!({"pid":1,"in_container":true,"source":"","target":"","fs_type":"","comm":"bash"})
+            ),
+            &empty_allowlist()
+        )
+        .is_none());
+        // But a userspace process mounting a real host path still promotes
+        // (regression guard: the FP fix must not blind real escapes).
+        assert!(kernel_syscall_incident(
+            &ev(
+                "filesystem.mount",
+                serde_json::json!({"pid":1,"in_container":true,"source":"/dev/sda","target":"/host","fs_type":"ext4","comm":"sh"})
+            ),
+            &empty_allowlist()
+        )
+        .is_some());
     }
 
     #[test]
