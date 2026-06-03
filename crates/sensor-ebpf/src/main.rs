@@ -1777,8 +1777,21 @@ pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
     let is_sensitive = etc
         || (f[0] == b'/' && f[1] == b'r' && f[2] == b'o' && f[3] == b'o' && f[4] == b't')
         || (f[0] == b'/' && f[1] == b'h' && f[2] == b'o' && f[3] == b'm' && f[4] == b'e');
+    // Kill-chain credential bit (CHAIN_SENSITIVE_READ -> DATA_EXFIL, which can
+    // gate the LSM execve-block): ONLY genuine /etc secrets, NOT the broad
+    // telemetry set. Previously this fired on EVERY /etc|/root|/home read, so
+    // any process reading /etc/passwd (world-readable, nss), /etc/ssl certs (TLS
+    // clients), or any home/root file and then connecting out tripped the kernel
+    // DATA_EXFIL chain. Excludes /etc/passwd + /etc/ssl|ssh; mirrors the
+    // userspace is_sensitive_read_path tightening. Home-dir private keys/creds
+    // are still detected via the userspace tracker (the broad telemetry emit
+    // below keeps surfacing those reads).
+    let is_chain_credential = etc
+        && ((f[5] == b's' && f[6] == b'h')   // shadow
+            || (f[5] == b's' && f[6] == b'u') // sudoers
+            || (f[5] == b'g' && f[6] == b's')); // gshadow
     let pid = bpf_get_current_pid_tgid() as u32;
-    if is_sensitive {
+    if is_chain_credential {
         chain_flag(pid, CHAIN_SENSITIVE_READ);
     }
     if is_comm_allowed(2) || is_cgroup_allowed() {
