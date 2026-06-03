@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-06-03
+
+### Fixed
+- **pt_regs offset self-check false positive on aarch64 (spec 069 #6).** The
+  startup self-check logged a scary `offset MISMATCH — syscall args may read
+  GARBAGE` on aarch64 kernels. It is a false alarm: aarch64's `pt_regs.regs[31]`
+  lives inside an anonymous union, so a flat top-level BTF scan never finds a
+  member literally named `regs`, even though the layout (regs at offset 0) is
+  correct and syscall capture works. The check now distinguishes a **wrong
+  offset** (a member present at a different offset → real, warns) from an
+  **absent field** (not a direct member → inconclusive, info, no alarm). x86_64
+  (direct `di`/`si`/… members) still validates true.
+
 ## [0.15.2] - 2026-06-02
 
 Headline: **spec 069 — full kernel-7.0 eBPF syscall capture + 6 hardening

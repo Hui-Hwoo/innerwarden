@@ -156,71 +156,102 @@ pub fn struct_member_offsets(btf: &[u8], struct_name: &str) -> Option<Vec<(Strin
     None
 }
 
-/// Compare `expected` against the kernel's `actual` members; return one
-/// human-readable line per mismatch (empty = all good).
-pub fn offset_mismatches(actual: &[(String, u32)], expected: &[(&str, u32)]) -> Vec<String> {
-    let mut out = Vec::new();
+/// Compare `expected` against the kernel's `actual` members. Returns
+/// `(wrong, absent)`:
+/// - `wrong` — an expected member that IS present but at a **different**
+///   offset. A real, alarm-worthy mismatch: the eBPF reads would be garbage.
+/// - `absent` — an expected member not found as a **direct** member of
+///   `pt_regs`. Often **inconclusive**, not wrong: on aarch64 the register
+///   array `pt_regs.regs[31]` lives inside an anonymous union, so a flat
+///   top-level scan never sees a member literally named `regs` even though the
+///   layout (regs at offset 0) is correct. Treated as inconclusive, not a
+///   failure — a flat BTF reader cannot verify nested offsets.
+pub fn offset_check(
+    actual: &[(String, u32)],
+    expected: &[(&str, u32)],
+) -> (Vec<String>, Vec<String>) {
+    let mut wrong = Vec::new();
+    let mut absent = Vec::new();
     for (name, want) in expected {
         match actual.iter().find(|(n, _)| n == name) {
             Some((_, got)) if got == want => {}
             Some((_, got)) => {
-                out.push(format!(
+                wrong.push(format!(
                     "pt_regs.{name}: kernel BTF offset {got} != hardcoded {want}"
                 ));
             }
-            None => out.push(format!("pt_regs.{name}: field not present in kernel BTF")),
+            None => absent.push(format!("pt_regs.{name}")),
         }
     }
-    out
+    (wrong, absent)
 }
 
-/// Pure self-check over a raw BTF blob. `None` = `pt_regs` is absent (nothing
-/// to check); `Some(vec)` = found, `vec` lists the offset mismatches against
-/// the hardcoded values (empty = all good). Split out from the I/O wrapper so
-/// every branch is unit-testable.
-pub fn pt_regs_mismatches_in_btf(btf: &[u8]) -> Option<Vec<String>> {
+/// Pure self-check over a raw BTF blob. `None` = `pt_regs` struct absent
+/// (nothing to check); `Some((wrong, absent))` = found (see [`offset_check`]).
+pub fn pt_regs_check_in_btf(btf: &[u8]) -> Option<(Vec<String>, Vec<String>)> {
     let actual = struct_member_offsets(btf, "pt_regs")?;
-    Some(offset_mismatches(&actual, expected_offsets()))
+    Some(offset_check(&actual, expected_offsets()))
 }
 
 /// Read `/sys/kernel/btf/vmlinux` and self-check the `pt_regs` syscall-arg
 /// offsets against the values the eBPF object hardcodes. Fail-open: logs and
-/// returns on any problem. Returns the number of mismatches found (0 = OK or
-/// could-not-check) for callers/tests that want it.
+/// returns on any problem. Returns the number of real (wrong-offset) mismatches
+/// (0 = OK / inconclusive / could-not-check) for callers/tests that want it.
 pub fn verify_pt_regs_offsets() -> usize {
+    verify_from(std::path::Path::new("/sys/kernel/btf/vmlinux"))
+}
+
+/// Inner of [`verify_pt_regs_offsets`] parameterised by BTF path so a test can
+/// drive the read-Ok + check + report path with a synthetic blob (CI runners
+/// have no readable `/sys/kernel/btf/vmlinux`).
+fn verify_from(path: &std::path::Path) -> usize {
     if expected_offsets().is_empty() {
         return 0; // arch without eBPF syscall-arg reads
     }
-    let btf = match std::fs::read("/sys/kernel/btf/vmlinux") {
+    let btf = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             info!(error = %e, "pt_regs offset self-check skipped (no kernel BTF)");
             return 0;
         }
     };
-    report_check(pt_regs_mismatches_in_btf(&btf))
+    report_check(pt_regs_check_in_btf(&btf))
 }
 
-/// Log the outcome of a `pt_regs` check and return the mismatch count. Split
-/// from the I/O wrapper so the log/return arms are unit-testable.
-fn report_check(result: Option<Vec<String>>) -> usize {
-    match result {
+/// Log the outcome of a `pt_regs` check and return the count of real
+/// (wrong-offset) mismatches. Absent fields are logged as inconclusive, not
+/// as failures (e.g. aarch64's nested `regs`). Split from the I/O wrapper so
+/// every arm is unit-testable.
+fn report_check(result: Option<(Vec<String>, Vec<String>)>) -> usize {
+    // `match` rather than `let ... else` — tarpaulin does not attribute the
+    // `let-else` arm, which silently drops it from coverage (see
+    // RECURRING_BUGS / tarpaulin-coverage-patterns).
+    let (wrong, absent) = match result {
+        Some(r) => r,
         None => {
             info!("pt_regs offset self-check skipped (pt_regs struct not found in kernel BTF)");
-            0
+            return 0;
         }
-        Some(m) if m.is_empty() => {
-            info!("eBPF pt_regs syscall-arg offsets validated against kernel BTF");
-            0
+    };
+    if !wrong.is_empty() {
+        for x in &wrong {
+            warn!(
+                "eBPF pt_regs offset MISMATCH — syscall args may read GARBAGE on this kernel: {x}"
+            );
         }
-        Some(m) => {
-            for x in &m {
-                warn!(
-                    "eBPF pt_regs offset MISMATCH — syscall args may read GARBAGE on this kernel: {x}"
-                );
-            }
-            m.len()
-        }
+        wrong.len()
+    } else if !absent.is_empty() {
+        // e.g. aarch64's `regs[]` is nested in an anonymous union, so a flat
+        // top-level scan can't find it — inconclusive, NOT a failure.
+        info!(
+            fields = %absent.join(", "),
+            "pt_regs offset self-check inconclusive — expected fields are not direct pt_regs \
+             members (nested layout, e.g. aarch64 regs[]); not flat-verifiable on this arch"
+        );
+        0
+    } else {
+        info!("eBPF pt_regs syscall-arg offsets validated against kernel BTF");
+        0
     }
 }
 
@@ -294,22 +325,37 @@ mod tests {
     }
 
     #[test]
-    fn pt_regs_mismatches_in_btf_covers_match_absent_and_wrong() {
-        // pt_regs matching the build-arch expected offsets -> Some(empty).
+    fn pt_regs_check_in_btf_covers_match_absent_and_wrong() {
+        // pt_regs matching the build-arch expected offsets -> (no wrong, no absent).
         let good = build_pt_regs_btf(expected_offsets());
-        assert_eq!(pt_regs_mismatches_in_btf(&good), Some(vec![]));
+        assert_eq!(pt_regs_check_in_btf(&good), Some((vec![], vec![])));
 
         // No pt_regs struct -> None.
         let other = build_btf(b"\0other\0", &btf_type_common(1, BTF_KIND_STRUCT, 0, 0));
-        assert!(pt_regs_mismatches_in_btf(&other).is_none());
+        assert!(pt_regs_check_in_btf(&other).is_none());
 
-        // Every member at a wrong offset -> Some(non-empty).
+        // Every member present but at a wrong offset -> non-empty WRONG, empty absent.
         let wrong: Vec<(&str, u32)> = expected_offsets()
             .iter()
             .map(|(n, o)| (*n, o + 8))
             .collect();
         let bad = build_pt_regs_btf(&wrong);
-        assert!(!pt_regs_mismatches_in_btf(&bad).unwrap().is_empty());
+        let (w, a) = pt_regs_check_in_btf(&bad).unwrap();
+        assert!(
+            !w.is_empty(),
+            "wrong-offset members must be flagged as wrong"
+        );
+        assert!(
+            a.is_empty(),
+            "members present (wrong offset) are not absent"
+        );
+
+        // pt_regs present but WITHOUT the expected members (e.g. aarch64's nested
+        // regs) -> empty wrong, non-empty ABSENT (inconclusive, not a failure).
+        let empty_struct = build_pt_regs_btf(&[]);
+        let (w2, a2) = pt_regs_check_in_btf(&empty_struct).unwrap();
+        assert!(w2.is_empty());
+        assert_eq!(a2.len(), expected_offsets().len());
     }
 
     // Emit one BTF type of `kind` with `vlen` and `trailing` zero bytes after
@@ -408,10 +454,42 @@ mod tests {
 
     #[test]
     fn report_check_covers_all_arms() {
+        // none / validated / wrong (alarm) / inconclusive(absent, no alarm)
         assert_eq!(report_check(None), 0);
-        assert_eq!(report_check(Some(vec![])), 0);
-        assert_eq!(report_check(Some(vec!["pt_regs.di: ...".to_string()])), 1);
-        assert_eq!(report_check(Some(vec!["a".into(), "b".into()])), 2);
+        assert_eq!(report_check(Some((vec![], vec![]))), 0);
+        assert_eq!(
+            report_check(Some((vec!["pt_regs.di: ...".to_string()], vec![]))),
+            1
+        );
+        assert_eq!(
+            report_check(Some((vec!["a".into(), "b".into()], vec![]))),
+            2
+        );
+        // absent-only (e.g. aarch64 nested regs) → inconclusive, returns 0.
+        assert_eq!(report_check(Some((vec![], vec!["pt_regs.regs".into()]))), 0);
+    }
+
+    #[test]
+    fn verify_from_covers_read_check_and_missing_paths() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.path().join(name);
+            std::fs::File::create(&p).unwrap().write_all(bytes).unwrap();
+            p
+        };
+        // matching pt_regs → validated → 0 real mismatches
+        let good = write("good.btf", &build_pt_regs_btf(expected_offsets()));
+        assert_eq!(verify_from(&good), 0);
+        // every member at a wrong offset → real mismatches counted
+        let wrong: Vec<(&str, u32)> = expected_offsets()
+            .iter()
+            .map(|(n, o)| (*n, o + 8))
+            .collect();
+        let bad = write("bad.btf", &build_pt_regs_btf(&wrong));
+        assert_eq!(verify_from(&bad), expected_offsets().len());
+        // missing file → fail-open Err branch → 0
+        assert_eq!(verify_from(&dir.path().join("nope.btf")), 0);
     }
 
     #[test]
@@ -458,17 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn mismatches_detected_exactly() {
+    fn offset_check_splits_wrong_from_absent() {
         let expected: &[(&str, u32)] = &[("di", 112), ("si", 104)];
-        // exact match -> empty
+        // exact match -> no wrong, no absent
         let ok = vec![("di".to_string(), 112), ("si".to_string(), 104)];
-        assert!(offset_mismatches(&ok, expected).is_empty());
-        // wrong offset + missing field -> two lines
+        assert_eq!(offset_check(&ok, expected), (vec![], vec![]));
+        // di present but wrong offset; si missing -> 1 wrong, 1 absent
         let bad = vec![("di".to_string(), 999)];
-        let m = offset_mismatches(&bad, expected);
-        assert_eq!(m.len(), 2);
-        assert!(m[0].contains("999"));
-        assert!(m[1].contains("not present"));
+        let (wrong, absent) = offset_check(&bad, expected);
+        assert_eq!(wrong.len(), 1);
+        assert!(wrong[0].contains("999"));
+        assert_eq!(absent, vec!["pt_regs.si".to_string()]);
     }
 
     // Real-kernel validation: on a host with kernel BTF (Linux CI, test001),
@@ -476,16 +554,23 @@ mod tests {
     // where there is no BTF (e.g. the macOS dev host) or no `pt_regs` type.
     #[test]
     fn pt_regs_offsets_match_real_kernel_btf_if_present() {
-        let Ok(btf) = std::fs::read("/sys/kernel/btf/vmlinux") else {
-            return;
+        // `match` not `let-else` — keep tarpaulin attribution (the else arm runs
+        // on CI runners that have no /sys/kernel/btf/vmlinux).
+        let btf = match std::fs::read("/sys/kernel/btf/vmlinux") {
+            Ok(b) => b,
+            Err(_) => return,
         };
-        let Some(actual) = struct_member_offsets(&btf, "pt_regs") else {
-            return;
+        let actual = match struct_member_offsets(&btf, "pt_regs") {
+            Some(a) => a,
+            None => return,
         };
-        let mism = offset_mismatches(&actual, expected_offsets());
+        // Only a WRONG offset is a failure. An absent field is inconclusive,
+        // not wrong — on aarch64 `regs` is nested in an anonymous union and is
+        // never a direct member, yet the layout (regs at 0) is correct.
+        let (wrong, _absent) = offset_check(&actual, expected_offsets());
         assert!(
-            mism.is_empty(),
-            "hardcoded pt_regs offsets disagree with the running kernel BTF: {mism:?}"
+            wrong.is_empty(),
+            "hardcoded pt_regs offsets disagree with the running kernel BTF: {wrong:?}"
         );
     }
 
