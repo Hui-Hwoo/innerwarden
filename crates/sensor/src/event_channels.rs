@@ -93,6 +93,11 @@ pub fn classify(ev: &Event) -> Lane {
         || k.starts_with("kernel.module")
         || k.starts_with("filesystem.mount")
         || k.starts_with("process.memfd")
+        // Spec 070: namespace pivots (root setns into a foreign user namespace)
+        // are a rare, security-critical privilege-escalation signal. Without this
+        // they classify as Bulk telemetry (severity Debug) and get shed under
+        // brownout — exactly when an exploit is generating the surrounding burst.
+        || k.starts_with("namespace.")
         || k == "network.outbound_connect"
         || k == "file.read_access"
         || k == "process.injection";
@@ -468,6 +473,7 @@ mod tests {
             "kernel.module_load",
             "filesystem.mount",
             "process.memfd_create",
+            "namespace.setns",
             "network.outbound_connect",
             "file.read_access",
             "process.injection",
