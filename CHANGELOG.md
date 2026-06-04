@@ -9,6 +9,42 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.6] - 2026-06-04
+
+### Added
+- **Privilege-provenance / technique-independent LPE detection (spec 070).**
+  The escalation *mechanism* of a local privilege escalation varies per bug, but
+  the end-state is observable: a process acquires or uses root through a path its
+  non-forgeable provenance (executable, parent, target-namespace owner) does not
+  justify. New shared `provenance` module (`/proc/<pid>/exe` readlink, exe
+  owner/mode, cgroup container hint → Trusted/Unknown/Illegitimate). New
+  detectors: `setns_owner` (root joining a non-root-owned user namespace outside
+  any container runtime — backed by a new `setns(2)` eBPF kprobe emitting
+  `namespace.setns`) and `untrusted_root_exec` (uid-0 execve of a binary from an
+  unprivileged-writable path). `privesc` now decides legitimacy by the parent/self
+  exe **path** rather than the forgeable comm (defeats a payload renamed `sudo` in
+  `/tmp`); `sensitive_write` adds an exe-path gate for its Critical categories.
+  New correlation rule **CL-072**: any illegitimate-provenance signal followed by
+  any high-value root action (sudoers/shadow/cron/persistence/kmod) on the same
+  host within 120s collapses into one Critical incident (68 → 69 built-in rules).
+  Container runtimes are filtered by non-forgeable exe-prefix/cgroup; the
+  provenance verdict is attached as evidence, not suppressed at detect.
+- Detector count 79 → 82.
+
+### Changed
+- **Namespace-pivot events routed to the priority event lane.** `namespace.*`
+  events carried severity `Debug` and were classified as shed-able bulk
+  telemetry; they are now priority so a rare privilege-escalation pivot is not
+  dropped under the burst an exploit generates.
+- **Autonomy gap (spec 062):** orphan-recovery now routes High/Critical orphan
+  incidents to `needs_review` (awaiting human) instead of auto-dismissing them.
+
+### Fixed
+- `kernel_promote` `container_mount_escape` skips kernel threads.
+- Calibrated three detector false positives from routine system activity
+  (kernel-update kmod tooling, package-manager state `rm -rf`, shell history
+  append).
+
 ## [0.15.5] - 2026-06-03
 
 ### Added
