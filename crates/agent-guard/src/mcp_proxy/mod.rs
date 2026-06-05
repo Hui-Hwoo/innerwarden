@@ -17,3 +17,4 @@
 //! exists purely to route and inspect a message.
 
 pub mod jsonrpc;
+pub mod router;
