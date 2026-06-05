@@ -9,6 +9,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **ATR community rules now actually load in production (agent-guard).** The
+  `check-command` snitch path advertised "71 ATR community rules", but the agent
+  loaded them from `/etc/innerwarden/rules` while `deploy-prod.sh` only ever
+  copied `rules/sigma` there — so the ATR engine booted with **zero** rules in
+  prod and `check-command` ran on built-in heuristics alone. The 62 pattern-tier
+  ATR rules are now embedded into the agent binary at compile time via
+  `include_dir!` (`RuleEngine::load_embedded`), so they are always present with
+  no deploy step and cannot drift from the vendored `rules/atr` tree. Operators
+  can still drop override/extra rules in the on-disk rules dir
+  (`RuleEngine::load_with_overlay`, override-by-id). Boot now logs the loaded
+  ATR rule count so a degraded engine is observable. A new crate-level test
+  anchors the embedded corpus at 62 pattern-tier rules so a malformed community
+  rule or a regex-compile regression fails CI here instead of silently in prod.
+
 ## [0.15.7] - 2026-06-04
 
 ### Fixed

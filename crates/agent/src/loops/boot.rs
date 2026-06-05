@@ -773,13 +773,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         let max_sessions = cfg.dashboard.max_sessions;
         let dashboard_advisory_cache = advisory_cache.clone();
 
-        // Load ATR rule engine from rules directory.
+        // Load ATR rule engine: embedded community corpus (always present, no
+        // deploy step) plus any operator overlay rules dropped in the on-disk
+        // rules dir. Previously this loaded ONLY from disk, but the deploy
+        // script only ever copies `rules/sigma` there, so the ATR engine ran
+        // empty in prod — embedding fixes that.
         let rules_dir = std::path::Path::new("/etc/innerwarden/rules");
         let rule_engine = std::sync::Arc::new(
-            innerwarden_agent_guard::rules::RuleEngine::load(rules_dir).unwrap_or_else(|e| {
-                warn!(error = %e, "failed to load ATR rules, starting with empty engine");
-                innerwarden_agent_guard::rules::RuleEngine::empty()
-            }),
+            innerwarden_agent_guard::rules::RuleEngine::load_with_overlay(rules_dir),
+        );
+        info!(
+            atr_rules = rule_engine.rule_count(),
+            "agent-guard ATR rule engine ready"
         );
 
         let agent_alert_tx = agent_alert_tx.clone();
