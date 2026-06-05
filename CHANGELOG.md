@@ -9,6 +9,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`innerwarden_agent_guard_atr_rules_loaded` Prometheus gauge.** The
+  `/metrics` endpoint now exports the number of ATR rules loaded in the
+  agent-guard engine. `0` means the engine is degraded (rules failed to load
+  or were never deployed) and `check-command` is running on built-in heuristics
+  only — a state a scrape/alert can now catch. Always emitted, so absence vs
+  zero is unambiguous. (Boot already logs the count; this makes it observable
+  in monitoring.)
+
 ### Changed
 - **agent-guard capability descriptions made honest (C1 audit follow-up).** The
   crate docs and Cargo description claimed "MCP protocol inspection", "process

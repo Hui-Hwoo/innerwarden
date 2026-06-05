@@ -824,6 +824,19 @@ pub(super) fn build_prometheus_metrics_text(
         }
     }
 
+    // agent-guard ATR rule engine health. 0 means the engine is degraded
+    // (rules failed to load or were never deployed), so /api/agent/check-command
+    // falls back to built-in heuristics with no ATR community-rule coverage.
+    // Always emitted so a scrape can alert on `== 0` (see docs/prometheus-alerts).
+    out.push_str(
+        "# HELP innerwarden_agent_guard_atr_rules_loaded ATR rules loaded in the agent-guard engine (0 = degraded)\n",
+    );
+    out.push_str("# TYPE innerwarden_agent_guard_atr_rules_loaded gauge\n");
+    out.push_str(&format!(
+        "innerwarden_agent_guard_atr_rules_loaded {}\n",
+        state.rule_engine.rule_count()
+    ));
+
     // Spec 024 drift metrics — appended after legacy metrics so any existing
     // Prometheus scrape keeps reading the same fields.
     append_spec024_metrics(&mut out, state, now);
@@ -2608,6 +2621,7 @@ enabled = false
             "innerwarden_executions_total",
             "innerwarden_incidents_per_hour",
             "innerwarden_blocks_per_hour",
+            "innerwarden_agent_guard_atr_rules_loaded",
         ] {
             assert!(
                 out.contains(&format!("# HELP {family} "))
@@ -2615,6 +2629,39 @@ enabled = false
                 "metric family {family} missing HELP/TYPE headers on empty state",
             );
         }
+
+        // The empty-state fixture uses RuleEngine::empty(), so the agent-guard
+        // health gauge must report 0 — the "degraded engine" signal a scrape
+        // alerts on.
+        assert!(
+            out.contains("innerwarden_agent_guard_atr_rules_loaded 0\n"),
+            "atr_rules_loaded gauge should be 0 on empty state",
+        );
+    }
+
+    #[test]
+    fn atr_rules_loaded_gauge_reflects_engine_count() {
+        let td = tmpdir();
+        let mut state = dashboard_state_for_metrics(td.path(), None);
+        // Swap the empty engine for the embedded ATR corpus (62 pattern-tier).
+        state.rule_engine =
+            std::sync::Arc::new(innerwarden_agent_guard::rules::RuleEngine::load_embedded());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let out = super::build_prometheus_metrics_text(&state, now);
+        let expected = state.rule_engine.rule_count();
+        assert!(
+            expected >= 62,
+            "embedded corpus should load >= 62 rules, got {expected}"
+        );
+        assert!(
+            out.contains(&format!(
+                "innerwarden_agent_guard_atr_rules_loaded {expected}\n"
+            )),
+            "gauge should report the loaded rule count {expected}",
+        );
     }
 
     #[tokio::test]
