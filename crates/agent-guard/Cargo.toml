@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "AI agent protection module for InnerWarden — auto-detect agents, wrap MCP servers, enforce security policies"
+description = "AI agent protection module for InnerWarden — detect AI agents, scan their tool calls and commands for threats, and alert on dangerous activity"
 
 [dependencies]
 innerwarden_core = { path = "../core" }

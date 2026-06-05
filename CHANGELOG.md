@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **agent-guard capability descriptions made honest (C1 audit follow-up).** The
+  crate docs and Cargo description claimed "MCP protocol inspection", "process
+  monitoring via eBPF", and "wrap MCP servers / enforce security policies" —
+  none of which exist: tool-call screening is pattern/regex scanning over the
+  serialized call (no MCP-protocol parsing, no inline proxy), discovery is a
+  `/proc` walk (no eBPF), and detection is advisory ("snitch" alerts), not
+  enforcement. Descriptions now state what the code actually does. Added
+  count-anchor tests pinning the advertised numbers to the code (prompt-injection
+  patterns = 24 — the previously marketed "29" was false; dangerous commands = 14;
+  API-key patterns = 7; AI agent/tool/runtime signatures = 20, not "25+"), so a
+  doc/code drift fails CI.
+
 ### Fixed
 - **ATR community rules now actually load in production (agent-guard).** The
   `check-command` snitch path advertised "71 ATR community rules", but the agent

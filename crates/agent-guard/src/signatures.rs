@@ -295,4 +295,22 @@ mod tests {
         let idx = SignatureIndex::new();
         assert!(!idx.is_known("nginx"));
     }
+
+    /// Pin the advertised signature count. Detection is by process `comm` only
+    /// (no port/config-content fingerprinting), so the marketed number must
+    /// match `KNOWN` exactly. If you add a signature, update any doc that
+    /// quotes the count in the same change. (C1 audit: "25+ AI agents" was
+    /// false; the real count is 20.)
+    #[test]
+    fn known_signature_count_matches_advertised() {
+        assert_eq!(KNOWN.len(), 20, "AI agent/tool/runtime signature count");
+        let agents = KNOWN.iter().filter(|s| s.kind == Kind::Agent).count();
+        let tools = KNOWN.iter().filter(|s| s.kind == Kind::Tool).count();
+        let runtimes = KNOWN.iter().filter(|s| s.kind == Kind::Runtime).count();
+        assert_eq!(
+            (agents, tools, runtimes),
+            (2, 14, 4),
+            "signature kind breakdown"
+        );
+    }
 }

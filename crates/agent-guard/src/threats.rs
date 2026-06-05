@@ -617,4 +617,20 @@ mod tests {
         );
         assert!(check_download_execute_staged("ls -la").is_none());
     }
+
+    /// Pin the operator-/doc-visible pattern counts so the numbers in the
+    /// README, crate docs, and marketing copy stay true to the code. If you
+    /// add or remove a pattern, update the docs in the SAME change — do not
+    /// just bump the constant. (See the C1 agent-guard audit: the "29 prompt
+    /// injection patterns" claim was false; the real count is 24.)
+    #[test]
+    fn advertised_pattern_counts_match_code() {
+        assert_eq!(
+            INJECTION_PATTERNS.len(),
+            24,
+            "prompt-injection pattern count"
+        );
+        assert_eq!(DANGEROUS_COMMANDS.len(), 14, "dangerous-command count");
+        assert_eq!(API_KEY_PATTERNS.len(), 7, "API-key pattern count");
+    }
 }
