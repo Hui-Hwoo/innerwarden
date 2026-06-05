@@ -16,6 +16,7 @@
 
 pub mod detect;
 pub mod mcp;
+pub mod mcp_proxy;
 pub mod registry;
 pub mod rules;
 pub mod session;
