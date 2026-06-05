@@ -106,6 +106,14 @@ coverage:
           - "!crates/agent/src/loops/boot.rs"
           - "!crates/supervisor/src/main.rs"
           - "!crates/ctl/src/main.rs"
+          # `innerwarden agent proxy` entry: build a tokio runtime + block_on the
+          # proxy over real stdin + process::exit — runtime/exit glue that can't
+          # be unit-tested (would block on the test's stdin / kill the process),
+          # same class as ctl/src/main.rs. All the logic it composes IS
+          # unit-tested: build_proxy_config, load_engine, build_runtime,
+          # format_alert, and `serve` (driven over in-memory pipes) in
+          # agent_proxy.rs, plus the agent-guard proxy itself.
+          - "!crates/ctl/src/commands/agent_proxy.rs"
           - "!crates/sensor/src/main.rs"
           # Sensor dispatch/wiring: process_event dispatches to 79
           # detectors + writes incidents via SQLite. Unit-testing

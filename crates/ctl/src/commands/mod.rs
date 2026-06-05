@@ -1,4 +1,5 @@
 pub(crate) mod agent;
+pub(crate) mod agent_proxy;
 pub(crate) mod ai;
 pub(crate) mod capability;
 pub(crate) mod chain_break;

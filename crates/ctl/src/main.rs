@@ -608,6 +608,31 @@ enum AgentCommand {
 
     /// List available agents for installation
     List,
+
+    /// Run an inspecting MCP proxy in front of a real MCP server.
+    ///
+    /// Wraps the server's stdio, scanning `tools/call` arguments and
+    /// `tools/list` / tool results for threats (prompt injection, credential
+    /// leaks, dangerous commands, ATR rules). Default mode is advisory (alert
+    /// only); `guard`/`kill` block disallowed calls. Example:
+    ///   innerwarden agent proxy --mode guard -- npx -y some-mcp-server --flag
+    Proxy {
+        /// Enforcement mode: advisory (default), warn, guard, or kill.
+        #[arg(long, default_value = "advisory")]
+        mode: String,
+
+        /// Optional label for audit / alerts.
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Return denials as a JSON-RPC error instead of an isError result.
+        #[arg(long)]
+        error_response: bool,
+
+        /// The real MCP server command and its arguments (everything after `--`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        server_cmd: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]

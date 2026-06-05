@@ -866,6 +866,15 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
             println!();
             Ok(())
         }
+
+        Some(AgentCommand::Proxy {
+            mode,
+            label,
+            error_response,
+            server_cmd,
+        }) => {
+            crate::commands::agent_proxy::run(mode, label.as_deref(), *error_response, server_cmd)
+        }
     }
 }
 
@@ -1275,6 +1284,25 @@ bind = "http://127.0.0.1:1"
 
         let request = handle.join().expect("server thread should finish");
         assert!(request.contains("POST /api/agent-guard/disconnect"));
+    }
+
+    #[test]
+    fn cmd_agent_proxy_with_empty_server_cmd_errors() {
+        // Dispatches `agent proxy` with no server command → agent_proxy::run
+        // rejects it before building any runtime, so this is safe to call in a
+        // test (no block_on / process::exit). Covers the Proxy dispatch arm.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let err = cmd_agent(
+            &cli,
+            Some(&AgentCommand::Proxy {
+                mode: "advisory".to_string(),
+                label: None,
+                error_response: false,
+                server_cmd: vec![],
+            }),
+        );
+        assert!(err.is_err(), "empty server command must be rejected");
     }
 
     // -----------------------------------------------------------------
