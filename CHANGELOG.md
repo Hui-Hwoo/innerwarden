@@ -14,11 +14,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   man-in-the-middle that wraps a real MCP server and inspects the JSON-RPC
   traffic in both directions: `tools/call` arguments (prompt injection,
   credential leaks, dangerous commands, ATR rules), `tools/list` descriptions
-  (tool poisoning), and tool results (injection in responses). Three modes:
+  (tool poisoning), and tool results (injection in responses). Four modes:
   `advisory` (default — a transparent, alerting pipe, no behavior change),
-  `guard` (a disallowed `tools/call` is not forwarded; the client gets an
-  `isError` denial keyed to the request id), and `kill` (block + terminate the
-  server). Usage: `innerwarden agent proxy --mode guard -- npx -y <server>`.
+  `warn` (same forward-and-alert behavior as advisory, never blocks, but
+  tagged for louder operator surfacing), `guard` (a disallowed `tools/call`
+  is not forwarded; the client gets an `isError` denial keyed to the request
+  id), and `kill` (block + terminate the server). Usage: `innerwarden agent
+  proxy --mode guard -- npx -y <server>`.
   The decision logic is pure and unit-tested; the transport is a single-task
   `select!` loop (one client writer, no shared lock). Pass-through preserves
   original bytes; stdout carries only MCP traffic. New `crates/agent-guard/src/
