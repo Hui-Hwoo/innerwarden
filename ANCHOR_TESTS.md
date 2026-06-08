@@ -135,6 +135,12 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/correlation_engine.rs::tests::cl008_no_comm_field_does_not_panic_and_falls_through` — older sensors (or non-eBPF event sources) emit `file.read_access` without a `comm` field. `event_comm_is_suppressed` returns false in that case (event proceeds to normal kind/entity matching) instead of panicking on the missing JSON key.
 
+### data_exfil_cmd build-toolchain FP suppression (spec 071 Part B)
+
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_skips_zig_compiler` / `command_exec_skips_zigcc_truncated_comm` / `command_exec_skips_cargo_build_script` / `command_exec_skips_rust_lld_linker` — each feeds a real `tar | curl` exfil-shaped command whose only reason to be suppressed is that `comm` is a build tool (`zig`, the truncated `zigcc-x86_64-un`, `build-script-bu`, `rust-lld`). Pins the 2026-06-08 test001 FP cluster where the Rust/Zig build toolchain produced 100+ `data_exfil_cmd` High incidents that flooded `needs_review`. The `build_tools` list previously had `cargo`/`rustc`/`gcc` but not `zig`/`zigcc`/`build-script`.
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_skips_zig_via_first_word_of_command` / `command_exec_skips_zig_build_shell_wrapper` — cover the two non-comm suppression branches (first word of a `bash -c` command is a build tool; the long-shell-wrapper `zig build` guard).
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_still_detects_real_exfil_from_non_build_comm` — anti-regression: a genuine `tar /etc/shadow | curl` from `comm=python3` MUST still raise the incident. The exclusion list is a tight allowlist, not a hole that disables the detector.
+
 ### Allowlist audit trail (Wave 8e)
 
 - `crates/ctl/src/commands/response.rs::tests::cmd_allowlist_add_with_reason_persists_reason_in_admin_audit` — `innerwarden allowlist add --ip <cidr> --reason "<text>"` writes the verbatim reason into the daily `admin-actions-YYYY-MM-DD.jsonl`. Pinned the 2026-05-04 operator pain: 4 emergency CIDRs (Ubuntu mirrors, Telegram, GitHub Pages, Oracle Cloud) were added during a CL-008 mitigation with no flag to record WHY, so a future operator looking at the allowlist had no way to tell if the entries were still load-bearing or stale.
