@@ -111,6 +111,11 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/neural_lifecycle.rs::tests::train_nightly_post_recal_skips_when_no_graph_features` — the post-train recalibration block in `train_nightly_with_store` is gated on `Some(graph_features)`; without graph features the recalibration is skipped so test fixtures and pre-graph boots do not get a recalibration that would overwrite anchors with a degraded no-graph distribution. Pinned the operator-observed bug where the 2026-05-04 nightly retrain wiped Wave 7a's boot recalibration and prod returned to 100% saturation by morning.
 
+### rootkit:timing protocol-stream FP skip (spec 071 Part B)
+
+- `crates/sensor/src/detectors/rootkit.rs::tests::timing_skips_tcp_stream_protocol_kinds` — `tcp_stream.http` / `.ssh` / `.smb` are excluded from the timing-anomaly pipeline (alongside the already-skipped `tcp_stream.flow` and `network.*`): their inter-event delta measures traffic idleness, not syscall-hook latency, so they are never tracked or flagged. Pinned the 2026-06-08 test001 FP where an 895-second gap between two HTTP streams (baseline ~4.8s) fired a critical `rootkit:timing` "getdents64 hook" incident that flooded `needs_review`.
+- `crates/sensor/src/detectors/rootkit.rs::tests::timing_still_tracks_file_read_access_after_tcp_stream_skip` — anti-regression: extending the skip list did NOT disable the real latency-tracked kinds; `file.read_access` still trains and remains eligible for timing detection (a getdents64 hook adds µs and is the detector's actual purpose).
+
 ### CLI module/capability surface (Wave 7b)
 
 - `crates/ctl/src/scan.rs::tests::module_ids_use_module_install_not_enable` — every `enable_hint` on a `ModuleRec` and every step of `activation_sequence()` that starts with `innerwarden enable <id>` must use a real capability id (`block-ip`, `sudo-protection`, `shell-audit`, `ai`); module ids must use `innerwarden module install <id>`. Pinned the 2026-05-04 operator-hit bug where `innerwarden scan` printed `→ innerwarden enable container-security` and the operator running it got `unknown capability 'container-security'` because container-security is a module, not a capability.
