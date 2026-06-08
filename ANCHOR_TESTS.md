@@ -116,6 +116,17 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/sensor/src/detectors/rootkit.rs::tests::timing_skips_tcp_stream_protocol_kinds` — `tcp_stream.http` / `.ssh` / `.smb` are excluded from the timing-anomaly pipeline (alongside the already-skipped `tcp_stream.flow` and `network.*`): their inter-event delta measures traffic idleness, not syscall-hook latency, so they are never tracked or flagged. Pinned the 2026-06-08 test001 FP where an 895-second gap between two HTTP streams (baseline ~4.8s) fired a critical `rootkit:timing` "getdents64 hook" incident that flooded `needs_review`.
 - `crates/sensor/src/detectors/rootkit.rs::tests::timing_still_tracks_file_read_access_after_tcp_stream_skip` — anti-regression: extending the skip list did NOT disable the real latency-tracked kinds; `file.read_access` still trains and remains eligible for timing detection (a getdents64 hook adds µs and is the detector's actual purpose).
 
+### Warden Context Gate — no forgeable-comm dismiss of a real threat (spec 071 Part A)
+
+These pin the 2026-06-08 adversarial red-team must-fixes. `comm` is attacker-forgeable, so the gate must NEVER auto-dismiss a High/Critical incident on it. A failure here means a real attack can be silenced by a process rename.
+
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_self_spoofed_critical_privesc_is_never_dismissed` — naming the binary `innerwarden-agent` must NOT dismiss a Critical privesc (it surfaces). Undoing this re-opens the spec-070 anti-spoof bypass (B1).
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_build_spoofed_critical_host_drift_tmp_is_never_dismissed` — `comm=rust-lld` on a Critical `/tmp` host_drift is not dismissed (host_drift is off both allowlists; B2).
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_self_spoofed_high_data_exfil_is_never_dismissed` — `comm=innerwarden-ctl` on a High data_exfil_cmd is not dismissed (B3).
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_self_spoof_does_not_launder_block_to_dismiss` — a `block_ip` on a Critical incident with a spoofed trusted comm is never turned into a silent dismiss (B4).
+- `crates/agent/src/warden_context_gate.rs::tests::adversarial_overbroad_comm_does_not_impersonate` — exact base-name match: `innerwarden9` / `ccminer` do NOT match the allowlists (B6).
+- `crates/agent/src/warden_context_gate.rs::tests::unlisted_detector_from_self_not_dismissed_even_at_medium` — the Medium/Low provenance dismiss is a tight per-detector allowlist, not a blanket self/build pass.
+
 ### CLI module/capability surface (Wave 7b)
 
 - `crates/ctl/src/scan.rs::tests::module_ids_use_module_install_not_enable` — every `enable_hint` on a `ModuleRec` and every step of `activation_sequence()` that starts with `innerwarden enable <id>` must use a real capability id (`block-ip`, `sudo-protection`, `shell-audit`, `ai`); module ids must use `innerwarden module install <id>`. Pinned the 2026-05-04 operator-hit bug where `innerwarden scan` printed `→ innerwarden enable container-security` and the operator running it got `unknown capability 'container-security'` because container-security is a module, not a capability.

@@ -186,6 +186,10 @@ mod trust_rules;
 mod trust_scoring;
 #[allow(dead_code)]
 mod two_factor;
+// Only compiled with the on-device classifier; its sole caller is
+// `LocalClassifier::decide` (spec 071 Part A), which is feature-gated the same.
+#[cfg(feature = "local-classifier")]
+mod warden_context_gate;
 mod warden_labels;
 mod web_push;
 mod webhook;
