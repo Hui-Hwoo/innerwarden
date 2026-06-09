@@ -157,6 +157,15 @@ These pin the 2026-06-08 adversarial red-team must-fixes. `comm` is attacker-for
 
 - `crates/agent/src/correlation_engine.rs::tests::cl008_no_comm_field_does_not_panic_and_falls_through` — older sensors (or non-eBPF event sources) emit `file.read_access` without a `comm` field. `event_comm_is_suppressed` returns false in that case (event proceeds to normal kind/entity matching) instead of panicking on the missing JSON key.
 
+### data_exfil_cmd build-tool skip is gated on the non-forgeable exe path (spec 072 Part D-sensor)
+
+`comm` is attacker-forgeable (argv0 / prctl), so the build-tool skip is only honoured when the kernel-captured `exe_path` is NOT in an untrusted staging dir. A failure here means a renamed payload in `/tmp` can launder exfil through the build-tool skip.
+
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_fires_when_build_tool_name_runs_from_staging_dir` — `comm=cargo` but `exe_path=/tmp/cargo` on a real exfil command MUST fire (the skip is bypassed for staging exes).
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_skips_build_tool_from_trusted_exe_path` — same `comm=cargo` with `exe_path=/usr/bin/cargo` is suppressed (a real toolchain binary).
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_falls_back_to_comm_skip_when_no_exe_path` — when `exe_path` is absent (a /proc race), the comm-only skip (#970) still applies (no regression).
+- `crates/sensor/src/detectors/data_exfiltration.rs::tests::exe_path_in_untrusted_staging_classifies_dirs` — `/tmp`,`/var/tmp`,`/dev/shm` are staging; `/usr/bin`, `~/.cargo/bin` are not.
+
 ### data_exfil_cmd build-toolchain FP suppression (spec 071 Part B)
 
 - `crates/sensor/src/detectors/data_exfiltration.rs::tests::command_exec_skips_zig_compiler` / `command_exec_skips_zigcc_truncated_comm` / `command_exec_skips_cargo_build_script` / `command_exec_skips_rust_lld_linker` — each feeds a real `tar | curl` exfil-shaped command whose only reason to be suppressed is that `comm` is a build tool (`zig`, the truncated `zigcc-x86_64-un`, `build-script-bu`, `rust-lld`). Pins the 2026-06-08 test001 FP cluster where the Rust/Zig build toolchain produced 100+ `data_exfil_cmd` High incidents that flooded `needs_review`. The `build_tools` list previously had `cargo`/`rustc`/`gcc` but not `zig`/`zigcc`/`build-script`.
