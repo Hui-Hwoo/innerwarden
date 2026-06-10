@@ -241,6 +241,9 @@ enabled = false
 [collectors.tcp_stream]
 enabled = false
 
+[collectors.audit_state]
+enabled = false
+
 [detectors.suid_page_cache_integrity]
 enabled = false
 

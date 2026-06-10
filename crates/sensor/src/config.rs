@@ -120,6 +120,12 @@ pub struct CollectorsConfig {
     pub systemd_inventory: AlwaysOnCollectorConfig,
     #[serde(default)]
     pub tcp_stream: AlwaysOnCollectorConfig,
+    /// audit_state (spec 074): polls the kernel audit `enabled` flag and emits
+    /// `audit.disabled` when it is found off (method-independent T1562.001).
+    /// Default-on like the other always-on collectors; fail-open if auditctl
+    /// is absent.
+    #[serde(default)]
+    pub audit_state: AlwaysOnCollectorConfig,
 }
 
 impl CollectorsConfig {
@@ -168,6 +174,7 @@ impl CollectorsConfig {
             sysctl_drift: AlwaysOnCollectorConfig { enabled: false },
             systemd_inventory: AlwaysOnCollectorConfig { enabled: false },
             tcp_stream: AlwaysOnCollectorConfig { enabled: false },
+            audit_state: AlwaysOnCollectorConfig { enabled: false },
         }
     }
 }

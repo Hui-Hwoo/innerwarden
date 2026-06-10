@@ -1,3 +1,4 @@
+pub mod audit_state;
 pub mod auth_log;
 pub mod cloudtrail;
 pub mod dns_capture;

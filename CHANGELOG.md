@@ -9,6 +9,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Audit-state monitor (spec 074) — catch an audit disable by ANY method.** A
+  new `audit_state` collector polls the kernel audit `enabled` flag
+  (`auditctl -s`) every 60s and emits `audit.disabled` when it is found off —
+  either already disabled when the sensor starts or transitioning
+  enabled->disabled at runtime. The `auditd_disable` detector turns it into a
+  Critical incident (T1562.001). This closes a real gap found in prod on
+  2026-06-09: a host ran with kernel audit disabled (`enabled 0`) for ~22h with
+  NO alert, because the existing detector only watches for the disabling
+  *command* in execve and that disable left no observed command. A state poll
+  catches it regardless of how audit was disabled (`auditctl -e 0`, a netlink
+  `AUDIT_SET`, etc.). Default-on like the other always-on collectors; fail-open
+  when auditctl is absent. Brings the sensor to 30 collectors.
+
 ## [0.15.8] - 2026-06-09
 
 ### Added
