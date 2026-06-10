@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.9] - 2026-06-10
+
 ### Added
 - **Audit-state monitor (spec 074) — catch an audit disable by ANY method.** A
   new `audit_state` collector polls the kernel audit `enabled` flag
