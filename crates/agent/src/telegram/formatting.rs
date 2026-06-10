@@ -580,6 +580,23 @@ pub(super) fn format_simple_message(
     let ip_entity = first_ip_entity(incident);
     let detail = simple_detail_line(incident, &ip_entity);
 
+    // Spec 075 (Explained Alerts): a plain-language "why this matters" line so
+    // the alert teaches instead of just naming a detector — turns a scary raw
+    // alert into "InnerWarden saw this, knows what it is, is handling it".
+    // Sourced from the shared catalog + the live MITRE mapping (never dup'd).
+    let explanation = crate::detector_catalog::explain(detector);
+    let why_line = match crate::detector_catalog::mitre_line(detector) {
+        Some(m) => format!(
+            "\n\n\u{1f6e1}\u{fe0f} <b>Why this matters:</b> {} <i>({})</i>",
+            escape_html(explanation.why),
+            escape_html(&m)
+        ),
+        None => format!(
+            "\n\n\u{1f6e1}\u{fe0f} <b>Why this matters:</b> {}",
+            escape_html(explanation.why)
+        ),
+    };
+
     // Action line depends on mode.
     let action_line = match mode {
         GuardianMode::Guard => "\u{26a1} <b>Handled automatically</b> — no action needed.",
@@ -604,7 +621,7 @@ pub(super) fn format_simple_message(
     format!(
         "{sev_emoji} {det_emoji} <b>{sev_word} — {det_label}</b>\n\
          \n\
-         {detail}\n\
+         {detail}{why_line}\n\
          \n\
          {action_line}{link_line}",
     )
@@ -694,6 +711,22 @@ mod tests {
         assert!(msg.contains("CRITICAL"));
         assert!(msg.contains("SSH brute force"));
         assert!(msg.contains("1.2.3.4"));
+    }
+
+    #[test]
+    fn simple_message_includes_explained_why_line() {
+        // Spec 075 (Explained Alerts): every plain alert teaches the operator
+        // why it matters, with a live MITRE attribution, then reassures.
+        let inc = make_incident(
+            Severity::Critical,
+            vec!["ssh".to_string()],
+            vec![EntityRef::ip("1.2.3.4".to_string())],
+        );
+        let msg = format_simple_message(&inc, None, GuardianMode::Guard);
+        assert!(msg.contains("Why this matters:"), "missing why line: {msg}");
+        assert!(msg.contains("guess passwords"), "missing why text: {msg}");
+        assert!(msg.contains("MITRE T1110"), "missing MITRE line: {msg}");
+        assert!(msg.contains("Handled automatically"), "missing reassurance");
     }
 
     #[test]

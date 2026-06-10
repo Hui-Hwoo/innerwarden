@@ -88,6 +88,7 @@ mod decision_cooldown;
 mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
+mod detector_catalog;
 mod dna_inline;
 mod dshield;
 mod environment_profile;
