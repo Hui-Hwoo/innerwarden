@@ -1348,9 +1348,14 @@ fi
 # blocks the install or writes to stdout. If the request fails (DNS,
 # network, server down), the install completes silently regardless.
 if [[ "${INNERWARDEN_TELEMETRY:-0}" == "1" ]]; then
-  curl -fsS \
+  # Use the canonical www host and follow redirects (-L): the apex
+  # innerwarden.com 308-redirects to www, and `curl -fsS` without -L drops
+  # the request — so every opted-in ping was silently lost. (Found 2026-06-11:
+  # the app_events install_ping stream went dry; the endpoint was healthy, the
+  # installer just never followed the redirect.)
+  curl -fsSL \
     -m 5 \
-    "https://innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" \
+    "https://www.innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" \
     >/dev/null 2>&1 &
 fi
 
