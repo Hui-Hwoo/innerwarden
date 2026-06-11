@@ -10,6 +10,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **MCP proxy: capped the line reader (OOM/DoS).** The agent-guard MCP proxy
+  (`innerwarden agent proxy -- <server>`) sits in front of UNTRUSTED MCP servers
+  (and an untrusted client); its `tokio` `Lines` reader grew a single
+  newline-less line without limit, so a hostile server/client could OOM the
+  proxy with a multi-GB line. A new `CappedLines` reader (4 MB ceiling) fails the
+  session closed instead of buffering unbounded. Regression tests cover normal
+  lines, oversized-without-newline, and oversized-with-newline-past-cap.
 - **Input-robustness hardening across the enrichment clients (same class as the
   DShield bug).** A Zero-Trust audit found the DShield failure mode lurking in
   siblings and a few unbounded reads:
