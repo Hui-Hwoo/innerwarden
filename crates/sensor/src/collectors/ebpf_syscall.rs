@@ -665,6 +665,12 @@ const COMM_CAP_PIN: &str = "/sys/fs/bpf/innerwarden/comm_capabilities";
 /// The agent populates this via `agent::lsm_policy::register_blocked_pid`.
 const BLOCKED_PIDS_PIN: &str = "/sys/fs/bpf/innerwarden/blocked_pids";
 
+/// Pin path for the Execution Gate allowlist (FNV(path) -> 1). Pinned so the paid
+/// Active Defence `config-sign exec-gate` tooling can populate it from userspace.
+/// The map + gate ship free + INERT; only LSM_POLICY key 3 = 1 (license-gated
+/// arming) makes the `bprm_check_security` hook enforce against it.
+const EXEC_ALLOWLIST_PIN: &str = "/sys/fs/bpf/innerwarden/exec_allowlist";
+
 /// Attach LSM execution policy and pin the policy map.
 /// Requires `lsm=...,bpf` in kernel boot cmdline.
 /// Non-critical - if LSM is not available, the sensor continues without it.
@@ -703,6 +709,36 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
         }
         None => {
             info!("innerwarden_lsm_exec_min program not found in .o (sensor built without Spec 052 Phase 1?)");
+        }
+    }
+
+    // Execution Gate (Active Defence) — dedicated minimal LSM on bprm_check_security.
+    // Attaches alongside _min; inert unless LSM_POLICY key 3 = 1 (license-gated arm).
+    // Lives in its own program because the full innerwarden_lsm_exec fails the
+    // verifier on kernel ≥ 6.4, so a gate buried there never runs.
+    match bpf.program_mut("innerwarden_lsm_exec_gate") {
+        Some(prog) => {
+            let lsm_res: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_res {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("bprm_check_security", b) {
+                            warn!("innerwarden_lsm_exec_gate: failed to load: {:?}", e);
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_exec_gate: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_exec_gate → bprm_check_security (Execution Gate) ✅");
+                        }
+                    } else {
+                        info!("innerwarden_lsm_exec_gate: BTF not available; skipping");
+                    }
+                }
+                Err(e) => info!(error = %e, "innerwarden_lsm_exec_gate: not available as Lsm"),
+            }
+        }
+        None => {
+            info!("innerwarden_lsm_exec_gate program not found in .o");
         }
     }
 
@@ -929,6 +965,7 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
         ("CGROUP_CAPABILITIES", CGROUP_CAP_PIN),
         ("COMM_CAPABILITIES", COMM_CAP_PIN),
         ("BLOCKED_PIDS", BLOCKED_PIDS_PIN),
+        ("EXEC_ALLOWLIST", EXEC_ALLOWLIST_PIN),
     ] {
         if let Some(map) = bpf.map_mut(map_name) {
             let _ = std::fs::remove_file(pin_path);
@@ -943,6 +980,45 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // Populate INODE_SIZE map for overlayfs drift detection.
     // sizeof(struct inode) varies by kernel config; query BTF at runtime.
     populate_inode_size(bpf);
+
+    // Populate BPRM_OFFSETS (linux_binprm.filename byte offset) from BTF so the
+    // Execution Gate reads the right field across kernels (CO-RE).
+    populate_bprm_offset(bpf);
+}
+
+/// Query the `linux_binprm.filename` byte offset from kernel BTF and write it to
+/// the BPRM_OFFSETS map (key 0). The Execution Gate eBPF reads it so it works
+/// across kernels (the offset differs: 96 on 6.8). Falls back to the eBPF default
+/// (96) if BTF is unavailable.
+#[cfg(feature = "ebpf")]
+fn populate_bprm_offset(bpf: &mut aya::Ebpf) {
+    use aya::maps::HashMap as BpfHashMap;
+
+    let off = match std::fs::read("/sys/kernel/btf/vmlinux") {
+        Ok(btf) => crate::btf_offsets::member_offset(&btf, "linux_binprm", "filename"),
+        Err(e) => {
+            info!(error = %e, "BPRM_OFFSETS: no kernel BTF — Execution Gate uses default offset 96");
+            None
+        }
+    };
+    let Some(off) = off else {
+        info!("BPRM_OFFSETS: linux_binprm.filename not in BTF — Execution Gate uses default 96");
+        return;
+    };
+    if let Some(map) = bpf.map_mut("BPRM_OFFSETS") {
+        let mut hash: BpfHashMap<_, u32, u32> = match map.try_into() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "BPRM_OFFSETS: map type mismatch");
+                return;
+            }
+        };
+        if let Err(e) = hash.insert(0u32, off, 0) {
+            warn!(error = %e, "BPRM_OFFSETS: failed to write filename offset");
+        } else {
+            info!("eBPF: BPRM_OFFSETS linux_binprm.filename offset = {off} (from BTF)");
+        }
+    }
 }
 
 /// Query sizeof(struct inode) from kernel BTF and write it to the INODE_SIZE map.

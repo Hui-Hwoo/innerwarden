@@ -156,6 +156,18 @@ pub fn struct_member_offsets(btf: &[u8], struct_name: &str) -> Option<Vec<(Strin
     None
 }
 
+/// Byte offset of a single `member` inside `struct_name`, from a raw BTF blob.
+/// `None` if the blob is not valid BTF, the struct is absent, or the member is
+/// not a direct member. The Execution Gate uses this for
+/// `linux_binprm.filename` (CO-RE: the offset differs across kernels — 96 on
+/// 6.8, where the old hardcoded 72 was actually `cred`).
+pub fn member_offset(btf: &[u8], struct_name: &str, member: &str) -> Option<u32> {
+    struct_member_offsets(btf, struct_name)?
+        .into_iter()
+        .find(|(name, _)| name == member)
+        .map(|(_, off)| off)
+}
+
 /// Compare `expected` against the kernel's `actual` members. Returns
 /// `(wrong, absent)`:
 /// - `wrong` — an expected member that IS present but at a **different**
@@ -453,6 +465,21 @@ mod tests {
     }
 
     #[test]
+    fn member_offset_finds_member_and_misses_absent() {
+        // Reuse the pt_regs builder with linux_binprm-shaped members: the
+        // Execution Gate looks up `filename` (96 on kernel 6.8; 72 is `cred`).
+        let blob = build_pt_regs_btf(&[("cred", 72), ("filename", 96)]);
+        assert_eq!(member_offset(&blob, "pt_regs", "filename"), Some(96));
+        assert_eq!(member_offset(&blob, "pt_regs", "cred"), Some(72));
+        // member absent from the struct
+        assert_eq!(member_offset(&blob, "pt_regs", "interp"), None);
+        // struct absent from the blob
+        assert_eq!(member_offset(&blob, "linux_binprm", "filename"), None);
+        // not BTF at all
+        assert_eq!(member_offset(b"junk", "pt_regs", "filename"), None);
+    }
+
+    #[test]
     fn report_check_covers_all_arms() {
         // none / validated / wrong (alarm) / inconclusive(absent, no alarm)
         assert_eq!(report_check(None), 0);
@@ -579,12 +606,15 @@ mod tests {
     #[test]
     fn expected_offsets_match_sc_off_macro() {
         let src = include_str!("../../sensor-ebpf/src/main.rs");
+        // Whitespace-normalise so the anchor survives rustfmt (which expands
+        // `(0) => { 112 };` into a multi-line arm).
+        let normalized: String = src.split_whitespace().collect();
         for (name, off) in expected_offsets() {
-            // x86_64 macro arms look like `(0) => { 112 };`; aarch64 `(0) => { 0 };`.
+            // x86_64 macro arms normalise to `(0)=>{112};`; aarch64 `(0)=>{0};`.
             // We just assert the offset literal appears in the macro block.
             let _ = name;
             assert!(
-                src.contains(&format!("=> {{ {off} }}")) || *off == 0,
+                normalized.contains(&format!("=>{{{off}}}")) || *off == 0,
                 "offset {off} not found as a __sc_off! literal in sensor-ebpf/src/main.rs"
             );
         }

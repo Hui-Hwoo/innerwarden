@@ -69,6 +69,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resolves it.
 
 ### Added
+- **Execution Gate primitive (eBPF, ships INERT).** A new dedicated minimal LSM
+  program `innerwarden_lsm_exec_gate` on `bprm_check_security`: when armed
+  (`LSM_POLICY` key 3 = 1), an exec whose path-hash (FNV-1a of `bprm->filename`,
+  ≤256 bytes) is absent from the new `EXEC_ALLOWLIST` map is denied with `-EPERM`
+  and an `EXEC_GATE_BLOCKED` event is emitted; allowlisted paths run untouched.
+  Default is key 3 = 0 — the gate is **inert** out of the box and arming is
+  operator-driven tooling, so OSS behaviour is unchanged. It lives in its own
+  program (not `innerwarden_lsm_exec`) because the full hook fails the verifier
+  on kernel ≥ 6.4. The `bprm->filename` byte offset is read from kernel BTF at
+  load time (`BPRM_OFFSETS` map, CO-RE — it is 96 on 6.8, not the 72 older code
+  assumed, which is `cred`), with 96 as fallback. `EXEC_ALLOWLIST` is pinned at
+  `/sys/fs/bpf/innerwarden/exec_allowlist` so userspace tooling can populate it.
+  Path read uses a per-CPU scratch buffer (zero BPF stack cost) and the gate
+  fails OPEN (allow) on any read error. Proven end-to-end on kernel 6.8 x86_64:
+  unknown binary blocked at exec, allowlisted binaries run, clean disarm, no
+  brick. `scripts/verify-lsm-hooks.sh` now also pins the per-program FUNC
+  symbol surface (bpf-linker folds same-hook programs into one ELF section, so
+  the section check alone cannot see a dropped program).
 - **More case actions than just "Block IP".** The case detail offered only a
   Block button (which hid once a case was blocked, leaving zero actions). New
   operator actions, all behind the same auth + CSRF gate as block-ip and

@@ -103,7 +103,7 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 │                                                                   │
 │  ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────────────────────┐    │
 │  │auth.log │ │journald │ │ Docker │ │    eBPF collector      │◄─┘ |
-│  │nginx    │ │syslog   │ │ cgroup │ │    (46 compiled)       │    |
+│  │nginx    │ │syslog   │ │ cgroup │ │    (47 compiled)       │    |
 │  └────┬────┘ └────┬────┘ └──┬──── ┘ └───────────┬────────────┘    │
 │       │           │         │                   │                 │
 │  ┌────┴────┐ ┌────┴─────┐ ┌─┴──────────────┐    │                 │
@@ -335,14 +335,14 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 
 **Sensor**: deterministic signal collection. No AI, no HTTP. 30 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 45 kernel programs loaded, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, kernel audit state monitoring (alerts when the audit subsystem is disabled, T1562.001), USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **8000+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
 
-**eBPF**: 46 kernel programs compiled, 45 loaded in prod (kernel-dependent). Linux 5.8+, CO-RE/BTF portable:
+**eBPF**: 47 kernel programs compiled, 45 loaded in prod (kernel-dependent). Linux 5.8+, CO-RE/BTF portable:
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
 - **10 kprobes**: `commit_creds` (privilege escalation), `native_write_msr` (firmware MSR tampering), `acpi_evaluate_object` (ACPI rootkit detection), `do_truncate` (log tampering), plus 6 timing-based rootkit kprobes (Trace of the Times: iterate_dir, filldir64, tcp4_seq_show, proc_pid_readdir kprobe/kretprobe pairs)
 - **5 LSM kernel-block hooks** (Spec 052/053 + PR-A/B/C/D): `bprm_check_security` (exec blocking via PID→BLOCKED_PIDS map populated by kill chain detector), `userns_create` (container escape — blocks `unshare(CLONE_NEWUSER)` from chain-flagged PIDs), `ptrace_access_check` (process injection — blocks PTRACE_ATTACH/POKETEXT), `bpf_prog` (VoidLink defence — blocks malicious BPF program loads), `mmap_file` (real-time RWX block, replacing 5s `proc_maps` polling). Plus 2 legacy hooks (`file_open`, `bpf`) kept in parallel. All FP-free by design: legitimate users (Chrome sandbox, gdb, JIT compilers, systemd) pass through because they're never in BLOCKED_PIDS.
 - **XDP program**: wire-speed IP blocking at the network driver (10M+ pps drop rate)
 - **Phase 2 firmware hooks**: MSR write guard (LSTAR/SMRR), I/O port access (SPI controller probing), ACPI method execution monitoring
 
-> **Looking for the eBPF source code?** All 46 kernel programs live in a single file: [`crates/sensor-ebpf/src/main.rs`](crates/sensor-ebpf/src/main.rs).
+> **Looking for the eBPF source code?** All 47 kernel programs live in a single file: [`crates/sensor-ebpf/src/main.rs`](crates/sensor-ebpf/src/main.rs).
 
 **Kernel-level noise filters** keep overhead near zero: COMM_ALLOWLIST (137 trusted processes like sshd, systemd, docker), CGROUP_ALLOWLIST, PID_RATE_LIMIT, and PID_CHAIN. Tail call dispatcher routes events through a single attach point to N handlers via ProgramArray. Ring buffer with epoll wakeup delivers events in microseconds.
 
