@@ -1941,6 +1941,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     }
 
                     // Hot-reload response rules from /etc/innerwarden/rules/event_pipeline/.
+                    // This includes dashboard "Trust IP" entries: they are written
+                    // as ordinary suppress_response/scope:ip rules into the same
+                    // dir (see operator_trust.rs), so YamlResponseRules picks them
+                    // up here and drops expired ones via the expires_at check.
                     {
                         let rules_dir = std::path::Path::new("/etc/innerwarden/rules/event_pipeline");
                         let yaml_rules = crate::allowlist::YamlResponseRules::load(rules_dir);

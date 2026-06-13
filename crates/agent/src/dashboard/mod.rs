@@ -702,6 +702,11 @@ pub async fn serve(
         // operator-action decision rows the read path classifies.
         .route("/api/action/unblock-ip", post(api_action_unblock_ip))
         .route("/api/action/triage-case", post(api_action_triage_case))
+        // Operator "Trust IP" — monitor-only allowlist (still detected/logged/
+        // notified, only auto-block suppressed). add / remove / list.
+        .route("/api/action/trust-ip", post(api_action_trust_ip))
+        .route("/api/action/untrust-ip", post(api_action_untrust_ip))
+        .route("/api/action/trusted-ips", get(api_action_trusted_ips))
         // 2026-05-01 (`tracked-spec-ai-override`): operator
         // overrides AI decisions / re-opens dismissed incidents /
         // labels decisions for retraining. Audit-only for v1.

@@ -132,6 +132,31 @@ pub(crate) struct TriageCaseRequest {
     pub(super) reason: String,
 }
 
+/// Operator "Trust IP" (monitor-only allowlist). Adds an IP/CIDR to
+/// `dynamic_trusted_ips` so the agent stops AUTO-blocking it — the IP is still
+/// detected, logged, and notified (see `operator_trust.rs`). Body fields:
+/// - `ip`: the IP or CIDR to trust (internal/private ranges ARE allowed here,
+///   unlike the block path; `/0` is rejected).
+/// - `reason`: operator rationale (mandatory; audit trail).
+/// - `ttl_hours`: optional time-box. Omit for permanent trust; when set the
+///   entry expires on its own (≤ one slow-loop tick after lapsing).
+#[derive(Debug, Deserialize)]
+pub(crate) struct TrustIpRequest {
+    pub(super) ip: String,
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) ttl_hours: Option<u64>,
+}
+
+/// Remove an IP/CIDR from the operator trust list (re-enables auto-response).
+/// `reason` is optional (recorded for the audit trail when present).
+#[derive(Debug, Deserialize)]
+pub(crate) struct UntrustIpRequest {
+    pub(super) ip: String,
+    #[serde(default)]
+    pub(super) reason: String,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ActionResponse {
     pub(super) success: bool,

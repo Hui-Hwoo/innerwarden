@@ -9,6 +9,34 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Operator "Trust IP" — a monitor-only allowlist managed from the dashboard.**
+  New endpoints `POST /api/action/trust-ip`, `POST /api/action/untrust-ip`, and
+  `GET /api/action/trusted-ips` (all under the existing dashboard auth + CSRF
+  gate) let an operator mark an IP or CIDR as trusted so the agent stops
+  AUTO-blocking it. Trust is deliberately the *safe* half of allowlisting: a
+  trusted IP is **still detected, still logged, and still notified** (Telegram /
+  Slack / webhook) — only the automated response is suppressed. There is no
+  "drop / suppress detection" mode on this surface, so a dashboard-authenticated
+  session cannot self-allowlist into silence. Internal/private ranges are allowed
+  (trusting your own office/VPN/LB range is the point); ranges broader than
+  `/8` (v4) or `/16` (v6) are rejected — this blocks `0.0.0.0/0` and the
+  `0.0.0.0/1` + `128.0.0.0/1` two-halves end-run that would otherwise trust the
+  whole internet from a hijacked session. Entries can be **time-boxed**
+  (`ttl_hours`) and expire on their own within one slow-loop tick — no manual
+  cleanup. Every add/remove is recorded in the hash-chained admin-actions audit
+  trail. **Integrated with the user-facing rule system:** entries are written as
+  ordinary `suppress_response`/`scope: ip` rules into the event_pipeline rules
+  dir (`70-operator-trust.yml`) — the same format a user can hand-write — so they
+  show up in `innerwarden rule list`, can be disabled with
+  `innerwarden rule disable <id>`, appear in `innerwarden trust list` (now reads
+  the dynamic rules too), and are hot-reloaded into `dynamic_trusted_ips` with
+  TTL honoured. The sensor's `suppress_response` schema was relaxed
+  (`SuppressConfig { detector?, scope? }`) so these shared-dir rules parse
+  cleanly instead of warn-and-skipping — a fix that also benefits any
+  hand-written `suppress_response` rule. Dashboard UI button is a follow-up; the
+  API is live.
+
 ### Fixed
 - **macOS release signing.** The release workflow's "Sign macOS release
   binaries" step failed on every run from 0.15.9 through 0.15.11

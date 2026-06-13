@@ -152,6 +152,7 @@ mod notification_gate;
 mod notification_pipeline;
 mod observation_verify;
 mod operator_actions;
+mod operator_trust;
 mod orphan_recovery;
 mod pcap_capture;
 mod playbook_engine;

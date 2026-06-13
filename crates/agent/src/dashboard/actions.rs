@@ -1285,6 +1285,230 @@ pub(super) async fn api_action_triage_case(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Operator "Trust IP" — monitor-only allowlist (add / remove / list).
+//
+// Trusting an IP suppresses only the AUTOMATED response: the IP is still
+// detected, logged, and you are still notified (see operator_trust.rs). It does
+// NOT blind detection, and there is deliberately no "drop / suppress detection"
+// mode on this surface — a dashboard-authenticated attacker must not be able to
+// self-allowlist into silence. Entries can be time-boxed and expire on their
+// own. All three handlers ride the same auth+CSRF gate as the other actions.
+// ---------------------------------------------------------------------------
+
+/// POST /api/action/trust-ip — operator adds an IP/CIDR to the monitor-only
+/// trust list.
+pub(super) async fn api_action_trust_ip(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::TrustIpRequest>,
+) -> Json<ActionResponse> {
+    if state.insecure_http {
+        warn!("trust-ip executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    Json(trust_ip_inner(
+        std::path::Path::new(crate::operator_trust::DEFAULT_RULES_DIR),
+        &state.data_dir,
+        state.action_cfg.enabled,
+        state.action_cfg.dry_run,
+        &body.ip,
+        &body.reason,
+        body.ttl_hours,
+        Utc::now(),
+    ))
+}
+
+/// POST /api/action/untrust-ip — operator removes an IP/CIDR from the trust list.
+pub(super) async fn api_action_untrust_ip(
+    State(state): State<DashboardState>,
+    Json(body): Json<crate::dashboard::types::UntrustIpRequest>,
+) -> Json<ActionResponse> {
+    if state.insecure_http {
+        warn!("untrust-ip executed over HTTP without TLS — consider a reverse proxy with TLS");
+    }
+    Json(untrust_ip_inner(
+        std::path::Path::new(crate::operator_trust::DEFAULT_RULES_DIR),
+        &state.data_dir,
+        state.action_cfg.enabled,
+        state.action_cfg.dry_run,
+        &body.ip,
+        &body.reason,
+    ))
+}
+
+/// GET /api/action/trusted-ips — list the current operator trust entries.
+pub(super) async fn api_action_trusted_ips(
+    State(_state): State<DashboardState>,
+) -> Json<serde_json::Value> {
+    Json(list_trusted_inner(
+        std::path::Path::new(crate::operator_trust::DEFAULT_RULES_DIR),
+        Utc::now(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn trust_ip_inner(
+    rules_dir: &Path,
+    data_dir: &Path,
+    enabled: bool,
+    dry_run: bool,
+    ip: &str,
+    reason: &str,
+    ttl_hours: Option<u64>,
+    now: chrono::DateTime<Utc>,
+) -> ActionResponse {
+    let skill_id = "operator_trust".to_string();
+    if !enabled {
+        return ActionResponse {
+            success: false,
+            dry_run,
+            message: "dashboard actions are disabled - set responder.enabled = true in agent.toml"
+                .to_string(),
+            skill_id,
+        };
+    }
+
+    let outcome = crate::operator_trust::add(rules_dir, ip, reason, ttl_hours, now);
+
+    let (success, message, expires_at) = match &outcome {
+        Ok(entry) => {
+            let expiry = entry
+                .expires_at
+                .map(|e| e.to_rfc3339())
+                .unwrap_or_else(|| "never".to_string());
+            let msg = if entry.expires_at.is_some() {
+                format!(
+                    "Now trusting {} (monitor-only): auto-block is suppressed, but it is still \
+                     detected, logged, and you are still notified. Trust expires {expiry}.",
+                    entry.value
+                )
+            } else {
+                format!(
+                    "Now trusting {} (monitor-only): auto-block is suppressed, but it is still \
+                     detected, logged, and you are still notified. Remove it any time.",
+                    entry.value
+                )
+            };
+            (true, msg, Some(expiry))
+        }
+        Err(e) => (false, e.clone(), None),
+    };
+
+    let mut audit = AdminActionEntry {
+        ts: Utc::now(),
+        operator: "dashboard:operator".to_string(),
+        source: "dashboard".to_string(),
+        action: "trust_ip".to_string(),
+        target: ip.trim().to_string(),
+        parameters: serde_json::json!({
+            "reason": reason,
+            "ttl_hours": ttl_hours,
+            "expires_at": expires_at,
+            "mode": "monitor_only",
+        }),
+        result: if success {
+            "success".to_string()
+        } else {
+            format!("failure: {message}")
+        },
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(data_dir, &mut audit) {
+        warn!("failed to write admin audit: {e:#}");
+    }
+
+    info!(ip = %ip.trim(), success, "dashboard action: trust-ip");
+    ActionResponse {
+        success,
+        dry_run,
+        message,
+        skill_id,
+    }
+}
+
+pub(super) fn untrust_ip_inner(
+    rules_dir: &Path,
+    data_dir: &Path,
+    enabled: bool,
+    dry_run: bool,
+    ip: &str,
+    reason: &str,
+) -> ActionResponse {
+    let skill_id = "operator_untrust".to_string();
+    if !enabled {
+        return ActionResponse {
+            success: false,
+            dry_run,
+            message: "dashboard actions are disabled - set responder.enabled = true in agent.toml"
+                .to_string(),
+            skill_id,
+        };
+    }
+
+    let (success, message) = match crate::operator_trust::remove(rules_dir, ip) {
+        Ok(true) => (
+            true,
+            format!(
+                "Removed {} from the trust list. Auto-response resumes within one slow-loop \
+                 tick (≤30 s).",
+                ip.trim()
+            ),
+        ),
+        Ok(false) => (false, format!("{} is not in the trust list", ip.trim())),
+        Err(e) => (false, e),
+    };
+
+    let mut audit = AdminActionEntry {
+        ts: Utc::now(),
+        operator: "dashboard:operator".to_string(),
+        source: "dashboard".to_string(),
+        action: "untrust_ip".to_string(),
+        target: ip.trim().to_string(),
+        parameters: serde_json::json!({ "reason": reason }),
+        result: if success {
+            "success".to_string()
+        } else {
+            format!("failure: {message}")
+        },
+        prev_hash: None,
+    };
+    if let Err(e) = append_admin_action(data_dir, &mut audit) {
+        warn!("failed to write admin audit: {e:#}");
+    }
+
+    info!(ip = %ip.trim(), success, "dashboard action: untrust-ip");
+    ActionResponse {
+        success,
+        dry_run,
+        message,
+        skill_id,
+    }
+}
+
+pub(super) fn list_trusted_inner(
+    rules_dir: &Path,
+    now: chrono::DateTime<Utc>,
+) -> serde_json::Value {
+    let file = crate::operator_trust::managed_file_in(rules_dir);
+    let entries: Vec<serde_json::Value> = crate::operator_trust::read_entries(&file)
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "value": e.value,
+                "reason": e.reason,
+                "id": e.id,
+                "expires_at": e.expires_at.map(|t| t.to_rfc3339()),
+                "expired": e.is_expired_at(now),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "count": entries.len(),
+        "trusted_ips": entries,
+        // Reminder the UI can surface so operators understand the semantics.
+        "note": "Trusted IPs are still detected, logged, and notified — only automated blocking is suppressed.",
+    })
+}
+
 /// Truncate a string to at most `max_chars` chars, appending an
 /// ellipsis when truncated. Used by override reason to bound the
 /// length of the original AI rationale included in the audit row.
@@ -2912,5 +3136,174 @@ mod tests {
             latest_action_type(&store, "i:9").as_deref(),
             Some("operator_reopen"),
         );
+    }
+
+    // ── Operator "Trust IP" (monitor-only allowlist) ──────────────────────
+
+    fn ts(s: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Read today's admin-actions audit file contents (empty string if absent).
+    fn read_admin_audit(data_dir: &std::path::Path) -> String {
+        let mut out = String::new();
+        if let Ok(rd) = std::fs::read_dir(data_dir) {
+            for e in rd.flatten() {
+                if e.file_name()
+                    .to_string_lossy()
+                    .starts_with("admin-actions-")
+                {
+                    if let Ok(c) = std::fs::read_to_string(e.path()) {
+                        out.push_str(&c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // The trust inner-fns take the event_pipeline RULES DIR (they write a
+    // managed suppress_response rule file into it). We use one tempdir as both
+    // the rules dir and the audit data_dir; the agent's YamlResponseRules reads
+    // the same dir, which is exactly the integration we want to assert.
+    fn trusted_active(rules_dir: &std::path::Path, now: chrono::DateTime<Utc>) -> Vec<String> {
+        crate::allowlist::YamlResponseRules::load_at(rules_dir, now).trusted_ips
+    }
+    fn trust_entries(rules_dir: &std::path::Path) -> Vec<crate::operator_trust::TrustEntry> {
+        crate::operator_trust::read_entries(&crate::operator_trust::managed_file_in(rules_dir))
+    }
+
+    #[test]
+    fn trust_ip_inner_adds_entry_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = ts("2026-06-13T10:00:00Z");
+        let resp = trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "203.0.113.10",
+            "office vpn",
+            None,
+            now,
+        );
+        assert!(resp.success, "{}", resp.message);
+        // end-to-end: the agent's hot-reload now treats it as trusted
+        assert_eq!(trusted_active(dir.path(), now), vec!["203.0.113.10"]);
+        let audit = read_admin_audit(dir.path());
+        assert!(audit.contains("trust_ip"));
+        assert!(audit.contains("monitor_only"));
+        assert!(audit.contains("success"));
+    }
+
+    #[test]
+    fn trust_ip_inner_disabled_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            false, // disabled
+            true,
+            "203.0.113.10",
+            "vpn",
+            None,
+            ts("2026-06-13T10:00:00Z"),
+        );
+        assert!(!resp.success);
+        assert!(resp.message.contains("disabled"));
+        assert!(trust_entries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn trust_ip_inner_rejects_slash_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "0.0.0.0/0",
+            "trust everything (should fail)",
+            None,
+            ts("2026-06-13T10:00:00Z"),
+        );
+        assert!(!resp.success);
+        assert!(trust_entries(dir.path()).is_empty());
+        // the rejected attempt is still recorded in the audit trail
+        assert!(read_admin_audit(dir.path()).contains("failure"));
+    }
+
+    #[test]
+    fn trust_ip_inner_ttl_reports_expiry_and_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = ts("2026-06-13T10:00:00Z");
+        let resp = trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "198.51.100.7",
+            "temporary",
+            Some(24),
+            now,
+        );
+        assert!(resp.success);
+        assert!(resp.message.contains("expires"));
+        // active now, gone two days later (driven by the YamlResponseRules TTL)
+        assert!(!trusted_active(dir.path(), now).is_empty());
+        assert!(trusted_active(dir.path(), ts("2026-06-15T10:00:00Z")).is_empty());
+    }
+
+    #[test]
+    fn untrust_ip_inner_removes_then_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = ts("2026-06-13T10:00:00Z");
+        trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "203.0.113.10",
+            "vpn",
+            None,
+            now,
+        );
+
+        let removed = untrust_ip_inner(dir.path(), dir.path(), true, false, "203.0.113.10", "done");
+        assert!(removed.success);
+        assert!(trusted_active(dir.path(), now).is_empty());
+
+        // removing again → not found, but not an error
+        let again = untrust_ip_inner(dir.path(), dir.path(), true, false, "203.0.113.10", "");
+        assert!(!again.success);
+        assert!(again.message.contains("not in the trust list"));
+    }
+
+    #[test]
+    fn list_trusted_inner_reports_entries_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = ts("2026-06-13T10:00:00Z");
+        trust_ip_inner(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            "10.0.0.0/8",
+            "corp",
+            Some(24),
+            now,
+        );
+
+        let listed = list_trusted_inner(dir.path(), now);
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["trusted_ips"][0]["value"], "10.0.0.0/8");
+        assert_eq!(listed["trusted_ips"][0]["id"], "operator-trust-10-0-0-0-8");
+        assert_eq!(listed["trusted_ips"][0]["expired"], false);
+
+        // same entry, evaluated after expiry → flagged expired in the listing
+        let later = list_trusted_inner(dir.path(), ts("2026-06-15T10:00:00Z"));
+        assert_eq!(later["trusted_ips"][0]["expired"], true);
     }
 }
