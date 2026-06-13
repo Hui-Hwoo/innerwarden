@@ -31,6 +31,61 @@ fn changelog_snippet(body: Option<&str>, max_chars: usize) -> String {
         .collect::<String>()
 }
 
+/// Map the build OS to the `uname -s`-shaped family install.sh reports, so the
+/// `os` dimension is consistent across the install.sh and upgrade ping paths.
+fn telemetry_os() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "Darwin",
+        other => other,
+    }
+}
+
+/// Build the anonymous ping URL. Pure (no I/O) so the query shape — which must
+/// match the install.sh ping and what `pages/api/ping.ts` reads — is testable.
+fn ping_url(tag: &str, os: &str, arch: &str, event: &str) -> String {
+    format!("https://www.innerwarden.com/api/ping?v={tag}&os={os}&arch={arch}&event={event}")
+}
+
+/// Fire the anonymous, opt-OUT install/upgrade ping (best-effort, never blocks
+/// or fails the command). Mirrors the install.sh ping: version + OS + arch +
+/// event, no IP/PII (the server hashes ip+day into a dedup id and discards the
+/// IP). Suppressed by `INNERWARDEN_NO_TELEMETRY=1`. Prints a one-line notice so
+/// the default-on collection is transparent.
+/// Telemetry is opt-OUT: enabled unless `INNERWARDEN_NO_TELEMETRY=1`. Pure over
+/// its input so the policy is unit-tested without touching the process env.
+fn telemetry_enabled_from(no_telemetry: Option<&str>) -> bool {
+    no_telemetry != Some("1")
+}
+
+fn send_telemetry_ping(tag: &str, event: &str) {
+    let no_telemetry = std::env::var("INNERWARDEN_NO_TELEMETRY").ok();
+    if !telemetry_enabled_from(no_telemetry.as_deref()) {
+        return;
+    }
+    let arch = crate::upgrade::detect_arch().unwrap_or("unknown");
+    let os = telemetry_os();
+    println!(
+        "\n  Sent an anonymous {event} ping (version + OS + CPU arch only — no IP, no host data)."
+    );
+    println!(
+        "  Opt out any time with INNERWARDEN_NO_TELEMETRY=1. Details: https://www.innerwarden.com/privacy"
+    );
+    do_ping(&ping_url(tag, os, arch, event));
+}
+
+/// Fire one GET at `url`. Best-effort: a short timeout, errors ignored —
+/// telemetry must never break or slow an upgrade. Separated from
+/// [`send_telemetry_ping`] so the network send is exercised against a local
+/// mock in tests (the rest of `send_telemetry_ping` is env + stdout).
+fn do_ping(url: &str) {
+    let _ = ureq::get(url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
+        .call();
+}
+
 fn render_upgrade_notification(
     latest: &str,
     current: &str,
@@ -388,6 +443,12 @@ fn cmd_upgrade_with_release(
         release.tag_name, date_display
     );
 
+    // Anonymous upgrade ping (opt-OUT, event=upgrade) — `innerwarden upgrade`
+    // does not go through install.sh, so without this the upgrade path is
+    // invisible to the install_ping stream. Same anonymous/minimal data + the
+    // same INNERWARDEN_NO_TELEMETRY=1 opt-out + the same printed notice.
+    send_telemetry_ping(&release.tag_name, "upgrade");
+
     // Show what's new in this release
     if let Some(preview) = release.changelog_preview() {
         println!("\nWhat's new in {}:", release.tag_name);
@@ -431,6 +492,72 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use tempfile::TempDir;
+
+    #[test]
+    fn ping_url_matches_install_sh_query_shape() {
+        // Must mirror install.sh: ?v=&os=&arch=&event= against the www host so
+        // pages/api/ping.ts reads every field. The upgrade path always sends
+        // event=upgrade.
+        let u = ping_url("v0.15.12", "Linux", "x86_64", "upgrade");
+        assert_eq!(
+            u,
+            "https://www.innerwarden.com/api/ping?v=v0.15.12&os=Linux&arch=x86_64&event=upgrade"
+        );
+        assert!(u.starts_with("https://www.innerwarden.com/api/ping?"));
+    }
+
+    #[test]
+    fn do_ping_sends_the_get_with_the_query() {
+        // Exercises the real network send against a local mock: the upgrade
+        // ping must reach the server as a GET carrying the install.sh-shaped
+        // query (v/os/arch/event).
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = s.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        do_ping(&format!(
+            "http://{addr}/api/ping?v=v0.15.12&os=Linux&arch=x86_64&event=upgrade"
+        ));
+        let req = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("mock server received the ping");
+        assert!(
+            req.starts_with("GET /api/ping?v=v0.15.12&os=Linux&arch=x86_64&event=upgrade"),
+            "unexpected request line: {req}"
+        );
+    }
+
+    #[test]
+    fn telemetry_is_opt_out() {
+        // Opt-OUT: on unless explicitly "1".
+        assert!(telemetry_enabled_from(None));
+        assert!(telemetry_enabled_from(Some("0")));
+        assert!(telemetry_enabled_from(Some("")));
+        assert!(telemetry_enabled_from(Some("true"))); // only "1" disables
+        assert!(!telemetry_enabled_from(Some("1")));
+    }
+
+    #[test]
+    fn telemetry_os_is_uname_s_shaped() {
+        // Matches install.sh's `uname -s` family so the os dimension is
+        // consistent across install + upgrade pings.
+        let os = telemetry_os();
+        assert!(matches!(os, "Linux" | "Darwin") || !os.is_empty());
+        #[cfg(target_os = "linux")]
+        assert_eq!(os, "Linux");
+        #[cfg(target_os = "macos")]
+        assert_eq!(os, "Darwin");
+    }
 
     fn test_cli(dir: &TempDir, dry_run: bool) -> Cli {
         let agent_path = dir.path().join("agent.toml");

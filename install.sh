@@ -1324,13 +1324,16 @@ if [[ "${CANARY}" -eq 1 ]] && [[ "${IW_VERSION}" != "canary" ]]; then
   fi
 fi
 
-# SEC-019: Install telemetry is opt-in only.
-# Opt in with: export INNERWARDEN_TELEMETRY=1
+# Install telemetry is opt-OUT (default on, anonymous). Disable with:
+#   export INNERWARDEN_NO_TELEMETRY=1
+# The data is anonymous + minimal enough that an opt-out default with a
+# clear notice (printed above the ping) is the policy; see /privacy.
 #
-# What we collect when you opt in:
-#   - the release version you are installing (e.g. v0.13.4)
+# What we collect:
+#   - the release version you are installing (e.g. v0.15.12)
 #   - the OS family (uname -s — Linux or Darwin)
 #   - the CPU arch (uname -m — x86_64 / aarch64 / arm64)
+#   - whether this was a fresh install or an upgrade (event=install|upgrade)
 #
 # What we never collect:
 #   - your IP. The server hashes (ip + UTC day + a server-side secret)
@@ -1347,15 +1350,19 @@ fi
 # The curl is backgrounded with a 5 s timeout and `-fsS` so it never
 # blocks the install or writes to stdout. If the request fails (DNS,
 # network, server down), the install completes silently regardless.
-if [[ "${INNERWARDEN_TELEMETRY:-0}" == "1" ]]; then
+if [[ "${INNERWARDEN_NO_TELEMETRY:-0}" != "1" ]]; then
+  # Anonymous install ping (opt-OUT). One-line notice + how to opt out, so the
+  # default-on collection is transparent (informed consent, not silent).
+  log "Sending an anonymous install ping (version + OS + CPU arch only — no IP, no host data)."
+  log "Opt out any time: re-run with INNERWARDEN_NO_TELEMETRY=1. Details: https://www.innerwarden.com/privacy"
   # Use the canonical www host and follow redirects (-L): the apex
   # innerwarden.com 308-redirects to www, and `curl -fsS` without -L drops
-  # the request — so every opted-in ping was silently lost. (Found 2026-06-11:
-  # the app_events install_ping stream went dry; the endpoint was healthy, the
+  # the request — so the ping was silently lost. (Found 2026-06-11: the
+  # app_events install_ping stream went dry; the endpoint was healthy, the
   # installer just never followed the redirect.)
   curl -fsSL \
     -m 5 \
-    "https://www.innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" \
+    "https://www.innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}&event=${IW_PING_EVENT:-install}" \
     >/dev/null 2>&1 &
 fi
 
