@@ -9,6 +9,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Install/upgrade telemetry is now opt-OUT (was opt-in), transparent, and
+  covers upgrades.** The anonymous install ping flips to on-by-default; disable
+  it with `INNERWARDEN_NO_TELEMETRY=1`. The installer and `innerwarden upgrade`
+  each print a one-line notice (what is sent + how to opt out + link to
+  `/privacy`) before sending, so the default-on collection is informed. The ping
+  now also fires on `innerwarden upgrade` (previously only fresh `install.sh`, so
+  upgrades were invisible) and carries an `event=install|upgrade` field. The data
+  is unchanged — anonymous and minimal: release version + OS + CPU arch + event,
+  no IP (the server hashes ip+day into a one-way dedup id and discards the raw
+  IP), no host/agent/config data. See https://www.innerwarden.com/privacy.
+
 ## [0.15.11] - 2026-06-12
 
 Headline: the **Execution Gate eBPF primitive** ships — a free, auditable,
