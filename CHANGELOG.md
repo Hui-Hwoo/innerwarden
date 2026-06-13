@@ -34,8 +34,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   TTL honoured. The sensor's `suppress_response` schema was relaxed
   (`SuppressConfig { detector?, scope? }`) so these shared-dir rules parse
   cleanly instead of warn-and-skipping — a fix that also benefits any
-  hand-written `suppress_response` rule. Dashboard UI button is a follow-up; the
-  API is live.
+  hand-written `suppress_response` rule. **Dashboard:** a "✓ Trust IP" button on
+  the case/journey view (next to Block/Unblock) opens a confirm modal and calls
+  `trust-ip`; available on any IP case. Manage/time-box trusted entries via the
+  CLI (`innerwarden trust`).
 
 ### Fixed
 - **macOS release signing.** The release workflow's "Sign macOS release
