@@ -36,6 +36,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     module(s)" low finding on Azure/AWS/GCP images.
 
 ### Fixed
+- **`innerwarden agent scan` missed interpreter-launched AI agents.** Detection
+  matched `/proc/<pid>/comm` only. OpenClaw installed via npm runs as
+  `node .../node_modules/openclaw/dist/index.js`, and node renames its main
+  thread, so `comm` is `MainThread` (never `openclaw`) — `agent scan` reported
+  "No known agents detected" on a host actively running OpenClaw. The same blind
+  spot hid every node/python-launched agent (aider, goose, cline, …). Detection
+  now falls back to scanning `/proc/<pid>/cmdline`: when the executable is a
+  known interpreter, a signature name matched as an exact path component
+  (`node_modules/openclaw/…`) or a `python -m <module>` argument is detected.
+  Stays precise — bare args (`grep openclaw`) and `openclaw.md` do not match.
 - **`configure ai azure_openai` wrote a config that silently 404'd.** Azure's
   chat endpoint is versioned via a required `api-version` query param the agent
   reads from `[ai].api_version`; `configure ai` never wrote it, so every Azure
