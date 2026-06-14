@@ -9,6 +9,32 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`innerwarden harden` — two new check categories.**
+  - **Kernel Hardening**: 15 CIS-aligned sysctls the advisor did not check
+    before (`kptr_restrict`, `dmesg_restrict`, Yama `ptrace_scope`,
+    `unprivileged_bpf_disabled`, `bpf_jit_harden`, `protected_{hardlinks,
+    symlinks,fifos,regular}`, `suid_dumpable`, `rp_filter`, `log_martians`,
+    `icmp_echo_ignore_broadcasts`, `send_redirects`, `kexec_load_disabled`).
+    Deliberately does **not** check `perf_event_paranoid` — raising it would
+    break InnerWarden's own eBPF sensor.
+  - **Access Control**: flags a host with neither AppArmor nor SELinux
+    enforcing (a root compromise would otherwise be unconfined); warns when
+    SELinux is merely permissive.
+
+### Changed
+- **`innerwarden harden` — cloud-aware false-positive reduction.** A clean
+  public-cloud host no longer raises noise that buries real findings:
+  - `cifs-utils`' SUID-root `/usr/sbin/mount.cifs` (and `ecryptfs-utils`) are
+    recognised as packaged mount helpers, not anomalous SUID binaries. The
+    trusted-owner dpkg lookup now also handles **usrmerge path aliasing** —
+    `find` reports the canonical `/usr/sbin/...` while some packages record the
+    pre-merge `/sbin/...` path, so the query retries the alias before flagging.
+  - Stock cloud/virt/AMD/NIC kernel modules (Azure Hyper-V + MANA, RDMA/IB,
+    AMD `ccp`, `irqbypass`, AWS `ena`, GCP `gve`, `dm_multipath`, common NIC
+    drivers, …) are added to the known-good set, clearing the "unusual kernel
+    module(s)" low finding on Azure/AWS/GCP images.
+
 ### Fixed
 - **`configure ai azure_openai` wrote a config that silently 404'd.** Azure's
   chat endpoint is versioned via a required `api-version` query param the agent
