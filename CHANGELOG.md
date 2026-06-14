@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.12] - 2026-06-14
+
 ### Fixed
 - **Installer (`install.sh`) failed on a clean `curl | sudo bash`.** Three bugs,
   all on the product's front-door install path, now fixed + guarded by CI:
