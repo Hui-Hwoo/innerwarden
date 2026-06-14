@@ -169,7 +169,12 @@ mod tests {
         assert!(!line.contains('\n'), "alert must be a single line");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    // multi_thread (2 workers): the proxy task awaits a real spawned child
+    // (`cat`) while this test drains the duplex. On a single-threaded runtime
+    // those two starve each other under CI load and the reader observed an
+    // empty buffer (the `out.contains("sk-ant-")` flake that failed #1010 even
+    // with `join!`). A second worker lets the reader progress independently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_drives_the_proxy_over_pipes() {
         // `cat` echoes input; serve should run the proxy to completion and
         // return the child's exit code, exercising the on_alert closure path.

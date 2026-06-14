@@ -9,6 +9,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Flaky MCP-proxy pipe tests.** The proxy tests that pipe through a real
+  spawned child ran on a single-threaded tokio runtime and drained the duplex on
+  the same thread that awaits the child, so under CI load the reader could
+  observe an empty buffer (intermittent `out.contains(...)` failures, e.g. on
+  PR #1010). They now use a 2-worker runtime so the reader progresses
+  independently of the child wait. Test-only; no behavior change.
+
 ### Added
 - **`innerwarden mesh connect <peer>` — one-command collaborative defense.**
   Enables mesh, registers the peer, and opens the local host firewall
