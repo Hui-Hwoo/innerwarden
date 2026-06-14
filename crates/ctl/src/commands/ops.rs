@@ -868,6 +868,36 @@ pub(crate) fn doctor_resolve_agent_data_dir(agent_doc: Option<&toml_edit::Docume
         .unwrap_or_else(|| PathBuf::from("/var/lib/innerwarden"))
 }
 
+/// Doctor lines for one enabled capability's sudoers drop-in, plus whether it
+/// is an issue. A capability whose drop-in is missing is non-functional (e.g.
+/// block-ip cannot run the firewall as the `innerwarden` user), so the fix
+/// hint points at `enable <cap> --force` — the command that actually re-applies
+/// the drop-in (plain `enable` no-ops on an already-enabled capability).
+pub(crate) fn capability_sudoers_status_lines(
+    cap_id: &str,
+    drop_in: Option<&str>,
+    present: bool,
+) -> (Vec<String>, bool) {
+    match drop_in {
+        None => (vec![format!("  [ok]   {cap_id} (enabled)")], false),
+        Some(_) if present => (
+            vec![format!(
+                "  [ok]   {cap_id} (enabled): sudoers drop-in present"
+            )],
+            false,
+        ),
+        Some(name) => (
+            vec![
+                format!(
+                    "  [warn] {cap_id} (enabled): sudoers drop-in missing (/etc/sudoers.d/{name})"
+                ),
+                format!("         → sudo innerwarden enable {cap_id} --force"),
+            ],
+            true,
+        ),
+    }
+}
+
 /// Map a Cli's configured paths to the sudoers drop-in for a given capability.
 pub(crate) fn capability_sudoers_drop_in(capability_id: &str) -> Option<&'static str> {
     match capability_id {
@@ -2400,20 +2430,16 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
         any_enabled = true;
 
         // Map capability → expected sudoers drop-in name
-        if let Some(name) = capability_sudoers_drop_in(cap.id()) {
-            let path = std::path::Path::new("/etc/sudoers.d").join(name);
-            if path.exists() {
-                println!("  [ok]   {} (enabled): sudoers drop-in present", cap.id());
-            } else {
-                println!(
-                    "  [warn] {} (enabled): sudoers drop-in missing (/etc/sudoers.d/{name})",
-                    cap.id()
-                );
-                println!("         → innerwarden enable {}", cap.id());
-                total_issues += 1;
-            }
-        } else {
-            println!("  [ok]   {} (enabled)", cap.id());
+        let drop_in = capability_sudoers_drop_in(cap.id());
+        let present = drop_in
+            .map(|name| std::path::Path::new("/etc/sudoers.d").join(name).exists())
+            .unwrap_or(false);
+        let (lines, has_issue) = capability_sudoers_status_lines(cap.id(), drop_in, present);
+        for line in lines {
+            println!("{line}");
+        }
+        if has_issue {
+            total_issues += 1;
         }
     }
 
@@ -4265,6 +4291,29 @@ enabled = true
     fn build_sudoers_dir_check_missing_fails_on_linux() {
         let c = build_sudoers_dir_check(false, false);
         assert_eq!(c.sev, Sev::Fail);
+    }
+
+    #[test]
+    fn capability_sudoers_status_lines_covers_present_missing_and_no_dropin() {
+        // Missing drop-in -> warn + the --force fix hint, and it IS an issue.
+        let (lines, issue) =
+            capability_sudoers_status_lines("block-ip", Some("innerwarden-block-ip"), false);
+        assert!(issue);
+        assert!(lines.iter().any(|l| l.contains("drop-in missing")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("innerwarden enable block-ip --force")));
+
+        // Present drop-in -> ok, no issue.
+        let (lines, issue) =
+            capability_sudoers_status_lines("block-ip", Some("innerwarden-block-ip"), true);
+        assert!(!issue);
+        assert!(lines.iter().any(|l| l.contains("drop-in present")));
+
+        // Capability with no drop-in -> plain ok, no issue.
+        let (lines, issue) = capability_sudoers_status_lines("ai", None, false);
+        assert!(!issue);
+        assert_eq!(lines, vec!["  [ok]   ai (enabled)".to_string()]);
     }
 
     #[test]

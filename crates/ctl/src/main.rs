@@ -316,6 +316,11 @@ enum Command {
         /// Skip interactive confirmation prompts (e.g. privacy gate)
         #[arg(long)]
         yes: bool,
+
+        /// Re-apply even if already enabled. Repairs drift such as a missing
+        /// sudoers drop-in (the side effect that makes block-ip actually work).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Deactivate a capability
@@ -2650,9 +2655,10 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             ref capability,
             ref params,
             yes,
+            force,
         } => {
             let params = commands::capability::parse_params(params)?;
-            commands::capability::cmd_enable(&cli, &registry, capability, params, yes)
+            commands::capability::cmd_enable(&cli, &registry, capability, params, yes, force)
         }
         Command::Disable {
             ref capability,
@@ -3464,6 +3470,27 @@ bind_addr = "127.0.0.1:8787"
             Err(err) => err,
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cli_parses_enable_with_force_flag() {
+        let cli =
+            Cli::try_parse_from(["innerwarden", "enable", "block-ip", "--force"]).expect("parse");
+        match cli.command {
+            Some(Command::Enable {
+                capability, force, ..
+            }) => {
+                assert_eq!(capability, "block-ip");
+                assert!(force, "--force must parse to true");
+            }
+            _ => panic!("expected enable command"),
+        }
+        // Default: force is false.
+        let cli2 = Cli::try_parse_from(["innerwarden", "enable", "block-ip"]).expect("parse");
+        match cli2.command {
+            Some(Command::Enable { force, .. }) => assert!(!force),
+            _ => panic!("expected enable command"),
+        }
     }
 
     #[test]

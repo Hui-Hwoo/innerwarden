@@ -2021,6 +2021,7 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
             capability.params.clone(),
             true,
             true,
+            false,
         ) {
             println!("  [warn] Could not enable {}: {err:#}", capability.id);
         } else {

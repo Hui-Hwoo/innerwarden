@@ -10,6 +10,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **`innerwarden enable` could not repair a half-enabled capability.** A
+  capability marked enabled in config but missing its sudoers drop-in (so
+  block-ip silently could not run firewall commands) was a dead end: `doctor`
+  flagged it and told you to run `innerwarden enable block-ip`, but that command
+  replied "already enabled, nothing to do" and never re-applied. `enable` now
+  takes `--force` to re-run apply and repair drift (idempotent), and `doctor`
+  points at `sudo innerwarden enable <cap> --force`.
 - **Integration Advisor no longer flags Telegram + Slack as a problem.** Running
   both notification channels (Telegram for real-time, Slack for team visibility)
   is an intentional, supported setup, but the advisor showed it as a red
