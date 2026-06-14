@@ -788,14 +788,27 @@ fn install_classifier_archive(url: &str, expected_sha: &str, target_dir: &str) -
     }
 
     println!("[3/3] Extracting into {target_dir}...");
-    let status = Command::new("tar")
+    // Capture stderr so we can drop the harmless macOS-xattr noise: the model
+    // tarball is packaged on macOS, which stamps `com.apple.provenance` extended
+    // headers that GNU tar on Linux doesn't recognise and warns about once per
+    // file ("Ignoring unknown extended header keyword 'LIBARCHIVE.xattr...'").
+    // The files extract fine; the warnings just look alarming. We filter only
+    // those lines and pass any real tar error through. Portable (no
+    // GNU-tar-only `--warning=` flag that would break bsdtar on macOS).
+    let output = Command::new("tar")
         .args(["-xzf"])
         .arg(&tmp)
         .args(["-C", target_dir])
-        .status()
+        .output()
         .map_err(|e| anyhow::anyhow!("spawn tar: {e}"))?;
-    if !status.success() {
-        anyhow::bail!("tar failed (exit {status})");
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if line.contains("Ignoring unknown extended header keyword") {
+            continue;
+        }
+        eprintln!("{line}");
+    }
+    if !output.status.success() {
+        anyhow::bail!("tar failed (exit {})", output.status);
     }
     let _ = std::fs::remove_file(&tmp);
     Ok(())

@@ -187,10 +187,16 @@ mod tests {
             .unwrap();
         to_proxy.shutdown().await.unwrap();
 
-        let code = h.await.unwrap().unwrap();
-        assert_eq!(code, 0);
+        // Drain the output CONCURRENTLY with the proxy, not after it. Awaiting
+        // `h` first and only then reading `from_proxy` is a duplex race: if the
+        // reader isn't draining while the proxy writes/closes, the test can
+        // observe an empty/partial buffer (the `out.contains("sk-ant-")` flake,
+        // OS-thread/scheduling dependent — same class as the mcp_proxy transport
+        // test fix, 2026-06-13). `join!` runs both to completion together.
         let mut out = String::new();
-        from_proxy.read_to_string(&mut out).await.unwrap();
+        let (proxy_res, read_res) = tokio::join!(h, from_proxy.read_to_string(&mut out));
+        assert_eq!(proxy_res.unwrap().unwrap(), 0);
+        read_res.unwrap();
         // Advisory forwards the call (cat echoes it).
         assert!(out.contains("sk-ant-"));
     }
