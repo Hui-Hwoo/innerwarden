@@ -2031,6 +2031,15 @@ pub(crate) fn cmd_setup(cli: &Cli, mode: &str) -> Result<()> {
     }
     apply_setup_preconfig_defaults(&cli.agent_config, &preconfig_plan);
 
+    // Cloud-aware: if this host runs on a cloud whose platform uses a fixed
+    // infrastructure IP outside its published ranges (e.g. Azure's wireserver),
+    // add it to the HOST allowlist so the responder never blocks the platform's
+    // own DNS/health traffic. Server-side rule, not a hardcoded never-block in
+    // the product. Idempotent + best-effort (a failure must not abort setup).
+    if let Err(err) = crate::commands::cloud_detect::apply_cloud_platform_allowlist(cli) {
+        println!("  [warn] cloud platform allowlist step skipped: {err:#}");
+    }
+
     if let Some(plan) = &ai_plan {
         apply_setup_ai_plan(cli, &env_file, plan)?;
     }

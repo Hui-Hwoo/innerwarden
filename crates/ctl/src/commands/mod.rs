@@ -4,6 +4,7 @@ pub(crate) mod ai;
 pub(crate) mod capability;
 pub(crate) mod chain_break;
 pub(crate) mod circuit;
+pub(crate) mod cloud_detect;
 pub(crate) mod core;
 pub(crate) mod firmware;
 pub(crate) mod history;

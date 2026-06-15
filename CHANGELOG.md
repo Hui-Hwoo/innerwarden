@@ -36,6 +36,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   independently of the child wait. Test-only; no behavior change.
 
 ### Added
+- **`innerwarden setup` is now cloud-aware.** It detects the host's cloud
+  platform (offline, via DMI) and adds that platform's fixed infrastructure
+  addresses (e.g. Azure's wireserver, used for DNS/DHCP/health) to the host
+  allowlist automatically, so the responder treats the cloud's own platform
+  traffic as infrastructure rather than a third party. A per-host server-side
+  rule the operator can see/edit in `agent.toml [allowlist]` — not a hardcoded
+  entry in the product's block path. Idempotent.
 - **`innerwarden mesh connect <peer>` — one-command collaborative defense.**
   Enables mesh, registers the peer, and opens the local host firewall
   (ufw/firewalld, source-scoped to the peer IP) for the mesh port in a single
