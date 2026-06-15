@@ -1,5 +1,15 @@
 use crate::{abuseipdb, ai, config, geoip, AgentState};
 
+/// Whether a decided action is worth a post-execution report to the operator.
+///
+/// `Dismiss` and `Ignore` are non-actions — the agent decided the incident is
+/// not a threat, so "🛡️ Threat neutralized — Dismissed" reports are pure noise.
+/// Every other action did something the operator should be told about.
+fn is_reportable_action(action: &ai::AiAction) -> bool {
+    use ai::AiAction;
+    !matches!(action, AiAction::Dismiss { .. } | AiAction::Ignore { .. })
+}
+
 /// Send a post-execution action report to Telegram when an action was executed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn maybe_send_post_execution_telegram_report(
@@ -30,6 +40,15 @@ pub(crate) fn maybe_send_post_execution_telegram_report(
     };
 
     use ai::AiAction;
+    // Dismiss / Ignore are non-actions: the agent decided this incident is NOT a
+    // threat. Sending "🛡️ Threat neutralized — Dismissed" for every dismissed
+    // false positive floods the operator with reports about things that needed
+    // no response. Skip them here (the first-alert and the daily digest still
+    // record the incident).
+    if !is_reportable_action(&decision.action) {
+        return;
+    }
+
     let (action_label, target) = match &decision.action {
         AiAction::BlockIp { ip, .. } => ("Blocked".to_string(), ip.clone()),
         AiAction::Monitor { ip } => ("Monitoring traffic from".to_string(), ip.clone()),
@@ -82,6 +101,30 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn dismiss_and_ignore_are_not_reportable() {
+        // Non-actions must not produce a "Threat neutralized" report — that
+        // floods the operator with noise about incidents that needed nothing.
+        assert!(!is_reportable_action(&ai::AiAction::Dismiss {
+            reason: "false positive".to_string(),
+        }));
+        assert!(!is_reportable_action(&ai::AiAction::Ignore {
+            reason: "benign".to_string(),
+        }));
+
+        // Real actions still report.
+        assert!(is_reportable_action(&ai::AiAction::BlockIp {
+            ip: "203.0.113.7".to_string(),
+            skill_id: "block-ip-ufw".to_string(),
+        }));
+        assert!(is_reportable_action(&ai::AiAction::Monitor {
+            ip: "203.0.113.7".to_string(),
+        }));
+        assert!(is_reportable_action(&ai::AiAction::RequestConfirmation {
+            summary: "needs operator".to_string(),
+        }));
+    }
 
     fn base_decision(action: ai::AiAction) -> ai::AiDecision {
         ai::AiDecision {

@@ -10,6 +10,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **No more "Threat neutralized — Dismissed" notification spam.** The
+  post-execution action report fired for every decided action, including
+  `Dismiss` and `Ignore` — which are *non-actions* (the agent judged the
+  incident benign). Operators were flooded with "Threat neutralized —
+  Dismissed" messages for false positives that needed no response. Dismissed
+  and ignored incidents now skip the action report entirely; the first-alert
+  and daily digest still record them.
 - **False-positive "data exfiltration" on source/package files.** The exfil
   detector's sensitive-path list matched generic substrings (`/secret`,
   `/token`, `/credentials`) anywhere in a path, so an AI agent loading its own
