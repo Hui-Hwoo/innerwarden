@@ -36,6 +36,7 @@ mod sensors;
 mod sse;
 mod still_active_now;
 mod threat_contract;
+mod two_fa;
 
 #[cfg(test)]
 mod consistency_block_counts;
@@ -70,6 +71,8 @@ use push::*;
 use sensors::*;
 #[allow(unused_imports)]
 use sse::*;
+#[allow(unused_imports)]
+use two_fa::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -576,6 +579,8 @@ pub async fn serve(
         fleet_state,
         two_factor: Arc::new(two_factor),
         playbook_sim: Arc::new(playbook_sim),
+        pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+        approval_outcome_tx: None,
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -821,6 +826,10 @@ pub async fn serve(
             "/api/push/subscribe",
             post(api_push_subscribe).delete(api_push_unsubscribe),
         )
+        // Issue #71: Dashboard 2FA approval endpoints
+        .route("/api/2fa/pending", get(api_2fa_pending))
+        .route("/api/2fa/approve/:approval_id", post(api_2fa_approve))
+        .route("/api/2fa/deny/:approval_id", post(api_2fa_deny))
         // Session management endpoints (auth-protected)
         .route("/api/auth/logout", post(api_auth_logout))
         .route("/api/auth/sessions", get(api_auth_sessions))
