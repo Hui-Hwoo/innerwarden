@@ -9,6 +9,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **False-positive "data exfiltration" on source/package files.** The exfil
+  detector's sensitive-path list matched generic substrings (`/secret`,
+  `/token`, `/credentials`) anywhere in a path, so an AI agent loading its own
+  `node_modules/.../secret-contract-api.js` or `.../token/const.mjs` and then
+  calling an API was flagged CRITICAL. Source files (`.js/.mjs/.ts/...`) and
+  anything under `node_modules/` are no longer treated as credential reads
+  (`.json` stays sensitive — gcloud's credentials file is genuine).
+
 ## [0.15.13] - 2026-06-15
 
 ### Added
