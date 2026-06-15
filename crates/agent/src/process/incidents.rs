@@ -833,7 +833,7 @@ pub(crate) async fn process_incidents(
         // No operational regression. Future home for declarative
         // playbook-style orchestration: Spec 042 active defense (Lua).
 
-        incident_action_report::maybe_send_post_execution_telegram_report(
+        incident_action_report::maybe_send_post_execution_report(
             incident,
             &decision,
             &execution_result,

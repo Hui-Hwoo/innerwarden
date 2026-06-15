@@ -27,14 +27,12 @@ use crate::telegram::{GuardianMode, TelegramClient};
 use crate::webhook::severity_rank;
 use crate::AgentState;
 
-/// Per-incident context derived from config that a channel renderer may need.
-///
-/// Each channel uses only the subset it cares about — Telegram ignores
-/// `slack_dashboard_url`, Slack ignores `mode`/`telegram_is_simple`.
+/// Per-incident render context for the incident-alert kind. Channel-specific
+/// destinations (e.g. the Slack dashboard deep-link) live on the channel
+/// itself, so this only carries the per-incident Telegram rendering knobs.
 pub(crate) struct ChatContext {
     pub(crate) mode: GuardianMode,
     pub(crate) telegram_is_simple: bool,
-    pub(crate) slack_dashboard_url: Option<String>,
 }
 
 impl ChatContext {
@@ -42,13 +40,24 @@ impl ChatContext {
         Self {
             mode: crate::agent_context::guardian_mode(cfg),
             telegram_is_simple: cfg.telegram.is_simple_profile(),
-            slack_dashboard_url: if cfg.slack.dashboard_url.is_empty() {
-                None
-            } else {
-                Some(cfg.slack.dashboard_url.clone())
-            },
         }
     }
+}
+
+/// A post-execution action report: "what the agent did about an incident".
+///
+/// Built once by `incident_action_report` and fanned out to every chat channel
+/// so Telegram, Slack, and (future) Discord render the same disposition.
+pub(crate) struct ActionReport {
+    pub(crate) action_label: String,
+    pub(crate) target: String,
+    pub(crate) incident_title: String,
+    pub(crate) confidence: f32,
+    pub(crate) host: String,
+    pub(crate) dry_run: bool,
+    pub(crate) ip_reputation: Option<crate::abuseipdb::IpReputation>,
+    pub(crate) ip_geo: Option<crate::geoip::GeoInfo>,
+    pub(crate) cloudflare_pushed: bool,
 }
 
 /// An operator-facing chat channel.
@@ -67,6 +76,11 @@ pub(crate) trait ChatChannel: Send + Sync {
     fn filter_level(&self) -> ChannelFilterLevel;
     /// Render + send an incident alert.
     async fn incident_alert(&self, incident: &Incident, ctx: &ChatContext) -> anyhow::Result<()>;
+    /// Render + send a post-execution action report ("what the agent did").
+    async fn action_report(&self, report: &ActionReport) -> anyhow::Result<()>;
+    /// Send a pre-rendered summary line (burst/group rollups). Input is Telegram
+    /// HTML; non-HTML channels strip the tags.
+    async fn summary(&self, html: &str) -> anyhow::Result<()>;
 }
 
 pub(crate) struct TelegramChannel {
@@ -91,12 +105,31 @@ impl ChatChannel for TelegramChannel {
             .send_incident_alert(incident, ctx.mode, ctx.telegram_is_simple)
             .await
     }
+    async fn action_report(&self, report: &ActionReport) -> anyhow::Result<()> {
+        self.client
+            .send_action_report(
+                &report.action_label,
+                &report.target,
+                &report.incident_title,
+                report.confidence,
+                &report.host,
+                report.dry_run,
+                report.ip_reputation.as_ref(),
+                report.ip_geo.as_ref(),
+                report.cloudflare_pushed,
+            )
+            .await
+    }
+    async fn summary(&self, html: &str) -> anyhow::Result<()> {
+        self.client.send_alert_html(html).await
+    }
 }
 
 pub(crate) struct SlackChannel {
     client: SlackClient,
     min_rank: u8,
     filter_level: ChannelFilterLevel,
+    dashboard_url: Option<String>,
 }
 
 #[async_trait]
@@ -110,10 +143,18 @@ impl ChatChannel for SlackChannel {
     fn filter_level(&self) -> ChannelFilterLevel {
         self.filter_level
     }
-    async fn incident_alert(&self, incident: &Incident, ctx: &ChatContext) -> anyhow::Result<()> {
+    async fn incident_alert(&self, incident: &Incident, _ctx: &ChatContext) -> anyhow::Result<()> {
         self.client
-            .send_incident_alert(incident, ctx.slack_dashboard_url.as_deref())
+            .send_incident_alert(incident, self.dashboard_url.as_deref())
             .await
+    }
+    async fn action_report(&self, report: &ActionReport) -> anyhow::Result<()> {
+        self.client
+            .send_action_report(report, self.dashboard_url.as_deref())
+            .await
+    }
+    async fn summary(&self, html: &str) -> anyhow::Result<()> {
+        self.client.send_summary(html).await
     }
 }
 
@@ -145,6 +186,11 @@ pub(crate) fn collect_chat_channels(
                 client: sc.clone(),
                 min_rank: severity_rank(&cfg.slack.parsed_min_severity()),
                 filter_level: cfg.slack.channel_notifications.notification_level,
+                dashboard_url: if cfg.slack.dashboard_url.is_empty() {
+                    None
+                } else {
+                    Some(cfg.slack.dashboard_url.clone())
+                },
             }));
         }
     }
@@ -176,6 +222,36 @@ pub(crate) async fn fan_out_alert(
     }
 }
 
+/// Fan a post-execution action report out to every chat channel.
+///
+/// Action reports are NOT severity-gated here: they fire only for executed
+/// actions on immediate threats that the caller already judged reportable
+/// (non-`Dismiss`/`Ignore`), so the disposition reaches every channel the
+/// operator wired. Per-channel failure is logged and skipped.
+pub(crate) async fn fan_out_action_report(
+    channels: &[Box<dyn ChatChannel>],
+    report: &ActionReport,
+) {
+    for ch in channels {
+        if let Err(e) = ch.action_report(report).await {
+            warn!(
+                channel = ch.name(),
+                "chat-channel action report failed: {e:#}"
+            );
+        }
+    }
+}
+
+/// Fan a pre-rendered summary line (burst/group rollup) out to every chat
+/// channel. Per-channel failure is logged and skipped.
+pub(crate) async fn fan_out_summary(channels: &[Box<dyn ChatChannel>], html: &str) {
+    for ch in channels {
+        if let Err(e) = ch.summary(html).await {
+            warn!(channel = ch.name(), "chat-channel summary failed: {e:#}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,15 +278,35 @@ mod tests {
         ChatContext {
             mode: GuardianMode::Watch,
             telegram_is_simple: false,
-            slack_dashboard_url: None,
         }
+    }
+
+    fn report() -> ActionReport {
+        ActionReport {
+            action_label: "Blocked".to_string(),
+            target: "203.0.113.5".to_string(),
+            incident_title: "t".to_string(),
+            confidence: 0.95,
+            host: "h".to_string(),
+            dry_run: false,
+            ip_reputation: None,
+            ip_geo: None,
+            cloudflare_pushed: false,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Counters {
+        alert: Arc<AtomicUsize>,
+        report: Arc<AtomicUsize>,
+        summary: Arc<AtomicUsize>,
     }
 
     struct MockChannel {
         name: &'static str,
         min_rank: u8,
         filter_level: ChannelFilterLevel,
-        calls: Arc<AtomicUsize>,
+        c: Counters,
         fail: bool,
     }
 
@@ -226,7 +322,21 @@ mod tests {
             self.filter_level
         }
         async fn incident_alert(&self, _i: &Incident, _c: &ChatContext) -> anyhow::Result<()> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.c.alert.fetch_add(1, Ordering::SeqCst);
+            self.maybe_fail()
+        }
+        async fn action_report(&self, _r: &ActionReport) -> anyhow::Result<()> {
+            self.c.report.fetch_add(1, Ordering::SeqCst);
+            self.maybe_fail()
+        }
+        async fn summary(&self, _html: &str) -> anyhow::Result<()> {
+            self.c.summary.fetch_add(1, Ordering::SeqCst);
+            self.maybe_fail()
+        }
+    }
+
+    impl MockChannel {
+        fn maybe_fail(&self) -> anyhow::Result<()> {
             if self.fail {
                 anyhow::bail!("simulated channel failure");
             }
@@ -239,34 +349,34 @@ mod tests {
         min_rank: u8,
         filter_level: ChannelFilterLevel,
         fail: bool,
-    ) -> (Box<dyn ChatChannel>, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
+    ) -> (Box<dyn ChatChannel>, Counters) {
+        let c = Counters::default();
         let ch = MockChannel {
             name,
             min_rank,
             filter_level,
-            calls: calls.clone(),
+            c: c.clone(),
             fail,
         };
-        (Box::new(ch), calls)
+        (Box::new(ch), c)
     }
 
     #[tokio::test]
     async fn fan_out_skips_channel_below_its_min_rank() {
         let high = severity_rank(&Severity::High);
-        let (ch, calls) = mock("telegram", high, ChannelFilterLevel::All, false);
+        let (ch, c) = mock("telegram", high, ChannelFilterLevel::All, false);
         let channels = vec![ch];
 
         fan_out_alert(&channels, &incident(Severity::Low), &ctx()).await;
         assert_eq!(
-            calls.load(Ordering::SeqCst),
+            c.alert.load(Ordering::SeqCst),
             0,
             "Low must not reach a High-rank channel"
         );
 
         fan_out_alert(&channels, &incident(Severity::Critical), &ctx()).await;
         assert_eq!(
-            calls.load(Ordering::SeqCst),
+            c.alert.load(Ordering::SeqCst),
             1,
             "Critical must reach a High-rank channel"
         );
@@ -274,11 +384,11 @@ mod tests {
 
     #[tokio::test]
     async fn fan_out_respects_filter_level_none() {
-        let (ch, calls) = mock("slack", 0, ChannelFilterLevel::None, false);
+        let (ch, c) = mock("slack", 0, ChannelFilterLevel::None, false);
         let channels = vec![ch];
         fan_out_alert(&channels, &incident(Severity::Critical), &ctx()).await;
         assert_eq!(
-            calls.load(Ordering::SeqCst),
+            c.alert.load(Ordering::SeqCst),
             0,
             "filter None silences every severity"
         );
@@ -286,12 +396,12 @@ mod tests {
 
     #[tokio::test]
     async fn fan_out_critical_filter_drops_medium_keeps_high() {
-        let (ch, calls) = mock("slack", 0, ChannelFilterLevel::Critical, false);
+        let (ch, c) = mock("slack", 0, ChannelFilterLevel::Critical, false);
         let channels = vec![ch];
         fan_out_alert(&channels, &incident(Severity::Medium), &ctx()).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(c.alert.load(Ordering::SeqCst), 0);
         fan_out_alert(&channels, &incident(Severity::High), &ctx()).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(c.alert.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -302,12 +412,12 @@ mod tests {
         let channels = vec![ch1, ch2];
         fan_out_alert(&channels, &incident(Severity::High), &ctx()).await;
         assert_eq!(
-            c1.load(Ordering::SeqCst),
+            c1.alert.load(Ordering::SeqCst),
             1,
             "failing channel was attempted"
         );
         assert_eq!(
-            c2.load(Ordering::SeqCst),
+            c2.alert.load(Ordering::SeqCst),
             1,
             "second channel still fired despite first failing"
         );
@@ -354,20 +464,11 @@ mod tests {
 
     #[test]
     fn chat_context_maps_config_fields() {
-        let mut cfg = AgentConfig::default();
-        cfg.slack.dashboard_url = String::new();
+        let cfg = AgentConfig::default();
         let c = ChatContext::from_config(&cfg);
-        assert_eq!(c.slack_dashboard_url, None, "empty dashboard_url -> None");
-        // mode is whatever the responder state maps to; just assert it resolves.
+        // mode + telegram_is_simple resolve from config without panic.
         let _ = c.mode;
         let _ = c.telegram_is_simple;
-
-        cfg.slack.dashboard_url = "https://dash.example/incidents".to_string();
-        let c = ChatContext::from_config(&cfg);
-        assert_eq!(
-            c.slack_dashboard_url.as_deref(),
-            Some("https://dash.example/incidents")
-        );
     }
 
     #[tokio::test]
@@ -418,6 +519,85 @@ mod tests {
         assert_eq!(channels.len(), 1);
         let ctx = ChatContext::from_config(&cfg);
         fan_out_alert(&channels, &incident(Severity::Critical), &ctx).await;
+
+        hook.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn action_report_fans_out_to_every_channel_ungated() {
+        // Action reports are not severity-gated: a channel with a High min_rank
+        // and a Critical-only filter still receives the report.
+        let (ch1, c1) = mock("telegram", 0, ChannelFilterLevel::All, false);
+        let (ch2, c2) = mock(
+            "slack",
+            severity_rank(&Severity::Critical),
+            ChannelFilterLevel::Critical,
+            false,
+        );
+        let channels = vec![ch1, ch2];
+        fan_out_action_report(&channels, &report()).await;
+        assert_eq!(c1.report.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            c2.report.load(Ordering::SeqCst),
+            1,
+            "action reports ignore the severity/filter gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_report_isolates_per_channel_failure() {
+        let (ch1, c1) = mock("telegram", 0, ChannelFilterLevel::All, true);
+        let (ch2, c2) = mock("slack", 0, ChannelFilterLevel::All, false);
+        let channels = vec![ch1, ch2];
+        fan_out_action_report(&channels, &report()).await;
+        assert_eq!(c1.report.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            c2.report.load(Ordering::SeqCst),
+            1,
+            "second channel still got the report"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_fans_out_to_every_channel() {
+        let (ch1, c1) = mock("telegram", 0, ChannelFilterLevel::All, false);
+        let (ch2, c2) = mock("slack", 0, ChannelFilterLevel::All, true);
+        let channels = vec![ch1, ch2];
+        fan_out_summary(&channels, "<b>3 contained</b>").await;
+        assert_eq!(c1.summary.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            c2.summary.load(Ordering::SeqCst),
+            1,
+            "failure on one channel doesn't block the other"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_action_report_and_summary_post_through_the_registry() {
+        // Drives SlackChannel::action_report + summary end-to-end against a mock
+        // webhook, including the dashboard_url deep-link branch.
+        let mut server = mockito::Server::new_async().await;
+        let hook = server
+            .mock("POST", "/services/T/B/X")
+            .with_status(200)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.slack_client = Some(
+            crate::slack::SlackClient::new(format!("{}/services/T/B/X", server.url())).unwrap(),
+        );
+
+        let mut cfg = AgentConfig::default();
+        cfg.slack.enabled = true;
+        cfg.slack.dashboard_url = "https://dash.example".to_string();
+
+        let channels = collect_chat_channels(&cfg, &state);
+        assert_eq!(channels.len(), 1);
+        fan_out_action_report(&channels, &report()).await;
+        fan_out_summary(&channels, "<b>burst</b> of 5").await;
 
         hook.assert_async().await;
     }

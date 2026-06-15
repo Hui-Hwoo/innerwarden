@@ -18,6 +18,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   channels; the point is that a new operator-facing channel (e.g. Discord) now
   plugs in by implementing one trait + one registry line, with no edits to any
   dispatch site. Webhook and Web Push remain non-chat sinks. (Spec 078 Phase 1.)
+- **Action reports and burst summaries reach Slack too.** Post-execution action
+  reports ("🛡️ Threat neutralized — Blocked …") and burst rollups were
+  Telegram-only; they now fan out through the chat-channel registry so Slack
+  (and future Discord) render the same disposition. `SlackClient` gained
+  `send_action_report` (Block Kit) + `send_summary`. The `Dismiss`/`Ignore`
+  suppression stays — only real actions report, on every channel. Action reports
+  now follow the Telegram notification master switch (`[telegram] enabled`)
+  instead of the conversational-bot switch. (Spec 078 Phase 2.)
 
 ### Fixed
 - **No more "Threat neutralized — Dismissed" notification spam.** The

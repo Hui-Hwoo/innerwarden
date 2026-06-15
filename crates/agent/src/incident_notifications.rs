@@ -151,13 +151,15 @@ pub(crate) async fn dispatch_incident_notifications(
                     .entry(detector.to_string())
                     .or_insert(0) += 1;
 
-                // Record contained + check if burst threshold hit
+                // Record contained + check if burst threshold hit. The burst
+                // summary fans out through the chat-channel registry (spec 078
+                // P2) so Slack/Discord get it too, not just Telegram.
                 if let Some(count) = state.notification_burst_tracker.record_contained() {
-                    if let Some(ref tg) = state.telegram_client {
+                    let channels = crate::notification_channels::collect_chat_channels(cfg, state);
+                    if !channels.is_empty() {
                         let msg = crate::notification_gate::format_burst_summary(count);
-                        let tg = tg.clone();
                         tokio::spawn(async move {
-                            let _ = tg.send_alert_html(&msg).await;
+                            crate::notification_channels::fan_out_summary(&channels, &msg).await;
                         });
                     }
                 }
