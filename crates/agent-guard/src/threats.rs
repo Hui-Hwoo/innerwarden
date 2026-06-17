@@ -282,10 +282,16 @@ pub fn check_reverse_shell(content: &str) -> Option<(&'static str, u32)> {
 /// Check for obfuscation patterns. Returns (indicator, score).
 pub fn check_obfuscation(content: &str) -> Option<(&'static str, u32)> {
     let lower = content.to_ascii_lowercase();
-    OBFUSCATION_INDICATORS
-        .iter()
-        .find(|i| lower.contains(*i))
-        .map(|i| (*i, 30))
+    if let Some(i) = OBFUSCATION_INDICATORS.iter().find(|i| lower.contains(*i)) {
+        return Some((*i, 30));
+    }
+    // Multiple `\xNN` hex escapes (e.g. building a command from hex bytes:
+    // `p=\x72\x6d; $p -rf /`). Two or more is well past coincidence in a
+    // command and is a classic command-obfuscation technique. Spec 079 P3.
+    if lower.matches("\\x").count() >= 2 {
+        return Some(("\\x hex-escaped bytes", 30));
+    }
+    None
 }
 
 /// Check for persistence attempts. Returns (indicator, score).
@@ -429,6 +435,16 @@ mod tests {
         assert_eq!(indicator, "base64 -d");
         assert_eq!(score, 30);
         assert!(check_obfuscation("echo hello").is_none());
+    }
+
+    #[test]
+    fn detects_hex_escaped_command() {
+        // Spec 079 P3: building a command from \xNN hex bytes is obfuscation.
+        let (_, score) = check_obfuscation("p=\\x72\\x6d; $p -rf /").unwrap();
+        assert_eq!(score, 30);
+        // A single stray \x is not enough (anti-FP bound).
+        assert!(check_obfuscation("printf one \\x then text").is_none());
+        assert!(check_obfuscation("ls -la /home").is_none());
     }
 
     #[test]
