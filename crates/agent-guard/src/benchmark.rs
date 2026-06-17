@@ -94,6 +94,12 @@ pub struct CaseResult {
     /// `"deny" | "review" | "allow"`.
     pub recommendation: String,
     pub risk_score: u32,
+    /// Signal labels that fired (e.g. `reverse_shell`, `atr:tool-poisoning`) —
+    /// the WHY behind the verdict, so misses + false positives are actionable.
+    pub signals: Vec<String>,
+    /// Exact ATR rule ids that matched — so a false positive points at the
+    /// precise rule to tighten (no guessing from the category label).
+    pub atr_rule_ids: Vec<String>,
     pub outcome: Outcome,
 }
 
@@ -112,6 +118,8 @@ pub fn run(corpus: &Corpus, engine: &RuleEngine) -> Vec<CaseResult> {
         .iter()
         .map(|c| {
             let a = analyze_command(&c.input, Some(engine));
+            let signals = a.signals.iter().map(|s| s.signal.clone()).collect();
+            let atr_rule_ids = a.atr_matches.iter().map(|m| m.rule_id.clone()).collect();
             CaseResult {
                 id: c.id.clone(),
                 category: c.category.clone(),
@@ -119,6 +127,8 @@ pub fn run(corpus: &Corpus, engine: &RuleEngine) -> Vec<CaseResult> {
                 input: c.input.clone(),
                 recommendation: a.recommendation.clone(),
                 risk_score: a.risk_score,
+                signals,
+                atr_rule_ids,
                 outcome: classify(c.label, &a.recommendation),
             }
         })
@@ -214,6 +224,8 @@ mod tests {
                 input: "x".into(),
                 recommendation: "deny".into(),
                 risk_score: 60,
+                signals: vec![],
+                atr_rule_ids: vec![],
                 outcome: Outcome::Caught,
             },
             CaseResult {
@@ -223,6 +235,8 @@ mod tests {
                 input: "y".into(),
                 recommendation: "allow".into(),
                 risk_score: 0,
+                signals: vec![],
+                atr_rule_ids: vec![],
                 outcome: Outcome::Missed,
             },
             CaseResult {
@@ -232,6 +246,8 @@ mod tests {
                 input: "git status".into(),
                 recommendation: "allow".into(),
                 risk_score: 0,
+                signals: vec![],
+                atr_rule_ids: vec![],
                 outcome: Outcome::Ok,
             },
             CaseResult {
@@ -241,6 +257,8 @@ mod tests {
                 input: "rm -rf ./build".into(),
                 recommendation: "review".into(),
                 risk_score: 20,
+                signals: vec![],
+                atr_rule_ids: vec![],
                 outcome: Outcome::FalsePositive,
             },
         ];

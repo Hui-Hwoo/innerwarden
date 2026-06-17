@@ -96,16 +96,21 @@ fn main() {
     if misses.is_empty() {
         let _ = writeln!(md, "_None._");
     } else {
-        let _ = writeln!(md, "| id | category | risk | input |");
-        let _ = writeln!(md, "|----|----------|------|-------|");
+        let _ = writeln!(md, "| id | category | risk | signals | input |");
+        let _ = writeln!(md, "|----|----------|------|---------|-------|");
         for m in &misses {
-            let preview: String = m.input.chars().take(70).collect();
+            let preview: String = m.input.chars().take(60).collect();
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | `{}` |",
+                "| {} | {} | {} | {} | `{}` |",
                 m.id,
                 m.category,
                 m.risk_score,
+                if m.signals.is_empty() {
+                    "—".into()
+                } else {
+                    m.signals.join(", ")
+                },
                 preview.replace('|', "\\|")
             );
         }
@@ -120,17 +125,33 @@ fn main() {
     if fps.is_empty() {
         let _ = writeln!(md, "_None._");
     } else {
-        let _ = writeln!(md, "| id | category | rec | risk | input |");
-        let _ = writeln!(md, "|----|----------|-----|------|-------|");
+        let _ = writeln!(
+            md,
+            "| id | category | rec | risk | atr rules | signals | input |"
+        );
+        let _ = writeln!(
+            md,
+            "|----|----------|-----|------|-----------|---------|-------|"
+        );
         for f in &fps {
-            let preview: String = f.input.chars().take(60).collect();
+            let preview: String = f.input.chars().take(46).collect();
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | `{}` |",
+                "| {} | {} | {} | {} | {} | {} | `{}` |",
                 f.id,
                 f.category,
                 f.recommendation,
                 f.risk_score,
+                if f.atr_rule_ids.is_empty() {
+                    "—".into()
+                } else {
+                    f.atr_rule_ids.join(", ")
+                },
+                if f.signals.is_empty() {
+                    "—".into()
+                } else {
+                    f.signals.join(", ")
+                },
                 preview.replace('|', "\\|")
             );
         }
@@ -162,6 +183,28 @@ fn main() {
         println!("\nMISSES ({}):", misses.len());
         for m in &misses {
             println!("  [{}] {} (risk {})", m.category, m.id, m.risk_score);
+        }
+    }
+    if !fps.is_empty() {
+        println!("\nFALSE POSITIVES ({}):", fps.len());
+        for f in &fps {
+            println!(
+                "  [{}] {} ({}, risk {}) signals: {} | rules: {}",
+                f.category,
+                f.id,
+                f.recommendation,
+                f.risk_score,
+                if f.signals.is_empty() {
+                    "—".into()
+                } else {
+                    f.signals.join(", ")
+                },
+                if f.atr_rule_ids.is_empty() {
+                    "—".into()
+                } else {
+                    f.atr_rule_ids.join(", ")
+                }
+            );
         }
     }
 }
