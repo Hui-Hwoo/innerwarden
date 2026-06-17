@@ -767,7 +767,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             ai_personality: cfg.telegram.bot.personality.clone(),
         };
         let dashboard_data_dir = cli.data_dir.clone();
-        let dashboard_bind = cli.dashboard_bind.clone();
+        // Config-driven bind takes precedence over the `--dashboard-bind` CLI
+        // flag, so dashboard access is set in ONE place (`[dashboard] bind` in
+        // agent.toml via `innerwarden dashboard expose/local`) without editing
+        // the systemd unit. `None` = fall back to the flag (loopback default).
+        let dashboard_bind = cfg
+            .dashboard
+            .bind
+            .clone()
+            .unwrap_or_else(|| cli.dashboard_bind.clone());
         let web_push_pub_key = cfg.web_push.vapid_public_key.clone();
         let trusted_proxies = cfg.dashboard.trusted_proxies.clone();
         let session_timeout_minutes = cfg.dashboard.session_timeout_minutes;
@@ -845,7 +853,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             std::path::Path::new(crate::agent_discovery::PROD_DISCOVERY_DIR);
         match crate::agent_discovery::write_discovery(
             discovery_runtime_dir,
-            &cli.dashboard_bind,
+            &dashboard_bind,
             !cli.insecure_no_tls,
             env!("CARGO_PKG_VERSION"),
         ) {

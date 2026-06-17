@@ -370,6 +370,21 @@ enum Command {
         modules_dir: String,
     },
 
+    /// Open or check the security dashboard — easy + secure access.
+    ///
+    /// The dashboard binds to localhost by default (secure). This sets it up in
+    /// one step instead of editing systemd units + firewall by hand.
+    ///
+    /// Examples:
+    ///   innerwarden dashboard            # how to reach it (URL, login, SSH tunnel)
+    ///   innerwarden dashboard open       # expose securely (password + firewall-locked to your IP)
+    ///   innerwarden dashboard close      # back to localhost only
+    ///   innerwarden dashboard tunnel     # print the exact SSH-tunnel command
+    Dashboard {
+        #[command(subcommand)]
+        action: Option<commands::dashboard::DashboardAction>,
+    },
+
     #[clap(hide = true)]
     Welcome,
 
@@ -2760,6 +2775,12 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         Command::Welcome => commands::core::cmd_welcome(),
         Command::Navigator { ref output } => commands::status::cmd_navigator(output.as_deref()),
         Command::Scan { ref modules_dir } => scan::cmd_scan(modules_dir),
+        Command::Dashboard { ref action } => {
+            let act = action
+                .clone()
+                .unwrap_or(commands::dashboard::DashboardAction::Status);
+            commands::dashboard::run(&act, &cli.agent_config, cli.dry_run)
+        }
         Command::Status {
             ref target,
             ref modules_dir,

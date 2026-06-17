@@ -833,16 +833,52 @@ pub(crate) fn cmd_configure_dashboard(
     // Ensure --dashboard is in the service ExecStart
     ensure_dashboard_flag_in_service(cli);
 
+    // Offer to expose the dashboard on the network. The login above is now set,
+    // so the agent will accept a non-loopback bind (SEC-005). Default NO — an
+    // open admin panel is NEVER the silent default; we ASK (issue #1046). The
+    // bind is stored config-driven in `[dashboard] bind`, managed afterwards by
+    // `innerwarden dashboard {open,close,status}`.
+    let mut exposed = false;
+    if password_arg.is_none() && !cli.dry_run {
+        exposed = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(
+                "Make the dashboard reachable from other machines (network), not just localhost? \
+                 It requires the login you just set.",
+            )
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        let bind = if exposed {
+            "0.0.0.0:8787"
+        } else {
+            "127.0.0.1:8787"
+        };
+        let _ = crate::config_editor::write_str(&cli.agent_config, "dashboard", "bind", bind);
+        if exposed {
+            println!(
+                "  [ok] Dashboard set to listen on the network (0.0.0.0:8787). Login required."
+            );
+            println!(
+                "  ⚠ Lock the firewall to trusted IPs: `innerwarden dashboard open` (auto-locks to your IP), \
+                 or `sudo ufw allow from <your-ip> to any port 8787`."
+            );
+        }
+    }
+
     restart_agent(cli);
     println!();
     println!("Dashboard configured.");
-    println!("  URL:      http://localhost:8787");
+    if exposed {
+        println!("  URL:      https://YOUR_SERVER_IP:8787  (network — login required)");
+    } else {
+        println!("  URL:      https://localhost:8787  (localhost only — use the SSH tunnel below)");
+    }
     println!("  Username: {user}");
     println!("  Password: (the one you entered)");
     println!();
     println!("To access from your browser via SSH tunnel:");
     println!("  ssh -L 8787:127.0.0.1:8787 user@YOUR_SERVER");
-    println!("  Then open: http://localhost:8787");
+    println!("  Then open: https://localhost:8787");
     println!();
     println!("If you use nginx, add this to your server block:");
     println!("  location / {{");
