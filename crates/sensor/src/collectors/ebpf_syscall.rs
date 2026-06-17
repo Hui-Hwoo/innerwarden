@@ -970,29 +970,87 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
     pin_lsm_policy(bpf);
 }
 
+/// Re-pin a PERSISTENT map across a sensor restart WITHOUT losing its entries.
+///
+/// Spec 080 P0: the old code did `remove_file(pin)` then `map.pin(pin)` for the
+/// persistent maps. The remove-first avoids `EEXIST` (the previous instance's
+/// pin still references a live map), but it makes the fresh empty map the pinned
+/// one and DROPS every entry — fatal for `EXEC_ALLOWLIST` (the Execution Gate
+/// allowlist the active-defence reconciler writes incrementally and never
+/// re-applies) and `LSM_POLICY` (which holds the arm bit). A sensor restart
+/// (e.g. a deploy) silently zeroed the live allowlist on prod.
+///
+/// Here we read the old pinned map's `(key, value)` pairs first, re-pin the
+/// fresh map, then write the saved pairs back, so the allowlist + policy survive
+/// a restart. Fail-open throughout (the sensor must never crash); a fresh box
+/// with no prior pin just restores nothing.
+#[cfg(feature = "ebpf")]
+fn repin_preserving<K, V>(bpf: &mut aya::Ebpf, name: &str, pin: &str)
+where
+    K: aya::Pod,
+    V: aya::Pod,
+{
+    let saved: Vec<(K, V)> = if std::path::Path::new(pin).exists() {
+        aya::maps::MapData::from_pin(pin)
+            .ok()
+            .and_then(|md| {
+                // aya's typed HashMap is built from a `Map`, not a raw
+                // `MapData`; wrap the pinned data in the HashMap variant.
+                let map = aya::maps::Map::HashMap(md);
+                aya::maps::HashMap::<_, K, V>::try_from(&map)
+                    .ok()
+                    .map(|old| old.iter().filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let Some(map) = bpf.map_mut(name) else {
+        return;
+    };
+    let _ = std::fs::remove_file(pin);
+    if let Err(e) = map.pin(pin) {
+        warn!(error = %e, "{name}: failed to pin");
+        return;
+    }
+    info!("eBPF: {name} pinned at {pin}");
+
+    if saved.is_empty() {
+        return;
+    }
+    if let Some(map) = bpf.map_mut(name) {
+        if let Ok(mut hm) = aya::maps::HashMap::<_, K, V>::try_from(map) {
+            let n = saved.len();
+            for (k, v) in &saved {
+                let _ = hm.insert(k, v, 0);
+            }
+            info!("eBPF: {name}: restored {n} entries across sensor restart");
+        }
+    }
+}
+
 #[cfg(feature = "ebpf")]
 fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // Pin the LSM_POLICY map so the agent can enable/disable enforcement.
-    // Remove stale pin first — on sensor restart, the old pin points to a dead
-    // map from the previous instance, causing map.pin() to fail with EEXIST.
-    if let Some(map) = bpf.map_mut("LSM_POLICY") {
-        let _ = std::fs::remove_file(LSM_POLICY_PIN);
-        if let Err(e) = map.pin(LSM_POLICY_PIN) {
-            warn!(error = %e, "LSM: failed to pin policy map");
-        } else {
-            info!("eBPF: LSM policy map pinned at {LSM_POLICY_PIN}");
-            info!("eBPF: LSM enforcement is OFF by default - enable via: bpftool map update pinned {LSM_POLICY_PIN} key 0 0 0 0 value 1 0 0 0");
-        }
-    }
+    // Spec 080 P0: preserve entries across restart — LSM_POLICY holds the
+    // exec-gate arm bit (key 3); EXEC_ALLOWLIST holds the signed allowlist.
+    repin_preserving::<u32, u32>(bpf, "LSM_POLICY", LSM_POLICY_PIN);
+    info!("eBPF: LSM enforcement is OFF by default - enable via: bpftool map update pinned {LSM_POLICY_PIN} key 0 0 0 0 value 1 0 0 0");
 
-    // Pin capability maps so the agent can grant per-cgroup/per-comm permissions.
-    // Spec 052 Phase 1: pin BLOCKED_PIDS alongside the existing capability maps
-    // so `agent::lsm_policy::register_blocked_pid` can open it via `MapData::from_pin`.
+    // Execution Gate allowlist — MUST survive restart (active-defence writes it
+    // incrementally and does not re-apply; a wipe = empty allowlist = brick on
+    // arm). u64 FNV(path) keys, u8 value.
+    repin_preserving::<u64, u8>(bpf, "EXEC_ALLOWLIST", EXEC_ALLOWLIST_PIN);
+
+    // Capability + blocked-pid maps. These have the same restart-wipe behaviour
+    // (TODO spec 080 P0 follow-up: BLOCKED_PIDS is an LRU map + the capability
+    // maps use different value types; the agent re-registers BLOCKED_PIDS today,
+    // so they are lower-priority than the Execution Gate pair above).
     for (map_name, pin_path) in [
         ("CGROUP_CAPABILITIES", CGROUP_CAP_PIN),
         ("COMM_CAPABILITIES", COMM_CAP_PIN),
         ("BLOCKED_PIDS", BLOCKED_PIDS_PIN),
-        ("EXEC_ALLOWLIST", EXEC_ALLOWLIST_PIN),
     ] {
         if let Some(map) = bpf.map_mut(map_name) {
             let _ = std::fs::remove_file(pin_path);
