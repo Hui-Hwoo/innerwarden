@@ -13,6 +13,16 @@ use crate::{
     shield_inline, telemetry_tick, AgentState,
 };
 
+/// True when a post-graph anomaly recalibration error is just the expected
+/// "no autoencoder model trained yet" condition (a fresh or frequently
+/// redeployed host before the nightly trainer has produced a model). These are
+/// not failures and must not be WARN-logged every 30s slow-loop tick — a single
+/// untrained box produced ~2.7k WARN lines in 7 days. Real recalibration errors
+/// still log at WARN.
+fn is_pretraining_no_model(err_msg: &str) -> bool {
+    err_msg.contains("no model loaded")
+}
+
 // ── Disk-low guard for SQLite blob writes ────────────────────────────
 //
 // Operational fix for the 2026-04-25 02:59 UTC class of hangs: when
@@ -728,13 +738,26 @@ fn kg_tick(
                                             events_read = events.len(),
                                             "anomaly: post-graph anchor recalibration complete"
                                         );
-                                        state
-                                            .anomaly_engine
-                                            .clear_post_graph_recalibration_flag();
+                                        state.anomaly_engine.clear_post_graph_recalibration_flag();
                                     }
-                                    Err(e) => warn!(
-                                        "anomaly: post-graph recalibration failed (will retry next tick): {e}"
-                                    ),
+                                    Err(e) => {
+                                        let msg = e.to_string();
+                                        if is_pretraining_no_model(&msg) {
+                                            // Expected before the nightly
+                                            // autoencoder has trained a model on
+                                            // this host (fresh / frequently
+                                            // redeployed box). Not an error and
+                                            // must not spam WARN every 30s tick —
+                                            // 2.7k lines/7d observed on Azure.
+                                            tracing::debug!(
+                                                "anomaly: recalibration skipped — {msg}"
+                                            );
+                                        } else {
+                                            warn!(
+                                                "anomaly: post-graph recalibration failed (will retry next tick): {msg}"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1677,6 +1700,22 @@ mod tests {
     use crate::knowledge_graph::types::Node;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn pretraining_no_model_is_classified_as_expected() {
+        // The exact runtime message (neural_lifecycle.rs:1315) must be treated
+        // as the expected pre-training condition (debug, not WARN spam).
+        assert!(is_pretraining_no_model(
+            "no model loaded: train_nightly first"
+        ));
+        // A genuine recalibration failure must NOT be suppressed.
+        assert!(!is_pretraining_no_model(
+            "sqlite read failed: database is locked"
+        ));
+        assert!(!is_pretraining_no_model(
+            "anomaly engine: dimension mismatch 48 vs 65"
+        ));
+    }
 
     /// 2026-05-03 (Wave 5b PR-3 anchor): the slow_loop ticks every
     /// 30 s, but the src_ip backfill must run at MOST once per

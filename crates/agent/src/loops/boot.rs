@@ -3449,36 +3449,47 @@ interaction = "reject"
         // tick, snapshot persist, allowlist hot-reload, operator IPs
         // refresh). Short enough that the overall workspace test
         // run is not noticeably slower.
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), run_agent(cli)).await;
-
-        // The loop is designed to run forever, so a timeout Err is
-        // the expected shape. If run_agent returned Ok within 8s
-        // something cut the loop short — likely a spawn-time panic
-        // in dry-run mode that should be surfaced.
-        assert!(
-            outcome.is_err(),
-            "run_agent must keep running until cancelled — got early Ok/Err: {outcome:?}"
-        );
-
-        // Useful behavioural assertions: the slow-loop must have
-        // executed at least one full tick AND persisted the
-        // operator-visible state-of-the-loop snapshot to disk.
-        // These were the operator-observable side effects the
-        // pre-PR run did NOT prove: the test ran the loop for 8s
-        // and only asserted "no panic", which is filler. The
-        // assertions below pin specific paths the slow-loop body
-        // wrote to disk.
-
-        // 1) `incident-groups.json` is written on every grouping-engine
-        //    tick (boot.rs:1527). Its presence proves the slow-loop
-        //    select! arm fired and the group-snapshot path executed
-        //    end-to-end.
+        // Run the agent loop until the grouping-engine tick produces its
+        // on-disk side effect, rather than sleeping a fixed budget.
+        // `run_agent` never returns on its own, so the old
+        // `timeout(8s, run_agent)` ALWAYS burned the full 8s AND was flaky
+        // on slower hardware where the slow-loop tick had not landed within
+        // that window (observed failing 2 of 3 runs in isolation on a slow
+        // box). Poll for the file and finish the instant it appears, with a
+        // generous 30s ceiling so a loaded CI box still passes
+        // deterministically. The loop is meant to run forever, so if
+        // `run_agent` returns/panics on its own first, that is the bug we
+        // surface.
+        //
+        // `incident-groups.json` is written on every grouping-engine tick
+        // (boot.rs:1527). Its presence proves the slow-loop select! arm
+        // fired and the group-snapshot path executed end-to-end.
         let groups_snapshot = data_dir.join("incident-groups.json");
-        assert!(
-            groups_snapshot.exists(),
-            "slow-loop must write incident-groups.json at least once during the 8s window — \
-             missing file means the grouping-engine tick never executed"
-        );
+        let poll_target = groups_snapshot.clone();
+        let wait_for_snapshot = async {
+            loop {
+                if poll_target.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        let outcome = tokio::select! {
+            biased;
+            r = run_agent(cli) => Err(format!("{r:?}")),
+            res = tokio::time::timeout(std::time::Duration::from_secs(30), wait_for_snapshot) => Ok(res.is_ok()),
+        };
+        match outcome {
+            Err(early) => {
+                panic!("run_agent must keep running until cancelled — got early return: {early}")
+            }
+            Ok(false) => panic!(
+                "slow-loop must write incident-groups.json within 30s — \
+                 missing file means the grouping-engine tick never executed"
+            ),
+            Ok(true) => {}
+        }
+
         let groups_body = std::fs::read_to_string(&groups_snapshot).expect("read snapshot");
         assert!(
             groups_body.starts_with('{') || groups_body.starts_with('['),

@@ -736,6 +736,15 @@ pub(crate) fn build_dashboard_reachability_check(
     }
 }
 
+/// Scheme-agnostic reachability probe: is something accepting TCP connections
+/// on `addr`? Used as a fallback for the dashboard check because the dashboard
+/// is frequently HTTPS-only on prod, so a plain-HTTP probe gets connection
+/// refused and `doctor` would otherwise false-warn that it is down. A
+/// successful TCP connect means a listener is up regardless of HTTP vs HTTPS.
+fn tcp_port_listening(addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
 /// Build the GeoIP reachability check from a pre-computed flag.
 pub(crate) fn build_geoip_reachability_check(reachable: bool) -> Check {
     if reachable {
@@ -2360,13 +2369,24 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
         db.push(build_dashboard_flag_check(dashboard_flag_in_service));
         db.extend(build_dashboard_credentials_checks(has_user, has_hash));
 
-        // Check if the dashboard is actually reachable
+        // Check if the dashboard is actually reachable.
+        //
+        // The dashboard is frequently HTTPS-only (self-signed) on prod, so a
+        // plain-HTTP probe returns connection-refused and doctor used to warn
+        // "Dashboard port 8787 is not responding" even when the dashboard was
+        // serving HTTPS 200 (false negative observed on Azure prod). Fall back
+        // to a scheme-agnostic TCP connect: if something is listening on the
+        // port, the dashboard is up regardless of HTTP vs HTTPS.
         let dashboard_up = ureq::get("http://127.0.0.1:8787/api/status")
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(2)))
             .build()
             .call()
-            .is_ok();
+            .is_ok()
+            || tcp_port_listening(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 8787)),
+                std::time::Duration::from_secs(2),
+            );
         // Bug 3 (2026-05-06): pass agent-alive so the hint adapts
         // when the dashboard is unreachable but the agent itself is
         // running. `service_status::Active` is one signal; the
@@ -4379,6 +4399,27 @@ enabled = true
         // agent_alive value irrelevant on the reachable path.
         let c = build_dashboard_reachability_check(true, true, false).unwrap();
         assert_eq!(c.sev, Sev::Ok);
+    }
+
+    #[test]
+    fn tcp_port_listening_detects_open_and_closed_ports() {
+        use std::time::Duration;
+        // A bound listener (any scheme, incl. an HTTPS-only dashboard) is
+        // detected as up — this is the false-negative fix: the old HTTP-only
+        // probe missed an HTTPS-only listener.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        assert!(
+            tcp_port_listening(addr, Duration::from_secs(1)),
+            "open port must be detected"
+        );
+
+        // A closed port (drop the listener first) is reported down.
+        drop(listener);
+        assert!(
+            !tcp_port_listening(addr, Duration::from_millis(300)),
+            "closed port must be reported down"
+        );
     }
 
     /// Pre-Bug-3 behavior: agent down, dashboard down → "Start the agent".
