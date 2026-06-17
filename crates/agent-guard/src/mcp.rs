@@ -331,6 +331,33 @@ pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> Comma
             });
             score += 20;
         }
+        // Disk-wipe: dd writing to a raw block device (sd*, nvme*, vd*, hd*,
+        // mmcblk*). Spec 079 P3: was a destructive miss.
+        if lower.contains("dd ")
+            && (lower.contains("of=/dev/sd")
+                || lower.contains("of=/dev/nvme")
+                || lower.contains("of=/dev/vd")
+                || lower.contains("of=/dev/hd")
+                || lower.contains("of=/dev/mmcblk")
+                || lower.contains("of=/dev/disk"))
+        {
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "dd overwriting a raw block device (disk wipe)".into(),
+            });
+            score += 50;
+        }
+        // Fork bomb. The classic `:(){ :|:& };:` plus whitespace variants.
+        // Spec 079 P3: was a destructive miss.
+        if cmd.replace(' ', "").contains(":(){:|:&};:") {
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "fork bomb (resource-exhaustion denial of service)".into(),
+            });
+            score += 50;
+        }
     }
 
     // Dangerous command patterns from threats.rs (if not already caught above).
@@ -422,6 +449,30 @@ pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> Comma
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analyze_command_flags_dd_disk_wipe() {
+        // Spec 079 P3: dd overwriting a raw block device (disk wipe) was a miss.
+        let a = analyze_command("dd if=/dev/zero of=/dev/sda bs=1M", None);
+        assert_eq!(a.recommendation, "deny");
+        assert!(a.signals.iter().any(|s| s.signal == "destructive_command"));
+        // Benign dd to a regular file MUST NOT be flagged as destructive.
+        let b = analyze_command("dd if=input.iso of=/tmp/out.img bs=4M", None);
+        assert!(!b.signals.iter().any(|s| s.signal == "destructive_command"));
+    }
+
+    #[test]
+    fn analyze_command_flags_fork_bomb() {
+        // Spec 079 P3: classic fork bomb (+ whitespace variants) was a miss.
+        for fb in [":(){ :|:& };:", ":(){:|:&};:", ":() { :|: & };:"] {
+            let a = analyze_command(fb, None);
+            assert_eq!(
+                a.recommendation, "deny",
+                "fork bomb variant `{fb}` must deny"
+            );
+            assert!(a.signals.iter().any(|s| s.signal == "destructive_command"));
+        }
+    }
 
     #[test]
     fn blocks_credential_in_args() {

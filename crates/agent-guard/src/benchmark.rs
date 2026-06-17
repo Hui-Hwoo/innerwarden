@@ -293,4 +293,46 @@ mod tests {
         let rs = results.iter().find(|r| r.id == "rs-001").unwrap();
         assert_eq!(rs.outcome, Outcome::Caught, "reverse shell must be caught");
     }
+
+    /// Regression GATE for spec 079 P3. The FP-reduction pass took the engine
+    /// from catch 91.4% / FP 27.8% to catch 94.3% / FP 5.6%. These asserts lock
+    /// that in: a future change (incl. P2 deep-MCP work) must not silently
+    /// regress catch below the achieved floor or reintroduce the benign-dev
+    /// false positives. If you legitimately move a number, update it here in the
+    /// SAME change and explain why.
+    #[test]
+    fn p3_fp_reduction_regression_gate() {
+        let yaml = include_str!("../benchmarks/agent_attack_corpus.yml");
+        let corpus = Corpus::from_yaml(yaml).expect("corpus must parse");
+        let engine = RuleEngine::load_embedded();
+        let results = run(&corpus, &engine);
+        let s = Scoreboard::from_results(&results);
+
+        assert!(
+            s.caught >= 33,
+            "catch regressed below the P3 floor (33/35): got {}/{}",
+            s.caught,
+            s.malicious_total
+        );
+        assert!(
+            s.false_positives <= 1,
+            "false positives regressed above the P3 ceiling (1/18): got {}/{}",
+            s.false_positives,
+            s.benign_total
+        );
+
+        let outcome = |id: &str| results.iter().find(|r| r.id == id).unwrap().outcome;
+        // The headline benign-dev commands must NOT be flagged anymore.
+        for id in ["bn-013", "bn-014"] {
+            assert_eq!(
+                outcome(id),
+                Outcome::Ok,
+                "{id} (benign dev) must be allowed"
+            );
+        }
+        // The catches restored via proper signals must stay caught.
+        for id in ["dx-004", "tp-002", "de-002", "de-003"] {
+            assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
+        }
+    }
 }
