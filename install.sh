@@ -50,8 +50,12 @@ for arg in "$@"; do
     --simulate-mode=basic) SIMULATE_MODE="basic" ;;
     --simulate-mode=advanced) SIMULATE_MODE="advanced" ;;
     --supervised) SUPERVISED=true ;;
+    --uninstall) UNINSTALL=1 ;;
+    --purge) PURGE=1 ;;
   esac
 done
+UNINSTALL="${UNINSTALL:-0}"
+PURGE="${PURGE:-0}"
 
 # BASH_SOURCE[0] is unset when the script is piped through `curl | bash` —
 # `set -u` then aborts before we even print the banner. Fall back to $0
@@ -135,6 +139,53 @@ fail() {
   printf '[innerwarden-install] ERROR: %s\n' "$*" >&2
   exit 1
 }
+
+# ── Uninstall path ─────────────────────────────────────────────────────────
+# `curl -fsSL <installer> | sudo bash -s -- --uninstall [--purge]` mirrors the
+# install entrypoint for removal. Prefers the installed `innerwarden uninstall`
+# command (single source of truth for the teardown). If that binary is missing
+# or broken, falls back to an inline teardown so a half-installed box can still
+# be cleaned. Keeps config + data unless --purge.
+uninstall_inline() {
+  vlog "innerwarden binary not usable — running inline fallback teardown"
+  local units="innerwarden-watchdog innerwarden-supervisor innerwarden-agent innerwarden-sensor"
+  for u in $units; do
+    $SUDO systemctl stop "$u" 2>/dev/null || true
+    $SUDO systemctl disable "$u" 2>/dev/null || true
+    $SUDO rm -f "/etc/systemd/system/${u}.service" 2>/dev/null || true
+    $SUDO rm -rf "/etc/systemd/system/${u}.service.d" 2>/dev/null || true
+  done
+  $SUDO systemctl daemon-reload 2>/dev/null || true
+  $SUDO systemctl reset-failed 2>/dev/null || true
+  for b in innerwarden innerwarden-ctl innerwarden-agent innerwarden-sensor \
+           innerwarden-watchdog innerwarden-supervisor; do
+    $SUDO rm -f "${BIN_DIR}/${b}" 2>/dev/null || true
+  done
+  $SUDO rm -rf /usr/local/lib/innerwarden /sys/fs/bpf/innerwarden /run/innerwarden 2>/dev/null || true
+  $SUDO rm -f /etc/sudoers.d/innerwarden* 2>/dev/null || true
+  if [[ "${PURGE}" -eq 1 ]]; then
+    $SUDO rm -rf "${CONFIG_DIR}" "${DATA_DIR}" /var/log/innerwarden 2>/dev/null || true
+    $SUDO userdel innerwarden 2>/dev/null || true
+  fi
+}
+
+if [[ "${UNINSTALL}" -eq 1 ]]; then
+  echo ""
+  echo "  InnerWarden uninstall"
+  echo ""
+  args="--yes"
+  [[ "${PURGE}" -eq 1 ]] && args="${args} --purge"
+  if command -v innerwarden >/dev/null 2>&1 && innerwarden --version >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    $SUDO innerwarden uninstall ${args}
+  else
+    uninstall_inline
+    echo ""
+    echo "  ✅ InnerWarden removed."
+    [[ "${PURGE}" -eq 0 ]] && echo "  Config + data kept (re-run with --purge to remove)."
+  fi
+  exit 0
+fi
 
 normalize_bool() {
   local normalized

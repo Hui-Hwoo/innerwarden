@@ -622,6 +622,21 @@ Build from source:
 INNERWARDEN_BUILD_FROM_SOURCE=1 curl -fsSL https://innerwarden.com/install | sudo bash
 ```
 
+### Uninstall
+
+```bash
+sudo innerwarden uninstall            # remove the software, keep config + data
+sudo innerwarden uninstall --purge    # also remove config, data, logs, and the user
+sudo innerwarden uninstall --dry-run  # preview exactly what would be removed
+```
+
+This stops every service (sensor, agent, supervisor, watchdog), removes the binaries, systemd units, embedded eBPF object, pinned BPF maps, sudoers drop-ins, and the firewall rules InnerWarden added. Config (`/etc/innerwarden`) and data (`/var/lib/innerwarden`) are kept by default so a reinstall keeps your history and license; `--purge` removes them too.
+
+If the `innerwarden` binary is missing or broken, the installer can tear everything down the same way:
+```bash
+curl -fsSL https://innerwarden.com/install | sudo bash -s -- --uninstall          # or --uninstall --purge
+```
+
 ### Configure AI
 
 AI triage is optional. Add it when you want confidence-scored decisions.

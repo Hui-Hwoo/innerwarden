@@ -385,6 +385,22 @@ enum Command {
         action: Option<commands::dashboard::DashboardAction>,
     },
 
+    /// Uninstall InnerWarden — stop + remove services, binaries, eBPF maps,
+    /// sudoers + firewall rules. Keeps config + data unless --purge.
+    ///
+    /// Examples:
+    ///   innerwarden uninstall            # remove the software, keep config/data
+    ///   innerwarden uninstall --purge    # also remove config, data, logs + the user
+    ///   innerwarden uninstall --yes      # no confirmation prompt
+    Uninstall {
+        /// Also remove /etc/innerwarden, /var/lib/innerwarden, logs, and the user.
+        #[arg(long)]
+        purge: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+
     #[clap(hide = true)]
     Welcome,
 
@@ -2781,6 +2797,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 .unwrap_or(commands::dashboard::DashboardAction::Status);
             commands::dashboard::run(&act, &cli.agent_config, cli.dry_run)
         }
+        Command::Uninstall { purge, yes } => commands::uninstall::cmd_uninstall(&cli, purge, yes),
         Command::Status {
             ref target,
             ref modules_dir,

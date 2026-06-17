@@ -22,5 +22,6 @@ pub(crate) mod response;
 pub(crate) mod rule;
 pub(crate) mod setup;
 pub(crate) mod status;
+pub(crate) mod uninstall;
 pub(crate) mod update;
 pub(crate) mod watchdog;
