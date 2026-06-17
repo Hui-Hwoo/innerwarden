@@ -103,6 +103,117 @@ pub(crate) fn looks_like_anthropic_key(key: &str) -> bool {
     key.starts_with("sk-ant-") && key.len() >= 20
 }
 
+/// Map an Execution Gate state to a single doctor [`Check`] (spec 080 G4 — the
+/// FREE read-only honesty surface). Pure: the divergence verdict comes from
+/// `innerwarden_core::execution_gate`. `fail` on real drift, `warn` when the
+/// signed config is present but the live map couldn't be read (run as root),
+/// `ok` when live matches intent.
+pub(crate) fn gate_doctor_check(gate: &innerwarden_core::execution_gate::GateState) -> Check {
+    use innerwarden_core::execution_gate::{evaluate_divergence, Divergence};
+    let signed = gate
+        .signed_count
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "no file".into());
+    let live = gate
+        .live_count
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unreadable".into());
+    match evaluate_divergence(gate) {
+        Divergence::ActiveButEmpty { mode, .. } => Check::fail(
+            format!(
+                "Execution Gate is {} but the live allowlist is EMPTY (signed {signed}, live {live})",
+                mode.label()
+            ),
+            "Run a FULL `config-sign exec-gate apply`; never leave it armed with an empty map (enforce = host brick).",
+        ),
+        Divergence::ApplyDrift { .. } => Check::fail(
+            format!(
+                "Execution Gate apply drift: signed {signed} (intent {}), live map {live}, live mode {}",
+                gate.intended_mode.map(|m| m.label()).unwrap_or("unknown"),
+                gate.live_mode.label()
+            ),
+            "Signed config not applied to the kernel. Run a FULL `config-sign exec-gate apply`, then re-check that live == signed.",
+        ),
+        Divergence::None => {
+            if gate.live_count.is_none()
+                && (gate.signed_count.is_some() || gate.intended_mode.is_some())
+            {
+                Check::warn(
+                    format!("Execution Gate signed config present (signed {signed}) but live map not readable"),
+                    "Re-run `innerwarden doctor` as root (CAP_BPF / bpftool) to verify the live kernel map matches the signed file.",
+                )
+            } else {
+                Check::ok(format!(
+                    "Execution Gate consistent (signed {signed}, live {live}, mode {})",
+                    gate.live_mode.label()
+                ))
+            }
+        }
+    }
+}
+
+/// True when an Execution Gate is present on this host (a signed file or a
+/// pinned map) — so `doctor` only shows the section where it's relevant.
+fn execution_gate_present() -> bool {
+    use innerwarden_core::execution_gate::{EXEC_ALLOWLIST_PIN, SIGNED_ALLOWLIST_FILE};
+    std::path::Path::new(SIGNED_ALLOWLIST_FILE).exists()
+        || std::path::Path::new(EXEC_ALLOWLIST_PIN).exists()
+}
+
+/// Read + parse the signed allowlist file for `doctor` (plain JSON read).
+fn read_signed_allowlist_for_doctor() -> (
+    Option<usize>,
+    Option<innerwarden_core::execution_gate::GateMode>,
+) {
+    use innerwarden_core::execution_gate::{parse_signed_allowlist, SIGNED_ALLOWLIST_FILE};
+    match std::fs::read_to_string(SIGNED_ALLOWLIST_FILE) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .map(|v| parse_signed_allowlist(&v))
+            .unwrap_or((None, None)),
+        Err(_) => (None, None),
+    }
+}
+
+/// Live `EXEC_ALLOWLIST` entry count via `bpftool` (ctl doesn't link aya).
+/// `None` when bpftool is missing / unprivileged / the pin is absent.
+fn bpftool_allowlist_count() -> Option<usize> {
+    use innerwarden_core::execution_gate::{count_bpftool_dump, EXEC_ALLOWLIST_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args(["map", "dump", "pinned", EXEC_ALLOWLIST_PIN])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(count_bpftool_dump(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Live gate mode via `bpftool map lookup` of LSM_POLICY key 3. `Unknown` when
+/// it can't be read (absent key / no privilege / no bpftool).
+fn bpftool_gate_mode() -> innerwarden_core::execution_gate::GateMode {
+    use innerwarden_core::execution_gate::{parse_bpftool_value_u32, GateMode, LSM_POLICY_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args([
+            "map",
+            "lookup",
+            "pinned",
+            LSM_POLICY_PIN,
+            "key",
+            "3",
+            "0",
+            "0",
+            "0",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            GateMode::from_policy_key(parse_bpftool_value_u32(&String::from_utf8_lossy(&o.stdout)))
+        }
+        _ => GateMode::Unknown,
+    }
+}
+
 /// Heuristic check for Telegram bot tokens: `<digits>:<20+ alphanumeric>`.
 pub(crate) fn looks_like_telegram_token(token: &str) -> bool {
     if !token.contains(':') {
@@ -2155,6 +2266,24 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
 
     run_section(cfg, &mut total_issues);
 
+    // ── Execution Gate (spec 080 G4) ──────────────────────
+    // FREE read-only honesty surface: compare the signed allowlist to the LIVE
+    // kernel maps so a paid gate that staged-but-never-applied (or armed with an
+    // empty map) is visible here. Section is shown only where a gate is present.
+    if execution_gate_present() {
+        println!("\nExecution Gate");
+        let (signed_count, intended_mode) = read_signed_allowlist_for_doctor();
+        let live_count = bpftool_allowlist_count();
+        let live_mode = bpftool_gate_mode();
+        let gate = innerwarden_core::execution_gate::GateState {
+            signed_count,
+            intended_mode,
+            live_count,
+            live_mode,
+        };
+        run_section(vec![gate_doctor_check(&gate)], &mut total_issues);
+    }
+
     // ── Telegram ──────────────────────────────────────────
     // Only check Telegram when enabled = true in agent config.
     {
@@ -3233,6 +3362,63 @@ mod tests {
         assert!(!looks_like_openai_key(""));
         assert!(!looks_like_openai_key("sk-short"));
         assert!(!looks_like_openai_key("xx-abcdefghijklmnopqrstuv"));
+    }
+
+    #[test]
+    fn gate_doctor_check_fails_on_apply_drift_the_oracle_case() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: Some(0),
+            live_mode: GateMode::Inert,
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("apply drift"));
+        assert!(check.label.contains("1685"));
+    }
+
+    #[test]
+    fn gate_doctor_check_fails_critical_when_armed_and_empty() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(10),
+            intended_mode: Some(GateMode::Enforce),
+            live_count: Some(0),
+            live_mode: GateMode::Enforce,
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("EMPTY"));
+    }
+
+    #[test]
+    fn gate_doctor_check_ok_when_converged() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: Some(1685),
+            live_mode: GateMode::Observe,
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Ok);
+        assert!(check.label.contains("consistent"));
+    }
+
+    #[test]
+    fn gate_doctor_check_warns_when_live_unreadable_but_signed_present() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        let gate = GateState {
+            signed_count: Some(1685),
+            intended_mode: Some(GateMode::Observe),
+            live_count: None, // bpftool unavailable / unprivileged
+            live_mode: GateMode::Unknown,
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Warn);
+        assert!(check.label.contains("not readable"));
     }
 
     #[test]

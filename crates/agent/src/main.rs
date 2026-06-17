@@ -93,6 +93,8 @@ mod discord;
 mod dna_inline;
 mod dshield;
 mod environment_profile;
+mod execution_gate_aya;
+mod execution_gate_monitor;
 mod firmware_tick;
 mod fleet;
 mod forensics;

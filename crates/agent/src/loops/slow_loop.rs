@@ -1283,6 +1283,13 @@ pub(crate) async fn process_narrative_tick(
         }
     }
 
+    // Spec 080 G4 — Execution Gate divergence monitor (FREE honesty net).
+    // Self-throttled (10 min) live-vs-signed check: raises a self-incident when
+    // the paid gate's signed allowlist has not converged to the kernel maps, so
+    // the paid feature can never silently go inert / stay un-applied. Verifies
+    // the LIVE kernel state, never the record (same principle as spec 076).
+    crate::execution_gate_monitor::process_execution_gate_tick(data_dir);
+
     // Spec 062 Phase 2 — needs_review timeout sweep. Every 10 minutes,
     // auto-resolve low/medium needs_review items that sat past the grace
     // window with no human action (honest `auto_resolved_timeout` dismiss).
