@@ -1400,6 +1400,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // read error (logged `warn!`), matching pre-PR behaviour in
         // the degraded case.
         xdp_block_times: store.load_xdp_block_times(),
+        xdp_cleanup_backoff: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(
             &cli.data_dir,
             sqlite_store.as_deref(),
@@ -2187,6 +2188,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             .map(|(ip, _)| ip.clone())
                             .collect();
                         for ip in &expired_ips {
+                            // Skip IPs whose cleanup keeps failing for a
+                            // NON-transient reason (e.g. the agent lacks the
+                            // privilege to run `sudo bpftool`). They sit in an
+                            // exponential backoff so we don't re-spawn sudo and
+                            // re-log every 30s tick. Without this a single stuck
+                            // entry produced 44k failed sudo-auths + 44k WARN
+                            // lines in 7 days on a non-root deploy.
+                            if let Some((_, next_retry)) = state.xdp_cleanup_backoff.get(ip) {
+                                if now_utc < *next_retry {
+                                    continue;
+                                }
+                            }
                             // Wave 4 (AUDIT-WAVE4-XDP-IPV6, Copilot review on
                             // PR #462): route through the shared helper so v4
                             // and v6 entries both reach the matching pin path.
@@ -2198,6 +2211,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 // avoid a poison entry; can't act on kernel.
                                 warn!(ip, "XDP cleanup: unparseable IP in xdp_block_times, dropping local entry");
                                 state.xdp_block_times.remove(ip);
+                                state.xdp_cleanup_backoff.remove(ip);
                                 // Spec 037 PR-1: mirror the remove in SQLite so
                                 // warm-cache on next boot does not resurrect the
                                 // poison entry.
@@ -2220,6 +2234,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             match output {
                                 Ok(out) if out.status.success() => {
                                     state.xdp_block_times.remove(ip);
+                                    state.xdp_cleanup_backoff.remove(ip);
                                     // Spec 037 PR-1: mirror remove in SQLite so
                                     // the warm-cache does not resurrect an
                                     // already-expired block on next boot.
@@ -2236,10 +2251,35 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                         || lower.contains("does not exist");
                                     if already_absent {
                                         state.xdp_block_times.remove(ip);
+                                        state.xdp_cleanup_backoff.remove(ip);
                                         // Spec 037 PR-1: same mirror reason.
                                         state.store.remove_xdp_block_time(ip);
                                         info!(ip, ttl_secs, "XDP cleanup: entry already absent in kernel map, local state cleared");
+                                    } else if crate::skills::builtin::is_xdp_privilege_failure(&lower) {
+                                        // Non-transient: the agent cannot run
+                                        // `sudo bpftool` (no sudoers rule / no
+                                        // tty / not root). Retrying every tick is
+                                        // futile and floods the log + pam auth.
+                                        // Back off exponentially and log only on
+                                        // the FIRST failure and again once the
+                                        // cap is reached — not every tick.
+                                        let entry = state.xdp_cleanup_backoff.entry(ip.clone()).or_insert((0, now_utc));
+                                        entry.0 = entry.0.saturating_add(1);
+                                        let backoff = crate::skills::builtin::xdp_cleanup_backoff_secs(entry.0);
+                                        entry.1 = now_utc + chrono::Duration::seconds(backoff);
+                                        if entry.0 == 1 || backoff >= 3600 {
+                                            warn!(
+                                                ip,
+                                                ttl_secs,
+                                                consecutive_failures = entry.0,
+                                                backoff_secs = backoff,
+                                                stderr = %stderr.trim(),
+                                                "XDP cleanup cannot proceed (agent lacks privilege to run bpftool) - backing off; entry kept for drift visibility. Block backend may be ufw/iptables, or run the agent as root for XDP TTL cleanup."
+                                            );
+                                        }
                                     } else {
+                                        // Transient kernel/map drift - keep local
+                                        // state and retry next tick as before.
                                         warn!(
                                             ip,
                                             ttl_secs,
@@ -2250,11 +2290,22 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(
-                                        ip,
-                                        error = %e,
-                                        "XDP cleanup: bpftool spawn failed - keeping local state to retry next tick"
-                                    );
+                                    // Spawn failure (e.g. bpftool/sudo binary
+                                    // missing) is also non-transient - back off
+                                    // instead of re-spawning every tick.
+                                    let entry = state.xdp_cleanup_backoff.entry(ip.clone()).or_insert((0, now_utc));
+                                    entry.0 = entry.0.saturating_add(1);
+                                    let backoff = crate::skills::builtin::xdp_cleanup_backoff_secs(entry.0);
+                                    entry.1 = now_utc + chrono::Duration::seconds(backoff);
+                                    if entry.0 == 1 || backoff >= 3600 {
+                                        warn!(
+                                            ip,
+                                            error = %e,
+                                            consecutive_failures = entry.0,
+                                            backoff_secs = backoff,
+                                            "XDP cleanup: bpftool spawn failed - backing off; entry kept for drift visibility"
+                                        );
+                                    }
                                 }
                             }
                         }

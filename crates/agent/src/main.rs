@@ -573,6 +573,15 @@ struct AgentState {
     /// XDP blocklist entries with timestamps and per-IP TTL for adaptive expiration.
     /// Periodically cleaned: IPs older than their individual TTL are removed.
     xdp_block_times: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)>,
+    /// Per-IP exponential backoff for XDP cleanup that keeps failing for a
+    /// NON-transient reason (e.g. the agent lacks sudo/privilege to run
+    /// `bpftool map delete`, so every tick's retry is futile). Value is
+    /// `(consecutive_failures, next_retry_at)`. Without this, a single stuck
+    /// entry re-spawns `sudo bpftool` every slow-loop tick forever — observed
+    /// on a non-root deploy as 44k failed sudo-auths + 44k WARN lines in 7
+    /// days. Runtime-only (not persisted); a fresh boot retries immediately,
+    /// which is correct because privilege may have been granted since.
+    xdp_cleanup_backoff: HashMap<String, (u32, chrono::DateTime<chrono::Utc>)>,
     /// Unified response lifecycle: tracks all active responses (block IP, container,
     /// nginx, sudo) with TTL, auto-revert, manual revert, and Prometheus metrics.
     response_lifecycle: response_lifecycle::ResponseLifecycle,
