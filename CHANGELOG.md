@@ -9,6 +9,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.17] - 2026-06-18
+
+### Security
+- **Bumped the `tract-*` family 0.22.1 → 0.22.2 (CVE-2026-55093 / GHSA-x5mv-8wgw-29hg).** `tract-nnef`'s NNEF `.dat` tensor parser had an unchecked `product(shape) * size_of` that wraps in release builds, yielding a `Tensor` whose reported `len` (e.g. 2^61) far exceeds its tiny backing allocation → an out-of-bounds read on model load (CWE-190 → CWE-125, medium). `tract-onnx` is the on-device Local Warden classifier backend (`local-classifier` feature); InnerWarden only loads its own pinned, SHA-256-verified ONNX model (not attacker-supplied NNEF archives), so exposure is low, but the dependency is patched anyway. Dependabot could not apply the bump alone because the interdependent `tract-*` crates must move together; updated as a family to 0.22.2.
+
 ### Fixed
 - **Managed-agent verifier now resolves a real `agent connect`-registered agent (spec 081 follow-up).** Deploying 0.15.16 to the Azure box surfaced that `innerwarden agent connect <pid>` records the process **COMM** (`MainThread` for a node-launched agent) as the registry `name`, while the verifier's live `identify_cmdline` resolves the **signature** name (`OpenClaw`). The verifier required `live_sig_name == reg.name`, so a CORRECTLY-registered OpenClaw was rejected → it would still have been auto-blocked/kernel-blocked under enforce. (The spec-081 tests used `connect_with_facts("OpenClaw", …)` and masked it; production `connect` stores the comm.) The name-equality was **redundant** with the exact `cmdline_fingerprint` match (the real identity pin — it already defeats pid-reuse / a different agent at the same pid), so it is dropped: the verifier now requires only that the live cmdline re-IDs *a* known agent signature AND the live `interpreter|script` fingerprint EQUALS the one captured at `connect()`. No relaxation — a regression test proves a comm-named entry whose live fingerprint differs still BLOCKS. The audit line now surfaces the resolved signature name (`OpenClaw`) rather than the stored comm. Without this, `[responder] dry_run=false` (enforce) on a host running a registered agent would still sever it.
 
