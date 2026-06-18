@@ -1009,6 +1009,7 @@ pub(crate) fn notify_telegram(
     deferred: &mut std::collections::HashMap<String, u32>,
     gate_suppressed_counter: &AtomicU64,
     self_traffic_list: &[String],
+    host: &str,
 ) {
     let Some(tg) = telegram_client else { return };
 
@@ -1072,8 +1073,20 @@ pub(crate) fn notify_telegram(
             crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
                 *deferred.entry(ctx.detector.clone()).or_insert(0) += 1;
                 if ctx.is_contained {
-                    if let Some(count) = burst_tracker.record_contained() {
-                        let msg = crate::notification_gate::format_burst_summary(count);
+                    let category = crate::notification_gate::burst_category(&ctx.detector);
+                    // Attacker IP best-effort from the kill-chain evidence
+                    // (C2 endpoint) so the burst summary can count sources.
+                    let source_ip = evidence_obj(inc)
+                        .and_then(|ev| {
+                            ev.get("c2_ip")
+                                .or_else(|| ev.get("source_ip"))
+                                .or_else(|| ev.get("remote_ip"))
+                        })
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    if let Some(mut summary) = burst_tracker.record_contained(category, source_ip) {
+                        summary.host = host.to_string();
+                        let msg = crate::notification_gate::format_burst_summary(host, &summary);
                         let tg = tg.clone();
                         tokio::spawn(async move {
                             let _ = tg.send_alert_html(&msg).await;

@@ -1220,6 +1220,10 @@ pub(crate) async fn process_narrative_tick(
         )
         .await;
         let gate_counter = state.telemetry.gate_suppressed_counter();
+        // Resolve the operator-facing server identity once (cheap; uses the
+        // `[agent] tags` → knowledge-graph hostname → /etc/hostname ladder).
+        let burst_host =
+            crate::notification_gate::resolve_host_id(&cfg.agent.tags, &state.knowledge_graph);
         killchain_inline::notify_telegram(
             &state.telegram_client,
             &kc_incidents,
@@ -1227,6 +1231,7 @@ pub(crate) async fn process_narrative_tick(
             &mut state.telegram_deferred,
             gate_counter.as_ref(),
             &self_traffic_list,
+            &burst_host,
         );
 
         // Periodic stale PID cleanup (every 60s).
@@ -1369,12 +1374,15 @@ pub(crate) async fn process_narrative_tick(
             shield_inline::process_events(shield, &events_entries, &ip_risks).await;
         shield_inline::write_incidents(data_dir, &shield_incidents);
         let gate_counter = state.telemetry.gate_suppressed_counter();
+        let burst_host =
+            crate::notification_gate::resolve_host_id(&cfg.agent.tags, &state.knowledge_graph);
         shield_inline::notify_telegram(
             &state.telegram_client,
             &shield_incidents,
             &state.notification_burst_tracker,
             &mut state.telegram_deferred,
             gate_counter.as_ref(),
+            &burst_host,
         );
         // Sync: register shield blocks in agent blocklist and attacker intel.
         for ip in &shield_blocked {

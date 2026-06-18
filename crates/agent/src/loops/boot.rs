@@ -2931,9 +2931,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 }
                                 notification_gate::NotificationVerdict::DailyBriefingOnly => {
                                     *state.telegram_deferred.entry("mesh".to_string()).or_insert(0) += 1;
-                                    if let Some(count) = state.notification_burst_tracker.record_contained() {
+                                    let category = notification_gate::burst_category("mesh");
+                                    if let Some(mut summary) = state
+                                        .notification_burst_tracker
+                                        .record_contained(category, Some(ip.as_str()))
+                                    {
+                                        let host = notification_gate::resolve_host_id(
+                                            &cfg.agent.tags,
+                                            &state.knowledge_graph,
+                                        );
+                                        summary.host = host.clone();
                                         if let Some(ref tg) = state.telegram_client {
-                                            let msg = notification_gate::format_burst_summary(count);
+                                            let msg = notification_gate::format_burst_summary(&host, &summary);
                                             let tg = tg.clone();
                                             tokio::spawn(async move {
                                                 let _ = tg.send_alert_html(&msg).await;
