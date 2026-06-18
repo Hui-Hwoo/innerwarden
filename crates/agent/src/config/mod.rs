@@ -9,6 +9,7 @@ use serde::Deserialize;
 // section structs are re-exported so every `config::*` path is unchanged.
 mod ai;
 mod dashboard;
+mod dns_guard;
 mod environment;
 mod fleet;
 mod general;
@@ -26,6 +27,7 @@ mod signing;
 
 pub use ai::*;
 pub use dashboard::*;
+pub use dns_guard::*;
 pub use environment::*;
 pub use fleet::*;
 pub use general::*;
@@ -62,6 +64,10 @@ pub struct AgentConfig {
     pub honeypot: HoneypotConfig,
     #[serde(default)]
     pub responder: ResponderConfig,
+    /// DNS Guard intel bridge: export the agent's malicious-domain intel to the
+    /// paid `innerwarden-dns-guard` resolver's denylist file. Default off.
+    #[serde(default)]
+    pub dns_guard: DnsGuardConfig,
     /// Spec 062: decision review + learned suppression. Absent `[learning]`
     /// section deserializes to safe defaults (shadow mode), so existing
     /// agent.toml files upgrade with no edits.

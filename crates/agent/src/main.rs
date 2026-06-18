@@ -91,6 +91,7 @@ mod decisions;
 mod detector_catalog;
 mod discord;
 mod dna_inline;
+mod dns_guard_export;
 mod dshield;
 mod environment_profile;
 mod execution_gate_aya;

@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **DNS Guard intel bridge — free detection feeds the paid domain-prevention layer.** The paid Active Defence ships a second pre-authorization moat alongside the Execution Gate: `innerwarden-dns-guard`, a forwarding resolver that refuses to *resolve* a malicious domain (C2 / exfil / DGA / tunneling) before the connection is made — the AI-agent guardrail (point a sandbox's `resolv.conf` at it and the agent literally cannot look up an exfil/C2 domain). This OSS change is the free half of the wire: a new `[dns_guard]` config section + a slow-loop exporter that, when `export_enabled = true`, writes the agent's known-malicious domains (the consolidated threat-feed intel: IOC feeds + dns_c2 / dns_tunneling) to `denylist_path` (default `/etc/innerwarden/dns-deny.txt`). The write is atomic (temp + rename, so the guard never reads a half-written file), throttled (5 min), and skipped when unchanged (no reload churn); the running DNS Guard hot-reloads the file and blocks the listed domains. Off by default — an OSS-only install does nothing. Same free-detect / paid-prevent line as the Execution Gate (the detection is free and auditable; arming the prevention is the paid layer).
+
 ## [0.15.14] - 2026-06-17
 
 ### Added

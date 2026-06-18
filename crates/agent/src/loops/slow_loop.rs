@@ -1290,6 +1290,11 @@ pub(crate) async fn process_narrative_tick(
     // the LIVE kernel state, never the record (same principle as spec 076).
     crate::execution_gate_monitor::process_execution_gate_tick(data_dir);
 
+    // DNS Guard intel bridge — export the agent's malicious-domain intel to the
+    // paid DNS Guard's denylist file (free detect → paid prevent). Self-throttled
+    // (5 min) + write-only-if-changed; no-op unless `[dns_guard] export_enabled`.
+    crate::dns_guard_export::process_dns_guard_export_tick(&cfg.dns_guard, state);
+
     // Spec 062 Phase 2 — needs_review timeout sweep. Every 10 minutes,
     // auto-resolve low/medium needs_review items that sat past the grace
     // window with no human action (honest `auto_resolved_timeout` dismiss).
