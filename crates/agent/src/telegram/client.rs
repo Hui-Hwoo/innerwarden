@@ -11,9 +11,9 @@ use tracing::{info, warn};
 use super::explain_detector;
 use super::formatting::{
     callback_data, country_flag_emoji, enforce_length, entity_summary, escape_html,
-    first_ip_entity, format_incident_message, format_simple_message, parse_callback, plain_action,
-    reputation_action_phrase, reputation_score_bar, reputation_tier_label, sanitize_url,
-    severity_label, source_icon, strip_bot_suffix,
+    first_ip_entity, format_incident_message, format_simple_message, host_tag, parse_callback,
+    plain_action, reputation_action_phrase, reputation_score_bar, reputation_tier_label,
+    sanitize_url, severity_label, source_icon, strip_bot_suffix,
 };
 use super::{ApprovalResult, GuardianMode};
 
@@ -283,13 +283,16 @@ impl TelegramClient {
         target: &str,
         incident_title: &str,
         confidence: f32,
-        _host: &str,
+        host: &str,
         dry_run: bool,
         reputation: Option<&crate::abuseipdb::IpReputation>,
         geo: Option<&crate::geoip::GeoInfo>,
         cloudflare_pushed: bool,
     ) -> Result<()> {
         let pct = (confidence * 100.0) as u32;
+        // Name the server this action was taken on (operator principle: every
+        // notification names the server). Empty for a blank/unknown host.
+        let host_tag = host_tag(host);
 
         // Build optional enrichment block
         let mut enrichment = String::new();
@@ -318,24 +321,24 @@ impl TelegramClient {
 
         let text = if dry_run {
             format!(
-                "\u{1f9ea} <b>Simulation</b>\n\
+                "\u{1f9ea} <b>Simulation</b>{host_tag}\n\
                  \n\
                  Would have {action_label} <code>{target}</code>\n\
                  {enrichment}\n\
                  <i>{incident_title}</i>\n\
                  \n\
-                 Confidence: {pct}% \u{2014} dry-run, no real action.\n\
+                 Confidence: {pct}%. Dry-run, no real action.\n\
                  <i>Enable live mode to let me handle these.</i>",
                 target = escape_html(target),
                 incident_title = escape_html(incident_title),
             )
         } else if action_label.to_lowercase().contains("ignore") {
             format!(
-                "\u{2705} <b>Analyzed &amp; cleared</b>\n\
+                "\u{2705} <b>Analyzed &amp; cleared</b>{host_tag}\n\
                  \n\
                  <i>{incident_title}</i>{enrichment}\n\
                  \n\
-                 Confidence: {pct}% \u{2014} no action needed.",
+                 Confidence: {pct}%. No action needed.",
                 incident_title = escape_html(incident_title),
             )
         } else {
@@ -346,12 +349,12 @@ impl TelegramClient {
                 _ => "Contained. Keeping watch.",
             };
             format!(
-                "\u{1f6e1}\u{fe0f} <b>Threat neutralized</b>\n\
+                "\u{1f6e1}\u{fe0f} <b>Threat neutralized</b>{host_tag}\n\
                  \n\
                  {action_label} <code>{target}</code>{enrichment}\n\
                  <i>{incident_title}</i>\n\
                  \n\
-                 Confidence: {pct}% \u{2014} {kill_quip}{cf_line}",
+                 Confidence: {pct}%. {kill_quip}{cf_line}",
                 target = escape_html(target),
                 incident_title = escape_html(incident_title),
             )
@@ -390,7 +393,7 @@ impl TelegramClient {
                 // Send one final warning, then stop
                 let warning = format!(
                     "\u{26a0}\u{fe0f} <b>Alert flood detected</b>\n\n\
-                     {} alerts this hour — pausing automated notifications.\n\
+                     {} alerts this hour. Pausing automated notifications.\n\
                      Check the dashboard for details. Alerts resume next hour.",
                     count
                 );
