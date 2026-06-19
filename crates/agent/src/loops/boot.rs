@@ -1761,8 +1761,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         // Activate approval channel and start Telegram polling task
         state.approval_rx = Some(approval_rx_for_state);
         if let Some(ref tg) = state.telegram_client {
-            // Register persistent command menu (fire-and-forget)
-            tg.set_commands().await;
+            // Register persistent command menu (fire-and-forget), scoped to the
+            // operator's profile so a lay user sees the tiny 5-command menu.
+            tg.set_commands(cfg.telegram.is_simple_profile()).await;
             let tg_clone = tg.clone();
             // Spec 036 PR-2: register the long-lived Telegram polling
             // loop in the agent's TaskGroup so SIGTERM-driven shutdown

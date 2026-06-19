@@ -1194,25 +1194,46 @@ impl TelegramClient {
 
     /// Register the bot's persistent command menu (shown in the text input).
     /// Called once at startup.
-    pub async fn set_commands(&self) {
-        let body = serde_json::json!({
-            "commands": [
-                { "command": "status",       "description": "Guardian status - mode, AI, threat intel" },
+    /// Register the bot's persistent command menu, PROFILE-AWARE so a
+    /// non-technical operator (the "simple" profile) sees a tiny, obvious set
+    /// and is never confronted with admin jargon, while the technical profile
+    /// gets the full control surface. The audit found a flat 13-command menu
+    /// (with the lie-by-button /guard + /watch) was the main "confunde o
+    /// usuário" problem; this is the de-clutter. /guard + /watch are dropped
+    /// from the menu in favour of the actuating /mode (both still work if typed
+    /// for back-compat). `simple` comes from `cfg.telegram.is_simple_profile()`.
+    pub async fn set_commands(&self, simple: bool) {
+        let body = serde_json::json!({ "commands": Self::command_menu(simple) });
+        let _ = self.post_json("setMyCommands", &body).await;
+    }
+
+    /// The profile-aware command list (pure, so it is unit-testable). Lay menu =
+    /// 5 plain commands; technical menu = the 11-command control surface. Neither
+    /// carries the dropped lie-by-button /guard or /watch (replaced by /mode).
+    fn command_menu(simple: bool) -> serde_json::Value {
+        if simple {
+            serde_json::json!([
+                { "command": "status",  "description": "Is my server safe right now?" },
+                { "command": "threats", "description": "Who tried to attack, and what I did" },
+                { "command": "mode",    "description": "Turn auto-defend on or off" },
+                { "command": "ask",     "description": "Ask me anything about your server" },
+                { "command": "help",    "description": "What I can do" }
+            ])
+        } else {
+            serde_json::json!([
+                { "command": "status",       "description": "Guardian status: mode, AI, threat intel" },
                 { "command": "threats",      "description": "Recent intrusion attempts" },
                 { "command": "decisions",    "description": "Actions I've taken" },
                 { "command": "blocked",      "description": "Threat actors currently contained" },
-                { "command": "capabilities", "description": "List all capabilities and their status" },
-                { "command": "enable",       "description": "Enable a capability - /enable block-ip" },
-                { "command": "disable",      "description": "Disable a capability - /disable ai" },
+                { "command": "posture",      "description": "Live host posture: sshd, sudo, firewall" },
+                { "command": "mode",         "description": "Set defend mode: guard, watch, dryrun" },
+                { "command": "capabilities", "description": "List capabilities and their status" },
                 { "command": "doctor",       "description": "Full health check with fix hints" },
-                { "command": "guard",        "description": "Activate auto-defend mode" },
-                { "command": "watch",        "description": "Switch to passive monitor mode" },
-                { "command": "ask",          "description": "Ask me anything - I know my config" },
+                { "command": "ask",          "description": "Ask about config, incidents, posture" },
                 { "command": "undo",         "description": "Undo recent allowlist additions" },
                 { "command": "help",         "description": "Operator command playbook" }
-            ]
-        });
-        let _ = self.post_json("setMyCommands", &body).await;
+            ])
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1232,14 +1253,19 @@ impl TelegramClient {
     ///
     /// Telegram chat ids are always `i64`. When the configured `chat_id` is a
     /// numeric id (every real deployment) the sender's chat id MUST equal it or
-    /// the update is dropped. A non-numeric configured id only occurs on a
-    /// non-functional / misconfigured bot (Telegram rejects non-numeric ids for
-    /// outbound `sendMessage` too), and cannot be matched against an `i64`
-    /// sender, so it is not enforced rather than silently dropping every update.
+    /// the update is dropped.
+    ///
+    /// FAIL CLOSED: a non-numeric configured chat_id (a placeholder, a typo, an
+    /// unset env var) cannot be matched against an `i64` sender, so we drop ALL
+    /// updates rather than authorising every sender. Privileged commands now
+    /// reach root (`/enable`, `/disable`) and flip enforcement (`/mode`); a
+    /// misconfigured id must never become an open door. (A bot whose id is
+    /// non-numeric also cannot send outbound, so failing closed only makes an
+    /// already-broken bot inert, never less safe.)
     fn inbound_authorized(&self, chat_id: i64) -> bool {
         match self.chat_id.parse::<i64>() {
             Ok(allowed) => allowed == chat_id,
-            Err(_) => true,
+            Err(_) => false,
         }
     }
 
@@ -2195,7 +2221,10 @@ mod tests {
 
         Ok(TelegramClient {
             bot_token: "test-token".to_string(),
-            chat_id: "chat-123".to_string(),
+            // Numeric chat id matching the `chat: { id: 99 }` the polling tests
+            // inject, so the (now fail-closed) inbound_authorized gate admits
+            // them. A non-numeric id is dropped by design (see inbound_authorized).
+            chat_id: "99".to_string(),
             dashboard_url: Some("https://dashboard.local".to_string()),
             dev_mode: false,
             http,
@@ -2286,6 +2315,55 @@ mod tests {
     }
 
     #[test]
+    fn command_menu_is_profile_aware_and_decluttered() {
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["command"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let lay = names(&TelegramClient::command_menu(true));
+        let tech = names(&TelegramClient::command_menu(false));
+
+        // Lay menu is tiny and jargon-free.
+        assert_eq!(lay.len(), 5, "lay menu must stay small: {lay:?}");
+        assert_eq!(
+            lay,
+            ["status", "threats", "mode", "ask", "help"],
+            "lay menu content"
+        );
+        // The lay menu's only control is /mode (auto-defend on/off), which is
+        // a real working command, so the menu carries no lie-by-button.
+
+        // Technical menu is the full surface, with /mode and /posture present.
+        assert_eq!(tech.len(), 11, "tech menu size: {tech:?}");
+        assert!(tech.contains(&"mode".to_string()), "tech has /mode");
+        assert!(
+            tech.contains(&"posture".to_string()),
+            "tech promotes /posture"
+        );
+
+        // The dropped lie-by-button commands appear in NEITHER menu.
+        for menu in [&lay, &tech] {
+            assert!(!menu.contains(&"guard".to_string()), "guard dropped");
+            assert!(!menu.contains(&"watch".to_string()), "watch dropped");
+        }
+        // No menu item description carries an em dash (house rule).
+        for v in [
+            TelegramClient::command_menu(true),
+            TelegramClient::command_menu(false),
+        ] {
+            for c in v.as_array().unwrap() {
+                assert!(
+                    !c["description"].as_str().unwrap().contains('\u{2014}'),
+                    "no em dash in menu copy"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn inbound_authorized_enforces_numeric_chat_id() {
         // Numeric operator chat_id (every real deployment): only that chat passes.
         let c = TelegramClient::new("tok", "88", None).expect("client");
@@ -2296,10 +2374,14 @@ mod tests {
             "missing/zero chat must be dropped"
         );
 
-        // Non-numeric configured id (misconfigured/test bot, can't send outbound
-        // either) is not enforced rather than dropping every update.
+        // Non-numeric configured id (placeholder/typo/unset) FAILS CLOSED: every
+        // update is dropped rather than authorising any sender for privileged
+        // commands (/mode, /enable). A misconfigured id is never an open door.
         let c2 = TelegramClient::new("tok", "chat-123", None).expect("client");
-        assert!(c2.inbound_authorized(42));
+        assert!(
+            !c2.inbound_authorized(42),
+            "non-numeric id must drop all senders"
+        );
     }
 
     #[test]
@@ -2378,7 +2460,7 @@ mod tests {
             .find(|r| r.path.ends_with("/sendMessage"))
             .expect("sendMessage request should be emitted");
         assert_eq!(send_message.method, "POST");
-        assert_eq!(send_message.body["chat_id"], "chat-123");
+        assert_eq!(send_message.body["chat_id"], "99");
         assert!(send_message.body["text"]
             .as_str()
             .unwrap_or("")
@@ -2434,7 +2516,7 @@ mod tests {
                         "id": "cb-1",
                         "from": { "first_name": "Alice" },
                         "data": "quick:block:1.2.3.4",
-                        "message": { "message_id": 1001, "chat": { "id": 42 } }
+                        "message": { "message_id": 1001, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2443,7 +2525,7 @@ mod tests {
                         "id": "cb-2",
                         "from": { "first_name": "Alice" },
                         "data": "hpot:monitor:2.2.2.2",
-                        "message": { "message_id": 1002, "chat": { "id": 42 } }
+                        "message": { "message_id": 1002, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2452,7 +2534,7 @@ mod tests {
                         "id": "cb-3",
                         "from": { "first_name": "Alice" },
                         "data": "allow:proc:sshd",
-                        "message": { "message_id": 1003, "chat": { "id": 42 } }
+                        "message": { "message_id": 1003, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2461,7 +2543,7 @@ mod tests {
                         "id": "cb-4",
                         "from": { "first_name": "Alice" },
                         "data": "allow:ip:10.0.0.1",
-                        "message": { "message_id": 1004, "chat": { "id": 42 } }
+                        "message": { "message_id": 1004, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2470,7 +2552,7 @@ mod tests {
                         "id": "cb-5",
                         "from": { "first_name": "Alice" },
                         "data": "fp:incident-123",
-                        "message": { "message_id": 1005, "chat": { "id": 42 } }
+                        "message": { "message_id": 1005, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2479,7 +2561,7 @@ mod tests {
                         "id": "cb-6",
                         "from": { "first_name": "Alice" },
                         "data": "autofp:yes:proc:sshd",
-                        "message": { "message_id": 1006, "chat": { "id": 42 } }
+                        "message": { "message_id": 1006, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2488,7 +2570,7 @@ mod tests {
                         "id": "cb-7",
                         "from": { "first_name": "Alice" },
                         "data": "undo:proc:sshd",
-                        "message": { "message_id": 1007, "chat": { "id": 42 } }
+                        "message": { "message_id": 1007, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2497,7 +2579,7 @@ mod tests {
                         "id": "cb-8",
                         "from": { "first_name": "Alice" },
                         "data": "enable2fa",
-                        "message": { "message_id": 1008, "chat": { "id": 42 } }
+                        "message": { "message_id": 1008, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2506,7 +2588,7 @@ mod tests {
                         "id": "cb-9",
                         "from": { "first_name": "Alice" },
                         "data": "menu:status",
-                        "message": { "message_id": 1009, "chat": { "id": 42 } }
+                        "message": { "message_id": 1009, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2515,7 +2597,7 @@ mod tests {
                         "id": "cb-10",
                         "from": { "first_name": "Alice" },
                         "data": "dismiss2fa",
-                        "message": { "message_id": 1010, "chat": { "id": 42 } }
+                        "message": { "message_id": 1010, "chat": { "id": 99 } }
                     }
                 },
                 {
@@ -2524,7 +2606,7 @@ mod tests {
                         "message_id": 1011,
                         "text": "/enable ai",
                         "from": { "first_name": "Alice" },
-                        "chat": { "id": 42 }
+                        "chat": { "id": 99 }
                     }
                 },
                 {
@@ -2533,7 +2615,7 @@ mod tests {
                         "id": "cb-12",
                         "from": { "first_name": "Alice" },
                         "data": "review:dismiss:kill_chain:9.9.9.9:test",
-                        "message": { "message_id": 1012, "chat": { "id": 42 } }
+                        "message": { "message_id": 1012, "chat": { "id": 99 } }
                     }
                 }
             ]
@@ -2798,7 +2880,8 @@ mod tests {
         client.react_eyes(42, 100).await;
         client.react(42, 101, "✅").await;
         client.send_typing().await;
-        client.set_commands().await;
+        client.set_commands(true).await;
+        client.set_commands(false).await;
 
         let dir = tempfile::tempdir()?;
         let allowlist_path = dir.path().join("allowlist.toml");
@@ -3239,7 +3322,7 @@ mod tests {
                     "id": "cb-301",
                     "from": { "first_name": "Dana" },
                     "data": "hpot:honeypot:3.3.3.3",
-                    "message": { "message_id": 3001, "chat": { "id": 77 } }
+                    "message": { "message_id": 3001, "chat": { "id": 99 } }
                 }
             }),
             json!({
@@ -3248,7 +3331,7 @@ mod tests {
                     "id": "cb-302",
                     "from": { "first_name": "Dana" },
                     "data": "hpot:block:4.4.4.4",
-                    "message": { "message_id": 3002, "chat": { "id": 77 } }
+                    "message": { "message_id": 3002, "chat": { "id": 99 } }
                 }
             }),
             json!({
@@ -3257,7 +3340,7 @@ mod tests {
                     "id": "cb-303",
                     "from": { "first_name": "Dana" },
                     "data": "hpot:ignore:5.5.5.5",
-                    "message": { "message_id": 3003, "chat": { "id": 77 } }
+                    "message": { "message_id": 3003, "chat": { "id": 99 } }
                 }
             }),
         ];
@@ -3287,7 +3370,7 @@ mod tests {
                     "message_id": 3100 + idx as i64,
                     "text": text_command,
                     "from": { "first_name": "Dana" },
-                    "chat": { "id": 77 }
+                    "chat": { "id": 99 }
                 }
             }));
         }
