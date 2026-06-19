@@ -875,6 +875,10 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
         }) => {
             crate::commands::agent_proxy::run(mode, label.as_deref(), *error_response, server_cmd)
         }
+
+        Some(AgentCommand::McpServe { label }) => {
+            crate::commands::agent_mcp_serve::run(cli, label.as_deref())
+        }
     }
 }
 

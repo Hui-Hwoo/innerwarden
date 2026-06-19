@@ -237,7 +237,7 @@ still work but the grouped forms below are canonical.
 | `system` | Health / security / data | `system doctor`, `system scan`, `system harden`, `system tune`, `system calibrate`, `system test`, `system export`, `system backup`, `system reconcile-blocks`, `system gdpr` |
 | `rule` | Detection rules | `rule list [--type ...]`, `rule enable <id>`, `rule disable <id>` |
 | `module` | Security modules | `module list`, `module search`, `module install <src>`, `module enable <path>`, `module disable <id>` |
-| `agent` | AI-agent protection | `agent list`, `agent scan`, `agent connect [pid]`, `agent disconnect <id>`, `agent proxy --mode {advisory\|warn\|guard\|kill} -- <server-cmd>` |
+| `agent` | AI-agent protection | `agent list`, `agent scan`, `agent connect [pid]`, `agent disconnect <id>`, `agent proxy --mode {advisory\|warn\|guard\|kill} -- <server-cmd>`, `agent mcp-serve` |
 | top-level | Lifecycle | `setup`, `upgrade [--check]`, `uninstall [--purge]`, `dashboard {open\|close\|tunnel}`, `install-warden`, `enable <cap>`, `disable <cap>`, `list`, `completions <shell>` |
 
 **`agent proxy` is the MCP enforcement front door:** wrap an MCP server so InnerWarden sits *in
@@ -246,6 +246,14 @@ the path* of the AI agent's tool calls and inspects / blocks / kills them. Examp
 ```bash
 innerwarden agent proxy --mode guard -- npx -y @some/mcp-server
 ```
+
+**`agent mcp-serve` is the advisory front door:** run InnerWarden as an MCP server over stdio
+so a coding agent can *voluntarily* ask it, before acting, `innerwarden_check_command` (is this
+command safe → deny/review/allow), `innerwarden_check_ip` (known threat?), and
+`innerwarden_security_context` (host threat level). It is a thin adapter over the loopback brain
+below; it returns capability-level answers only (never the rule that fired). This is advisory and
+bypassable on its own — the enforcement that does not depend on the agent cooperating is `agent
+proxy` plus the host eBPF / Execution Gate.
 
 Loopback Agent API (for an agent to consult the brain at runtime — see section 2):
 `GET /api/agent/security-context`, `GET /api/agent/check-ip?ip=`, `POST /api/agent/check-command`,

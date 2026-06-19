@@ -669,6 +669,23 @@ enum AgentCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         server_cmd: Vec<String>,
     },
+
+    /// Expose InnerWarden as an MCP server over stdio (spec 082 Phase 2).
+    ///
+    /// The advisory front door: an AI coding agent can wire this as an MCP
+    /// server and ask InnerWarden, before acting, whether a command is safe
+    /// (`innerwarden_check_command`), whether an IP is a known threat
+    /// (`innerwarden_check_ip`), or what the host threat level is
+    /// (`innerwarden_security_context`). A thin adapter over the loopback Agent
+    /// API; stdio only (no network listener); returns capability-level answers
+    /// (deny/review/allow) without exposing detection internals. The host's
+    /// enforcement (the `proxy` MCP guard + eBPF) is unchanged: this is
+    /// additive, for a cooperating agent.
+    McpServe {
+        /// Optional label for audit / alerts.
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
