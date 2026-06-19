@@ -479,6 +479,18 @@ impl NarrativeAccumulator {
     }
 }
 
+/// A queued UI setting change from a Telegram Settings button, applied by the
+/// main loop (which owns `cfg`). Lets those buttons actuate at runtime instead
+/// of printing a "run on server" CLI hint.
+#[derive(Debug, Clone)]
+pub(crate) enum SettingChange {
+    /// Operator profile: `true` = simple (lay), `false` = technical. Flips alert
+    /// language + re-registers the profile-scoped command menu.
+    Profile(bool),
+    /// Alert sensitivity for the bot channel: `"quiet" | "normal" | "verbose"`.
+    Sensitivity(String),
+}
+
 struct AgentState {
     skill_registry: skills::SkillRegistry,
     blocklist: skills::Blocklist,
@@ -678,6 +690,12 @@ struct AgentState {
     /// override) so the mutated `cfg` stays the single source of truth for every
     /// `cfg.responder.*` enforcement read, with no per-site threading and no gap.
     pending_mode_change: Option<telegram::GuardianMode>,
+    /// One-shot signals from the Telegram Settings buttons (profile / alert
+    /// sensitivity) up to the main loop, same pattern as `pending_mode_change`:
+    /// the handler only has `&mut state`, the loop owns `cfg`, applies +
+    /// persists, and re-registers the command menu when the profile flips. This
+    /// is what makes those buttons ACTUATE instead of printing a CLI hint.
+    pending_setting_changes: Vec<SettingChange>,
     /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
     /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
     dynamic_trusted_ips: Vec<String>,

@@ -73,6 +73,86 @@ pub(crate) fn persist_responder_mode(
     Ok(())
 }
 
+/// Map a Telegram sensitivity word to the bot channel's notification filter.
+/// Returns None for an unknown word (caller leaves the level unchanged).
+pub(crate) fn sensitivity_to_filter(level: &str) -> Option<crate::config::ChannelFilterLevel> {
+    use crate::config::ChannelFilterLevel as L;
+    match level.trim().to_ascii_lowercase().as_str() {
+        "quiet" => Some(L::Critical),
+        "normal" => Some(L::Actionable),
+        "verbose" => Some(L::All),
+        _ => None,
+    }
+}
+
+/// The lowercase TOML token for a filter level (matches its serde repr).
+fn filter_level_token(l: crate::config::ChannelFilterLevel) -> &'static str {
+    use crate::config::ChannelFilterLevel::*;
+    match l {
+        All => "all",
+        Actionable => "actionable",
+        Critical => "critical",
+        None => "none",
+    }
+}
+
+/// Apply a queued Settings change to `cfg` in place + persist it to
+/// `config_path`. Returns the human label of what changed for logging/reply, or
+/// None if the change was invalid (e.g. an unknown sensitivity word). The
+/// `[telegram]` reads (alert language via `user_profile`, alert noise via
+/// `channel_notifications.notification_level`) all see the new value because we
+/// mutate the owned `cfg`, same single-source-of-truth approach as `/mode`.
+pub(crate) fn apply_setting_change(
+    cfg: &mut config::AgentConfig,
+    change: &crate::SettingChange,
+    config_path: Option<&std::path::Path>,
+) -> Option<String> {
+    match change {
+        crate::SettingChange::Profile(simple) => {
+            cfg.telegram.user_profile = if *simple { "simple" } else { "technical" }.to_string();
+            if let Some(path) = config_path {
+                let _ =
+                    persist_telegram_string(path, &["user_profile"], &cfg.telegram.user_profile);
+            }
+            Some(format!("profile={}", cfg.telegram.user_profile))
+        }
+        crate::SettingChange::Sensitivity(level) => {
+            let filter = sensitivity_to_filter(level)?;
+            cfg.telegram.channel_notifications.notification_level = filter;
+            if let Some(path) = config_path {
+                let _ = persist_telegram_string(
+                    path,
+                    &["channel_notifications", "notification_level"],
+                    filter_level_token(filter),
+                );
+            }
+            Some(format!("sensitivity={level}"))
+        }
+    }
+}
+
+/// Write a string key under `[telegram]` (or a nested sub-table) to agent.toml,
+/// format-preserving + atomic. `key_path` is the dotted path under `telegram`.
+fn persist_telegram_string(
+    path: &std::path::Path,
+    key_path: &[&str],
+    value: &str,
+) -> std::io::Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut item = &mut doc["telegram"];
+    for seg in &key_path[..key_path.len() - 1] {
+        item = &mut item[*seg];
+    }
+    item[key_path[key_path.len() - 1]] = toml_edit::value(value);
+    let tmp = path.with_extension("toml.iwtmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Take a queued `/mode` change (if any), apply it to `cfg` in place, and
 /// persist it to `config_path` (best-effort). Returns the applied mode so the
 /// caller can log it. Pure of the run loop so the glue is unit-testable.
@@ -398,6 +478,64 @@ mod tests {
         let reparsed: config::AgentConfig = toml::from_str(&written).unwrap();
         assert!(reparsed.responder.enabled);
         assert!(!reparsed.responder.dry_run);
+    }
+
+    #[test]
+    fn apply_setting_change_actuates_profile_and_sensitivity() {
+        use crate::config::ChannelFilterLevel;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, "# cfg\n[telegram]\nuser_profile = \"technical\"\n").unwrap();
+        let mut cfg = config::AgentConfig::default();
+
+        // Profile flips the key + persists.
+        let label =
+            apply_setting_change(&mut cfg, &crate::SettingChange::Profile(true), Some(&path));
+        assert_eq!(label.as_deref(), Some("profile=simple"));
+        assert_eq!(cfg.telegram.user_profile, "simple");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# cfg"), "comment preserved");
+        assert!(
+            written.contains("user_profile = \"simple\""),
+            "persisted: {written}"
+        );
+
+        // Sensitivity maps quiet->Critical + persists the lowercase token.
+        let l2 = apply_setting_change(
+            &mut cfg,
+            &crate::SettingChange::Sensitivity("quiet".to_string()),
+            Some(&path),
+        );
+        assert_eq!(l2.as_deref(), Some("sensitivity=quiet"));
+        assert_eq!(
+            cfg.telegram.channel_notifications.notification_level,
+            ChannelFilterLevel::Critical
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("notification_level = \"critical\""));
+
+        // Unknown sensitivity word changes nothing (returns None).
+        let before = cfg.telegram.channel_notifications.notification_level;
+        let l3 = apply_setting_change(
+            &mut cfg,
+            &crate::SettingChange::Sensitivity("loud".to_string()),
+            Some(&path),
+        );
+        assert!(l3.is_none(), "unknown sensitivity is rejected");
+        assert_eq!(
+            cfg.telegram.channel_notifications.notification_level,
+            before
+        );
+    }
+
+    #[test]
+    fn sensitivity_to_filter_maps_the_three_words() {
+        use crate::config::ChannelFilterLevel as L;
+        assert_eq!(sensitivity_to_filter("quiet"), Some(L::Critical));
+        assert_eq!(sensitivity_to_filter("NORMAL"), Some(L::Actionable));
+        assert_eq!(sensitivity_to_filter("verbose"), Some(L::All));
+        assert_eq!(sensitivity_to_filter("nonsense"), Option::None);
     }
 
     #[test]

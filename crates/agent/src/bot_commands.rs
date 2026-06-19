@@ -157,53 +157,94 @@ pub(crate) async fn handle_telegram_bot_command(
         return true;
     }
 
-    // Sensitivity buttons from onboarding menu
+    // Sensitivity buttons from the Settings menu. These ACTUATE now: the change
+    // is queued for the main loop (which owns cfg), applied to the bot channel's
+    // alert filter, and persisted. No 2FA (alert noise is not a privileged
+    // action). Unknown words are rejected.
     if let Some(level) = result.incident_id.strip_prefix("__sensitivity__:") {
         info!(operator = %result.operator_name, level, "Telegram sensitivity change");
-        if let Some(ref tg) = state.telegram_client {
-            let (emoji, desc) = match level {
-                "quiet" => ("🔇", "Only Critical alerts (server compromised, privesc)"),
-                "verbose" => ("🔊", "Medium, High, and Critical alerts"),
-                _ => ("🔔", "High and Critical alerts (recommended)"),
-            };
-            let msg = format!(
-                "{emoji} <b>Notification sensitivity: {level}</b>\n\n\
-                 <i>{desc}</i>\n\n\
-                 To apply permanently, run on server:\n\
-                 <code>innerwarden configure sensitivity {level}</code>"
-            );
-            let tg = tg.clone();
-            tokio::spawn(async move {
-                let _ = tg.send_raw_html(&msg).await;
-            });
+        if cfg.telegram.bot.enabled {
+            if crate::agent_context::sensitivity_to_filter(level).is_some() {
+                let (emoji, desc) = match level {
+                    "quiet" => ("🔇", "only Critical alerts (compromise, privesc)"),
+                    "verbose" => ("🔊", "Medium, High and Critical alerts"),
+                    _ => ("🔔", "High and Critical alerts (recommended)"),
+                };
+                state
+                    .pending_setting_changes
+                    .push(crate::SettingChange::Sensitivity(level.to_string()));
+                bot_helpers::write_telegram_triage_audit(
+                    state,
+                    "__sensitivity__",
+                    &result.operator_name,
+                    "sensitivity_change",
+                    None,
+                    None,
+                    format!(
+                        "Operator {} set sensitivity to {level}",
+                        result.operator_name
+                    ),
+                    format!("sensitivity:{level}"),
+                );
+                tg_reply(
+                    state,
+                    format!(
+                        "{emoji} <b>Alerts: {level}</b>\n<i>{desc}.</i>\nApplied now and saved."
+                    ),
+                );
+            } else {
+                tg_reply(
+                    state,
+                    "Unknown level. Use <b>quiet</b>, <b>normal</b>, or <b>verbose</b>."
+                        .to_string(),
+                );
+            }
         }
         return true;
     }
 
-    // Profile toggle: "profile:simple" or "profile:technical"
+    // Profile toggle: ACTUATES now. Queues the change for the main loop, which
+    // flips cfg.telegram.user_profile, persists it, and re-registers the
+    // profile-scoped command menu so the operator immediately sees the right one.
     if let Some(profile) = result.incident_id.strip_prefix("__profile__:") {
         info!(operator = %result.operator_name, profile, "Telegram profile change");
-        if let Some(ref tg) = state.telegram_client {
-            let (emoji, desc) = match profile {
-                "simple" => (
+        if cfg.telegram.bot.enabled {
+            let simple = profile.eq_ignore_ascii_case("simple");
+            let (emoji, desc) = if simple {
+                (
                     "✨",
-                    "Simple mode. Plain language alerts, no technical details.",
-                ),
-                _ => (
+                    "Simple mode. Plain-language alerts, no jargon, a 5-command menu.",
+                )
+            } else {
+                (
                     "🔧",
-                    "Technical mode. Full details, IPs, detectors, evidence.",
-                ),
+                    "Technical mode. Full detail (IPs, detectors, evidence) and the full menu.",
+                )
             };
-            let msg = format!(
-                "{emoji} <b>Profile: {profile}</b>\n\n\
-                 <i>{desc}</i>\n\n\
-                 To apply permanently, run on server:\n\
-                 <code>innerwarden configure profile {profile}</code>"
+            state
+                .pending_setting_changes
+                .push(crate::SettingChange::Profile(simple));
+            bot_helpers::write_telegram_triage_audit(
+                state,
+                "__profile__",
+                &result.operator_name,
+                "profile_change",
+                None,
+                None,
+                format!(
+                    "Operator {} switched profile to {}",
+                    result.operator_name,
+                    if simple { "simple" } else { "technical" }
+                ),
+                format!("profile:{}", if simple { "simple" } else { "technical" }),
             );
-            let tg = tg.clone();
-            tokio::spawn(async move {
-                let _ = tg.send_raw_html(&msg).await;
-            });
+            tg_reply(
+                state,
+                format!(
+                    "{emoji} <b>Profile: {}</b>\n<i>{desc}</i>\nApplied now and saved; the menu just updated.",
+                    if simple { "simple" } else { "technical" }
+                ),
+            );
         }
         return true;
     }
@@ -1327,6 +1368,54 @@ mod tests {
         assert!(
             state.pending_mode_change.is_none(),
             "bare /mode just reports; it must not queue a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_buttons_actuate_by_queuing_changes() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+
+        // Profile button queues a Profile(simple) change for the main loop.
+        assert!(
+            handle_telegram_bot_command(&cmd("__profile__:simple"), dir.path(), &cfg, &mut state)
+                .await
+        );
+        assert!(
+            matches!(
+                state.pending_setting_changes.last(),
+                Some(crate::SettingChange::Profile(true))
+            ),
+            "profile button must queue an actuating change, not print a CLI hint"
+        );
+
+        // Sensitivity button queues a Sensitivity change.
+        assert!(
+            handle_telegram_bot_command(
+                &cmd("__sensitivity__:quiet"),
+                dir.path(),
+                &cfg,
+                &mut state
+            )
+            .await
+        );
+        assert!(matches!(
+            state.pending_setting_changes.last(),
+            Some(crate::SettingChange::Sensitivity(s)) if s == "quiet"
+        ));
+
+        // A garbage sensitivity word queues NOTHING (handled, but rejected).
+        let before = state.pending_setting_changes.len();
+        assert!(
+            handle_telegram_bot_command(&cmd("__sensitivity__:loud"), dir.path(), &cfg, &mut state)
+                .await
+        );
+        assert_eq!(
+            state.pending_setting_changes.len(),
+            before,
+            "unknown sensitivity must not queue a change"
         );
     }
 

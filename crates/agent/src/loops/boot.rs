@@ -1535,6 +1535,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         last_agent_registry_reconcile: std::time::Instant::now()
             - std::time::Duration::from_secs(4 * 60),
         pending_mode_change: None,
+        pending_setting_changes: Vec::new(),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
         dynamic_trusted_ips: Vec::new(),
         dynamic_trusted_users: Vec::new(),
@@ -1929,6 +1930,31 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     dry_run = cfg.responder.dry_run,
                     "guardian mode changed live via Telegram /mode"
                 );
+            }
+            // Apply queued Settings changes (profile / sensitivity) the same way:
+            // mutate the owned cfg + persist, and re-register the command menu
+            // when the profile flips so the operator immediately sees the right
+            // (lay vs technical) menu.
+            if !state.pending_setting_changes.is_empty() {
+                let changes = std::mem::take(&mut state.pending_setting_changes);
+                let mut profile_flipped = false;
+                for change in &changes {
+                    if let Some(label) = crate::agent_context::apply_setting_change(
+                        &mut cfg,
+                        change,
+                        cli.config.as_deref(),
+                    ) {
+                        if matches!(change, crate::SettingChange::Profile(_)) {
+                            profile_flipped = true;
+                        }
+                        info!(change = %label, "Telegram setting applied live");
+                    }
+                }
+                if profile_flipped {
+                    if let Some(ref tg) = state.telegram_client {
+                        tg.set_commands(cfg.telegram.is_simple_profile()).await;
+                    }
+                }
             }
             let shutdown = tokio::select! {
                 _ = incident_ticker.tick() => {
