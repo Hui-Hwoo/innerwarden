@@ -1694,6 +1694,11 @@ impl TelegramClient {
                                 } else if let Some(m) = text.strip_prefix("/mode ") {
                                     // /mode guard|watch|dryrun → live mode change.
                                     format!("__mode__:{m}")
+                                } else if text == "/unblock" {
+                                    "__unblock__:".to_string()
+                                } else if let Some(ip) = text.strip_prefix("/unblock ") {
+                                    // /unblock <ip> → reverse a containment (2FA).
+                                    format!("__unblock__:{ip}")
                                 } else if text == "/guard" || text.starts_with("/guard ") {
                                     "__guard__".to_string()
                                 } else if text == "/watch" || text.starts_with("/watch ") {

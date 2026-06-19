@@ -163,6 +163,11 @@ pub enum PendingActionType {
     ModeChange {
         mode: String,
     },
+    /// Reverse a containment from `/unblock <ip>`. Privileged (re-opens an IP to
+    /// the host), so 2FA-gated.
+    Unblock {
+        ip: String,
+    },
 }
 
 /// Tracks pending 2FA actions and brute force protection state.

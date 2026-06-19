@@ -569,6 +569,40 @@ pub(crate) async fn handle_telegram_bot_command(
         return true;
     }
 
+    // /unblock <ip> - reverse a containment from the phone (2FA-gated; queues an
+    // operator_unblock_request the slow loop drains through the lifecycle).
+    if let Some(ip_arg) = result.incident_id.strip_prefix("__unblock__:") {
+        let ip_arg = ip_arg.trim().to_string();
+        info!(operator = %result.operator_name, ip = %ip_arg, "Telegram /unblock command received");
+        if cfg.telegram.bot.enabled {
+            if ip_arg.is_empty() {
+                tg_reply(
+                    state,
+                    "Usage: <code>/unblock &lt;ip&gt;</code>. See <code>/blocked</code> for what is contained."
+                        .to_string(),
+                );
+            } else if ip_arg.parse::<std::net::IpAddr>().is_err() {
+                tg_reply(
+                    state,
+                    format!(
+                        "<code>{}</code> is not a valid IP address.",
+                        telegram::escape_html_pub(&ip_arg)
+                    ),
+                );
+            } else if bot_helpers::check_2fa_gate(
+                state,
+                cfg,
+                &result.operator_name,
+                two_factor::PendingActionType::Unblock { ip: ip_arg.clone() },
+            ) {
+                // 2FA enabled: pending stored, TOTP requested; post-TOTP applies.
+            } else {
+                bot_helpers::request_unblock(state, data_dir, &result.operator_name, &ip_arg);
+            }
+        }
+        return true;
+    }
+
     if result.incident_id == "__guard__" {
         info!(operator = %result.operator_name, "Telegram /guard command received");
         if cfg.telegram.bot.enabled {
@@ -630,8 +664,14 @@ pub(crate) async fn handle_telegram_bot_command(
         if cfg.telegram.bot.enabled {
             let blocked: Vec<String> = state.blocklist.as_vec();
             let text = if blocked.is_empty() {
-                "🛡 No kills this session - perimeter's been clean.\n\
-                 <i>Previous firewall rules still active.</i>"
+                // Honest framing: an empty SESSION list does not mean unprotected.
+                // The old "perimeter's been clean" read as "nothing is guarding
+                // you" to a lay operator, while persistent firewall rules and
+                // active enforcement were both still in effect.
+                "🛡 <b>Nobody new in the cooler this session.</b>\n\
+                 <i>Still locked down: every IP I dropped earlier is still \
+                 blackholed at the firewall (those rules outlive restarts), and \
+                 I'm watching the door. Use /unblock &lt;ip&gt; to release one.</i>"
                     .to_string()
             } else {
                 let mut sorted = blocked;
@@ -642,7 +682,8 @@ pub(crate) async fn handle_telegram_bot_command(
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    "🛡 <b>Kill list</b> - {} contained this session\n\n{list}",
+                    "🛡 <b>Contained this session: {}</b>\n<i>(earlier blocks persist \
+                     at the firewall too)</i>\n\n{list}\n\nRelease one: /unblock &lt;ip&gt;",
                     sorted.len()
                 )
             };
@@ -1286,6 +1327,50 @@ mod tests {
         assert!(
             state.pending_mode_change.is_none(),
             "bare /mode just reports; it must not queue a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_command_validates_and_queues() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.telegram.bot.enabled = true;
+
+        // Valid IP (no 2FA) → handled + queues an operator_unblock_request.
+        let ok = handle_telegram_bot_command(
+            &cmd("__unblock__:198.51.100.9"),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+        assert!(ok, "valid /unblock must be handled");
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let jsonl =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{today}.jsonl"))).unwrap();
+        assert!(
+            jsonl.contains("operator_unblock_request") && jsonl.contains("198.51.100.9"),
+            "valid /unblock queues the request"
+        );
+
+        // Garbage IP and bare /unblock are still handled (reply with an error /
+        // usage), and must NOT queue anything.
+        for id in ["__unblock__:not-an-ip", "__unblock__:"] {
+            assert!(
+                handle_telegram_bot_command(&cmd(id), dir.path(), &cfg, &mut state).await,
+                "{id} must be handled"
+            );
+        }
+        let after =
+            std::fs::read_to_string(dir.path().join(format!("decisions-{today}.jsonl"))).unwrap();
+        assert_eq!(
+            after.matches("operator_unblock_request").count(),
+            1,
+            "only the valid IP queued; garbage + bare queue nothing"
         );
     }
 
