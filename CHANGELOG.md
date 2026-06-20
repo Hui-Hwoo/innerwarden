@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Public live feed reads what actually happened, not "High severity threat detected."** A large share of real catches on the `/live` sales feed fell through `live_feed_title`/`live_feed_reason` to the generic severity line (`High severity threat detected.` / `Suspicious activity detected and logged.`) even though the detector was known, because the title map had no arm for them. On the production feed that was ~110 of 112 items (proto_anomaly, threat_intel, honeypot, suspicious_login). Added specific, **sanitized** headlines + reasons for those detectors plus `data_exfiltration`, `credential_harvest`, `sudo_abuse`, `setns_owner`, `untrusted_root_exec`, `provenance`, `nmap_scan` (no paths, rule names, or thresholds leaked — a regression test asserts the new headlines carry none). The site (`inner-warden-site`) was updated in parallel to map the `detector` field straight to its copy, so the feed says "known-bad IP turned away", "took the honeypot bait", "protocol anomaly" instead of a flat severity line. (The own-infra IP noise on the feed is a separate item: it must be a feed-display-only filter, never an `is_self_traffic_ip` cloud-IP safelist, since attackers use Azure too.)
+
 ## [0.15.20] - 2026-06-20
 
 ### Added
