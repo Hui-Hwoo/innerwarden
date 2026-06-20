@@ -567,6 +567,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
 
     // Initialize cloud provider IP safelist (Google, AWS, Azure, Cloudflare, etc.)
     cloud_safelist::init();
+    // Operator's own-infrastructure IPs (config-driven, empty by default): the
+    // operator's other boxes seen as a remote source are self-traffic, so they
+    // stay out of the operator + public feeds while detection continues.
+    cloud_safelist::init_operator_self_infra(&cfg.allowlist.self_infra_ips);
 
     // Deep security snapshot: shared between agent (updates) and dashboard (reads).
     let deep_security_snapshot = std::sync::Arc::new(std::sync::RwLock::new(

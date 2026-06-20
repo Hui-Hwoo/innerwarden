@@ -889,6 +889,7 @@ async fn run_playbook_replay(cli: Cli) -> Result<()> {
     // cloud ranges, which are lazily populated by this init (the live agent
     // does it at boot).
     crate::cloud_safelist::init();
+    crate::cloud_safelist::init_operator_self_infra(&cfg.allowlist.self_infra_ips);
 
     let rules_dir = std::path::Path::new(&cfg.playbooks.rules_dir);
     let playbooks = playbook_engine::load_dir(rules_dir).unwrap_or_else(|e| {
