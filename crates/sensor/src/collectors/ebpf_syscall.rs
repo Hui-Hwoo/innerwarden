@@ -354,6 +354,11 @@ fn execve_to_event(
         .collect();
 
     let parent_comm = crate::detectors::exec_context::proc_comm(ppid).unwrap_or_default();
+    // Controlling-terminal proof for the exec_context classifier: read the
+    // PARENT's tty (the long-lived shell), not the microsecond-lived recon child
+    // whose /proc entry is often already gone. tty_nr != 0 ⇒ real interactive
+    // session; an implant / reverse shell / daemon-spawned shell has none.
+    let has_tty = crate::detectors::exec_context::proc_has_tty(ppid);
 
     let mut details = serde_json::json!({
         "pid": pid,
@@ -361,6 +366,7 @@ fn execve_to_event(
         "ppid": ppid,
         "comm": comm,
         "parent_comm": parent_comm,
+        "has_tty": has_tty,
         "command": command,
         "argv": argv_json,
         "argc": argc,
@@ -2724,6 +2730,11 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         2 => "stderr",
                         _ => "fd",
                     };
+                    // Resolve ppid so reverse_shell can correlate a fork()'d
+                    // reverse shell (connect in the parent, dup2 onto stdio in the
+                    // child — socat/python). Only for stdio redirects (newfd<=2,
+                    // the reverse-shell case); a non-stdio dup skips the /proc read.
+                    let ppid = if newfd <= 2 { resolve_ppid(pid) } else { 0 };
                     Some(Event {
                         ts: chrono::Utc::now(),
                         host: host.to_string(),
@@ -2733,7 +2744,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         summary: format!(
                             "{comm} (PID {pid}) redirected fd {oldfd} → {fd_name}({newfd})"
                         ),
-                        details: serde_json::json!({"pid": pid, "uid": uid, "oldfd": oldfd, "newfd": newfd, "comm": comm}),
+                        details: serde_json::json!({"pid": pid, "uid": uid, "oldfd": oldfd, "newfd": newfd, "comm": comm, "ppid": ppid}),
                         tags: vec!["ebpf".to_string(), "reverse_shell".to_string()],
                         entities: vec![],
                     })
