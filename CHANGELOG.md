@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.23] - 2026-06-21
+
 ### Fixed
 - **`innerwarden upgrade` now retries transient asset/sidecar download failures.** Right after a release, GitHub's asset CDN intermittently fails individual binary or sidecar (`.sha256`/`.sig`) downloads while it propagates the new release. The old code aborted on the first such failure, which made `upgrade` brittle in exactly that window — deploying 0.15.22, two consecutive runs on one box each failed on a *different* sidecar before a manual `curl --retry` deploy succeeded. The binary download and both sidecar fetches now retry (4 attempts, 3s apart); a binary retry re-creates the destination so a partial download is never kept. Retry policy is a pure, unit-tested helper.
 
