@@ -591,6 +591,8 @@ pub async fn serve(
         ),
         require_auth,
     );
+    // Issue #71: clone before `state` is moved into the router builders below.
+    let cleanup_pending_approvals = state.pending_approvals.clone();
     let activity_state = state.last_activity.clone();
     let activity_layer = middleware::from_fn(move |req: Request<Body>, next: Next| {
         let ts = activity_state.clone();
@@ -908,7 +910,7 @@ pub async fn serve(
         }
     });
 
-    // Session + advisory cleanup: remove expired entries every 60 seconds
+    // Session + advisory + pending-approval cleanup: remove expired entries every 60 seconds
     let cleanup_sessions = sessions;
     let cleanup_timeout = session_timeout_minutes;
     let cleanup_advisory_cache = advisory_cache.clone();
@@ -922,6 +924,14 @@ pub async fn serve(
             if let Ok(mut cache) = cleanup_advisory_cache.write() {
                 let cutoff = Utc::now() - chrono::Duration::hours(1);
                 cache.retain(|e| e.ts > cutoff);
+            }
+            // Issue #71: evict expired 2FA approval requests so the map
+            // does not grow unbounded when the operator never acts on them.
+            {
+                let mut approvals = cleanup_pending_approvals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                approvals.retain(|_, r| !r.is_expired());
             }
         }
     });

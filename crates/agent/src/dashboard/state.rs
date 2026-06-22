@@ -73,8 +73,10 @@ pub(crate) struct DashboardApprovalOutcome {
     pub approved: bool,
     /// Username of the operator who acted.
     pub operator: String,
-    /// TOTP code supplied (empty when 2FA not enforced).
-    pub totp_supplied: String,
+    /// Whether the TOTP code was verified (true = verified or not enforced).
+    /// The raw code is intentionally NOT stored here to avoid CWE-532 leakage
+    /// if the struct is ever serialised or logged.
+    pub totp_verified: bool,
 }
 
 /// Request body used by the 2FA approve and deny handlers.
