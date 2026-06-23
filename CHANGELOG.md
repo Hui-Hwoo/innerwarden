@@ -10,6 +10,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **n8n integration recipe for the Agent Guard API (docs).** New
+  `docs/integration-recipes/n8n-agent-guard.md` shows how to drive the existing
+  `GET /api/agent/security-context` (threat assessment) and
+  `POST /api/agent/check-command` (safety validation) endpoints from an [n8n](https://n8n.io/)
+  workflow: HTTP Request node configuration for each endpoint, the request/response shapes
+  and recommendation thresholds (`allow`/`review`/`deny`), and a complete importable
+  workflow JSON that halts automatically when the server threat level is elevated or a
+  command is denied. Documentation-only — no code or behaviour change. Closes the n8n gap
+  noted alongside the existing OpenClaw guide; linked from `integrations/README.md`.
 - **Mesh / overlay-VPN remote-access tools are now detected as a persistence channel (Tailscale, ZeroTier, NetBird, Nebula).** Closes a real gap: an attacker who lands on a host can install a mesh VPN (`tailscale`/`tailscaled`, `zerotier-one`/`zerotier-cli`, `netbird`, `nebula`) and SSH back in over the encrypted, NAT-traversing tunnel — stable persistent access that looks like ordinary infrastructure (T1572 protocol tunneling / T1219 remote-access software). Ngrok/Cloudflare/bore/frp/chisel were already covered by `c2_web_tunnel`; the mesh-VPN family was not. The detector now fires on exec of a known mesh-VPN binary. **UX-safe by design** because these tools are commonly legitimate: fired at **High** (not Critical, unlike the C2 tunnels) so it never auto-blocks on its own, **exec-only** (no coordination-DNS matching, which would be noisy on hosts that legitimately run a mesh VPN), deduped on a 600s cooldown, and allowlistable via `[detectors.c2_web_tunnel]`; the incident text says plainly "LEGITIMATE if you use it for admin access — allowlist it; if you did NOT install it, it is a common attacker-persistence channel." **Anti-gap, honestly scoped:** the match is on the exact argv0 basename, so a *renamed* mesh-VPN binary evades exec-name detection — that limitation is documented in the detector and tracked as a behavioural TUN/WireGuard follow-up (the tunnel still has to create a `tun`/`wg` interface, which is the rename-proof signal). New unit tests pin: mesh binaries fire High with sub_kind `mesh_vpn`, the existing tunnel binaries stay Critical, substring/unrelated binaries stay quiet, and repeat execs are deduped. Detector count unchanged (82 — extends the existing `c2_web_tunnel`).
 
 ### Fixed
