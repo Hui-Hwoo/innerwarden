@@ -244,6 +244,9 @@ enabled = false
 [collectors.audit_state]
 enabled = false
 
+[collectors.tunnel_iface]
+enabled = false
+
 [detectors.suid_page_cache_integrity]
 enabled = false
 

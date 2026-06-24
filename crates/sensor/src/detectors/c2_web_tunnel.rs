@@ -104,8 +104,40 @@ impl C2WebTunnelDetector {
         match event.kind.as_str() {
             "shell.command_exec" | "process.exec" => self.process_exec(event),
             "dns.query" => self.process_dns(event),
+            "network.tunnel_interface_created" => self.process_tunnel_iface(event),
             _ => None,
         }
+    }
+
+    /// Behavioural mesh-VPN signal: the `tunnel_iface` collector saw a new
+    /// tun/WireGuard interface appear. This is rename-proof — an attacker can
+    /// rename the binary, but the tunnel still needs the interface — so it
+    /// fires at High (allowlistable) regardless of process name.
+    fn process_tunnel_iface(&mut self, event: &Event) -> Option<Incident> {
+        let ifname = event
+            .details
+            .get("ifname")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let iface_kind = event
+            .details
+            .get("iface_kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tunnel");
+        if ifname.is_empty() {
+            return None;
+        }
+        self.emit(
+            event,
+            Severity::High,
+            "mesh_vpn_iface",
+            ifname,
+            iface_kind,
+            "",
+            ifname,
+            0,
+            0,
+        )
     }
 
     fn process_exec(&mut self, event: &Event) -> Option<Incident> {
@@ -227,13 +259,29 @@ impl C2WebTunnelDetector {
             }
         }
         self.last_fired.insert(key.clone(), now);
-        let mesh = sub_kind == "mesh_vpn";
-        let title = if mesh {
+        // `mesh_vpn` = exec-name match; `mesh_vpn_iface` = behavioural (a new
+        // tun/wg interface appeared). Both get the mesh dual-use framing, tags,
+        // and checks; only the title/summary differ.
+        let iface = sub_kind == "mesh_vpn_iface";
+        let mesh = sub_kind == "mesh_vpn" || iface;
+        let title = if iface {
+            format!("Remote-access tunnel interface appeared: {target} ({comm})")
+        } else if mesh {
             format!("Remote-access mesh VPN started: {target}")
         } else {
             format!("Web-tunnel C2 indicator ({sub_kind}): {target}")
         };
-        let summary = if mesh {
+        let summary = if iface {
+            format!(
+                "A new {comm} tunnel interface `{target}` appeared on this host (it was not \
+                 present at startup). This is the rename-proof signal of a mesh/overlay VPN \
+                 (Tailscale/ZeroTier/NetBird/WireGuard/OpenVPN) being brought up: the binary \
+                 can be renamed, but the tunnel still has to create a tun/wg interface. \
+                 LEGITIMATE if you (or a service) just started a VPN — allowlist it. If you did \
+                 NOT, it is a common attacker-persistence channel: a stable, encrypted, \
+                 NAT-traversing way back into a compromised host (T1572 / T1219)."
+            )
+        } else if mesh {
             format!(
                 "A mesh/overlay VPN remote-access tool `{target}` ran (comm=`{comm}`, \
                  parent_comm=`{parent_comm}`, pid={pid}, uid={uid}, command=`{command}`). \
@@ -275,7 +323,11 @@ impl C2WebTunnelDetector {
                 "mitre": ["T1572", "T1090.003"],
             }]),
             recommended_checks: vec![
-                format!("Inspect process tree: pstree -p {pid}"),
+                if iface {
+                    format!("Inspect the tunnel interface and find what created it: ip -d link show {target}; ss -tup | grep -i wireguard")
+                } else {
+                    format!("Inspect process tree: pstree -p {pid}")
+                },
                 if mesh {
                     "If you legitimately use this mesh VPN (Tailscale/ZeroTier/…) for admin, allowlist it via [detectors.c2_web_tunnel]; otherwise treat as attacker persistence and investigate who installed it".to_string()
                 } else {
@@ -350,6 +402,44 @@ mod tests {
             tags: vec![],
             entities: vec![],
         }
+    }
+
+    fn tunnel_iface_event(ifname: &str, kind: &str) -> Event {
+        Event {
+            ts: Utc::now(),
+            host: "test".into(),
+            source: "tunnel_iface".into(),
+            kind: "network.tunnel_interface_created".into(),
+            severity: Severity::Medium,
+            summary: format!("new tunnel interface {ifname} ({kind})"),
+            details: serde_json::json!({ "ifname": ifname, "iface_kind": kind }),
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    /// Behavioural mesh-VPN: a new tun/wg interface fires High with the
+    /// rename-proof framing (sub_kind mesh_vpn_iface + persistence tag), even
+    /// though no process name was involved.
+    #[test]
+    fn fires_high_on_new_tunnel_interface() {
+        let mut det = C2WebTunnelDetector::new("test");
+        let inc = det
+            .process(&tunnel_iface_event("wg0", "wireguard"))
+            .expect("new tunnel interface should fire");
+        assert_eq!(inc.severity, Severity::High);
+        assert!(inc.incident_id.contains(":mesh_vpn_iface:"));
+        assert!(inc.tags.contains(&"persistence".to_string()));
+        assert!(inc.summary.contains("wg0"));
+        assert!(inc.summary.contains("rename-proof"));
+    }
+
+    #[test]
+    fn tunnel_interface_without_ifname_does_not_fire() {
+        let mut det = C2WebTunnelDetector::new("test");
+        let mut ev = tunnel_iface_event("wg0", "tun");
+        ev.details = serde_json::json!({ "iface_kind": "tun" }); // no ifname
+        assert!(det.process(&ev).is_none());
     }
 
     #[test]

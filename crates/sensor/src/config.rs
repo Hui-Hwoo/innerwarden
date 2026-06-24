@@ -126,6 +126,12 @@ pub struct CollectorsConfig {
     /// is absent.
     #[serde(default)]
     pub audit_state: AlwaysOnCollectorConfig,
+    /// tunnel_iface: watches `/sys/class/net` for a NEW tun/WireGuard
+    /// interface appearing at runtime — the rename-proof behavioural signal
+    /// of a mesh/overlay VPN being brought up (complements the c2_web_tunnel
+    /// exec-name detection). Interfaces present at startup are baselined.
+    #[serde(default)]
+    pub tunnel_iface: AlwaysOnCollectorConfig,
 }
 
 impl CollectorsConfig {
@@ -175,6 +181,7 @@ impl CollectorsConfig {
             systemd_inventory: AlwaysOnCollectorConfig { enabled: false },
             tcp_stream: AlwaysOnCollectorConfig { enabled: false },
             audit_state: AlwaysOnCollectorConfig { enabled: false },
+            tunnel_iface: AlwaysOnCollectorConfig { enabled: false },
         }
     }
 }

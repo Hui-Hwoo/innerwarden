@@ -42,4 +42,5 @@ pub mod tcp_stream;
 // a no-op.
 #[cfg_attr(not(feature = "ebpf"), allow(dead_code, unused_imports))]
 pub mod tls_fingerprint;
+pub mod tunnel_iface;
 pub mod usb_monitor;
