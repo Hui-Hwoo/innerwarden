@@ -704,6 +704,13 @@ const BLOCKED_PIDS_PIN: &str = "/sys/fs/bpf/innerwarden/blocked_pids";
 /// arming) makes the `bprm_check_security` hook enforce against it.
 const EXEC_ALLOWLIST_PIN: &str = "/sys/fs/bpf/innerwarden/exec_allowlist";
 
+/// Pin path for the Execution Gate SCOPE (cgroup id -> 1). Populated by the paid
+/// `config-sign exec-gate` tooling with the AI agent's cgroup id(s). Consulted by
+/// the gate ONLY when `LSM_POLICY` key 4 = 1 (agent-scoped mode): enforce solely
+/// inside these cgroups, allow the rest of the host. Empty + scoped = the gate
+/// never fires (fail-open), so a wipe is safe, not a brick.
+const EXEC_GATE_SCOPE_PIN: &str = "/sys/fs/bpf/innerwarden/exec_gate_scope";
+
 /// Attach LSM execution policy and pin the policy map.
 /// Requires `lsm=...,bpf` in kernel boot cmdline.
 /// Non-critical - if LSM is not available, the sensor continues without it.
@@ -1048,6 +1055,11 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // incrementally and does not re-apply; a wipe = empty allowlist = brick on
     // arm). u64 FNV(path) keys, u8 value.
     repin_preserving::<u64, u8>(bpf, "EXEC_ALLOWLIST", EXEC_ALLOWLIST_PIN);
+
+    // Execution Gate SCOPE (cgroup id -> 1) — agent-scoped enforcement (spec 083).
+    // Preserve across restart like the allowlist so the agent stays scoped; a
+    // wipe is fail-open (empty scope = gate never fires) so it is not a brick.
+    repin_preserving::<u64, u8>(bpf, "EXEC_GATE_SCOPE", EXEC_GATE_SCOPE_PIN);
 
     // Capability + blocked-pid maps. These have the same restart-wipe behaviour
     // (TODO spec 080 P0 follow-up: BLOCKED_PIDS is an LRU map + the capability

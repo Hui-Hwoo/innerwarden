@@ -567,6 +567,22 @@ static EXEC_PATH_SCRATCH: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries
 #[map]
 static BPRM_OFFSETS: HashMap<u32, u32> = HashMap::with_max_entries(4, 0);
 
+/// Execution Gate SCOPE (Active Defence / paid). Key = cgroup id of a process
+/// tree the gate should enforce (typically the AI agent's systemd cgroup and any
+/// descendant cgroups). Value = 1. Populated by the userspace loader from the
+/// resolved agent cgroup id(s); pinned at `/sys/fs/bpf/innerwarden/exec_gate_scope`
+/// so it survives sensor restart.
+///
+/// Used ONLY when `LSM_POLICY` key 4 (scope mode) == 1: the gate then applies
+/// solely to tasks whose current cgroup id is present here, and allows every
+/// other exec on the host unconditionally (host maintenance, containers, other
+/// services are never gated). When key 4 is absent/0 the gate is host-wide, the
+/// original behaviour, so this is opt-in with no regression. This is the
+/// "zero-trust for the AI agent" scoping: lock the agent's executable surface
+/// without touching the rest of the machine.
+#[map]
+static EXEC_GATE_SCOPE: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
+
 /// Per-PID and per-TGID block list consulted by `innerwarden_lsm_exec_min`.
 /// Spec 052 / INV-LSM-06: LRU eviction at capacity so a worm-style burst can't
 /// silently drop new registrations. INV-LSM-07: the agent inserts BOTH the PID
@@ -716,6 +732,20 @@ fn try_exec_gate(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(0);
     }
     let observe = mode == 2;
+    // Agent-scoped enforcement (spec 083): when LSM_POLICY key 4 == 1 the gate
+    // applies ONLY to tasks whose cgroup is in EXEC_GATE_SCOPE (the AI agent's
+    // cgroup tree). Every other exec on the host — system services, containers,
+    // package maintenance — is allowed unconditionally, so a general server can
+    // run the gate around just the agent without bricking apt/certbot/Docker.
+    // key 4 absent/0 = host-wide (the original, unchanged behaviour). Opt-in, no
+    // regression. One map read + (when scoped) one cgroup lookup: verifier-cheap.
+    let scoped = unsafe { LSM_POLICY.get(&4u32) }.copied().unwrap_or(0) == 1;
+    if scoped {
+        let cg = unsafe { bpf_get_current_cgroup_id() };
+        if unsafe { EXEC_GATE_SCOPE.get(&cg) }.is_none() {
+            return Ok(0); // outside the agent's scope → not gated
+        }
+    }
     // Read bprm->filename. The byte offset is supplied at load time by the
     // userspace loader from kernel BTF (CO-RE) via BPRM_OFFSETS key 0, so the gate
     // works across kernels — the offset differs (96 on 6.8; `filename` is at
@@ -1973,8 +2003,8 @@ pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
                                                 // Broader sensitive telemetry: any /etc, /root, /home read. High volume on a
                                                 // live host, so rate-limited below (the kprobe now reads filenames correctly
                                                 // and would otherwise flood the ring buffer).
-    // Credential dirs anywhere (/.ssh/, /.aws/, /.kube/, /.gnupg/) — home/root
-    // private keys + cloud/k8s creds. High value, low legit frequency.
+                                                // Credential dirs anywhere (/.ssh/, /.aws/, /.kube/, /.gnupg/) — home/root
+                                                // private keys + cloud/k8s creds. High value, low legit frequency.
     let secret_dir = contains_secret_dir(f);
     let is_sensitive = etc
         || (f[0] == b'/' && f[1] == b'r' && f[2] == b'o' && f[3] == b'o' && f[4] == b't')
