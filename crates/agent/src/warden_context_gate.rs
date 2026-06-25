@@ -238,6 +238,28 @@ pub(crate) fn apply(ctx: &DecisionContext<'_>, decision: AiDecision) -> AiDecisi
         );
     }
 
+    // DShield (ISC) signal: the community has confirmed this IP attacking the
+    // internet (reports > 0 or active threat-feed membership). A passive close
+    // (dismiss/monitor) on a confirmed global attacker is never allowed to
+    // stand — surface it, regardless of severity or the classifier's
+    // confidence. Escalate-only by construction: a block/contain verdict is not
+    // a passive close, so this can only raise a weak dismiss/monitor, never
+    // relax an enforcement verdict. This is how the DShield enrichment becomes a
+    // real decision signal on the classifier path (the gate wraps the
+    // classifier) without touching the trained model's text input.
+    if ctx.ip_dshield_attacker && is_passive_close(&decision.action) {
+        return surface(
+            ctx,
+            format!(
+                "context gate: refusing a {} ({:.2}) on a DShield-confirmed global attacker \
+                 (ISC reports this IP attacking the internet); surfaced, not closed.",
+                decision.action.name(),
+                decision.confidence
+            ),
+            "high".to_string(),
+        );
+    }
+
     let provenance_benign = match provenance {
         ActorProvenance::SelfComponent => SELF_NOISY_DETECTORS.contains(&detector),
         ActorProvenance::BuildToolchain => BUILD_NOISY_DETECTORS.contains(&detector),
@@ -245,8 +267,11 @@ pub(crate) fn apply(ctx: &DecisionContext<'_>, decision: AiDecision) -> AiDecisi
     };
 
     // 1. Provenance dismiss — Medium/Low ONLY. A forgeable `comm` must never
-    //    auto-dismiss a High/Critical incident (red-team must-fix #1).
-    if provenance_benign && !high_sev {
+    //    auto-dismiss a High/Critical incident (red-team must-fix #1). Also never
+    //    provenance-dismiss a DShield-confirmed global attacker, even at low
+    //    severity with benign-looking lineage (the override above only catches an
+    //    incoming passive close; this guards the provenance-driven dismiss too).
+    if provenance_benign && !high_sev && !ctx.ip_dshield_attacker {
         let label = match provenance {
             ActorProvenance::SelfComponent => "an InnerWarden component",
             _ => "the local build toolchain",
@@ -339,6 +364,7 @@ mod tests {
             ip_reputation: None,
             ip_geo: None,
             ip_dshield: None,
+            ip_dshield_attacker: false,
             host_posture: None,
             prior_decisions: None,
             graph_context: None,
@@ -390,6 +416,50 @@ mod tests {
 
     fn is_dismiss(d: &AiDecision) -> bool {
         matches!(d.action, AiAction::Dismiss { .. })
+    }
+
+    #[test]
+    fn dshield_attacker_passive_close_is_surfaced() {
+        // A DShield-confirmed global attacker must never be passively closed,
+        // even at low severity with a confident classifier dismiss.
+        let i = inc("d1", Severity::Low, "ssh probe", &["9.9.9.9"]);
+        let mut c = ctx(&i, vec![]);
+        c.ip_dshield_attacker = true;
+        let out = apply(&c, dismiss(0.97));
+        assert!(
+            !is_dismiss(&out),
+            "DShield-confirmed attacker must not be dismissed"
+        );
+        assert_eq!(out.confidence, ESCALATE_FLOOR);
+        assert!(out.reason.contains("DShield-confirmed"));
+    }
+
+    #[test]
+    fn dshield_attacker_block_left_intact() {
+        // Escalate-only: DShield raises a passive close but never touches an
+        // enforcement verdict.
+        let i = inc("d2", Severity::High, "c2 beacon", &["9.9.9.9"]);
+        let mut c = ctx(&i, vec![]);
+        c.ip_dshield_attacker = true;
+        let out = apply(&c, block(0.6));
+        assert!(
+            matches!(out.action, AiAction::BlockIp { .. }),
+            "block must survive"
+        );
+        assert_eq!(out.confidence, 0.6);
+    }
+
+    #[test]
+    fn no_dshield_low_sev_dismiss_unchanged() {
+        // DShield off (default) must not change prior behavior: a low-sev,
+        // non-attacker, confident dismiss stays a dismiss.
+        let i = inc("d3", Severity::Low, "noise", &["9.9.9.9"]);
+        let c = ctx(&i, vec![]); // ip_dshield_attacker = false
+        let out = apply(&c, dismiss(0.95));
+        assert!(
+            is_dismiss(&out),
+            "non-DShield low-sev dismiss must be unchanged"
+        );
     }
 
     // ============================================================
