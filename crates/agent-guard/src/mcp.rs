@@ -373,6 +373,18 @@ pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> Comma
         }
     }
 
+    // Security-control tampering: disabling/removing InnerWarden or the host's
+    // other security monitors (defense evasion, MITRE T1562/T1489). Blocked
+    // in-path so an agent cannot quietly turn off the guardrail.
+    if let Some((indicator, s)) = threats::check_security_tamper(cmd) {
+        signals.push(AnalysisSignal {
+            signal: "security_tooling_tamper".into(),
+            score: s,
+            detail: format!("disabling or tampering with security monitoring: `{indicator}`"),
+        });
+        score += s;
+    }
+
     // Dangerous command patterns from threats.rs (if not already caught above).
     if let Some((desc, _block)) = threats::check_command(cmd) {
         if !signals.iter().any(|s| s.detail.contains(desc)) {
@@ -567,6 +579,69 @@ mod tests {
         let a = analyze_command("ls -la /home", None);
         assert_eq!(a.recommendation, "allow");
         assert!(a.signals.is_empty());
+    }
+
+    #[test]
+    fn analyze_command_flags_innerwarden_self_disable() {
+        // B2: an agent told to turn off / remove InnerWarden must be DENIED
+        // in-path (was previously allow / risk 0). Covers service control,
+        // process kill, the CLI self-disable, and file/eBPF removal.
+        for cmd in [
+            "sudo systemctl stop innerwarden-sensor innerwarden-agent",
+            "sudo systemctl mask innerwarden-agent",
+            "pkill -f innerwarden",
+            "killall innerwarden-agent",
+            "sudo innerwarden uninstall",
+            "sudo innerwarden disable block-ip",
+            "sudo rm -rf /etc/innerwarden /usr/local/bin/innerwarden-sensor",
+            "rm -f /sys/fs/bpf/innerwarden/blocklist",
+            "truncate -s0 /var/lib/innerwarden/decisions-2026-06-27.jsonl",
+        ] {
+            let a = analyze_command(cmd, None);
+            assert_eq!(a.recommendation, "deny", "`{cmd}` must deny");
+            assert_eq!(a.severity, "high", "`{cmd}` must be high severity");
+            assert!(
+                a.signals
+                    .iter()
+                    .any(|s| s.signal == "security_tooling_tamper"),
+                "`{cmd}` missing security_tooling_tamper signal"
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_command_flags_host_monitor_disable() {
+        // Universal defense-evasion: disabling auditd / AppArmor / SELinux.
+        for cmd in [
+            "sudo systemctl stop auditd",
+            "setenforce 0",
+            "sudo systemctl disable apparmor",
+            "auditctl -e 0",
+        ] {
+            let a = analyze_command(cmd, None);
+            assert_eq!(a.recommendation, "deny", "`{cmd}` must deny");
+        }
+    }
+
+    #[test]
+    fn analyze_command_allows_innerwarden_status_read() {
+        // Reading status / restarting is legitimate ops and must NOT be a deny
+        // or trip the tamper signal (anti-FP for the in-path guardrail).
+        for cmd in [
+            "innerwarden get status",
+            "systemctl status innerwarden-agent",
+            "journalctl -u innerwarden-agent --no-pager",
+            "sudo systemctl restart innerwarden-agent",
+        ] {
+            let a = analyze_command(cmd, None);
+            assert_ne!(a.recommendation, "deny", "`{cmd}` must not deny");
+            assert!(
+                !a.signals
+                    .iter()
+                    .any(|s| s.signal == "security_tooling_tamper"),
+                "`{cmd}` wrongly flagged as tamper"
+            );
+        }
     }
 
     #[test]

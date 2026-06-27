@@ -227,6 +227,50 @@ pub const EXECUTORS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "python", "perl", "ruby", "node",
 ];
 
+/// Security-control tampering indicators (score 60 -> deny).
+///
+/// Disabling the host's own monitoring is a defense-evasion action
+/// (MITRE T1562 Impair Defenses / T1489 Service Stop). An AI coding agent
+/// asked to "turn off the security agent" should be blocked at the in-path
+/// guardrail, not merely recorded after the fact. Substrings are matched
+/// case-insensitively against the whole command; each phrase is a verb+target
+/// pair so a benign status read (`systemctl status innerwarden-agent`,
+/// `innerwarden get status`) does NOT match. Removal/alteration of
+/// InnerWarden's own files is handled separately in [`check_security_tamper`]
+/// (it needs a destructive verb AND an InnerWarden path).
+pub const SECURITY_TAMPER_INDICATORS: &[&str] = &[
+    // InnerWarden service control (systemctl stop/disable/mask/kill ...).
+    "stop innerwarden",
+    "disable innerwarden",
+    "mask innerwarden",
+    "kill innerwarden",
+    // InnerWarden process kill.
+    "pkill innerwarden",
+    "pkill -f innerwarden",
+    "killall innerwarden",
+    // InnerWarden CLI self-disable / removal.
+    "innerwarden uninstall",
+    "innerwarden disable",
+    // Host security monitors (universal defense-evasion).
+    "stop auditd",
+    "disable auditd",
+    "stop apparmor",
+    "disable apparmor",
+    "stop falcosecurity",
+    "stop wazuh-agent",
+    "setenforce 0",
+    "auditctl -e 0",
+];
+
+/// Paths that hold InnerWarden's own binaries, config, models, data, or pinned
+/// eBPF objects. Deleting/altering any of these is a self-tamper attempt.
+pub const INNERWARDEN_SELF_PATHS: &[&str] = &[
+    "/usr/local/bin/innerwarden",
+    "/etc/innerwarden",
+    "/var/lib/innerwarden",
+    "/sys/fs/bpf/innerwarden",
+];
+
 // ── Check functions ─────────────────────────────────────────────────────
 
 /// Check content for injection patterns. Returns first match.
@@ -310,6 +354,41 @@ pub fn check_tmp_execution(content: &str) -> Option<(&'static str, u32)> {
         .iter()
         .find(|d| lower.contains(*d))
         .map(|d| (*d, 30))
+}
+
+/// Check for security-control tampering (disabling/removing InnerWarden or the
+/// host's other security monitors). Returns (indicator, score). Score 60 maps
+/// to a "deny" recommendation, so an agent told to "turn off the monitoring"
+/// is blocked in-path. A status read or restart is NOT flagged.
+pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
+    let lower = content.to_ascii_lowercase();
+    // Direct verb+target phrases (service control / process kill / self-disable).
+    if let Some(i) = SECURITY_TAMPER_INDICATORS
+        .iter()
+        .find(|i| lower.contains(*i))
+    {
+        return Some((*i, 60));
+    }
+    // Deleting/altering InnerWarden's own files, models, or pinned eBPF objects:
+    // requires a destructive verb AND an InnerWarden path, so reading/grepping
+    // a config file under /etc/innerwarden stays allowed.
+    const DESTRUCTIVE_VERBS: &[&str] = &[
+        "rm ",
+        "rm-",
+        "unlink ",
+        "rmdir ",
+        "shred ",
+        "truncate ",
+        "mv ",
+        "> /",
+        ">/",
+    ];
+    if DESTRUCTIVE_VERBS.iter().any(|v| lower.contains(v))
+        && INNERWARDEN_SELF_PATHS.iter().any(|p| lower.contains(p))
+    {
+        return Some(("removing or altering InnerWarden files", 60));
+    }
+    None
 }
 
 /// Check for download-and-execute via pipe. Returns score.
