@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **The correlation-chain block path bypassed the cloud safelist and banned Canonical on Hetzner (cloud-FP sweep follow-up).** Two sibling response paths gate a candidate IP against the cloud/CDN safelist before escalating: the repeat-offender path and the completed-correlation-chain path. The repeat-offender path was switched from `identify_provider` (a first-octet heuristic that only knows a handful of broad ranges) to `cloud_safelist::safelist_label` (the real CIDR walk) on 2026-05-08, but the chain path was missed and still used the heuristic. Result: the `Data Exfiltration (eBPF Sequence)` chain (CL-008-class) banned Canonical `185.125.190.49` (apt/livepatch) on Hetzner, because `185.125.188.0/22` is in the safelist's CIDR table but the first-octet heuristic does not know `185.x`. Both paths now route through one shared `safelisted_provider` helper (a thin wrapper over `safelist_label`), so the gate cannot drift between them again. **Anti-evasion preserved:** the safelist is the existing CIDR table (no new IP hardcoded), and a real attacker IP outside every safelist range (`203.0.113.45`, `45.148.10.121`) is still blockable by both paths. A new `#[tokio::test]` drives both async paths end-to-end with a CIDR-only safelisted IP and asserts each purges it from reputation state instead of escalating.
+
 ## [0.15.29] - 2026-06-27
 
 ### Fixed
