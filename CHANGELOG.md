@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Official `claude-code-protection` module — Claude Code is now a first-class registered integration, mirroring OpenClaw's packaging.** Claude Code was already marked `IntegrationLevel::Official` in the agent-guard signature registry (`crates/agent-guard/src/signatures.rs`) and had a dedicated, enforcing in-path guard (`innerwarden agent install-hook`, 0.15.30), but it was missing the module/registry/docs that make `openclaw-protection` discoverable and installable. This adds: a `registry.toml` entry (so `innerwarden module install/enable claude-code-protection` resolves and `known_module_id` recognises it), `modules/claude-code-protection/` (`module.toml` + `docs/README.md`), and a step-by-step `docs/integration-recipes/claude-code-agent-guard.md` (linked from `integrations/README.md`). The docs frame Claude Code's two-layer model: the enforcing fail-closed PreToolUse guard hook (pre-execution) plus the observe-layer kernel detection (`exec_audit` + `journald` -> `execution-guard`, post-execution), and the recommended posture (unprivileged agent + fail-closed hook + agent-scoped Execution Gate). No behaviour change to existing modules. Anchored by tests: the shipped `module.toml` parses with the expected builtin fields, and `known_module_id` recognises `claude-code-protection`.
+
 ## [0.15.30] - 2026-06-28
 
 ### Added
