@@ -27,12 +27,17 @@ fn home() -> Result<PathBuf> {
 /// (by default only `deny` blocks). Always fails CLOSED on an unreachable or
 /// unparsable inspection result, so a stopped agent does not silently open the
 /// gate.
-fn guard_script(url: &str, block_review: bool) -> String {
+fn guard_script(url: &str, block_review: bool, tenant: Option<&str>) -> String {
     let deny_cases = if block_review {
         "deny | review"
     } else {
         "deny"
     };
+    // Spec 084 P0 1D: when a tenant is supplied, the guard stamps every
+    // check-command call with it (body field + `X-InnerWarden-Tenant` header)
+    // so a multi-tenant fleet attributes guard activity per tenant. Empty when
+    // unset, in which case the header + body field are omitted.
+    let tenant = tenant.map(str::trim).unwrap_or("");
     format!(
         r#"#!/usr/bin/env bash
 # InnerWarden guard hook for Claude Code (PreToolUse:Bash).
@@ -40,6 +45,7 @@ fn guard_script(url: &str, block_review: bool) -> String {
 # command to InnerWarden's check-command brain and blocks (exit 2) on a
 # dangerous verdict, failing CLOSED if the endpoint is unreachable.
 IW_URL="${{INNERWARDEN_DASHBOARD_URL:-{url}}}"
+IW_TENANT="{tenant}"
 input="$(cat)"
 cmd="$(printf '%s' "$input" | python3 -c 'import sys, json
 try: print(json.load(sys.stdin).get("tool_input", {{}}).get("command", ""))
@@ -49,7 +55,11 @@ resp=""
 for _ in 1 2 3; do
   resp="$(curl -sk -m 8 -X POST "$IW_URL/api/agent/check-command" \
     -H 'content-type: application/json' \
-    -d "$(python3 -c 'import json, sys; print(json.dumps({{"command": sys.argv[1]}}))' "$cmd")" 2>/dev/null)"
+    ${{IW_TENANT:+-H "x-innerwarden-tenant: $IW_TENANT"}} \
+    -d "$(python3 -c 'import json, sys
+b = {{"command": sys.argv[1]}}
+if len(sys.argv) > 2 and sys.argv[2]: b["tenant"] = sys.argv[2]
+print(json.dumps(b))' "$cmd" "$IW_TENANT")" 2>/dev/null)"
   [ -n "$resp" ] && break
 done
 read -r rec risk expl < <(printf '%s' "$resp" | python3 -c 'import sys, json
@@ -116,8 +126,9 @@ pub(crate) fn run(
     settings: Option<&str>,
     url: Option<&str>,
     block_review: bool,
+    tenant: Option<&str>,
 ) -> Result<()> {
-    run_in(&home()?, agent, settings, url, block_review)
+    run_in(&home()?, agent, settings, url, block_review, tenant)
 }
 
 /// Core of [`run`] with the home directory injected, so the full install
@@ -129,6 +140,7 @@ fn run_in(
     settings: Option<&str>,
     url: Option<&str>,
     block_review: bool,
+    tenant: Option<&str>,
 ) -> Result<()> {
     if agent != "claude-code" {
         anyhow::bail!("unsupported agent '{agent}' (only 'claude-code' is supported today)");
@@ -140,7 +152,7 @@ fn run_in(
     if let Some(parent) = script_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::write(&script_path, guard_script(url, block_review))
+    fs::write(&script_path, guard_script(url, block_review, tenant))
         .with_context(|| format!("writing {}", script_path.display()))?;
     #[cfg(unix)]
     {
@@ -248,19 +260,31 @@ mod tests {
 
     #[test]
     fn guard_script_deny_only_blocks_deny() {
-        let s = guard_script("https://127.0.0.1:8787", false);
+        let s = guard_script("https://127.0.0.1:8787", false, None);
         assert!(s.contains("/api/agent/check-command"));
         assert!(s.contains("exit 2"), "must be able to block");
         assert!(s.contains("inspection-unreachable"), "must fail closed");
         assert!(s.contains("  deny)"), "deny-only case present");
         assert!(!s.contains("deny | review"));
+        // No tenant -> empty IW_TENANT, so the header expansion is a no-op.
+        assert!(s.contains("IW_TENANT=\"\""));
     }
 
     #[test]
     fn guard_script_block_review_extends_cases() {
-        let s = guard_script("https://example:9", true);
+        let s = guard_script("https://example:9", true, None);
         assert!(s.contains("deny | review"));
         assert!(s.contains("https://example:9"));
+    }
+
+    // Spec 084 P0 1D: a tenant is baked into the script as IW_TENANT and flows
+    // to the check-command brain via the header + body field.
+    #[test]
+    fn guard_script_stamps_tenant() {
+        let s = guard_script("https://127.0.0.1:8787", false, Some("acme-corp"));
+        assert!(s.contains("IW_TENANT=\"acme-corp\""));
+        assert!(s.contains("x-innerwarden-tenant: $IW_TENANT"));
+        assert!(s.contains("b[\"tenant\"] = sys.argv[2]"));
     }
 
     #[test]
@@ -272,7 +296,15 @@ mod tests {
         std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
         std::fs::write(&settings, r#"{"model":"sonnet"}"#).unwrap();
 
-        run_in(home.path(), "claude-code", None, Some("https://h:1"), true).unwrap();
+        run_in(
+            home.path(),
+            "claude-code",
+            None,
+            Some("https://h:1"),
+            true,
+            None,
+        )
+        .unwrap();
 
         // Guard script written, fail-closed, block-review wired, 0755.
         let script = home.path().join(".config/innerwarden/claude_code_guard.sh");
@@ -299,7 +331,15 @@ mod tests {
         );
 
         // Idempotent: a second run does not duplicate the hook.
-        run_in(home.path(), "claude-code", None, Some("https://h:1"), true).unwrap();
+        run_in(
+            home.path(),
+            "claude-code",
+            None,
+            Some("https://h:1"),
+            true,
+            None,
+        )
+        .unwrap();
         let v2: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v2["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }
@@ -314,6 +354,7 @@ mod tests {
             Some(custom.to_str().unwrap()),
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(custom.exists(), "explicit --settings path is honoured");
@@ -329,7 +370,7 @@ mod tests {
     #[test]
     fn run_in_rejects_unknown_agent() {
         let home = tempfile::TempDir::new().unwrap();
-        let err = run_in(home.path(), "cursor", None, None, false).unwrap_err();
+        let err = run_in(home.path(), "cursor", None, None, false, None).unwrap_err();
         assert!(err.to_string().contains("unsupported agent"));
     }
 }

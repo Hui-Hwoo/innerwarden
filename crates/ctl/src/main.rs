@@ -713,6 +713,12 @@ enum AgentCommand {
         /// Also block "review" verdicts, not just "deny".
         #[arg(long)]
         block_review: bool,
+
+        /// Tenant id to stamp on every guard check (spec 084 P0 1D), so a
+        /// multi-tenant fleet attributes per-container guard activity per
+        /// tenant. Bake it into the agent's container image / pod template.
+        #[arg(long)]
+        tenant: Option<String>,
     },
 }
 

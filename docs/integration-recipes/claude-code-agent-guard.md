@@ -37,11 +37,29 @@ innerwarden agent install-hook                 # deny-only (default)
 innerwarden agent install-hook --block-review  # also block "review" verdicts
 # non-default dashboard URL:
 innerwarden agent install-hook --url https://127.0.0.1:8787
+# multi-tenant fleet: stamp every guard check with the tenant (spec 084 P0)
+innerwarden agent install-hook --tenant acme-corp
 ```
 
 It writes a guard script to `~/.config/innerwarden/claude_code_guard.sh` and
 merges an idempotent `PreToolUse` Bash hook into `~/.claude/settings.json`.
 Re-running it does not duplicate the hook.
+
+### Per-tenant attribution (multi-tenant fleets)
+
+`--tenant <id>` bakes the tenant into the guard script (`IW_TENANT`), which
+sends it to the `check-command` brain on every check (the `tenant` body field
+plus an `X-InnerWarden-Tenant` header). The agent logs and echoes the tenant,
+so per-container guard activity in a multi-tenant fleet is attributable per
+tenant alongside the per-tenant incident counter on `/metrics`
+(`innerwarden_incidents_by_tenant{tenant="..."}`).
+
+**Bake it into the container image / pod template** so every managed-agent
+container is guarded *and* tenant-stamped by construction — run
+`innerwarden agent install-hook --tenant "$TENANT"` in the image build (or an
+init step) with `$TENANT` injected from the pod's tenant label. The tenant the
+guard reports is then bound to the container, not self-asserted by the agent's
+prompt.
 
 ## 3. Verify
 

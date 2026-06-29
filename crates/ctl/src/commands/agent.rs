@@ -885,11 +885,13 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
             settings,
             url,
             block_review,
+            tenant,
         }) => crate::commands::agent_install_hook::run(
             agent,
             settings.as_deref(),
             url.as_deref(),
             *block_review,
+            tenant.as_deref(),
         ),
     }
 }
@@ -933,6 +935,7 @@ mod tests {
             settings: None,
             url: None,
             block_review: false,
+            tenant: Some("acme-corp".to_string()),
         };
         let res = cmd_agent(&cli, Some(&cmd));
         match prev {
