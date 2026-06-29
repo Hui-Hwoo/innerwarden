@@ -294,6 +294,36 @@ impl ReverseShellDetector {
             return None;
         }
 
+        // 2026-06-29: HTTP/download-client exclusion. wget / curl (and friends)
+        // connect to a web server and dup2 the socket onto stdio to stream the
+        // body — bit-identical to a reverse shell from the kernel's POV, but
+        // `curl https://...` is not an attack. This is the single most common
+        // false positive: ANY box (not just AI-agent boxes) running wget/curl
+        // gets flooded with Critical `ebpf_reverse_shell`. Observed on test001:
+        // busybox `wget http://1.1.1.1` -> connect:80 + fd_redirect(0) ->
+        // Critical, source_comm=wget.
+        //
+        // Same shape, same risk model, and INTENTIONALLY as narrow as the SSH
+        // exclusion above:
+        //   - source_comm comes from the CONNECT event (reliable).
+        //   - target_port must be a standard web port — a "wget" connecting to
+        //     4444 / 1337 / a random high C2 port still fires (real reverse
+        //     shells do not live on :443; a renamed binary cannot fake the
+        //     kernel-reported destination port).
+        //   - defence in depth: a genuinely malicious download is still seen by
+        //     c2_callback / c2_web_tunnel / process_tree / the agent context
+        //     gate; this only stops the connect+dup2 *shape* from self-flagging.
+        const REVERSE_SHELL_HTTP_CLIENTS: &[&str] = &[
+            "wget", "curl", "aria2c", "axel", "lynx", "links", "w3m", "fetch", "http", "https",
+        ];
+        let http_client_match = REVERSE_SHELL_HTTP_CLIENTS
+            .iter()
+            .any(|p| source_comm == *p || source_comm.starts_with(p));
+        let web_port = matches!(target_port, 80 | 443 | 8080 | 8443 | 8000 | 8888);
+        if http_client_match && web_port {
+            return None;
+        }
+
         // Cooldown check
         let key = Self::hash_command(&format!("{pattern}:{pid}"));
         if let Some(&last) = self.alerted.get(&key) {
@@ -853,6 +883,41 @@ mod tests {
             inc.is_none(),
             "ssh + connect + fd_redirect on port 22 must be suppressed"
         );
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_does_not_fire_on_wget_to_web_port() {
+        // 2026-06-29: the #1 false positive. wget/curl connect to a web server
+        // and dup2 the socket onto stdio to stream the body — bit-identical to a
+        // reverse shell. Observed on test001: busybox `wget http://1.1.1.1` ->
+        // connect:80 + fd_redirect(0) -> Critical. Must be suppressed for known
+        // HTTP clients on a standard web port.
+        for (comm, port) in [("wget", 80u16), ("curl", 443), ("wget", 8080)] {
+            let mut det = ReverseShellDetector::new("test", 300);
+            let now = Utc::now();
+            det.process(&connect_event_with_comm(7100, "1.1.1.1", port, comm, now));
+            let inc = det.process(&fd_redirect_event(7100, 5, 0, now + Duration::seconds(1)));
+            assert!(
+                inc.is_none(),
+                "{comm} connect+fd_redirect to web port {port} must be suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn ebpf_reverse_shell_still_fires_on_wget_to_non_web_port() {
+        // INTENTIONALLY narrow: a "wget" to a C2 port (4444/1337/random high)
+        // is NOT a real download and still fires — an attacker renaming their
+        // reverse shell to wget cannot also make the kernel report port 80.
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        det.process(&connect_event_with_comm(
+            7101, "10.0.0.1", 4444, "wget", now,
+        ));
+        let inc = det
+            .process(&fd_redirect_event(7101, 5, 0, now + Duration::seconds(1)))
+            .expect("wget to a non-web C2 port must still fire");
+        assert_eq!(inc.severity, Severity::Critical);
     }
 
     #[test]
