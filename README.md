@@ -24,7 +24,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
-![eBPF Programs](https://img.shields.io/badge/eBPF%20programs-45%20loaded-blueviolet)
+![eBPF Programs](https://img.shields.io/badge/eBPF%20programs-27%20loaded-blueviolet)
 ![Detectors](https://img.shields.io/badge/detectors-82-blue)
 ![Correlation Rules](https://img.shields.io/badge/correlation%20rules-69-purple)
 ![Tests](https://img.shields.io/badge/tests-7900%2B-brightgreen)
@@ -56,10 +56,10 @@ It lives where the action is: on the machine the agent can affect. Agent-facing 
 - **Watch.** It sees what actually executes on the host with eBPF, so if something slips past the polite guardrail it is still caught.
 - **Prove.** It records every decision locally in a tamper-evident audit trail. No cloud, your data never leaves the box.
 
-Under the hood: 45 eBPF programs, 82 detectors, 69 cross-layer correlation rules, 90+ MITRE ATT&CK techniques, and 7900+ tests gate every change. The full tour is further down: [what it does](#what-it-does), [what it detects](#what-it-detects), [how it works](#how-it-works).
+Under the hood: 27 eBPF programs loaded (kernel-dependent), 82 detectors, 69 cross-layer correlation rules, 56 MITRE ATT&CK technique IDs (90+ detector mappings), and 7900+ tests gate every change. The full tour is further down: [what it does](#what-it-does), [what it detects](#what-it-detects), [how it works](#how-it-works).
 
 <h3 align="center">
-  <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
+  <a href="https://innerwarden.com/live">See it responding to live network anomalies on our lab infrastructure</a>
 </h3>
 
 ---
@@ -217,11 +217,11 @@ Apache-2.0. If this project helps make agent automation safer to try, [give it a
 ## What it does
 
 1. **Guards agent actions**: agents and tool runners can call the local command-check API before acting, or route MCP tool calls through the inspecting proxy. Commands are scored against embedded Agent Threat Rules (ATR), risky actions can be denied or sent for review, and the host layer still verifies what actually ran.
-2. **Watches**: 31 collectors across every layer — eBPF syscall tracing (45 kernel programs), firmware integrity, memory forensics (/proc/maps RWX), native DNS/HTTP/TLS (JA3/JA4) capture, tunnel-interface monitoring (a new tun/WireGuard interface = a mesh-VPN brought up), real-time filesystem, cgroup, kernel integrity, plus auth.log, journald, Docker, nginx, CloudTrail. (Full collector list under [How it works](#how-it-works).)
-3. **Detects**: 82 stateful detectors + 8 YARA malware rules + 9 built-in Sigma rules + 209 community Sigma rules cover the full attack lifecycle — brute-force/credential stuffing, C2 (incl. ngrok/cloudflared/bore + mesh-VPN tunnels + DNS/ICMP/SSH-forward), privilege escalation, container escape, reverse shells (eBPF sequence, impossible to evade), ransomware, rootkits, exfiltration, persistence, defense evasion, data destruction, and more. **90+ MITRE ATT&CK techniques covered** across 12 ATT&CK tactics. (The per-detector table with MITRE IDs is in [What it detects](#what-it-detects).)
+2. **Watches**: 31 collectors across every layer — eBPF syscall tracing (27 kernel programs loaded, kernel-dependent), firmware integrity, memory forensics (/proc/maps RWX), native DNS/HTTP/TLS (JA3/JA4) capture, tunnel-interface monitoring (a new tun/WireGuard interface = a mesh-VPN brought up), real-time filesystem, cgroup, kernel integrity, plus auth.log, journald, Docker, nginx, CloudTrail. (Full collector list under [How it works](#how-it-works).)
+3. **Detects**: 82 stateful detectors + 8 YARA malware rules + 9 built-in Sigma rules + 209 community Sigma rules cover the full attack lifecycle — brute-force/credential stuffing, C2 (incl. ngrok/cloudflared/bore + mesh-VPN tunnels + DNS/ICMP/SSH-forward), privilege escalation, container escape, reverse shells (eBPF sequence, impossible to evade), ransomware, rootkits, exfiltration, persistence, defense evasion, data destruction, and more. **56 MITRE ATT&CK technique IDs** (90+ detector→technique mappings) across 12 ATT&CK tactics. (The per-detector table with MITRE IDs is in [What it detects](#what-it-detects).)
 4. **Correlates**: 69 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
 5. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
-6. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
+6. **Responds**: high/critical incidents drive response skills (block IP via XDP/UFW/iptables/nftables, suspend sudo, kill process, pause container, honeypot redirect). XDP drops attack traffic at wire speed. **Optional** in-kernel execution enforcement (LSM Execution Gate — inert by default, requires explicit arming + setup) stops reverse shells and /tmp execution before they run. Blocks propagate to mesh peers.
 7. **Responds automatically**: the AI decision path drives response skills directly (block IP via ufw/iptables/nftables/firewalld/XDP, suspend sudo, kill process, pause container, honeypot redirect, capture forensics + pcap, notify, escalate). On top of that, 3 built-in SOC playbook templates ship (data exfil, Log4Shell, credential stuffing) that you extend with your own YAML and turn on with `[playbooks] enabled` (opt-in, off by default)
 8. **Fingerprints attackers**: behavioral DNA (SHA-256 of detectors + tools + targets + timing patterns), **cross-IP tracking** (same attacker detected across VPN/Tor rotations via fuzzy DNA matching — risk score and detector knowledge inherited automatically), campaign detection via IOC clustering, recurrence tracking, risk scoring 0-100, monthly threat reports with MITRE heatmap
 
@@ -295,7 +295,7 @@ The real Autonomy Gap: an incident the Local Warden is not confident about, that
 
 ## What it detects
 
-82 stateful detectors + 8 YARA rules + 9 built-in Sigma rules + 209 community Sigma rules covering the full attack lifecycle. **90+ unique MITRE ATT&CK techniques across 12 ATT&CK tactics.** Highlights:
+82 stateful detectors + 8 YARA rules + 9 built-in Sigma rules + 209 community Sigma rules covering the full attack lifecycle. **56 unique MITRE ATT&CK technique IDs (90+ detector→technique mappings) across 12 ATT&CK tactics.** Highlights:
 
 | Detector | Threat | MITRE |
 |----------|--------|-------|
@@ -349,9 +349,9 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 
 ## How it works
 
-**Sensor**: deterministic signal collection. No AI, no HTTP. 31 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 45 kernel programs loaded, JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, kernel audit state monitoring (alerts when the audit subsystem is disabled, T1562.001), tunnel-interface monitoring (new tun/WireGuard interface = mesh-VPN persistence, rename-proof), USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **7900+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
+**Sensor**: deterministic signal collection. No AI, no HTTP. 31 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 27 kernel programs loaded (kernel-dependent), JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, kernel audit state monitoring (alerts when the audit subsystem is disabled, T1562.001), tunnel-interface monitoring (new tun/WireGuard interface = mesh-VPN persistence, rename-proof), USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **7900+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
 
-**eBPF**: 47 kernel programs compiled, 45 loaded in prod (kernel-dependent). Linux 5.8+, CO-RE/BTF portable:
+**eBPF**: 47 kernel programs compiled, 27 loaded in prod (kernel-dependent). Linux 5.8+, CO-RE/BTF portable:
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
 - **10 kprobes**: `commit_creds` (privilege escalation), `native_write_msr` (firmware MSR tampering), `acpi_evaluate_object` (ACPI rootkit detection), `do_truncate` (log tampering), plus 6 timing-based rootkit kprobes (Trace of the Times: iterate_dir, filldir64, tcp4_seq_show, proc_pid_readdir kprobe/kretprobe pairs)
 - **5 LSM kernel-block hooks** (Spec 052/053 + PR-A/B/C/D): `bprm_check_security` (exec blocking via PID→BLOCKED_PIDS map populated by kill chain detector), `userns_create` (container escape — blocks `unshare(CLONE_NEWUSER)` from chain-flagged PIDs), `ptrace_access_check` (process injection — blocks PTRACE_ATTACH/POKETEXT), `bpf_prog` (VoidLink defence — blocks malicious BPF program loads), `mmap_file` (real-time RWX block, replacing 5s `proc_maps` polling). Plus 2 legacy hooks (`file_open`, `bpf`) kept in parallel. All FP-free by design: legitimate users (Chrome sandbox, gdb, JIT compilers, systemd) pass through because they're never in BLOCKED_PIDS.
@@ -579,7 +579,7 @@ Checks SSH config, firewall, kernel params (ASLR, SYN cookies, IP forwarding), f
 
 ## Live threat feed
 
-See Inner Warden responding to real attacks in real time: [innerwarden.com/live](https://innerwarden.com/live)
+See Inner Warden responding to live network anomalies on our lab infrastructure in real time: [innerwarden.com/live](https://innerwarden.com/live)
 
 The agent exposes public read-only endpoints for live monitoring:
 
@@ -777,7 +777,7 @@ innerwarden agent proxy -- npx -y some-mcp-server   # wrap an MCP server with in
 
 ## Supported environments
 
-- **Linux**: Ubuntu 22.04+, any systemd-based distro. Full feature set with 45 eBPF kernel programs loaded (tracepoints, kprobes, LSM, XDP, raw_tracepoints), kill chain enforcement, wire-speed blocking.
+- **Linux**: Ubuntu 22.04+, any systemd-based distro. Full feature set: 27 eBPF kernel programs loaded (kernel-dependent; tracepoints, kprobes, LSM, XDP, raw_tracepoints), kill chain detection, wire-speed XDP blocking.
 - **macOS**: Ventura and later (launchd, pf firewall, unified log). Detection and response work fully, but eBPF kernel programs are Linux-only. macOS uses log-based collectors instead.
 
 Pre-built binaries: `x86_64` and `aarch64` for both platforms.
@@ -812,7 +812,7 @@ No. Starts in observe-only mode. You enable response skills and disable dry-run 
 No. Detection, logging, dashboard, and reports all work without AI. AI adds confidence-scored triage for autonomous response and is entirely optional.
 
 **How is this different from Fail2ban?**
-Fail2ban blocks IPs based on regex patterns. Inner Warden has 82 detectors, 45 eBPF kernel programs with kill chain enforcement, a collaborative defence mesh network, 10 response skills (including sudo suspension, process kill, container pause, honeypots, and traffic capture), twelve AI providers, 4-layer DDoS defence, Telegram bot, AbuseIPDB intelligence sharing, and a full investigation dashboard with MITRE ATT&CK mapping.
+Fail2ban blocks IPs based on regex patterns. Inner Warden has 82 detectors, 27 eBPF kernel programs (kernel-dependent) with kill chain detection, a collaborative defence mesh network, 10 response skills (including sudo suspension, process kill, container pause, honeypots, and traffic capture), twelve AI providers, 4-layer DDoS defence, Telegram bot, AbuseIPDB intelligence sharing, and a full investigation dashboard with MITRE ATT&CK mapping.
 
 **How is this different from other HIDS tools?**
 Most host intrusion detection systems only observe. They write alerts for a human to act on. Inner Warden observes AND blocks. LSM hooks stop reverse shells at the kernel's execve before the process runs. XDP drops attack traffic at wire speed. Kill chain detection blocks 7 generic exploit patterns without CVE signatures, catching zero-day exploits by behaviour rather than known hashes.
@@ -870,7 +870,7 @@ New detectors, integration recipes, and module documentation are especially appr
 ## Links
 
 - [Website](https://www.innerwarden.com)
-- [Live attack feed](https://innerwarden.com/live) — real attacks against our prod box, in real time
+- [Live activity feed](https://innerwarden.com/live) — network anomalies on our lab infrastructure (self/internal traffic filtered), in real time
 - [Blog](https://innerwarden.com/blog)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
