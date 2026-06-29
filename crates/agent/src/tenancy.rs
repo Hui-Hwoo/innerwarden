@@ -780,6 +780,44 @@ users:
         assert_eq!(inc.evidence["tenant_id"], "acme-corp");
     }
 
+    #[test]
+    fn enrich_incident_attributes_array_evidence_via_container_entity() {
+        // The real demo path: the sensor's behavioural detectors (reverse_shell,
+        // crypto_miner, ...) emit ARRAY evidence and the sensor's central
+        // `stamp_tenancy` re-attaches the container id as a Container ENTITY (it
+        // cannot write a top-level evidence key into an array). On array evidence
+        // the tenant_id evidence write is a no-op, so the operator-visible proof of
+        // attribution is the `tenant:<id>` TAG. This is the exact incident shape the
+        // sensor produces; it must still resolve to the right tenant.
+        reset_cache_with(
+            parse_pod_list(REAL_PODS_JSON, REAL_NS_JSON, "innerwarden.io/tenant").unwrap(),
+        );
+        let cfg = TenancyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut inc = Incident {
+            ts: chrono::Utc::now(),
+            host: "node1".to_string(),
+            incident_id: "reverse_shell:bash_dev_tcp:1234:2026-06-29T14:13Z".to_string(),
+            severity: Severity::Critical,
+            title: "t".to_string(),
+            summary: "s".to_string(),
+            evidence: serde_json::json!([{ "kind": "reverse_shell", "pid": 1234 }]),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::container("4858a7b75b55")],
+        };
+        enrich_incident(&mut inc, &cfg);
+        assert!(
+            inc.tags.contains(&"tenant:acme-corp".to_string()),
+            "array-evidence container incident must still get the tenant tag, got {:?}",
+            inc.tags
+        );
+        // Evidence stays an array (no shape flip); the tag is the attribution signal.
+        assert!(inc.evidence.is_array());
+    }
+
     // Real-world shape from test001: `container_escape` (and several other
     // sensor detectors) key the incident_id on the container id but do NOT copy
     // it into evidence or a container entity — enrich must still attribute it.

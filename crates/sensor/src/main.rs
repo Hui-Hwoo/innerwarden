@@ -56,6 +56,13 @@ pub(crate) struct WriteStats {
     pub(crate) events_written: u64,
     pub(crate) events_dropped: u64,
     pub(crate) incidents_written: u64,
+    // Container scope of the event currently being processed, set at the top of
+    // each `process_event` (None for host events and the emergency-lane signal).
+    // It rides here so the single incident sink (`write_incident`) can attribute
+    // an incident to its Kubernetes tenant without threading the event through
+    // every detector emit site. Request-scoped, overwritten each event. (spec 084)
+    pub(crate) current_container_id: Option<String>,
+    pub(crate) current_pod_uid: Option<String>,
 }
 
 fn load_config_for_cli(cli: &Cli) -> Result<config::Config> {
