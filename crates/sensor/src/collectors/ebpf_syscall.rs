@@ -206,8 +206,25 @@ fn resolve_ppid_kernel_first(kernel_ppid: u32, pid: u32) -> u32 {
     }
 }
 
-/// Extract container ID from /proc/<pid>/cgroup. Returns None for host processes.
-/// Resolve a PID's container id, memoised per PID.
+/// Non-forgeable container + Kubernetes pod identity parsed from
+/// `/proc/<pid>/cgroup`. The kernel writes this cgroup path; a process inside a
+/// container cannot forge it. `container_id` is the 12-char runtime container
+/// id, `pod_uid` is the Kubernetes pod UID (present only for pods — the
+/// per-tenant anchor), and `runtime` is the container runtime inferred from the
+/// cgroup leaf/prefix.
+///
+/// Spec 084 P0: `pod_uid` + `runtime` are the missing hops that let the agent
+/// map an event to its owning pod -> namespace -> tenant **without trusting any
+/// process-supplied label**. The cgroup path is the non-forgeable root of the
+/// `cgroup_id -> container -> pod -> tenant` attribution chain.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ContainerIdentity {
+    pub container_id: String,
+    pub pod_uid: Option<String>,
+    pub runtime: Option<String>,
+}
+
+/// Resolve a PID's container/pod identity, memoised per PID.
 ///
 /// Spec 069: the eBPF ring reader calls this for ~15 event kinds, once per
 /// event. Without the cache it was a synchronous `/proc/<pid>/cgroup` read on
@@ -217,11 +234,11 @@ fn resolve_ppid_kernel_first(kernel_ppid: u32, pid: u32) -> u32 {
 /// surfaced tens of seconds late. Memoising collapses repeated lookups for the
 /// same PID to a map hit. Pid reuse can briefly serve a stale id; acceptable for
 /// container attribution and bounded by an 8192-entry cap.
-fn resolve_container_id(pid: u32) -> Option<String> {
+fn resolve_container_identity(pid: u32) -> Option<ContainerIdentity> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     const CACHE_CAP: usize = 8192;
-    static CACHE: OnceLock<Mutex<HashMap<u32, Option<String>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<u32, Option<ContainerIdentity>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     // Recover from a poisoned lock rather than branching on the error so the
     // happy path stays single-expression.
@@ -231,7 +248,7 @@ fn resolve_container_id(pid: u32) -> Option<String> {
             return v.clone();
         }
     }
-    let result = resolve_container_id_uncached(pid);
+    let result = resolve_container_identity_uncached(pid);
     let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
     if map.len() >= CACHE_CAP {
         map.clear();
@@ -240,42 +257,123 @@ fn resolve_container_id(pid: u32) -> Option<String> {
     result
 }
 
-fn resolve_container_id_uncached(pid: u32) -> Option<String> {
+fn resolve_container_identity_uncached(pid: u32) -> Option<ContainerIdentity> {
     let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    parse_container_id_from_cgroup(&content)
+    parse_container_identity_from_cgroup(&content)
 }
 
-/// Parse a 12-char container id out of `/proc/<pid>/cgroup` contents. Pure
-/// (no I/O) so the Docker/Podman/k8s formats are unit-testable without a real
-/// container.
-fn parse_container_id_from_cgroup(content: &str) -> Option<String> {
-    // The container id is the cgroup LEAF identifier. It appears in several
-    // shapes depending on runtime + cgroup driver:
-    //   cgroupfs:  0::/docker/<id>
-    //              0::/kubepods/besteffort/pod<uuid>/<id>
-    //   systemd:   0::/system.slice/docker-<id>.scope
-    //              0::/kubepods.slice/.../cri-containerd-<id>.scope   (k3s/k8s)
-    //              0::/.../crio-<id>.scope
-    //   podman:    0::/libpod-<id>.scope
-    //
-    // Take the leaf path segment, drop a trailing ".scope", then take the last
-    // '-'-delimited token: the runtime prefixes (docker-, cri-containerd-, crio-,
-    // libpod-) are dash-joined alpha, while the id itself is hex with no '-'. A
-    // plain "<id>" leaf (cgroupfs) has no '-' and is returned whole. This fixes
-    // the prior systemd-driver miss where the k3s `cri-containerd-<id>.scope`
-    // leaf resolved to the constant prefix "cri-containe" for every pod.
+/// Attach the Kubernetes pod UID + container runtime to an event's `details`.
+/// The 12-char `container_id` is already set by the per-event builders / inline
+/// sites; this adds the two extra non-forgeable hops uniformly. Best-effort:
+/// host processes and non-k8s containers simply omit the fields.
+fn attach_pod_runtime(details: &mut serde_json::Value, identity: Option<&ContainerIdentity>) {
+    if let Some(id) = identity {
+        if let Some(pod) = &id.pod_uid {
+            details["pod_uid"] = serde_json::Value::String(pod.clone());
+        }
+        if let Some(rt) = &id.runtime {
+            details["runtime"] = serde_json::Value::String(rt.clone());
+        }
+    }
+}
+
+/// Parse container + pod identity out of `/proc/<pid>/cgroup` contents. Pure
+/// (no I/O) so the Docker/Podman/CRI-O/k8s formats are unit-testable without a
+/// real container.
+///
+/// The container id is the cgroup LEAF identifier. It appears in several shapes
+/// depending on runtime + cgroup driver:
+///   cgroupfs:  0::/docker/<id>
+///              0::/kubepods/besteffort/pod<uuid>/<id>
+///   systemd:   0::/system.slice/docker-<id>.scope
+///              0::/kubepods.slice/.../kubepods-besteffort-pod<uuid>.slice/cri-containerd-<id>.scope
+///              0::/.../crio-<id>.scope
+///   podman:    0::/libpod-<id>.scope
+///
+/// Take the leaf path segment, drop a trailing ".scope", then take the last
+/// '-'-delimited token: the runtime prefixes (docker-, cri-containerd-, crio-,
+/// libpod-) are dash-joined alpha, while the id itself is hex with no '-'. A
+/// plain "<id>" leaf (cgroupfs) has no '-' and is returned whole. The pod UID
+/// (when present) is parsed from the `pod<uuid>` slice/segment higher in the
+/// path; the runtime is inferred from the leaf prefix or the path.
+fn parse_container_identity_from_cgroup(content: &str) -> Option<ContainerIdentity> {
     for line in content.lines() {
-        let leaf = match line.rsplit('/').next() {
+        // cgroup v2: "0::/path"; v1: "12:pids:/path". The path is after the
+        // last ':' so both drivers share one code path.
+        let path = line.rsplit(':').next().unwrap_or(line);
+        let leaf = match path.rsplit('/').next() {
             Some(l) => l,
             None => continue,
         };
         let leaf = leaf.strip_suffix(".scope").unwrap_or(leaf);
         let id = leaf.rsplit('-').next().unwrap_or(leaf);
         if id.len() >= 12 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Some(id[..12].to_string());
+            return Some(ContainerIdentity {
+                container_id: id[..12].to_string(),
+                pod_uid: extract_pod_uid(path),
+                runtime: detect_runtime(path, leaf),
+            });
         }
     }
     None
+}
+
+/// Extract a Kubernetes pod UID from a cgroup path. The pod slice/segment
+/// carries the UID: the systemd driver escapes the UUID dashes to underscores
+/// (`kubepods-besteffort-pod<uid>.slice`), the cgroupfs driver keeps them
+/// (`/kubepods/besteffort/pod<uid>/`). Normalised to a canonical lowercase
+/// dashed UUID. Returns None for non-k8s containers and host processes.
+fn extract_pod_uid(path: &str) -> Option<String> {
+    for seg in path.split('/') {
+        let seg = seg.strip_suffix(".slice").unwrap_or(seg);
+        // A segment can contain "pod" twice ("kubepods-besteffort-pod<uid>");
+        // scan every occurrence and keep the first that yields a valid UID.
+        let mut start = 0;
+        while let Some(rel) = seg[start..].find("pod") {
+            let i = start + rel + 3;
+            let cand: String = seg[i..]
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == '-' || *c == '_')
+                .collect();
+            let norm = cand.replace('_', "-").to_lowercase();
+            if is_pod_uid(&norm) {
+                return Some(norm);
+            }
+            start = i;
+        }
+    }
+    None
+}
+
+/// A Kubernetes pod UID is a UUID: 32 hex digits, optionally dash-grouped
+/// 8-4-4-4-12. Accept both the dashed and undashed (32 raw hex) forms.
+fn is_pod_uid(s: &str) -> bool {
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Infer the container runtime from the cgroup leaf prefix (systemd driver) or
+/// the path (cgroupfs driver). Returns None for host processes.
+fn detect_runtime(path: &str, leaf: &str) -> Option<String> {
+    for (prefix, rt) in [
+        ("cri-containerd-", "containerd"),
+        ("containerd-", "containerd"),
+        ("docker-", "docker"),
+        ("crio-", "crio"),
+        ("libpod-", "podman"),
+    ] {
+        if leaf.starts_with(prefix) {
+            return Some(rt.to_string());
+        }
+    }
+    // cgroupfs driver: the leaf is the bare id, so infer from the path.
+    if path.contains("/docker/") {
+        Some("docker".to_string())
+    } else if path.contains("kubepods") {
+        Some("containerd".to_string())
+    } else {
+        None
+    }
 }
 
 /// Read full command-line arguments from /proc/PID/cmdline.
@@ -2122,9 +2220,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
-                    Some(execve_to_event(
+                    let mut ev = execve_to_event(
                         pid,
                         uid,
                         ppid,
@@ -2133,7 +2232,9 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &comm,
                         &filename,
                         &host,
-                    ))
+                    );
+                    attach_pod_runtime(&mut ev.details, cident.as_ref());
+                    Some(ev)
                 }
                 // ConnectEvent layout (#[repr(C)]):
                 //   kind(4) pid(4) tgid(4) uid(4) ppid(4) _pad(4) cgroup_id(8) comm(64)
@@ -2164,10 +2265,11 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
                     let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
-                    Some(connect_to_event(
+                    let mut ev = connect_to_event(
                         pid,
                         uid,
                         ppid,
@@ -2178,7 +2280,9 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         port,
                         &host,
                         exe_path.as_deref(),
-                    ))
+                    );
+                    attach_pod_runtime(&mut ev.details, cident.as_ref());
+                    Some(ev)
                 }
                 // FileOpenEvent layout (#[repr(C)]):
                 //   kind(4) pid(4) uid(4) ppid(4) cgroup_id(8) comm(64) filename(256) flags(4)
@@ -2198,9 +2302,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
-                    Some(file_open_to_event(
+                    let mut ev = file_open_to_event(
                         pid,
                         uid,
                         ppid,
@@ -2210,7 +2315,9 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &filename,
                         flags,
                         &host,
-                    ))
+                    );
+                    attach_pod_runtime(&mut ev.details, cident.as_ref());
+                    Some(ev)
                 }
                 // FileWrite from LSM file_open hook (same layout as FileOpenEvent)
                 // Emitted when a non-allowlisted process writes to sensitive paths.
@@ -2229,9 +2336,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
-                    Some(file_open_to_event(
+                    let mut ev = file_open_to_event(
                         pid,
                         uid,
                         ppid,
@@ -2241,7 +2349,9 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &filename,
                         flags,
                         &host,
-                    ))
+                    );
+                    attach_pod_runtime(&mut ev.details, cident.as_ref());
+                    Some(ev)
                 }
                 // PrivEscEvent layout (#[repr(C)]):
                 //   kind(4) pid(4) tgid(4) old_uid(4) new_uid(4) _pad(4) cgroup_id(8) comm(64) ts_ns(8)
@@ -2257,7 +2367,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         continue;
                     }
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
                     privesc_to_event(
                         pid,
@@ -2268,6 +2379,10 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &comm,
                         &host,
                     )
+                    .map(|mut ev| {
+                        attach_pod_runtime(&mut ev.details, cident.as_ref());
+                        ev
+                    })
                 }
                 // LSM blocked execution - uses ExecveEvent layout but kind=6
                 // Same offsets as ExecveEvent: kind(4) pid(4) tgid(4) uid(4) gid(4) ppid(4) cgroup_id(8) comm(64) filename(256)
@@ -2282,7 +2397,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     // allowed the exec (learning). Logged only, never an incident.
                     let observe = is_exec_gate_observe(data);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
                     let mut details = serde_json::json!({
                         "pid": pid,
@@ -2301,6 +2417,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_ref());
 
                     let mut tags = vec!["ebpf".to_string(), "lsm".to_string()];
                     tags.push(if observe { "would_block" } else { "blocked" }.to_string());
@@ -2364,7 +2481,19 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let comm = bytes_to_string(&data[32..96]);
                     let filename = bytes_to_string(&data[96..352]);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+
+                    let mut details = serde_json::json!({
+                        "pid": pid,
+                        "uid": uid,
+                        "comm": comm,
+                        "filename": filename,
+                        "cgroup_id": cgroup_id,
+                        "container_id": container_id.as_deref().unwrap_or(""),
+                        "overlay_upper": true,
+                    });
+                    attach_pod_runtime(&mut details, cident.as_ref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2375,15 +2504,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         summary: format!(
                             "Container drift: {comm} executed {filename} (overlay upper layer)"
                         ),
-                        details: serde_json::json!({
-                            "pid": pid,
-                            "uid": uid,
-                            "comm": comm,
-                            "filename": filename,
-                            "cgroup_id": cgroup_id,
-                            "container_id": container_id.as_deref().unwrap_or(""),
-                            "overlay_upper": true,
-                        }),
+                        details,
                         tags: vec!["ebpf".to_string(), "container_drift".to_string()],
                         entities: vec![],
                     })
@@ -2415,7 +2536,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     // event's `ts` field is the JSONL-canonical UTC time so
                     // operators don't have to translate boot-relative ns.
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
                     // PR-A: the `reason` field at offset 12 was repurposed
                     // as `hook_id` (sensor-ebpf-types LSM_HOOK_*) so kind=35
@@ -2460,6 +2582,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_ref());
                     if let Some(ctx) = exec_ctx {
                         details["filename"] = serde_json::Value::String(ctx.filename.clone());
                         details["comm"] = serde_json::Value::String(ctx.comm.clone());
@@ -2553,7 +2676,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         0x4206 => "PTRACE_SEIZE",
                         _ => "UNKNOWN",
                     };
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "target_pid": target_pid,
@@ -2563,6 +2687,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_ref());
 
                     let mut tags = vec![
                         "ebpf".to_string(),
@@ -2596,7 +2721,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "target_uid": target_uid,
                         "comm": comm, "cgroup_id": cgroup_id,
@@ -2604,6 +2730,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_ref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2631,7 +2758,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let comm = bytes_to_string(&data[32..96]);
 
                     let ip = std::net::Ipv4Addr::from(addr_raw);
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
                     // Low ports or INADDR_ANY are more suspicious
                     let severity = if port < 1024 || addr_raw == 0 {
@@ -2648,6 +2776,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_ref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2677,7 +2806,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let target = bytes_to_string(&data[344..600]);
                     let fs_type = bytes_to_string(&data[600..632]);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
                     let in_container = cgroup_id > 1;
 
                     let severity = if in_container {
@@ -2695,6 +2825,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_ref());
 
                     let mut tags = vec!["ebpf".to_string(), "mount".to_string()];
                     if in_container {
@@ -2725,7 +2856,8 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let comm = bytes_to_string(&data[24..88]);
                     let name = bytes_to_string(&data[88..344]);
 
-                    let container_id = resolve_container_id(pid);
+                    let cident = resolve_container_identity(pid);
+                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
 
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "flags": flags,
@@ -2734,6 +2866,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
+                    attach_pod_runtime(&mut details, cident.as_ref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -3520,52 +3653,273 @@ mod tests {
         assert!(syscall_wrapper_symbol("openat").ends_with("sys_openat"));
     }
 
-    // Spec 069: resolve_container_id is memoised; a second lookup for the same
-    // PID must return the same value (PID 0 has no container → None, cached).
+    // Spec 069: resolve_container_identity is memoised; a second lookup for the
+    // same PID must return the same value (PID 0 has no container → None, cached).
     #[test]
-    fn resolve_container_id_is_memoised() {
-        let first = resolve_container_id(0);
-        let second = resolve_container_id(0);
+    fn resolve_container_identity_is_memoised() {
+        let first = resolve_container_identity(0);
+        let second = resolve_container_identity(0);
         assert_eq!(first, second);
         assert_eq!(first, None);
     }
 
     // Spec 069: the cgroup parser is pure; cover Docker/Podman/k8s + no-match.
+    // Convenience: the 12-char container id half of the parsed identity.
     #[test]
     fn parse_container_id_from_cgroup_formats() {
+        let cid = |s: &str| parse_container_identity_from_cgroup(s).map(|c| c.container_id);
         assert_eq!(
-            parse_container_id_from_cgroup("0::/docker/abcdef0123456789aa"),
+            cid("0::/docker/abcdef0123456789aa"),
             Some("abcdef012345".to_string())
         );
         assert_eq!(
-            parse_container_id_from_cgroup("0::/libpod-fedcba9876543210bb.scope"),
+            cid("0::/libpod-fedcba9876543210bb.scope"),
             Some("fedcba987654".to_string())
         );
         assert_eq!(
-            parse_container_id_from_cgroup("0::/kubepods/besteffort/pod1234/0011223344556677"),
+            cid("0::/kubepods/besteffort/pod1234/0011223344556677"),
             Some("001122334455".to_string())
         );
         // systemd cgroup driver (the real k3s/k8s shape) — previously mis-parsed
         // to the constant "cri-containe" for every pod.
         assert_eq!(
-            parse_container_id_from_cgroup(
+            cid(
                 "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pode2ad6fd3_524d.slice/cri-containerd-8317eb4a8dd5fbb4b3f663b25f6d39c943bb1cf0ba0c14b973c9ad069605f57f.scope"
             ),
             Some("8317eb4a8dd5".to_string())
         );
         // systemd-driver Docker + CRI-O.
         assert_eq!(
-            parse_container_id_from_cgroup("0::/system.slice/docker-abcdef0123456789aa.scope"),
+            cid("0::/system.slice/docker-abcdef0123456789aa.scope"),
             Some("abcdef012345".to_string())
         );
         assert_eq!(
-            parse_container_id_from_cgroup("0::/machine.slice/crio-001122334455667788.scope"),
+            cid("0::/machine.slice/crio-001122334455667788.scope"),
             Some("001122334455".to_string())
         );
         // Short ids and unrelated lines yield nothing.
-        assert_eq!(parse_container_id_from_cgroup("0::/docker/short"), None);
-        assert_eq!(parse_container_id_from_cgroup("0::/user.slice"), None);
-        assert_eq!(parse_container_id_from_cgroup("0::/"), None);
+        assert_eq!(cid("0::/docker/short"), None);
+        assert_eq!(cid("0::/user.slice"), None);
+        assert_eq!(cid("0::/"), None);
+    }
+
+    // Spec 084 P0: the per-tenant attribution anchors — pod_uid (the k8s pod
+    // UID) and runtime — parsed from the cgroup path for BOTH cgroup drivers.
+    #[test]
+    fn parse_pod_identity_k8s_systemd_driver() {
+        // Real k3s/containerd systemd-driver shape: a full 32-hex pod UID is
+        // escaped with underscores inside the `kubepods-besteffort-pod<uid>.slice`
+        // segment; the container id lives in the `cri-containerd-<id>.scope` leaf.
+        let id = parse_container_identity_from_cgroup(
+            "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pode2ad6fd3_524d_4f6a_9b1c_0a1b2c3d4e5f.slice/cri-containerd-8317eb4a8dd5fbb4b3f663b25f6d39c943bb1cf0ba0c14b973c9ad069605f57f.scope"
+        )
+        .expect("k8s pod cgroup must parse");
+        assert_eq!(id.container_id, "8317eb4a8dd5");
+        assert_eq!(
+            id.pod_uid.as_deref(),
+            Some("e2ad6fd3-524d-4f6a-9b1c-0a1b2c3d4e5f")
+        );
+        assert_eq!(id.runtime.as_deref(), Some("containerd"));
+    }
+
+    #[test]
+    fn parse_pod_identity_k8s_cgroupfs_driver() {
+        // cgroupfs driver keeps the canonical dashed UUID and a bare-hex leaf.
+        let id = parse_container_identity_from_cgroup(
+            "0::/kubepods/burstable/pod3f5a8b2c-1d4e-4f5a-8b2c-9f0a1b2c3d4e/8317eb4a8dd5fbb4b3f663b25f6d39c943bb1cf0ba0c14b973c9ad069605f57f"
+        )
+        .expect("cgroupfs k8s pod must parse");
+        assert_eq!(id.container_id, "8317eb4a8dd5");
+        assert_eq!(
+            id.pod_uid.as_deref(),
+            Some("3f5a8b2c-1d4e-4f5a-8b2c-9f0a1b2c3d4e")
+        );
+        assert_eq!(id.runtime.as_deref(), Some("containerd"));
+    }
+
+    #[test]
+    fn parse_identity_runtime_inference() {
+        // systemd-driver Docker leaf → docker; bare cgroupfs docker path → docker.
+        assert_eq!(
+            parse_container_identity_from_cgroup(
+                "0::/system.slice/docker-abcdef0123456789aa.scope"
+            )
+            .and_then(|c| c.runtime),
+            Some("docker".to_string())
+        );
+        assert_eq!(
+            parse_container_identity_from_cgroup("0::/docker/abcdef0123456789aa")
+                .and_then(|c| c.runtime),
+            Some("docker".to_string())
+        );
+        // CRI-O leaf prefix → crio; podman libpod → podman.
+        assert_eq!(
+            parse_container_identity_from_cgroup("0::/machine.slice/crio-001122334455667788.scope")
+                .and_then(|c| c.runtime),
+            Some("crio".to_string())
+        );
+        assert_eq!(
+            parse_container_identity_from_cgroup("0::/libpod-fedcba9876543210bb.scope")
+                .and_then(|c| c.runtime),
+            Some("podman".to_string())
+        );
+        // A plain Docker container (no pod) has no pod_uid.
+        assert_eq!(
+            parse_container_identity_from_cgroup("0::/docker/abcdef0123456789aa")
+                .and_then(|c| c.pod_uid),
+            None
+        );
+    }
+
+    #[test]
+    fn pod_uid_validator_rejects_non_uuids() {
+        assert!(is_pod_uid("3f5a8b2c-1d4e-4f5a-8b2c-9f0a1b2c3d4e")); // dashed
+        assert!(is_pod_uid("3f5a8b2c1d4e4f5a8b2c9f0a1b2c3d4e")); // undashed 32 hex
+        assert!(!is_pod_uid("1234")); // too short
+        assert!(!is_pod_uid("g_not_hex_g_not_hex_g_not_hex_gg")); // non-hex
+        assert!(!is_pod_uid("")); // empty
+    }
+
+    // Spec 084 P0: GOLD fixtures captured LIVE from a real k3s v1.36.2+k3s1
+    // (containerd) node on 2026-06-29 — two pods in two tenant namespaces. The
+    // `pod_uid` asserted here is the exact value `kubectl get pod -o
+    // jsonpath='{.metadata.uid}'` returned, proving the cgroup-derived UID
+    // round-trips to the Kubernetes API object without any label trust. If a
+    // future containerd/k3s release changes the cgroup shape this test fails and
+    // the parser must be updated to keep per-tenant attribution at 100%.
+    #[test]
+    fn parse_real_k3s_v136_cgroups_gold() {
+        let a = parse_container_identity_from_cgroup(
+            "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podd729dbb9_5684_498d_9c5f_7244bfbba548.slice/cri-containerd-4858a7b75b55f36c13e0991cf8370fd2d05edbf33d7d813c06f4cb7a24318025.scope"
+        )
+        .expect("real k3s pod-a cgroup must parse");
+        assert_eq!(a.container_id, "4858a7b75b55");
+        assert_eq!(
+            a.pod_uid.as_deref(),
+            Some("d729dbb9-5684-498d-9c5f-7244bfbba548")
+        );
+        assert_eq!(a.runtime.as_deref(), Some("containerd"));
+
+        let b = parse_container_identity_from_cgroup(
+            "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podb9b2ae1e_9f07_4656_b1f5_71d0f7cb6191.slice/cri-containerd-1a0fb1e4f294cafd9e0da8c2e65de9310bccf1f6f6c950ecb09aa5f9343dfa1c.scope"
+        )
+        .expect("real k3s pod-b cgroup must parse");
+        assert_eq!(b.container_id, "1a0fb1e4f294");
+        assert_eq!(
+            b.pod_uid.as_deref(),
+            Some("b9b2ae1e-9f07-4656-b1f5-71d0f7cb6191")
+        );
+        assert_eq!(b.runtime.as_deref(), Some("containerd"));
+    }
+
+    // Spec 084 P0: directly exercise the pod/runtime enrichment that the ring
+    // decode arms apply to every container-scoped event. The decode arms
+    // themselves only run against a live kernel ring buffer (covered by the
+    // on-box live validation), so these cover the same logic via the helper +
+    // builders — the exact `let mut ev = builder(..); attach_pod_runtime(&mut
+    // ev.details, cident.as_ref())` shape used in every arm.
+    #[test]
+    fn attach_pod_runtime_adds_pod_and_runtime() {
+        let id = ContainerIdentity {
+            container_id: "4858a7b75b55".to_string(),
+            pod_uid: Some("d729dbb9-5684-498d-9c5f-7244bfbba548".to_string()),
+            runtime: Some("containerd".to_string()),
+        };
+        let mut details = serde_json::json!({"pid": 1});
+        attach_pod_runtime(&mut details, Some(&id));
+        assert_eq!(details["pod_uid"], "d729dbb9-5684-498d-9c5f-7244bfbba548");
+        assert_eq!(details["runtime"], "containerd");
+
+        // Host process (None) adds nothing.
+        let mut bare = serde_json::json!({"pid": 1});
+        attach_pod_runtime(&mut bare, None);
+        assert!(bare.get("pod_uid").is_none());
+        assert!(bare.get("runtime").is_none());
+
+        // A plain Docker container (no pod): runtime present, pod_uid absent.
+        let docker = ContainerIdentity {
+            container_id: "abcdef012345".to_string(),
+            pod_uid: None,
+            runtime: Some("docker".to_string()),
+        };
+        let mut d2 = serde_json::json!({});
+        attach_pod_runtime(&mut d2, Some(&docker));
+        assert_eq!(d2["runtime"], "docker");
+        assert!(d2.get("pod_uid").is_none());
+    }
+
+    #[test]
+    fn builders_then_attach_carry_full_pod_identity() {
+        let id = ContainerIdentity {
+            container_id: "4858a7b75b55".to_string(),
+            pod_uid: Some("d729dbb9-5684-498d-9c5f-7244bfbba548".to_string()),
+            runtime: Some("containerd".to_string()),
+        };
+        // execve
+        let mut ev = execve_to_event(
+            0,
+            0,
+            1,
+            99,
+            Some("4858a7b75b55"),
+            "bash",
+            "/usr/bin/id",
+            "h",
+        );
+        attach_pod_runtime(&mut ev.details, Some(&id));
+        assert_eq!(ev.details["container_id"], "4858a7b75b55");
+        assert_eq!(
+            ev.details["pod_uid"],
+            "d729dbb9-5684-498d-9c5f-7244bfbba548"
+        );
+        assert_eq!(ev.details["runtime"], "containerd");
+        assert!(ev.tags.contains(&"container".to_string()));
+
+        // connect
+        let ip = Ipv4Addr::new(8, 8, 8, 8);
+        let mut ev = connect_to_event(
+            0,
+            0,
+            1,
+            99,
+            Some("4858a7b75b55"),
+            "curl",
+            ip,
+            443,
+            "h",
+            None,
+        );
+        attach_pod_runtime(&mut ev.details, Some(&id));
+        assert_eq!(
+            ev.details["pod_uid"],
+            "d729dbb9-5684-498d-9c5f-7244bfbba548"
+        );
+        assert_eq!(ev.details["runtime"], "containerd");
+
+        // file_open
+        let mut ev = file_open_to_event(
+            0,
+            0,
+            1,
+            99,
+            Some("4858a7b75b55"),
+            "cat",
+            "/etc/hostname",
+            0,
+            "h",
+        );
+        attach_pod_runtime(&mut ev.details, Some(&id));
+        assert_eq!(ev.details["runtime"], "containerd");
+
+        // privesc inside a container is Critical; comm not in PRIVESC_ALLOWED.
+        let mut ev =
+            privesc_to_event(0, 1000, 0, 99, Some("4858a7b75b55"), "zz_attacker", "h").unwrap();
+        attach_pod_runtime(&mut ev.details, Some(&id));
+        assert_eq!(
+            ev.details["pod_uid"],
+            "d729dbb9-5684-498d-9c5f-7244bfbba548"
+        );
+        assert_eq!(ev.severity, Severity::Critical);
     }
 
     #[test]
@@ -3762,7 +4116,7 @@ mod tests {
         // Host process shouldn't have a container ID
         // (pid 1 is always the init process on the host)
         if cfg!(target_os = "linux") {
-            assert!(resolve_container_id(1).is_none());
+            assert!(resolve_container_identity(1).is_none());
         }
     }
 
