@@ -471,6 +471,19 @@ pub async fn serve(
     if let Err(e) = validate_bind_auth(&bind, auth.is_some()) {
         anyhow::bail!("{}", e);
     }
+    // SEC: plain HTTP (`--insecure-no-tls`) leaks credentials + data in
+    // cleartext. `validate_bind_auth` already blocks a non-loopback bind with no
+    // auth, but plain HTTP on a public interface is unacceptable even WITH auth
+    // (the Basic-Auth header crosses the wire in the clear). Refuse to start
+    // rather than just warn — a warning is not enough for a security product to
+    // expose itself unencrypted on a public interface.
+    if reject_insecure_public_bind(&bind, insecure_no_tls) {
+        anyhow::bail!(
+            "refusing to serve the dashboard over plain HTTP (--insecure-no-tls) on the \
+             non-loopback bind {bind}: use --tls-cert/--tls-key, bind to 127.0.0.1, or \
+             remove --insecure-no-tls"
+        );
+    }
     if auth.is_none() && is_loopback_bind {
         warn!(
             "dashboard is running WITHOUT authentication (loopback only) - \
@@ -1199,6 +1212,14 @@ pub(crate) fn validate_bind_auth(bind: &str, has_auth: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// SEC: true when the dashboard would serve plain HTTP (`--insecure-no-tls`) on
+/// a non-loopback bind — which leaks Basic-Auth credentials + data in cleartext
+/// over a public interface, even when auth is configured. The caller refuses to
+/// start in that case.
+pub(crate) fn reject_insecure_public_bind(bind: &str, insecure_no_tls: bool) -> bool {
+    insecure_no_tls && !is_loopback_address(bind)
+}
+
 /// SEC-013: Compute TLS certificate expiry date (year, month, day).
 pub(crate) fn cert_expiry_ymd(days_valid: i64) -> (i32, u8, u8) {
     let expiry = chrono::Utc::now() + chrono::Duration::days(days_valid);
@@ -1224,6 +1245,21 @@ pub(crate) fn cert_expiry_ymd(days_valid: i64) -> (i32, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SEC: plain HTTP is rejected on a public bind (even with auth), allowed on loopback.
+    #[test]
+    fn insecure_plain_http_rejected_on_public_bind() {
+        assert!(reject_insecure_public_bind("0.0.0.0:8787", true));
+        assert!(reject_insecure_public_bind("192.168.0.10:8787", true));
+        assert!(reject_insecure_public_bind("[::]:8787", true));
+        // loopback plain HTTP is fine (local dev)
+        assert!(!reject_insecure_public_bind("127.0.0.1:8787", true));
+        assert!(!reject_insecure_public_bind("[::1]:8787", true));
+        assert!(!reject_insecure_public_bind("localhost:8787", true));
+        // TLS path (insecure_no_tls=false) never rejected here regardless of bind
+        assert!(!reject_insecure_public_bind("0.0.0.0:8787", false));
+    }
+
     use crate::telemetry::TelemetrySnapshot;
     use argon2::password_hash::SaltString;
     use argon2::PasswordHasher;
