@@ -1666,6 +1666,162 @@ fn populate_kernel_filters(bpf: &mut aya::Ebpf) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// InnerWarden self-suppression (keep our OWN syscalls out of the ring buffer)
+// ---------------------------------------------------------------------------
+//
+// The sensor, agent, watchdog and supervisor are heavy multi-threaded tokio
+// programs. Their worker threads run under comm="tokio-rt-worker", which the
+// comm-keyed COMM_ALLOWLIST cannot match (it only sees the process comm, e.g.
+// "innerwarden-age"). On a busy node — observed on a real k3s cloud box where
+// the agent's tokio threads were 75% of the captured eBPF stream — InnerWarden's
+// own syscalls flood the ring buffer and starve the real host + container signal
+// (events dropped at RingBuf::reserve before they are ever processed). The
+// userspace `comm.starts_with("innerwarden")` filter runs AFTER reserve, so it
+// cannot save the ring slot.
+//
+// Fix: suppress IN-KERNEL by CGROUP. All of a process's threads share one
+// cgroup, so a single id covers every tokio worker. We seed CGROUP_ALLOWLIST
+// (value 1 = skip non-critical events; the in-kernel `is_cgroup_allowed()` gate
+// already consults it, while genuine critical paths — credential reads, IMDS,
+// the kill-chain — still emit) with InnerWarden's own cgroups and refresh on a
+// timer so a service restart (which lands in a fresh cgroup) is followed.
+//
+// Identity is NON-FORGEABLE: a process is "InnerWarden" only when /proc/<pid>/exe
+// resolves to an `innerwarden-*` binary in the sensor's own install directory.
+// We deliberately do NOT trust comm (an attacker could set comm=innerwarden-x to
+// get its own cgroup suppressed and go invisible).
+
+/// Parse the cgroup-v2 relative path from `/proc/<pid>/cgroup` contents.
+/// v2 is a single `0::<path>` line. Returns the `<path>` (leading slash kept).
+#[allow(dead_code)]
+fn parse_cgroup_v2_rel_path(content: &str) -> Option<&str> {
+    content.lines().find_map(|l| l.strip_prefix("0::"))
+}
+
+/// True when `exe` is one of InnerWarden's own binaries — `innerwarden-*` living
+/// in `install_dir` (the sensor's own binary directory). Non-forgeable: keyed on
+/// the real binary behind `/proc/<pid>/exe`, never on comm.
+#[allow(dead_code)]
+fn is_innerwarden_exe(exe: &std::path::Path, install_dir: &std::path::Path) -> bool {
+    exe.parent() == Some(install_dir)
+        && exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("innerwarden-"))
+}
+
+/// Compute the (to_add, to_remove) delta for the self-cgroup allowlist: add ids
+/// newly seen, remove ids we previously added that are gone (e.g. a restarted
+/// service's stale cgroup). Pure set algebra so it is unit-testable.
+#[allow(dead_code)]
+fn cgroup_allowlist_delta(
+    current: &std::collections::BTreeSet<u64>,
+    previously_added: &std::collections::BTreeSet<u64>,
+) -> (Vec<u64>, Vec<u64>) {
+    let to_add = current.difference(previously_added).copied().collect();
+    let to_remove = previously_added.difference(current).copied().collect();
+    (to_add, to_remove)
+}
+
+/// Build the absolute cgroup-v2 directory path for a process from the contents
+/// of its `/proc/<pid>/cgroup` file: `<unified-mount>/<rel>`. Pure (no I/O) so
+/// the path-join logic is unit-testable independent of the host; the inode stat
+/// lives in `cgroup_id_of_pid`. `None` on cgroup v1 (no `0::` line).
+#[allow(dead_code)]
+fn cgroup_dir_path(cgroup_file: &str) -> Option<std::path::PathBuf> {
+    let rel = parse_cgroup_v2_rel_path(cgroup_file)?;
+    Some(std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+}
+
+/// Resolve the cgroup-v2 id of a pid: the inode of its cgroup directory under
+/// `/sys/fs/cgroup`, which is exactly what `bpf_get_current_cgroup_id()` returns
+/// for tasks in that cgroup. `None` if the process is gone or on cgroup v1.
+/// Thin I/O wrapper over the pure `cgroup_dir_path`; `allow(dead_code)` keeps the
+/// non-`ebpf` build (which still compiles the pure helpers + their tests) clean.
+#[allow(dead_code)]
+fn cgroup_id_of_pid(pid: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let abs = cgroup_dir_path(&content)?;
+    std::fs::metadata(abs).ok().map(|m| m.ino())
+}
+
+/// Pure core of the self-cgroup scan: given `(exe, cgroup_id)` for each running
+/// process, keep only the cgroup ids whose exe is one of InnerWarden's own
+/// binaries in `install_dir`. No `/proc` I/O, so the non-forgeable exe filter
+/// (the no-regression invariant — a `/tmp/innerwarden-evil` or a plain `bash` is
+/// never selected) is unit-testable independent of the host. A `None` id (cgroup
+/// gone / v1) drops the entry.
+#[allow(dead_code)]
+fn select_self_cgroups<'a, I>(
+    procs: I,
+    install_dir: &std::path::Path,
+) -> std::collections::BTreeSet<u64>
+where
+    I: IntoIterator<Item = (&'a std::path::Path, Option<u64>)>,
+{
+    procs
+        .into_iter()
+        .filter(|(exe, _)| is_innerwarden_exe(exe, install_dir))
+        .filter_map(|(_, id)| id)
+        .collect()
+}
+
+/// Cgroup ids of every running InnerWarden process — the sensor itself plus the
+/// agent (whether a systemd service or a watchdog-spawned child), watchdog and
+/// supervisor — identified non-forgeably by exe path. One id per process covers
+/// all of its threads. Thin I/O wrapper: scans `/proc`, resolves each pid's exe,
+/// and defers the keep/drop decision to the pure `select_self_cgroups`. Only
+/// stats the cgroup of a pid whose exe already looks like ours (avoids a stat
+/// per host pid); `select_self_cgroups` re-validates so the invariant holds
+/// regardless. Only called from the feature-gated refresh task.
+#[allow(dead_code)]
+fn innerwarden_self_cgroup_ids(install_dir: &std::path::Path) -> std::collections::BTreeSet<u64> {
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return std::collections::BTreeSet::new();
+    };
+    let procs: Vec<(std::path::PathBuf, Option<u64>)> = rd
+        .flatten()
+        .filter_map(|ent| {
+            let fname = ent.file_name();
+            let pid = fname.to_str()?;
+            if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+            // Only stat the cgroup for our own binaries; the pure core re-checks.
+            if !is_innerwarden_exe(&exe, install_dir) {
+                return None;
+            }
+            Some((exe, cgroup_id_of_pid(pid)))
+        })
+        .collect();
+    select_self_cgroups(procs.iter().map(|(e, id)| (e.as_path(), *id)), install_dir)
+}
+
+/// Re-resolve InnerWarden's self-cgroups and reconcile the in-kernel
+/// CGROUP_ALLOWLIST: add the new ones, drop ones we previously added that have
+/// disappeared. Only touches ids it manages, so it never clobbers entries added
+/// for other reasons. `value 1` = "skip non-critical events" per the map.
+#[cfg(feature = "ebpf")]
+fn refresh_self_cgroup_allowlist(
+    map: &mut aya::maps::HashMap<aya::maps::MapData, u64, u32>,
+    install_dir: &std::path::Path,
+    previously_added: &mut std::collections::BTreeSet<u64>,
+) -> usize {
+    let current = innerwarden_self_cgroup_ids(install_dir);
+    let (to_add, to_remove) = cgroup_allowlist_delta(&current, previously_added);
+    for id in &to_add {
+        let _ = map.insert(id, 1u32, 0);
+    }
+    for id in &to_remove {
+        let _ = map.remove(id);
+    }
+    *previously_added = current;
+    previously_added.len()
+}
+
 /// Architecture syscall entry-wrapper symbol for a bare syscall name.
 /// On x86_64 the SYSCALL_DEFINE macro generates `__x64_sys_<name>`, on aarch64
 /// `__arm64_sys_<name>`. The wrapper takes a single `struct pt_regs *`, from
@@ -2073,6 +2229,37 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
     // Populate kernel-level noise filters BEFORE taking ring buffer borrow
     populate_kernel_filters(&mut bpf);
 
+    // InnerWarden self-suppression: seed SELF_CGROUP with our own services'
+    // cgroups so their syscalls — including the integrity collector's credential
+    // reads — are dropped IN-KERNEL (via `is_self_cgroup()`) before
+    // RingBuf::reserve, instead of flooding the ring and starving real host +
+    // container signal. `take_map` hands ownership to this loop (no borrow
+    // conflict with the EVENTS ring below); the kernel map stays live and the
+    // in-kernel gate keeps consulting it. The refresh runs INLINE in the ring
+    // loop below (a `tokio::spawn`'d task did not get scheduled inside this eBPF
+    // collector); it re-resolves every 30s to follow service restarts.
+    let self_install_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin"));
+    let mut self_cgroup_map = bpf
+        .take_map("SELF_CGROUP")
+        .and_then(|m| aya::maps::HashMap::<_, u64, u32>::try_from(m).ok());
+    let mut self_cgroup_added = std::collections::BTreeSet::new();
+    let mut last_self_refresh = std::time::Instant::now();
+    match self_cgroup_map {
+        Some(ref mut map) => {
+            let n = refresh_self_cgroup_allowlist(map, &self_install_dir, &mut self_cgroup_added);
+            info!(
+                self_cgroups = n,
+                "eBPF: InnerWarden self-cgroup suppression seeded"
+            );
+        }
+        None => warn!(
+            "eBPF: SELF_CGROUP map absent - self-suppression disabled (ring may flood under load)"
+        ),
+    }
+
     // Spec 052 Phase 1d: small in-memory cache that lets the kind=35
     // (LsmDecisionEvent) dispatch arm enrich its event with the comm,
     // filename, and uid captured by the earlier kind=1 (ExecveEvent)
@@ -2161,6 +2348,16 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
     }
 
     loop {
+        // Refresh InnerWarden's own-cgroup suppression set every 30s, inline in
+        // the ring loop (a spawned task never got scheduled here). Follows service
+        // restarts (fresh cgroup) and picks up the agent when it starts after the
+        // sensor. Cheap: a /proc scan gated to once per 30s.
+        if let Some(ref mut map) = self_cgroup_map {
+            if last_self_refresh.elapsed() >= std::time::Duration::from_secs(30) {
+                refresh_self_cgroup_allowlist(map, &self_install_dir, &mut self_cgroup_added);
+                last_self_refresh = std::time::Instant::now();
+            }
+        }
         while let Some(item) = ring_buf.next() {
             let data: &[u8] = &item;
             if data.len() < 4 {
@@ -4212,5 +4409,184 @@ mod tests {
         assert_eq!(resolve_target_comm(6, 0), ""); // SIGABRT (newly covered)
         assert_eq!(resolve_target_comm(40, 0), ""); // real-time signal
         assert_eq!(resolve_target_comm(19, 0), ""); // SIGSTOP
+    }
+
+    // ---- InnerWarden self-suppression (CGROUP_ALLOWLIST seeding) ----
+
+    #[test]
+    fn parse_cgroup_v2_rel_path_extracts_the_unified_path() {
+        // cgroup v2: single "0::<path>" line.
+        assert_eq!(
+            parse_cgroup_v2_rel_path("0::/system.slice/innerwarden-agent.service\n"),
+            Some("/system.slice/innerwarden-agent.service")
+        );
+        // Root cgroup.
+        assert_eq!(parse_cgroup_v2_rel_path("0::/\n"), Some("/"));
+        // cgroup v1 (no "0::" line) → None, we only handle v2.
+        assert_eq!(
+            parse_cgroup_v2_rel_path("12:devices:/\n11:memory:/system.slice\n"),
+            None
+        );
+        assert_eq!(parse_cgroup_v2_rel_path(""), None);
+    }
+
+    #[test]
+    fn is_innerwarden_exe_is_nonforgeable_and_dir_scoped() {
+        let dir = std::path::Path::new("/usr/local/bin");
+        // Our own binaries in the install dir → true.
+        for b in [
+            "innerwarden-sensor",
+            "innerwarden-agent",
+            "innerwarden-watchdog",
+            "innerwarden-supervisor",
+        ] {
+            assert!(is_innerwarden_exe(&dir.join(b), dir), "{b} should match");
+        }
+        // Right name, WRONG directory (a dropped/renamed copy) → false: an
+        // attacker can't drop /tmp/innerwarden-evil to get itself suppressed.
+        assert!(!is_innerwarden_exe(
+            std::path::Path::new("/tmp/innerwarden-evil"),
+            dir
+        ));
+        // In the dir but not one of ours → false.
+        assert!(!is_innerwarden_exe(&dir.join("bash"), dir));
+        // Prefix-only collision outside the family is still gated by the dir +
+        // the `innerwarden-` (with dash) prefix.
+        assert!(!is_innerwarden_exe(&dir.join("innerwardenX"), dir));
+    }
+
+    #[test]
+    fn cgroup_allowlist_delta_adds_new_and_drops_stale() {
+        use std::collections::BTreeSet;
+        // First run: nothing tracked yet → everything current is added.
+        let current: BTreeSet<u64> = [10, 20, 30].into_iter().collect();
+        let prev: BTreeSet<u64> = BTreeSet::new();
+        let (add, remove) = cgroup_allowlist_delta(&current, &prev);
+        assert_eq!(add, vec![10, 20, 30]);
+        assert!(remove.is_empty());
+
+        // Agent restarted: its old cgroup (20) is gone, a new one (40) appeared.
+        let prev: BTreeSet<u64> = [10, 20, 30].into_iter().collect();
+        let current: BTreeSet<u64> = [10, 30, 40].into_iter().collect();
+        let (add, remove) = cgroup_allowlist_delta(&current, &prev);
+        assert_eq!(add, vec![40], "the restarted service's new cgroup is added");
+        assert_eq!(remove, vec![20], "the stale cgroup is dropped, not leaked");
+
+        // Steady state: no churn → no map writes.
+        let (add, remove) = cgroup_allowlist_delta(&current, &current);
+        assert!(add.is_empty() && remove.is_empty());
+    }
+
+    #[test]
+    fn cgroup_dir_path_joins_unified_mount_with_the_relative_path() {
+        use std::path::Path;
+        // A normal service cgroup: <mount>/<rel> with the single leading slash
+        // collapsed (join would otherwise treat "/system.slice" as absolute and
+        // discard the mount).
+        assert_eq!(
+            cgroup_dir_path("0::/system.slice/innerwarden-agent.service\n"),
+            Some(Path::new("/sys/fs/cgroup/system.slice/innerwarden-agent.service").to_path_buf())
+        );
+        // Root cgroup → the mount itself.
+        assert_eq!(
+            cgroup_dir_path("0::/\n"),
+            Some(Path::new("/sys/fs/cgroup").to_path_buf())
+        );
+        // A nested k8s pod cgroup, the shape the tenancy resolver walks.
+        assert_eq!(
+            cgroup_dir_path("0::/kubepods/besteffort/pod13e125db/abc123\n"),
+            Some(Path::new("/sys/fs/cgroup/kubepods/besteffort/pod13e125db/abc123").to_path_buf())
+        );
+        // cgroup v1 (no "0::" line) → None: we never fabricate a path.
+        assert_eq!(cgroup_dir_path("11:memory:/system.slice\n"), None);
+    }
+
+    #[test]
+    fn select_self_cgroups_keeps_only_our_binaries_in_the_install_dir() {
+        use std::collections::BTreeSet;
+        use std::path::Path;
+        let dir = Path::new("/usr/local/bin");
+
+        let sensor = dir.join("innerwarden-sensor");
+        let agent = dir.join("innerwarden-agent");
+        let watchdog = dir.join("innerwarden-watchdog");
+        let bash = dir.join("bash");
+        let evil = Path::new("/tmp/innerwarden-evil");
+        let agent_no_cgroup = dir.join("innerwarden-supervisor");
+
+        let procs: Vec<(&Path, Option<u64>)> = vec![
+            (sensor.as_path(), Some(100)),
+            (agent.as_path(), Some(200)),
+            (watchdog.as_path(), Some(300)),
+            (bash.as_path(), Some(400)),       // not ours → dropped
+            (evil, Some(500)),                 // wrong dir → dropped (no evasion)
+            (agent_no_cgroup.as_path(), None), // ours but cgroup gone → dropped
+        ];
+
+        let got = select_self_cgroups(procs, dir);
+        let want: BTreeSet<u64> = [100, 200, 300].into_iter().collect();
+        assert_eq!(got, want);
+    }
+
+    // CROSS-TEST: the no-regression invariant. Self-suppression must NEVER hide a
+    // non-InnerWarden process — that is exactly the bug that would make a rogue
+    // tenant invisible. A renamed/dropped copy in the wrong dir, an ordinary host
+    // binary, and a same-prefix impostor must all be excluded; only the genuine
+    // install-dir binaries survive. If a future refactor widens the exe filter
+    // this test fails before the change can ship.
+    #[test]
+    fn self_suppression_never_selects_a_non_innerwarden_cgroup() {
+        use std::path::Path;
+        let dir = Path::new("/usr/local/bin");
+
+        // Every shape an attacker (or a regression) might use to sneak in.
+        let attacker_shapes = [
+            Path::new("/tmp/innerwarden-evil").to_path_buf(), // right name, wrong dir
+            Path::new("/home/user/innerwarden-agent").to_path_buf(), // copied elsewhere
+            dir.join("innerwardenX"),                         // prefix collision, no dash
+            dir.join("bash"),                                 // ordinary host tool
+            dir.join("sshd"),                                 // ordinary host daemon
+            Path::new("/usr/bin/python3").to_path_buf(),      // a rogue agent runtime
+        ];
+        for (i, exe) in attacker_shapes.iter().enumerate() {
+            let id = 900 + i as u64;
+            let got = select_self_cgroups(vec![(exe.as_path(), Some(id))], dir);
+            assert!(
+                got.is_empty(),
+                "{} must NOT be suppressed (would hide a real process)",
+                exe.display()
+            );
+        }
+
+        // Sanity floor: a genuine binary in the install dir IS selected, so the
+        // test above is proving exclusion, not just an always-empty function.
+        let real = dir.join("innerwarden-agent");
+        assert_eq!(
+            select_self_cgroups(vec![(real.as_path(), Some(42))], dir),
+            std::collections::BTreeSet::from([42])
+        );
+    }
+
+    // Integration smoke (Linux only): the live I/O path resolves a real cgroup id
+    // for our own pid (proc 0 alias) without panicking. This is the only test
+    // that touches /proc + /sys/fs/cgroup, so it is the thin wrapper's coverage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_id_of_pid_resolves_self_on_linux() {
+        // "self" is a valid /proc entry but not all-ascii-digits, so go through
+        // our real numeric pid the way the scanner does.
+        let pid = std::process::id().to_string();
+        // On a cgroup-v2 host this is Some(inode); on a v1-only or restricted
+        // host it is None. Either way it must not panic — that is the contract.
+        let _ = cgroup_id_of_pid(&pid);
+        // And the pure path builder agrees with what /proc/<pid>/cgroup says.
+        if let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+            if content.lines().any(|l| l.starts_with("0::")) {
+                assert!(
+                    cgroup_dir_path(&content).is_some(),
+                    "v2 host must yield a cgroup dir path"
+                );
+            }
+        }
     }
 }

@@ -98,6 +98,18 @@ static COMM_ALLOWLIST: HashMap<[u8; 16], u32> = HashMap::with_max_entries(256, 0
 #[map]
 static CGROUP_ALLOWLIST: HashMap<u64, u32> = HashMap::with_max_entries(128, 0);
 
+/// InnerWarden's OWN service cgroups (sensor, agent, watchdog, supervisor).
+/// Key: cgroup_id. Value: 1. Populated by the userspace loader from non-forgeable
+/// `/proc/<pid>/exe` identity, refreshed in the ring loop. Checked FIRST in the
+/// high-volume handlers via `is_self_cgroup()` so InnerWarden's own syscalls —
+/// including the integrity collector's credential reads — are dropped before the
+/// ring reserve and never flood the buffer or self-alert. DISTINCT from
+/// CGROUP_ALLOWLIST (known-safe containers, non-secret gate only): this map fully
+/// mutes a cgroup, so only our own non-forgeable cgroups may ever enter it — a
+/// container can never be silenced through it.
+#[map]
+static SELF_CGROUP: HashMap<u64, u32> = HashMap::with_max_entries(16, 0);
+
 /// Per-PID rate limiter - prevents ring buffer flood from noisy processes.
 /// Key: PID. Value: last emission timestamp (ktime_ns).
 /// If a PID emitted within the last RATE_LIMIT_NS, the event is dropped.
@@ -228,6 +240,17 @@ fn is_comm_allowed(handler_bit: u32) -> bool {
 fn is_cgroup_allowed() -> bool {
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     unsafe { CGROUP_ALLOWLIST.get(&cgroup_id) }.is_some()
+}
+
+/// True when the current task is one of InnerWarden's OWN processes (by cgroup).
+/// Drops our own syscalls — including credential reads the integrity collector
+/// makes — in-kernel before reserve, so we never flood the ring or alert on
+/// ourselves. Non-forgeable: SELF_CGROUP holds only our real service cgroups,
+/// seeded from `/proc/<pid>/exe`. Empty by default → no-op until seeded.
+#[inline(always)]
+fn is_self_cgroup() -> bool {
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    unsafe { SELF_CGROUP.get(&cgroup_id) }.is_some()
 }
 
 /// Per-PID rate limiter. Returns true if the event should be SKIPPED.
@@ -1741,7 +1764,7 @@ pub fn dispatch_execve(ctx: ProbeContext) -> u32 {
 
 #[inline(always)]
 fn try_dispatch_execve(regs: *const u8) -> Result<(), i64> {
-    if is_comm_allowed(0) || is_cgroup_allowed() {
+    if is_self_cgroup() || is_comm_allowed(0) || is_cgroup_allowed() {
         return Ok(());
     }
     let pid = bpf_get_current_pid_tgid() as u32;
@@ -1801,6 +1824,13 @@ pub fn dispatch_connect(ctx: ProbeContext) -> u32 {
 
 #[inline(always)]
 fn try_dispatch_connect(regs: *const u8) -> Result<(), i64> {
+    // InnerWarden's own outbound connects (agent → k8s API / Azure IMDS / cloud
+    // for tenancy + cloud detection) are self-noise — drop them. Safe before the
+    // IMDS parse: SELF_CGROUP is our non-forgeable own cgroup, an attacker cannot
+    // enter it, so a real IMDS-SSRF from any other cgroup still surfaces.
+    if is_self_cgroup() {
+        return Ok(());
+    }
     // Parse the destination BEFORE the comm allowlist gate so a renamed process
     // cannot suppress an IMDS connect (see is_imds below). The 8-byte sockaddr
     // read is cheap and connect is far lower frequency than openat.
@@ -2030,6 +2060,12 @@ fn contains_secret_dir(buf: &[u8]) -> bool {
 
 #[kprobe]
 pub fn dispatch_openat(ctx: ProbeContext) -> u32 {
+    // InnerWarden's own file reads (incl. the integrity collector reading
+    // /etc/shadow etc.) are noise + would flood the ring — drop before the path
+    // read. Non-forgeable (own cgroup only); empty map → no-op until seeded.
+    if is_self_cgroup() {
+        return 0;
+    }
     // openat(dfd, filename, flags, mode): filename=arg1, flags=arg2
     let Ok(filename_ptr) = (unsafe { syscall_arg!(ctx, 1) }) else {
         return 0;
