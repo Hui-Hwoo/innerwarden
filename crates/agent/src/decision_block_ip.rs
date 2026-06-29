@@ -1576,6 +1576,42 @@ mod tests {
         }
     }
 
+    /// Build a realistic reverse_shell incident: the eBPF connect+dup2 shape
+    /// emitted by `crates/sensor/src/detectors/reverse_shell.rs` (the
+    /// `ebpf_sequence` branch). Evidence carries `pid`/`comm`/`source_comm`/
+    /// `target_ip`/`target_port` but **no `sensitive_file`** — a pure outbound
+    /// connect with no prior sensitive read, so `incident_source_identity`
+    /// resolves `read_path = None`. The outbound destination is an Ip entity.
+    /// This is the FirstHit shape that protects the AI-agent wedge: a managed
+    /// agent multiplexing a socket (connect → dup2 stdio) looks exactly like a
+    /// reverse shell, and must downgrade to monitor — NOT auto-block the
+    /// destination IP a shared service depends on.
+    fn openclaw_reverse_shell_incident(pid: u32, dst_ip: &str) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "azure-dogfood".to_string(),
+            incident_id: format!("reverse_shell:bash_dup2:{pid}:2026-06-29T00:00Z"),
+            severity: Severity::Critical,
+            title: "Reverse shell detected via eBPF".to_string(),
+            summary: "connect → fd redirect to socket".to_string(),
+            // Mirrors the real detector evidence keys (no `sensitive_file`).
+            evidence: serde_json::json!([{
+                "kind": "reverse_shell",
+                "pattern": "bash_dup2",
+                "detection": "ebpf_sequence",
+                "comm": "MainThread",
+                "source_comm": "MainThread",
+                "pid": pid,
+                "target_ip": dst_ip,
+                "target_port": 443,
+                "redirected_fd": 1,
+            }]),
+            recommended_checks: vec![],
+            tags: vec!["reverse_shell".to_string(), "ebpf".to_string()],
+            entities: vec![EntityRef::ip(dst_ip)],
+        }
+    }
+
     #[test]
     fn incident_source_identity_parses_array_evidence() {
         let inc = openclaw_exfil_incident(4242, "1.2.3.4");
@@ -1699,6 +1735,58 @@ mod tests {
         assert!(
             evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, true).is_none(),
             "destination_known_bad=true forces the block even for a managed agent"
+        );
+    }
+
+    // ── REVERSE_SHELL (connect-only, read_path=None) DOWNGRADE — wedge guard ──
+    //
+    // Regression guard for the AI-agent wedge. A reverse_shell incident from a
+    // verified managed agent carries NO `sensitive_file` (`read_path = None`),
+    // unlike the exfil shape. The own-config gate in `decide()` is conditional
+    // (`if let Some(read_path)`), so read_path=None still reaches `Managed` once
+    // the identity gates pass. If a future refactor makes a read_path REQUIRED,
+    // every managed-agent socket-multiplex would auto-block its destination IP —
+    // the exact wedge-demo FP storm. This test pins the downgrade.
+
+    #[test]
+    fn evaluate_managed_agent_downgrade_managed_for_reverse_shell_shape() {
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        // No `.with_owner(...)`: a connect-only incident never stats a read_path,
+        // so the verdict must not depend on file ownership.
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000));
+        let inc = openclaw_reverse_shell_incident(pid, "203.0.113.7");
+        // Sanity: this shape has no read_path.
+        let (_, _, read_path) =
+            incident_source_identity(&inc).expect("reverse_shell evidence carries a pid");
+        assert!(
+            read_path.is_none(),
+            "reverse_shell evidence has no sensitive_file → read_path must be None"
+        );
+        let out = evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, false);
+        let (agent_id, name) =
+            out.expect("connect-only managed-agent activity (read_path=None) must downgrade");
+        assert_eq!(name, "OpenClaw");
+        assert!(agent_id.starts_with("ag-"));
+    }
+
+    #[test]
+    fn reverse_shell_to_known_bad_dest_still_blocks_for_managed_agent() {
+        // Anti-evasion: the connect-only downgrade NEVER becomes a destination
+        // exemption. A managed agent connecting to an independently known-bad IP
+        // is still blocked — the reputation override fires regardless of the
+        // missing read_path.
+        let pid = 4242;
+        let reg = registry_with_openclaw(pid);
+        let sigindex = SignatureIndex::new();
+        let stub = crate::managed_agent_guard::test_support::StubProc::default()
+            .with_proc(pid, oc_resolved(1000));
+        let inc = openclaw_reverse_shell_incident(pid, "203.0.113.7");
+        assert!(
+            evaluate_managed_agent_downgrade(&inc, &reg, &sigindex, &stub, true).is_none(),
+            "known-bad destination forces the block even on the connect-only shape"
         );
     }
 
