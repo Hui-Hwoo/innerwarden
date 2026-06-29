@@ -30,7 +30,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![Tests](https://img.shields.io/badge/tests-7900%2B-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-90%2B%20mappings-red)
 ![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-209-blueviolet)
-![Memory](https://img.shields.io/badge/memory-~250MB%20(full%20stack)-green)
+![Memory](https://img.shields.io/badge/memory-sensor%20~200MB%20%7C%20full%20stack%20~0.8GB-green)
 ![AI Optional](https://img.shields.io/badge/AI-optional-lightgrey)
 ![Storage](https://img.shields.io/badge/storage-SQLite%20WAL-blue)
 ![Graph](https://img.shields.io/badge/knowledge%20graph-11%20types%2C%2053%20relations-purple)
@@ -376,7 +376,7 @@ Container-aware via cgroup ID. Zero performance overhead.
 
 **Agent**: reads incidents from SQLite or Redis Streams. Fast loop (2s): algorithm gate → already-blocked / needs-review routing → enrichment (AbuseIPDB, GeoIP, CrowdSec, DShield, threat feeds) → VirusTotal hash check on YARA matches → SOC playbooks → AI triage → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (69 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → decision-review timeout sweep → monthly report generation → narrative summary. Auto-restart is handled by the OSS `innerwarden-supervisor` (rate-limited, `/metrics` health probe, Telegram alerts).
 
-Two Rust daemons. No external dependencies. ~250 MB RAM with all features active (sensor + agent + satellite modules, single SQLite database). Dashboard with 9 views: Sensors HUD, Threats investigation, Report, Health, Honeypot, Compliance (ISO 27001), Intelligence (Profiles, Campaigns, Chains, Baseline), Monthly Report. Live SSE feed, MITRE ATT&CK mapping, 20 integration cards. Sleeps after 15 min of inactivity.
+Two Rust daemons. No external dependencies. Measured production RSS (full stack): roughly **0.7–0.8 GB** with all features active — the always-on sensor is ~160–220 MB on its own, and the agent is ~400–650 MB once the on-device AI classifier (~150 MB) and inline modules are loaded. AI is optional: detection-only stays near the sensor footprint. Single SQLite database. (Reproduce with `scripts/memory-profile.sh`.) Dashboard with 9 views: Sensors HUD, Threats investigation, Report, Health, Honeypot, Compliance (ISO 27001), Intelligence (Profiles, Campaigns, Chains, Baseline), Monthly Report. Live SSE feed, MITRE ATT&CK mapping, 20 integration cards. Sleeps after 15 min of inactivity.
 
 ---
 
