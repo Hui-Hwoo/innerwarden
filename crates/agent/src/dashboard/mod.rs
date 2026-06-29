@@ -3699,6 +3699,7 @@ mod tests {
             events_by_collector: BTreeMap::new(),
             incidents_by_detector: BTreeMap::new(),
             gate_pass_count: 1,
+            incidents_by_tenant: Default::default(),
             ai_sent_count: 1,
             ai_decision_count: 1,
             avg_decision_latency_ms: 120.0,

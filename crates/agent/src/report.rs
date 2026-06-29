@@ -3406,6 +3406,7 @@ mod tests {
             events_by_collector,
             incidents_by_detector,
             gate_pass_count: 4,
+            incidents_by_tenant: Default::default(),
             ai_sent_count: 4,
             ai_decision_count: 4,
             avg_decision_latency_ms: 210.0,

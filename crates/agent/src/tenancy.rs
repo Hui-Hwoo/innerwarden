@@ -451,7 +451,7 @@ pub fn enrich_incident(incident: &mut innerwarden_core::incident::Incident, cfg:
         .get("pod_uid")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let container_id = incident
+    let mut container_id = incident
         .evidence
         .get("container_id")
         .and_then(|v| v.as_str())
@@ -463,6 +463,21 @@ pub fn enrich_incident(incident: &mut innerwarden_core::incident::Incident, cfg:
                 .find(|e| e.r#type == innerwarden_core::entities::EntityType::Container)
                 .map(|e| e.value.clone())
         });
+    // Fallback: several sensor detectors key the incident_id on the container
+    // (e.g. `container_escape:<cid>:...`) but do not copy the id into evidence
+    // or a container entity. Scan the id's `:`-tokens for one the pod cache
+    // recognises as a real container, so these incidents still attribute.
+    if pod_uid.is_none() && container_id.is_none() {
+        container_id = incident
+            .incident_id
+            .split(':')
+            .find(|tok| {
+                tok.len() >= 12
+                    && tok.as_bytes()[..12].iter().all(|b| b.is_ascii_hexdigit())
+                    && resolve(None, Some(tok)).is_some()
+            })
+            .map(|s| s.to_string());
+    }
     if pod_uid.is_none() && container_id.is_none() {
         return;
     }
@@ -479,6 +494,16 @@ pub fn enrich_incident(incident: &mut innerwarden_core::incident::Incident, cfg:
     if !incident.tags.contains(&tag) {
         incident.tags.push(tag);
     }
+    // Observable per-incident attribution (greppable on the box; the aggregate
+    // is the per-tenant telemetry counter). Only fires for container-scoped
+    // incidents that resolve to a tenant, so host incidents stay quiet.
+    tracing::info!(
+        incident_id = %incident.incident_id,
+        tenant = %pod.tenant_id,
+        namespace = %pod.namespace,
+        pod = %pod.pod_name,
+        "tenancy: incident attributed to tenant"
+    );
 }
 
 /// Enrich a batch of incidents in place (the agent's pre-pass before the
@@ -753,6 +778,37 @@ users:
         };
         enrich_incident(&mut inc, &cfg);
         assert_eq!(inc.evidence["tenant_id"], "acme-corp");
+    }
+
+    // Real-world shape from test001: `container_escape` (and several other
+    // sensor detectors) key the incident_id on the container id but do NOT copy
+    // it into evidence or a container entity — enrich must still attribute it.
+    #[test]
+    fn enrich_incident_resolves_via_incident_id_token() {
+        reset_cache_with(
+            parse_pod_list(REAL_PODS_JSON, REAL_NS_JSON, "innerwarden.io/tenant").unwrap(),
+        );
+        let cfg = TenancyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut inc = Incident {
+            ts: chrono::Utc::now(),
+            host: "node1".to_string(),
+            incident_id: "container_escape:4858a7b75b55:sensitive_file_access:2026-06-29T14:13Z"
+                .to_string(),
+            severity: Severity::High,
+            title: "t".to_string(),
+            summary: "s".to_string(),
+            // No pod_uid / container_id in evidence and no container entity.
+            evidence: serde_json::json!({"detail": "x"}),
+            recommended_checks: vec![],
+            tags: vec!["container".to_string()],
+            entities: vec![],
+        };
+        enrich_incident(&mut inc, &cfg);
+        assert_eq!(inc.evidence["tenant_id"], "acme-corp");
+        assert!(inc.tags.contains(&"tenant:acme-corp".to_string()));
     }
 
     #[test]

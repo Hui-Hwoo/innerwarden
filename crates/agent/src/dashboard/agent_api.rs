@@ -705,6 +705,21 @@ pub(super) fn build_prometheus_metrics_text(
         }
     }
 
+    // Spec 084 P0 1C: per-tenant incident counts (k8s pod -> tenant attribution).
+    out.push_str(
+        "# HELP innerwarden_incidents_by_tenant Total incidents today by attributed tenant\n",
+    );
+    out.push_str("# TYPE innerwarden_incidents_by_tenant counter\n");
+    if let Some(ref t) = telem {
+        for (tenant, count) in &t.incidents_by_tenant {
+            // Tenant ids come from k8s labels; escape the Prometheus label value.
+            let tenant = tenant.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!(
+                "innerwarden_incidents_by_tenant{{tenant=\"{tenant}\"}} {count}\n"
+            ));
+        }
+    }
+
     out.push_str("# HELP innerwarden_ai_calls_total Total AI provider calls today\n");
     out.push_str("# TYPE innerwarden_ai_calls_total counter\n");
     if let Some(ref t) = telem {
@@ -2219,6 +2234,7 @@ enabled = false
             decisions_by_action: Default::default(),
             dry_run_execution_count: 0,
             real_execution_count: 0,
+            incidents_by_tenant: Default::default(),
         }
     }
 
@@ -2742,6 +2758,7 @@ enabled = false
             decisions_by_action: Default::default(),
             dry_run_execution_count: 0,
             real_execution_count: 0,
+            incidents_by_tenant: Default::default(),
         };
         std::fs::write(
             &path,
