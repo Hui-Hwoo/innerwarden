@@ -1138,6 +1138,20 @@ if [[ "$OS_TYPE" == "Darwin" ]]; then
 </plist>
 EOF
 
+  # 2026-06-29: emit EVERY provider API key the operator actually set, not just
+  # OpenAI. Pre-fix the plist hardcoded only OPENAI_API_KEY, so a Mac user who
+  # exported ANTHROPIC_API_KEY (and not OPENAI) got a plist with an empty OpenAI
+  # key and the agent's AI silently never initialised — a "works on Linux,
+  # broken on macOS" cross-platform bug. Mirror the documented providers the
+  # Linux env-file path handles.
+  MACOS_AI_ENV=""
+  for _k in OPENAI_API_KEY ANTHROPIC_API_KEY; do
+    _v="${!_k:-}"
+    if [[ -n "${_v}" ]]; then
+      MACOS_AI_ENV+="    <key>${_k}</key><string>${_v}</string>"$'\n'
+    fi
+  done
+
   log "writing launchd plist: ${AGENT_PLIST}"
   install_from_stdin "${AGENT_PLIST}" 644 "${INSTALL_USER:-root}" "${INSTALL_GROUP:-root}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1156,8 +1170,7 @@ EOF
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>OPENAI_API_KEY</key><string>${OPENAI_API_KEY}</string>
-  </dict>
+${MACOS_AI_ENV}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>${LOG_DIR}/agent.log</string>
