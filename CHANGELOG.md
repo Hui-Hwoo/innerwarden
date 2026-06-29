@@ -16,6 +16,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Documentation
 - **The on-box AI-agent guide (`agents-install.md`) now documents `agent install-hook`.** The command catalog and front-door section listed `agent proxy` (MCP enforcement) and `agent mcp-serve` (advisory) but omitted `agent install-hook` — the fail-closed PreToolUse guard for a coding agent's RAW shell tool (shipped 0.15.30). Added it to the `agent` row and a prose paragraph explaining the enforcing/advisory distinction and pointing at the `claude-code-protection` module, so an AI agent reading the guide on the box can guard itself. Caught by the `verify-agents-install-commands.sh` CI gate (version + no-phantom-command tokens still pass).
 
+### Fixed
+- **Container-id resolution mis-parsed the systemd cgroup-driver shape, collapsing every k3s/containerd pod to a constant id.** `parse_container_id_from_cgroup` handled the cgroupfs shapes (`/docker/<id>`, `/kubepods/.../<id>`, `/libpod-<id>.scope`) but on the systemd cgroup driver — the default on k3s/k8s — a pod's cgroup leaf is `cri-containerd-<64hex>.scope`, and the old code took the whole leaf's first 12 chars, so EVERY containerd pod resolved to the constant `"cri-containe"` (and `docker-<id>.scope` / `crio-<id>.scope` likewise mis-resolved). Per-container attribution on k3s/k8s was therefore impossible. The parser now takes the cgroup leaf, strips a trailing `.scope`, and takes the last `-`-delimited token (runtime prefixes are dash-joined alpha; the id is hex with no `-`), validating it as a ≥12-char hex id — so `cri-containerd-8317eb4a…` resolves to `8317eb4a8dd5`. Pure function; the existing format test gains the systemd-driver containerd/docker/crio cases. (First fix from the spec 084 multi-tenant-fleet P0 investigation.)
+
 ## [0.15.30] - 2026-06-28
 
 ### Added

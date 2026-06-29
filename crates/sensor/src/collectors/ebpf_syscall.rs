@@ -249,29 +249,30 @@ fn resolve_container_id_uncached(pid: u32) -> Option<String> {
 /// (no I/O) so the Docker/Podman/k8s formats are unit-testable without a real
 /// container.
 fn parse_container_id_from_cgroup(content: &str) -> Option<String> {
+    // The container id is the cgroup LEAF identifier. It appears in several
+    // shapes depending on runtime + cgroup driver:
+    //   cgroupfs:  0::/docker/<id>
+    //              0::/kubepods/besteffort/pod<uuid>/<id>
+    //   systemd:   0::/system.slice/docker-<id>.scope
+    //              0::/kubepods.slice/.../cri-containerd-<id>.scope   (k3s/k8s)
+    //              0::/.../crio-<id>.scope
+    //   podman:    0::/libpod-<id>.scope
+    //
+    // Take the leaf path segment, drop a trailing ".scope", then take the last
+    // '-'-delimited token: the runtime prefixes (docker-, cri-containerd-, crio-,
+    // libpod-) are dash-joined alpha, while the id itself is hex with no '-'. A
+    // plain "<id>" leaf (cgroupfs) has no '-' and is returned whole. This fixes
+    // the prior systemd-driver miss where the k3s `cri-containerd-<id>.scope`
+    // leaf resolved to the constant prefix "cri-containe" for every pod.
     for line in content.lines() {
-        // Docker: 0::/docker/<container_id>
-        // Podman: 0::/libpod-<container_id>.scope
-        // k8s:    0::/kubepods/besteffort/pod<uuid>/<container_id>
-        if let Some(rest) = line.split("docker/").nth(1) {
-            let id = rest.split('/').next().unwrap_or(rest);
-            if id.len() >= 12 {
-                return Some(id[..12].to_string());
-            }
-        }
-        if let Some(rest) = line.split("libpod-").nth(1) {
-            let id = rest.split('.').next().unwrap_or(rest);
-            if id.len() >= 12 {
-                return Some(id[..12].to_string());
-            }
-        }
-        if line.contains("kubepods") {
-            // Last segment is the container ID
-            if let Some(id) = line.rsplit('/').next() {
-                if id.len() >= 12 {
-                    return Some(id[..12].to_string());
-                }
-            }
+        let leaf = match line.rsplit('/').next() {
+            Some(l) => l,
+            None => continue,
+        };
+        let leaf = leaf.strip_suffix(".scope").unwrap_or(leaf);
+        let id = leaf.rsplit('-').next().unwrap_or(leaf);
+        if id.len() >= 12 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(id[..12].to_string());
         }
     }
     None
@@ -3542,6 +3543,23 @@ mod tests {
         );
         assert_eq!(
             parse_container_id_from_cgroup("0::/kubepods/besteffort/pod1234/0011223344556677"),
+            Some("001122334455".to_string())
+        );
+        // systemd cgroup driver (the real k3s/k8s shape) — previously mis-parsed
+        // to the constant "cri-containe" for every pod.
+        assert_eq!(
+            parse_container_id_from_cgroup(
+                "0::/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pode2ad6fd3_524d.slice/cri-containerd-8317eb4a8dd5fbb4b3f663b25f6d39c943bb1cf0ba0c14b973c9ad069605f57f.scope"
+            ),
+            Some("8317eb4a8dd5".to_string())
+        );
+        // systemd-driver Docker + CRI-O.
+        assert_eq!(
+            parse_container_id_from_cgroup("0::/system.slice/docker-abcdef0123456789aa.scope"),
+            Some("abcdef012345".to_string())
+        );
+        assert_eq!(
+            parse_container_id_from_cgroup("0::/machine.slice/crio-001122334455667788.scope"),
             Some("001122334455".to_string())
         );
         // Short ids and unrelated lines yield nothing.
