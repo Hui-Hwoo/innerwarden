@@ -2070,6 +2070,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         state.last_operator_refresh = std::time::Instant::now();
                     }
 
+                    // Spec 084 P0 1C: refresh the Kubernetes pod -> tenant cache
+                    // from the node kubeconfig. Self-rate-limited to
+                    // `[tenancy] refresh_secs` and inert unless enabled, so this
+                    // is a cheap no-op on non-k8s hosts.
+                    crate::tenancy::maybe_refresh(&cfg.tenancy).await;
+
                     // Hot-reload response rules from /etc/innerwarden/rules/event_pipeline/.
                     // This includes dashboard "Trust IP" entries: they are written
                     // as ordinary suppress_response/scope:ip rules into the same

@@ -190,6 +190,7 @@ mod task_group;
 mod telegram;
 mod telemetry;
 mod telemetry_tick;
+mod tenancy;
 mod text_util;
 mod threat_feeds;
 mod threat_report;

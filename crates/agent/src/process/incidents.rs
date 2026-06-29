@@ -118,7 +118,7 @@ pub(crate) async fn process_incidents(
         .format("%Y-%m-%d")
         .to_string();
 
-    let new_incidents = if let Some(ref sq) = state.sqlite_store {
+    let mut new_incidents = if let Some(ref sq) = state.sqlite_store {
         let cval = sq.get_agent_cursor("incidents").unwrap_or(0);
         match sq.incidents_since(cval, 5000) {
             Ok(rows) if !rows.is_empty() => {
@@ -269,6 +269,13 @@ pub(crate) async fn process_incidents(
 
     let mut handled = 0;
     let mut ai_calls_this_tick: usize = 0;
+
+    // Spec 084 P0 1C: attribute each new incident to its owning tenant
+    // (pod_uid / container_id -> namespace/tenant, from the cached k8s pod map)
+    // BEFORE the read-only processing loops take references, so the knowledge
+    // graph, notifications, AI triage and decisions all see `tenant_id`. Inert
+    // unless `[tenancy] enabled = true`.
+    crate::tenancy::enrich_incidents(&mut new_incidents.entries, &cfg.tenancy);
 
     let all_incidents: Vec<&innerwarden_core::incident::Incident> =
         new_incidents.entries.iter().chain(neural.iter()).collect();

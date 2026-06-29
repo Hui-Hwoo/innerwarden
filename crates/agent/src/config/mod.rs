@@ -202,6 +202,10 @@ pub struct AgentConfig {
     /// KG-derived decision modifiers and detectors (spec 043).
     #[serde(default)]
     pub kg: KgConfig,
+    /// Per-tenant attribution — resolve k8s pod_uid -> namespace/tenant from the
+    /// node's kubeconfig and stamp it on container-scoped incidents (spec 084 P0).
+    #[serde(default)]
+    pub tenancy: crate::tenancy::TenancyConfig,
 }
 
 pub(super) fn default_packed_binary_entropy_threshold() -> f32 {
