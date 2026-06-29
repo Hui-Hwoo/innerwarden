@@ -1917,6 +1917,28 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             signal(SignalKind::terminate())?
         };
 
+        // Spec 084 P0 1C (hardening): refresh the Kubernetes pod -> tenant cache
+        // in a DEDICATED task. It previously lived in the narrative `select!`
+        // arm, where a heavy incident-processing tick (AI-triaging a flood
+        // backlog) starves the other arms — but a flood is exactly when
+        // per-tenant attribution must stay current (validated on test001: under
+        // a k3s + rogue flood the narrative arm never ran, so the cache stayed
+        // empty). A dedicated task is immune to the main loop's per-tick cost.
+        // Self-rate-limited (maybe_refresh checks refresh_secs) and inert unless
+        // `[tenancy] enabled`, so non-k8s hosts spawn nothing.
+        if cfg.tenancy.enabled {
+            let tcfg = cfg.tenancy.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                    tcfg.refresh_secs.clamp(15, 3600),
+                ));
+                loop {
+                    ticker.tick().await;
+                    crate::tenancy::maybe_refresh(&tcfg).await;
+                }
+            });
+        }
+
         loop {
             // Apply a live `/mode` change requested via Telegram on the previous
             // tick. Done here, in the loop that owns `cfg`, so the mutation is
@@ -2069,12 +2091,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         );
                         state.last_operator_refresh = std::time::Instant::now();
                     }
-
-                    // Spec 084 P0 1C: refresh the Kubernetes pod -> tenant cache
-                    // from the node kubeconfig. Self-rate-limited to
-                    // `[tenancy] refresh_secs` and inert unless enabled, so this
-                    // is a cheap no-op on non-k8s hosts.
-                    crate::tenancy::maybe_refresh(&cfg.tenancy).await;
 
                     // Hot-reload response rules from /etc/innerwarden/rules/event_pipeline/.
                     // This includes dashboard "Trust IP" entries: they are written
