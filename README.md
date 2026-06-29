@@ -222,7 +222,7 @@ Apache-2.0. If this project helps make agent automation safer to try, [give it a
 4. **Correlates**: 69 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
 5. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
 6. **Responds**: high/critical incidents drive response skills (block IP via XDP/UFW/iptables/nftables, suspend sudo, kill process, pause container, honeypot redirect). XDP drops attack traffic at wire speed. **Optional** in-kernel execution enforcement (LSM Execution Gate — inert by default, requires explicit arming + setup) stops reverse shells and /tmp execution before they run. Blocks propagate to mesh peers.
-7. **Responds automatically**: the AI decision path drives response skills directly (block IP via ufw/iptables/nftables/firewalld/XDP, suspend sudo, kill process, pause container, honeypot redirect, capture forensics + pcap, notify, escalate). On top of that, 3 built-in SOC playbook templates ship (data exfil, Log4Shell, credential stuffing) that you extend with your own YAML and turn on with `[playbooks] enabled` (opt-in, off by default)
+7. **Responds automatically** — *once you opt in. Every install ships in observe mode (`responder.enabled = false` + `dry_run = true`); you must flip both before any action fires, and nothing flips them for you ([details](#start-in-observe-mode-always)).* The AI decision path then drives response skills directly (block IP via ufw/iptables/nftables/firewalld/XDP, suspend sudo, kill process, pause container, honeypot redirect, capture forensics + pcap, notify, escalate). On top of that, 3 built-in SOC playbook templates ship (data exfil, Log4Shell, credential stuffing) that you extend with your own YAML and turn on with `[playbooks] enabled` (opt-in, off by default)
 8. **Fingerprints attackers**: behavioral DNA (SHA-256 of detectors + tools + targets + timing patterns), **cross-IP tracking** (same attacker detected across VPN/Tor rotations via fuzzy DNA matching — risk score and detector knowledge inherited automatically), campaign detection via IOC clustering, recurrence tracking, risk scoring 0-100, monthly threat reports with MITRE heatmap
 
 Everything is local, audited, and reversible.
@@ -630,6 +630,20 @@ No API key required. What the installer does:
 - Safe posture: detection active, no response skills enabled, `dry_run = true`
 
 The installer fail-closes for stable releases when signatures are missing or invalid. Override env vars exist for migration / air-gapped scenarios. See [Supply Chain Security](docs/supply-chain-security.md) for the manual verification recipe (`SHA256SUMS` + `.sig` + `gh attestation verify`), the active key fingerprint, and an honest list of what is and is not guaranteed.
+
+**Prefer not to pipe a script straight into `sudo bash`?** Don't — download it, confirm it matches the published manifest, read it, then run it yourself. The installer script ships as a release asset and is listed in the release `SHA256SUMS` manifest:
+
+```bash
+base="https://github.com/InnerWarden/innerwarden/releases/latest/download"
+curl -fsSLO "$base/install.sh"          # the bootstrap script
+curl -fsSLO "$base/SHA256SUMS"          # release manifest — lists install.sh too
+
+grep ' install.sh$' SHA256SUMS | sha256sum -c -   # confirm the script matches the manifest
+less install.sh                          # read what you're about to run
+sudo bash install.sh                     # then run the audited copy
+```
+
+That confirms the bytes match the published manifest and lets you read the script before anything runs as root. For full cryptographic verification of a release (Ed25519 binary signatures, the GPG-signed `SHA256SUMS.sig`, and SLSA build attestations), see [Supply Chain Security](docs/supply-chain-security.md).
 
 With external integrations:
 ```bash
