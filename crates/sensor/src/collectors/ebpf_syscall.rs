@@ -3761,16 +3761,29 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
             return;
         }
 
-        // Wait for ring buffer readability via epoll, or fall back to 100ms poll
+        // Wait for ring buffer readability via epoll, but ALWAYS with a 100ms
+        // timeout so the ring is still drained on kernels where the ring-buffer
+        // epoll wakeup is not delivered reliably. Observed on Linux 7.0 (Azure):
+        // the kprobes fire (run_cnt climbs into the thousands) but
+        // `afd.readable().await` blocked forever after the initial drain, so
+        // every subsequent event accumulated in the ring unseen and userspace
+        // captured nothing. Polling on timeout makes the drain robust to
+        // wakeup-delivery differences across kernels while keeping the fast
+        // epoll-wakeup path on kernels that signal correctly.
         if let Some(ref afd) = async_fd {
-            // Wait until the kernel signals data is available on the ring buffer fd
-            match afd.readable().await {
-                Ok(mut guard) => {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), afd.readable()).await
+            {
+                Ok(Ok(mut guard)) => {
                     guard.clear_ready();
                 }
-                Err(_) => {
-                    // epoll error - fall back to short sleep this iteration
+                Ok(Err(_)) => {
+                    // epoll error - fall back to a short sleep this iteration
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    // No wakeup within 100ms: loop back and drain the ring
+                    // directly (poll fallback). This is the path that keeps
+                    // Linux 7.0 capturing.
                 }
             }
         } else {
