@@ -10,6 +10,7 @@
 //! inert with 0 entries — staged but never applied).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Pin path the sensor pins + the paid active-defence watcher writes. Lowercase
 /// on purpose (an aya ByName pin would use the UPPERCASE map name; see the
@@ -306,6 +307,71 @@ pub fn fnv1a_path(buf: &[u8]) -> u64 {
 /// [`fnv1a_path`] over the path's UTF-8 bytes.
 pub fn allowlist_key(path: &str) -> u64 {
     fnv1a_path(path.as_bytes())
+}
+
+// ── Arming brain (spec 083): PURE planning ────────────────────────────────────
+//
+// What to WRITE to the kernel maps to arm the gate around the agent's cgroup.
+// Everything here is pure + host-portable + unit-tested; it touches no map, does
+// no I/O, and arms nothing. The actual writes (aya) + the cgroup-id stat that
+// turns a parsed path into the inode the kernel compares are the on-box half,
+// validated on a real kernel. Keeping the brain here means the diff/plan that
+// drives an arm is testable without a kernel and a writer can never blind-wipe.
+
+/// The set of `EXEC_ALLOWLIST` keys (FNV-1a of each path) for a target allowlist.
+/// A `BTreeSet` so a plan is deterministic regardless of input order.
+pub fn target_allowlist_keys(paths: &[String]) -> BTreeSet<u64> {
+    paths.iter().map(|p| allowlist_key(p)).collect()
+}
+
+/// An idempotent reconcile plan to bring the LIVE `EXEC_ALLOWLIST` to a target
+/// key set: only the difference, never a blind wipe (mirrors spec 076's
+/// verify-live, re-apply-on-divergence). Empty plan = already converged.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReconcilePlan {
+    /// Keys present in the target but not live — to insert.
+    pub to_insert: BTreeSet<u64>,
+    /// Keys present live but not in the target — to remove.
+    pub to_remove: BTreeSet<u64>,
+}
+
+impl ReconcilePlan {
+    /// Nothing to do — the live map already equals the target.
+    pub fn is_noop(&self) -> bool {
+        self.to_insert.is_empty() && self.to_remove.is_empty()
+    }
+}
+
+/// Diff the live key set against the target. The caller applies `to_insert` then
+/// `to_remove` against the pinned map; it must NEVER clear the map and rebuild
+/// (that would leave a window of an empty allowlist under an armed enforce gate —
+/// the brick). A purely additive-then-subtractive reconcile keeps the live set a
+/// superset-or-equal of the target throughout.
+pub fn reconcile_allowlist(live: &BTreeSet<u64>, target: &BTreeSet<u64>) -> ReconcilePlan {
+    ReconcilePlan {
+        to_insert: target.difference(live).copied().collect(),
+        to_remove: live.difference(target).copied().collect(),
+    }
+}
+
+/// Parse the cgroup-v2 path from the contents of `/proc/<pid>/cgroup`. Under the
+/// unified hierarchy that file has a single `0::/<path>` line; the `/<path>` is
+/// the cgroupfs-relative directory whose inode equals
+/// `bpf_get_current_cgroup_id()` for that task (the key the kernel compares
+/// against `EXEC_GATE_SCOPE`). Returns `None` for a cgroup-v1-only or empty file.
+/// PURE: the caller stats `/sys/fs/cgroup/<path>` to get the id (on-box).
+pub fn parse_cgroup_v2_path(proc_cgroup: &str) -> Option<String> {
+    proc_cgroup.lines().find_map(|line| {
+        // The unified (v2) controller line is the one with an empty controller
+        // list: "0::/...". v1 lines look like "N:controller:/...".
+        let path = line.strip_prefix("0::")?;
+        let path = path.trim();
+        if path.is_empty() {
+            None
+        } else {
+            Some(path.to_string())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -764,5 +830,80 @@ mod tests {
             kernel.contains("if b == 0 {"),
             "kernel FNV NUL-break drifted from the userspace mirror"
         );
+    }
+
+    #[test]
+    fn target_allowlist_keys_hash_and_dedup() {
+        let keys = target_allowlist_keys(&[
+            "/usr/bin/bash".into(),
+            "/usr/bin/cat".into(),
+            "/usr/bin/bash".into(), // duplicate path -> one key
+        ]);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&allowlist_key("/usr/bin/bash")));
+        assert!(keys.contains(&allowlist_key("/usr/bin/cat")));
+    }
+
+    #[test]
+    fn reconcile_is_the_diff_not_a_wipe() {
+        let live: BTreeSet<u64> = [1, 2, 3].into_iter().collect();
+        let target: BTreeSet<u64> = [2, 3, 4].into_iter().collect();
+        let plan = reconcile_allowlist(&live, &target);
+        assert_eq!(plan.to_insert, [4].into_iter().collect());
+        assert_eq!(plan.to_remove, [1].into_iter().collect());
+        assert!(!plan.is_noop());
+    }
+
+    #[test]
+    fn reconcile_noop_when_converged() {
+        let s: BTreeSet<u64> = [10, 20].into_iter().collect();
+        assert!(reconcile_allowlist(&s, &s).is_noop());
+    }
+
+    #[test]
+    fn reconcile_insert_only_and_remove_only() {
+        let empty = BTreeSet::new();
+        let two: BTreeSet<u64> = [1, 2].into_iter().collect();
+        // empty live -> insert all, remove none
+        let add = reconcile_allowlist(&empty, &two);
+        assert_eq!(add.to_insert, two);
+        assert!(add.to_remove.is_empty());
+        // empty target -> remove all, insert none (explicit, not a blind wipe)
+        let drop = reconcile_allowlist(&two, &empty);
+        assert!(drop.to_insert.is_empty());
+        assert_eq!(drop.to_remove, two);
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_unified() {
+        assert_eq!(
+            parse_cgroup_v2_path("0::/system.slice/innerwarden-agent.service\n").as_deref(),
+            Some("/system.slice/innerwarden-agent.service")
+        );
+        // root cgroup
+        assert_eq!(parse_cgroup_v2_path("0::/").as_deref(), Some("/"));
+        // a k8s pod cgroup
+        assert_eq!(
+            parse_cgroup_v2_path("0::/kubepods.slice/kubepods-besteffort.slice/pod123.slice\n")
+                .as_deref(),
+            Some("/kubepods.slice/kubepods-besteffort.slice/pod123.slice")
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v2_path_ignores_v1_and_empty() {
+        // cgroup v1 only (legacy hierarchies) -> no unified line -> None
+        assert_eq!(
+            parse_cgroup_v2_path("12:pids:/user.slice\n11:memory:/user.slice\n"),
+            None
+        );
+        // hybrid: v1 lines + the unified line -> picks the unified path
+        assert_eq!(
+            parse_cgroup_v2_path("11:memory:/foo\n0::/bar\n").as_deref(),
+            Some("/bar")
+        );
+        assert_eq!(parse_cgroup_v2_path(""), None);
+        // "0::" with no path is not a usable cgroup path
+        assert_eq!(parse_cgroup_v2_path("0::\n"), None);
     }
 }
