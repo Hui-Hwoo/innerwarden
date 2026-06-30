@@ -496,13 +496,16 @@ pub fn enrich_incident(incident: &mut innerwarden_core::incident::Incident, cfg:
     }
     // Observable per-incident attribution (greppable on the box; the aggregate
     // is the per-tenant telemetry counter). Only fires for container-scoped
-    // incidents that resolve to a tenant, so host incidents stay quiet.
+    // incidents that resolve to a tenant, so host incidents stay quiet. The
+    // tenant/namespace/pod are formatted INTO the message (not as structured
+    // fields) so the line is greppable under any tracing fmt layer — the
+    // journald/systemd default the agent runs under does not render k-v fields.
     tracing::info!(
-        incident_id = %incident.incident_id,
-        tenant = %pod.tenant_id,
-        namespace = %pod.namespace,
-        pod = %pod.pod_name,
-        "tenancy: incident attributed to tenant"
+        "tenancy: incident {} attributed to tenant {} (namespace {}, pod {})",
+        incident.incident_id,
+        pod.tenant_id,
+        pod.namespace,
+        pod.pod_name
     );
 }
 
