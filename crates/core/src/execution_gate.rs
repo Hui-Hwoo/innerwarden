@@ -374,6 +374,67 @@ pub fn parse_cgroup_v2_path(proc_cgroup: &str) -> Option<String> {
     })
 }
 
+/// A vetted, SAFE plan to arm the gate around a single cgroup (agent-scoped,
+/// spec 083). Only produced by [`plan_arm`] when the request passed every safety
+/// check; the caller applies it via aya (insert/remove the reconcile, write the
+/// scope cgroup id, then set the policy mode + scope bit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmPlan {
+    /// Allowlist diff to reach the target (apply inserts BEFORE removes so the
+    /// live set is never a strict subset of the target mid-apply).
+    pub reconcile: ReconcilePlan,
+    /// The cgroup id to write into `EXEC_GATE_SCOPE` (key 4 scoping target).
+    pub scope_cgroup_id: u64,
+    /// The mode to set in `LSM_POLICY` key 3 — `Observe` or `Enforce` only.
+    pub mode: GateMode,
+}
+
+/// Why an arm request was refused. A refusal NEVER touches a map — the gate is
+/// left exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArmRefusal {
+    /// Enforce requested but the resulting allowlist would be empty: every
+    /// in-scope exec would be denied (-EPERM), bricking the agent's own cgroup.
+    /// The single most important guard (mirrors the k7 host-wide brick lesson,
+    /// scaled to one pod). Observe-with-empty is allowed (it only learns).
+    EnforceWithEmptyAllowlist,
+    /// No cgroup id to scope to (unresolved / 0). A scoped gate with an empty
+    /// scope protects nothing, so refuse rather than arm a no-op that looks armed.
+    NoScopeCgroup,
+    /// Mode was not `Observe`/`Enforce` — use the disarm path for inert.
+    NotAnArmMode,
+}
+
+/// Vet an arm request and produce a SAFE [`ArmPlan`], or refuse. Pure: it reads
+/// no map and writes nothing — the caller applies the returned plan via aya or
+/// surfaces the refusal. Agent-scoped ONLY (a host-wide arm is not a product path
+/// here — that is the brick the k7 incident proved). `cgroup_id == 0` means the
+/// agent's cgroup could not be resolved.
+pub fn plan_arm(
+    target_keys: BTreeSet<u64>,
+    live_keys: &BTreeSet<u64>,
+    cgroup_id: u64,
+    mode: GateMode,
+) -> Result<ArmPlan, ArmRefusal> {
+    if !mode.is_active() {
+        return Err(ArmRefusal::NotAnArmMode);
+    }
+    if cgroup_id == 0 {
+        return Err(ArmRefusal::NoScopeCgroup);
+    }
+    // After the reconcile the live allowlist == target_keys. Enforce over an
+    // empty allowlist denies every in-scope exec — never arm that.
+    if mode == GateMode::Enforce && target_keys.is_empty() {
+        return Err(ArmRefusal::EnforceWithEmptyAllowlist);
+    }
+    let reconcile = reconcile_allowlist(live_keys, &target_keys);
+    Ok(ArmPlan {
+        reconcile,
+        scope_cgroup_id: cgroup_id,
+        mode,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,5 +966,64 @@ mod tests {
         assert_eq!(parse_cgroup_v2_path(""), None);
         // "0::" with no path is not a usable cgroup path
         assert_eq!(parse_cgroup_v2_path("0::\n"), None);
+    }
+
+    #[test]
+    fn plan_arm_refuses_enforce_with_empty_allowlist() {
+        // The headline guard: enforce over an empty allowlist would brick the
+        // scoped cgroup. Refused, no plan.
+        let live = BTreeSet::new();
+        let r = plan_arm(BTreeSet::new(), &live, 9772, GateMode::Enforce);
+        assert_eq!(r, Err(ArmRefusal::EnforceWithEmptyAllowlist));
+    }
+
+    #[test]
+    fn plan_arm_allows_observe_with_empty_allowlist() {
+        // Observe never denies — an empty allowlist just learns. Allowed.
+        let live = BTreeSet::new();
+        let plan = plan_arm(BTreeSet::new(), &live, 9772, GateMode::Observe)
+            .expect("observe+empty is safe");
+        assert_eq!(plan.mode, GateMode::Observe);
+        assert_eq!(plan.scope_cgroup_id, 9772);
+        assert!(plan.reconcile.is_noop());
+    }
+
+    #[test]
+    fn plan_arm_refuses_without_a_scope_cgroup() {
+        let live = BTreeSet::new();
+        let target: BTreeSet<u64> = [allowlist_key("/usr/bin/bash")].into_iter().collect();
+        assert_eq!(
+            plan_arm(target, &live, 0, GateMode::Enforce),
+            Err(ArmRefusal::NoScopeCgroup)
+        );
+    }
+
+    #[test]
+    fn plan_arm_refuses_inert_and_unknown_modes() {
+        let live = BTreeSet::new();
+        let t: BTreeSet<u64> = [1].into_iter().collect();
+        assert_eq!(
+            plan_arm(t.clone(), &live, 1, GateMode::Inert),
+            Err(ArmRefusal::NotAnArmMode)
+        );
+        assert_eq!(
+            plan_arm(t, &live, 1, GateMode::Unknown),
+            Err(ArmRefusal::NotAnArmMode)
+        );
+    }
+
+    #[test]
+    fn plan_arm_enforce_nonempty_yields_correct_reconcile() {
+        // live has {bash, stale}; target {bash, cat} -> insert cat, remove stale.
+        let bash = allowlist_key("/usr/bin/bash");
+        let cat = allowlist_key("/usr/bin/cat");
+        let stale = allowlist_key("/tmp/old");
+        let live: BTreeSet<u64> = [bash, stale].into_iter().collect();
+        let target: BTreeSet<u64> = [bash, cat].into_iter().collect();
+        let plan = plan_arm(target, &live, 555, GateMode::Enforce).expect("safe enforce");
+        assert_eq!(plan.mode, GateMode::Enforce);
+        assert_eq!(plan.scope_cgroup_id, 555);
+        assert_eq!(plan.reconcile.to_insert, [cat].into_iter().collect());
+        assert_eq!(plan.reconcile.to_remove, [stale].into_iter().collect());
     }
 }

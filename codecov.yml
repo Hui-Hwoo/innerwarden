@@ -149,6 +149,13 @@ coverage:
           # real pins. The verdict logic (innerwarden_core::execution_gate) and
           # the monitor's pure helpers ARE unit-tested.
           - "!crates/agent/src/execution_gate_aya.rs"
+          # Same kernel-FFI exclusion for the Execution Gate WRITER (spec 083
+          # arming): apply_arm_plan / disarm / resolve_cgroup_id write the pinned
+          # maps and need CAP_BPF + real pins. The SAFETY decision they apply
+          # (innerwarden_core::execution_gate::plan_arm + reconcile) IS
+          # unit-tested; the writes are validated on a real kernel by the
+          # `#[ignore]`d on-box roundtrip test in the file.
+          - "!crates/agent/src/execution_gate_arm.rs"
       # Orchestration / boot wiring gets its own *informational* gauge so
       # it is measured (not hidden) but never blocks merges. Real ceiling
       # is set by integration tests, not unit tests.

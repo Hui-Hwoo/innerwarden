@@ -96,6 +96,7 @@ mod dns_guard_export;
 mod dns_guard_ingest;
 mod dshield;
 mod environment_profile;
+mod execution_gate_arm;
 mod execution_gate_aya;
 mod execution_gate_monitor;
 mod firmware_tick;
