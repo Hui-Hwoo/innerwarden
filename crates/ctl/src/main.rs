@@ -1229,6 +1229,28 @@ enum ExecGateCommand {
         #[arg(long = "path")]
         paths: Vec<String>,
     },
+    /// Rehearse: show what the gate WOULD block for a pid's cgroup over a recent
+    /// window (read-only). Run before `enforce` to confirm zero would-block and to
+    /// see which binaries still need allowlisting.
+    Rehearse {
+        /// PID of the AI agent process whose cgroup to inspect.
+        #[arg(long)]
+        pid: u32,
+        /// Lookback window in seconds (default 300).
+        #[arg(long)]
+        window: Option<u64>,
+    },
+    /// Enforce: flip the gate to DENY unknown execs in the pid's cgroup. Succeeds
+    /// only after a clean rehearsal (observe-armed, scoped to the pid, zero
+    /// would-block in the window) — never a blind flip.
+    Enforce {
+        /// PID of the AI agent process to enforce around.
+        #[arg(long)]
+        pid: u32,
+        /// Rehearsal window in seconds to require clean (default 300).
+        #[arg(long)]
+        window: Option<u64>,
+    },
     /// Disarm: return the gate to inert. Always safe, no preconditions.
     Disarm,
 }
@@ -2849,6 +2871,16 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 observe,
                 ref paths,
             } => commands::exec_gate::cmd_arm(*pid, *observe, paths),
+            ExecGateCommand::Rehearse { pid, window } => commands::exec_gate::cmd_rehearse(
+                *pid,
+                *window,
+                &resolve_data_dir(&cli, &cli.data_dir),
+            ),
+            ExecGateCommand::Enforce { pid, window } => commands::exec_gate::cmd_enforce(
+                *pid,
+                *window,
+                &resolve_data_dir(&cli, &cli.data_dir),
+            ),
             ExecGateCommand::Disarm => commands::exec_gate::cmd_disarm(),
         },
         Command::Rule { ref command } => match command {

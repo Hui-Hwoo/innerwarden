@@ -5,14 +5,21 @@
 //! resolves the target cgroup, builds the plan, and translates it into bpftool
 //! commands.
 //!
-//! Scope of this command today: `status`, `arm --observe`, `disarm`. Observe
-//! never denies an exec, so it is the safe onboarding mode — arm observe, watch
-//! what the agent would-block, build the allowlist, then enforce. `arm --enforce`
-//! is intentionally gated behind a zero-would-deny rehearsal (a follow-up); it is
-//! refused here so nobody flips enforce blind (the k7 brick lesson).
+//! Commands: `status`, `arm --observe`, `rehearse`, `enforce`, `disarm`. The safe
+//! flow is observe first (never denies), watch the would-block events, allowlist
+//! the binaries, `rehearse` until clean, then `enforce`. `enforce` flips to deny
+//! ONLY after a clean rehearsal (observe-armed + scoped + zero would-block in the
+//! window), so nobody flips enforce blind (the k7 brick lesson). Personal use is
+//! free; the professional/fleet layer is the separate paid product.
 
+use innerwarden_core::event::Event;
 use innerwarden_core::execution_gate::{self as eg, GateMode};
+use innerwarden_store::Store;
 use std::collections::BTreeSet;
+use std::path::Path;
+
+/// Default rehearsal window (seconds) — how far back the would-block scan looks.
+const DEFAULT_REHEARSE_WINDOW_SECS: u64 = 300;
 
 /// Little-endian `0xNN` byte args for a bpftool map key/value of `n` bytes.
 pub(crate) fn le_hex(v: u64, n: usize) -> Vec<String> {
@@ -176,9 +183,9 @@ pub(crate) fn arm_plan_for_cli(
 ) -> Result<Vec<Vec<String>>, String> {
     if !observe {
         return Err(
-            "enforce is gated behind a zero-would-deny rehearsal (not yet available). \
-             Run `arm --observe` first, watch the would-block events, build the allowlist, \
-             then enforce once the rehearsal passes."
+            "`arm` only sets observe. To enforce, use `exec-gate enforce --pid <PID>` \
+             — it flips to enforce only after a clean rehearsal (observe-armed, scoped, zero \
+             would-block in the window)."
                 .to_string(),
         );
     }
@@ -268,6 +275,151 @@ pub(crate) fn cmd_disarm() -> anyhow::Result<()> {
         bpftool(&cmd)?;
     }
     println!("Execution Gate disarmed (inert). The host and the agent are ungated.");
+    Ok(())
+}
+
+// ── Rehearsal-gated enforce (spec 083, observe -> enforce safely) ─────────────
+
+/// PURE: whether flipping the gate to ENFORCE is safe, given the live state and
+/// the rehearsal result. Enforce only when the gate is ALREADY observe-armed and
+/// scoped to this cgroup AND zero would-block events fired in the window (every
+/// binary the agent ran is allowlisted). Anything else is refused — never a blind
+/// flip.
+pub(crate) fn enforce_decision(
+    live_mode: GateMode,
+    scoped: bool,
+    cgid_in_scope: bool,
+    would_block: usize,
+) -> Result<(), String> {
+    if live_mode != GateMode::Observe {
+        return Err("the gate is not in observe mode for this agent. Run \
+             `arm --pid <PID> --observe` first, let it run, then enforce."
+            .to_string());
+    }
+    if !scoped || !cgid_in_scope {
+        return Err(
+            "the gate is not agent-scoped to this pid's cgroup. Re-arm observe scoped \
+             to the right pid before enforcing."
+                .to_string(),
+        );
+    }
+    if would_block > 0 {
+        return Err(format!(
+            "rehearsal not clean: {would_block} would-block event(s) in the window — those \
+             binaries would be DENIED under enforce. Run `exec-gate rehearse --pid <PID>` to \
+             list them, allowlist them, then enforce."
+        ));
+    }
+    Ok(())
+}
+
+/// PURE: count would-block events for one cgroup + the distinct binary paths.
+pub(crate) fn filter_would_block_for_cgroup(
+    events: &[(i64, Event)],
+    cgid: u64,
+) -> (usize, Vec<String>) {
+    let mut count = 0usize;
+    let mut paths = BTreeSet::new();
+    for (_, ev) in events {
+        if ev.details.get("cgroup_id").and_then(|v| v.as_u64()) == Some(cgid) {
+            count += 1;
+            if let Some(f) = ev.details.get("filename").and_then(|v| v.as_str()) {
+                paths.insert(f.to_string());
+            }
+        }
+    }
+    (count, paths.into_iter().collect())
+}
+
+/// I/O: query the store for would-block events for `cgid` over the last `window`
+/// seconds, returning (count, distinct paths).
+fn scan_would_block(
+    dir: &Path,
+    cgid: u64,
+    window_secs: u64,
+) -> anyhow::Result<(usize, Vec<String>)> {
+    let store = Store::open(dir)
+        .map_err(|e| anyhow::anyhow!("open event store at {}: {e:#}", dir.display()))?;
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(window_secs as i64)).to_rfc3339();
+    let events = store.events_by_kind_since("lsm.exec_gate_would_block", &since, 50_000)?;
+    Ok(filter_would_block_for_cgroup(&events, cgid))
+}
+
+/// I/O: is `cgid` present in the EXEC_GATE_SCOPE map?
+fn bpftool_scope_has(cgid: u64) -> bool {
+    let mut args = vec![
+        "map".to_string(),
+        "lookup".to_string(),
+        "pinned".to_string(),
+        eg::EXEC_GATE_SCOPE_PIN.to_string(),
+        "key".to_string(),
+    ];
+    args.extend(le_hex(cgid, 8));
+    matches!(
+        std::process::Command::new("bpftool").args(&args).output(),
+        Ok(o) if o.status.success()
+    )
+}
+
+/// `innerwarden exec-gate rehearse --pid <PID> [--window N]` — read-only: show the
+/// would-block events for the pid's cgroup so the operator knows whether enforce
+/// is safe and which binaries still need allowlisting.
+pub(crate) fn cmd_rehearse(pid: u32, window: Option<u64>, dir: &Path) -> anyhow::Result<()> {
+    let window = window.unwrap_or(DEFAULT_REHEARSE_WINDOW_SECS);
+    let cgid = resolve_cgroup_id(pid).unwrap_or(0);
+    if cgid == 0 {
+        anyhow::bail!("could not resolve a cgroup-v2 id for pid {pid}.");
+    }
+    let (count, paths) = scan_would_block(dir, cgid, window)?;
+    if count == 0 {
+        println!(
+            "Rehearsal CLEAN for pid {pid} (cgroup {cgid}): 0 would-block in the last {window}s. \
+             Safe to `exec-gate enforce --pid {pid}`."
+        );
+    } else {
+        println!(
+            "Rehearsal for pid {pid} (cgroup {cgid}): {count} would-block in the last {window}s, \
+             from {} binaries:",
+            paths.len()
+        );
+        for p in &paths {
+            println!("  {p}");
+        }
+        println!(
+            "Allowlist these (`exec-gate arm --pid {pid} --observe --path <P> ...`) and \
+             re-rehearse, or they will be DENIED under enforce."
+        );
+    }
+    Ok(())
+}
+
+/// `innerwarden exec-gate enforce --pid <PID> [--window N]` — flip the gate to
+/// enforce, but ONLY after a clean rehearsal (observe-armed + scoped + zero
+/// would-block in the window). Otherwise refused — the gate is never flipped blind.
+pub(crate) fn cmd_enforce(pid: u32, window: Option<u64>, dir: &Path) -> anyhow::Result<()> {
+    let window = window.unwrap_or(DEFAULT_REHEARSE_WINDOW_SECS);
+    let cgid = resolve_cgroup_id(pid).unwrap_or(0);
+    if cgid == 0 {
+        anyhow::bail!("could not resolve a cgroup-v2 id for pid {pid}.");
+    }
+    let live_mode =
+        GateMode::from_policy_key(bpftool_lookup_u32(eg::LSM_POLICY_PIN, eg::GATE_MODE_KEY));
+    let scoped = bpftool_lookup_u32(eg::LSM_POLICY_PIN, eg::GATE_SCOPE_KEY) == Some(1);
+    let cgid_in_scope = bpftool_scope_has(cgid);
+    let (would_block, _paths) = scan_would_block(dir, cgid, window)?;
+    enforce_decision(live_mode, scoped, cgid_in_scope, would_block)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Flip key 3 to enforce; scope + allowlist are already in place from observe.
+    bpftool(&map_update(
+        eg::LSM_POLICY_PIN,
+        le_hex(eg::GATE_MODE_KEY as u64, 4),
+        le_hex(1, 4),
+    ))?;
+    println!(
+        "Execution Gate ENFORCING, scoped to pid {pid} (cgroup {cgid}). Unknown binaries in its \
+         cgroup are now denied (-EPERM); the host and other processes are untouched. \
+         `exec-gate disarm` to stop."
+    );
     Ok(())
 }
 
@@ -429,5 +581,89 @@ mod tests {
         {
             assert!(cmd_disarm().is_err());
         }
+    }
+
+    // ── PR4b: rehearsal-gated enforce ─────────────────────────────────────────
+
+    fn wb_event(cgid: u64, file: &str) -> (i64, Event) {
+        (
+            0,
+            Event {
+                ts: chrono::Utc::now(),
+                host: "h".into(),
+                source: "ebpf".into(),
+                kind: "lsm.exec_gate_would_block".into(),
+                severity: innerwarden_core::event::Severity::Info,
+                summary: String::new(),
+                details: serde_json::json!({"cgroup_id": cgid, "filename": file}),
+                tags: vec![],
+                entities: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn enforce_decision_requires_observe_mode() {
+        assert!(enforce_decision(GateMode::Inert, true, true, 0).is_err());
+        assert!(enforce_decision(GateMode::Enforce, true, true, 0).is_err());
+    }
+
+    #[test]
+    fn enforce_decision_requires_scope() {
+        assert!(enforce_decision(GateMode::Observe, false, true, 0).is_err());
+        assert!(enforce_decision(GateMode::Observe, true, false, 0).is_err());
+    }
+
+    #[test]
+    fn enforce_decision_refuses_dirty_rehearsal() {
+        let e = enforce_decision(GateMode::Observe, true, true, 3).unwrap_err();
+        assert!(e.contains("rehearsal not clean"));
+        assert!(e.contains('3'));
+    }
+
+    #[test]
+    fn enforce_decision_allows_clean_observe_scoped() {
+        assert!(enforce_decision(GateMode::Observe, true, true, 0).is_ok());
+    }
+
+    #[test]
+    fn filter_would_block_counts_and_dedups_paths() {
+        let evs = vec![
+            wb_event(9772, "/tmp/a"),
+            wb_event(9772, "/tmp/a"),
+            wb_event(9772, "/tmp/b"),
+            wb_event(1, "/tmp/c"), // other cgroup — excluded
+        ];
+        let (count, paths) = filter_would_block_for_cgroup(&evs, 9772);
+        assert_eq!(count, 3);
+        assert_eq!(paths, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+        // no events for an unknown cgroup
+        assert_eq!(filter_would_block_for_cgroup(&evs, 42).0, 0);
+    }
+
+    #[test]
+    fn scan_would_block_reads_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.insert_event(&wb_event(9772, "/tmp/x").1).unwrap();
+        store.insert_event(&wb_event(9772, "/tmp/y").1).unwrap();
+        store.insert_event(&wb_event(555, "/tmp/z").1).unwrap(); // other cgroup
+        let (count, paths) = scan_would_block(dir.path(), 9772, 3600).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(paths, vec!["/tmp/x".to_string(), "/tmp/y".to_string()]);
+    }
+
+    #[test]
+    fn bpftool_scope_has_false_for_absent() {
+        // No bpftool / no pin / key absent -> false (never a spurious true).
+        assert!(!bpftool_scope_has(0xdead_beef));
+    }
+
+    #[test]
+    fn cmd_rehearse_and_enforce_error_on_unresolvable_pid() {
+        // bogus pid -> cgid 0 -> bail before any store/bpftool work.
+        let dir = std::path::Path::new("/nonexistent-data-dir");
+        assert!(cmd_rehearse(u32::MAX, None, dir).is_err());
+        assert!(cmd_enforce(u32::MAX, None, dir).is_err());
     }
 }
