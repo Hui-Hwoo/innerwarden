@@ -23,6 +23,14 @@ pub const GATE_MODE_KEY: u32 = 3;
 /// Default signed allowlist file (paid active-defence managed). Shape:
 /// `{ "mode": "observe", "entries": { "<fnv>": "<path>", ... } }`.
 pub const SIGNED_ALLOWLIST_FILE: &str = "/etc/innerwarden/exec_allowlist.json";
+/// LSM_POLICY key 4 = scope mode (0 host-wide, 1 agent-scoped — spec 083). When
+/// 1, the kernel gate only consults the allowlist for execs whose cgroup id is in
+/// `EXEC_GATE_SCOPE`; every exec outside that set returns allow before any lookup
+/// (the agent-scoped, host-safe arming path). See `crates/sensor-ebpf/src/main.rs`.
+pub const GATE_SCOPE_KEY: u32 = 4;
+/// Pin path for the agent-scope map (`u64 cgroup_id -> u8`, spec 083). The sensor
+/// pins it; the writer (paid active-defence) populates the agent's cgroup id(s).
+pub const EXEC_GATE_SCOPE_PIN: &str = "/sys/fs/bpf/innerwarden/exec_gate_scope";
 
 /// The gate's operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +238,37 @@ pub fn parse_bpftool_value_u32(text: &str) -> Option<u32> {
         return None;
     }
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// FNV-1a (64-bit) of a path, hashed over the bytes up to the first NUL and
+/// capped at 256 bytes — the userspace MIRROR of the in-kernel hasher
+/// `fnv1a_path` in `crates/sensor-ebpf/src/main.rs`. This value IS the
+/// `EXEC_ALLOWLIST` key: the kernel hashes the exec path the same way at
+/// `bprm_check_security`, so a key produced here is exactly the key the kernel
+/// looks up. The two implementations MUST stay byte-for-byte identical — if they
+/// ever diverge, an armed *enforce* gate would deny every binary (no allowlist
+/// key could ever match the kernel's hash). `fnv1a_*` tests pin that agreement,
+/// including a source-parity check against the kernel constants.
+pub fn fnv1a_path(buf: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64-bit offset basis
+    let mut i = 0usize;
+    // Bounded by 256 (mirrors the kernel's verifier-bounded loop) and by len.
+    while i < 256 && i < buf.len() {
+        let b = buf[i];
+        if b == 0 {
+            break;
+        }
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a 64-bit prime
+        i += 1;
+    }
+    h
+}
+
+/// Convenience: the `EXEC_ALLOWLIST` key for an executable path string. Equal to
+/// [`fnv1a_path`] over the path's UTF-8 bytes.
+pub fn allowlist_key(path: &str) -> u64 {
+    fnv1a_path(path.as_bytes())
 }
 
 #[cfg(test)]
@@ -458,5 +497,72 @@ mod tests {
         );
         // no value section
         assert_eq!(parse_bpftool_value_u32("Not found"), None);
+    }
+
+    #[test]
+    fn fnv1a_matches_canonical_fnv1a_64_vectors() {
+        // Canonical FNV-1a 64-bit test vectors. Proves the constants + algorithm
+        // are standard FNV-1a-64, not a private variant — the empty input returns
+        // the offset basis, the rest are the published reference values.
+        assert_eq!(fnv1a_path(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_path(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_path(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn fnv1a_stops_at_first_nul_like_the_kernel() {
+        // The kernel breaks the loop on the first NUL; bytes past it are ignored,
+        // so a path and the same path with garbage past a NUL hash identically.
+        assert_eq!(
+            fnv1a_path(b"/usr/bin/cat"),
+            fnv1a_path(b"/usr/bin/cat\0junk")
+        );
+        assert_eq!(fnv1a_path(b""), fnv1a_path(b"\0anything"));
+    }
+
+    #[test]
+    fn fnv1a_caps_at_256_bytes() {
+        // Bytes at/after index 256 must not affect the hash (verifier-bound mirror).
+        let mut a = vec![b'x'; 256];
+        let mut b = a.clone();
+        b.push(b'y'); // 257th byte, must be ignored
+        assert_eq!(fnv1a_path(&a), fnv1a_path(&b));
+        // ...but the first 256 DO matter.
+        a[255] = b'z';
+        assert_ne!(fnv1a_path(&a), fnv1a_path(&vec![b'x'; 256]));
+    }
+
+    #[test]
+    fn allowlist_key_hashes_the_path_bytes() {
+        assert_eq!(allowlist_key("/usr/bin/cat"), fnv1a_path(b"/usr/bin/cat"));
+        // Distinct paths -> distinct keys.
+        assert_ne!(allowlist_key("/usr/bin/cat"), allowlist_key("/usr/bin/sh"));
+    }
+
+    #[test]
+    fn fnv1a_source_parity_with_kernel_hasher() {
+        // The kernel hasher (sensor-ebpf) and this userspace mirror MUST use
+        // identical constants + structure. Pin that by asserting the kernel source
+        // still declares the same offset basis, prime, 256-bound loop, and NUL
+        // break. If a future edit changes the kernel FNV, this fails until the
+        // mirror above is brought back into agreement (the keys would otherwise
+        // silently stop matching and an armed enforce gate would block everything).
+        let kernel = include_str!("../../sensor-ebpf/src/main.rs");
+        assert!(
+            kernel.contains("0xcbf2_9ce4_8422_2325"),
+            "kernel FNV offset basis drifted from the userspace mirror"
+        );
+        assert!(
+            kernel.contains("0x0000_0100_0000_01b3"),
+            "kernel FNV prime drifted from the userspace mirror"
+        );
+        assert!(
+            kernel.contains("while i < 256 && i < buf.len()"),
+            "kernel FNV bound drifted from the userspace mirror"
+        );
+        assert!(
+            kernel.contains("if b == 0 {"),
+            "kernel FNV NUL-break drifted from the userspace mirror"
+        );
     }
 }
