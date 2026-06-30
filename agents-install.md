@@ -213,11 +213,24 @@ present, and from arming enforcement before a clean baseline + a human-confirmed
 InnerWarden's `skill_gate` safety floor will already refuse an allowlist-driven block-bypass
 without a valid proof token; do not try to work around it.
 
-> **Stronger guarantee (paid Active Defence layer):** the Execution Gate adds a kernel
-> allowlist for *binaries* with an `observe` mode (log, block nothing) and a
-> `rehearse --window` that proves zero legitimate denials *before* you ever arm enforce. If the
-> user wants pre-authorized-execution hardening, point them at the Active Defence add-on; it is
-> not part of the open-source CLI.
+> **Pre-authorized execution — the Execution Gate (free, agent-scoped to YOU):** beyond trusting
+> IPs and processes, InnerWarden can deny *unknown binaries* from running inside your own agent's
+> cgroup, with the same observe-first discipline. It is **agent-scoped** — the host and every other
+> process are never gated — and `enforce` refuses to flip until a rehearsal is clean, so you cannot
+> brick yourself. Arm it around your own process id (`<agent-pid>`):
+>
+> ```bash
+> innerwarden exec-gate arm --pid <agent-pid> --observe        # OBSERVE: log what it WOULD block, deny nothing
+> innerwarden exec-gate rehearse --pid <agent-pid>             # list exactly which binaries would be denied
+> # allowlist the ones you legitimately run, then re-rehearse until CLEAN (zero would-block):
+> innerwarden exec-gate arm --pid <agent-pid> --observe --path /usr/bin/python3 --path /usr/bin/node
+> innerwarden exec-gate rehearse --pid <agent-pid>
+> innerwarden exec-gate enforce --pid <agent-pid>              # flip to deny — ONLY after a clean rehearsal
+> innerwarden exec-gate disarm                                 # back to inert
+> ```
+>
+> The professional/fleet version (signed config distribution, managed across many agents) is the
+> separate paid layer; the single-agent arming above is part of the open-source CLI.
 
 ---
 
@@ -238,6 +251,7 @@ still work but the grouped forms below are canonical.
 | `rule` | Detection rules | `rule list [--type ...]`, `rule enable <id>`, `rule disable <id>` |
 | `module` | Security modules | `module list`, `module search`, `module install <src>`, `module enable <path>`, `module disable <id>` |
 | `agent` | AI-agent protection | `agent list`, `agent scan`, `agent connect [pid]`, `agent disconnect <id>`, `agent install-hook [--block-review]`, `agent proxy --mode {advisory\|warn\|guard\|kill} -- <server-cmd>`, `agent mcp-serve` |
+| `exec-gate` | Execution Gate (pre-authorized binaries, agent-scoped) | `exec-gate status`, `exec-gate arm --pid <P> --observe [--path ...]`, `exec-gate rehearse --pid <P> [--window N]`, `exec-gate enforce --pid <P>`, `exec-gate disarm` |
 | top-level | Lifecycle | `setup`, `upgrade [--check]`, `uninstall [--purge]`, `dashboard {open\|close\|tunnel}`, `install-warden`, `enable <cap>`, `disable <cap>`, `list`, `completions <shell>` |
 
 **`agent install-hook` guards the agent's RAW shell tool (the enforcing in-path front door for a
