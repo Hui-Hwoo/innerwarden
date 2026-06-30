@@ -32,7 +32,7 @@ tracing-journald = "0.3"
 # writes PID/TGID entries the kernel LSM hook consults. Aya is Linux-only
 # (depends on libc symbols that don't exist on macOS/Windows); the
 # `lsm_policy` module stubs to no-ops on non-Linux via cfg.
-aya = "0.13"
+aya = "0.14"
 
 [dependencies]
 innerwarden_core = { path = "../core" }

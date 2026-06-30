@@ -759,7 +759,7 @@ const XDP_ALLOWLIST_PIN: &str = "/sys/fs/bpf/innerwarden/allowlist";
 /// only created inside `attach_xdp`, which runs AFTER `attach_lsm`. So
 /// LSM/CGROUP/COMM pins always failed silently on first boot until
 /// `attach_xdp` ran. Operator-visible: `LSM: failed to pin policy map`
-/// + `CGROUP_CAPABILITIES: failed to pin` warnings during sensor
+/// plus `CGROUP_CAPABILITIES: failed to pin` warnings during sensor
 /// startup, with the (only) recovery path being a sensor restart.
 ///
 /// Returns `Ok(())` if the dir already exists or was created. Returns
@@ -1066,7 +1066,7 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
                 }
             };
             let btf = aya::Btf::from_sys_fs().ok();
-            if let Err(e) = lsm.load("bpf", &btf.as_ref().unwrap()) {
+            if let Err(e) = lsm.load("bpf", btf.as_ref().unwrap()) {
                 info!(error = %e, "innerwarden_lsm_bpf: failed to load");
             } else if let Err(e) = lsm.attach() {
                 warn!(error = %e, "innerwarden_lsm_bpf: failed to attach");
@@ -1362,7 +1362,7 @@ fn attach_lsm(_bpf: &mut ()) {}
 /// Non-critical - if it fails, the sensor continues without XDP.
 #[cfg(feature = "ebpf")]
 fn attach_xdp(bpf: &mut aya::Ebpf) {
-    use aya::programs::{Xdp, XdpFlags};
+    use aya::programs::{Xdp, XdpMode};
 
     let iface = match detect_default_interface() {
         Some(i) => i,
@@ -1386,7 +1386,7 @@ fn attach_xdp(bpf: &mut aya::Ebpf) {
                 return;
             }
             // Use SKB mode (generic) for maximum compatibility.
-            // Native mode (XdpFlags::default()) is faster but requires driver support.
+            // Native mode (XdpMode::Driver) is faster but requires driver support.
             //
             // 2026-05-08: do NOT early-return on attach failure. The most
             // common cause is `EBUSY` because the previous sensor instance
@@ -1403,7 +1403,7 @@ fn attach_xdp(bpf: &mut aya::Ebpf) {
             // (the maps it references can still be updated by the agent)
             // until either the kernel reaps the orphaned link or the
             // operator triggers a clean detach + re-attach cycle.
-            let attach_outcome = xdp.attach(&iface, XdpFlags::SKB_MODE);
+            let attach_outcome = xdp.attach(&iface, XdpMode::Skb);
             match &attach_outcome {
                 Ok(_) => {
                     info!(iface = %iface, "eBPF: innerwarden_xdp → {iface} (XDP firewall) ✅");
@@ -1458,9 +1458,6 @@ fn attach_xdp(bpf: &mut aya::Ebpf) {
 #[cfg(not(feature = "ebpf"))]
 fn attach_xdp(_bpf: &mut ()) {}
 
-/// Start the eBPF collector. Loads programs, attaches tracepoints, reads ring buffer.
-///
-/// Events flow through the same mpsc channel as all other collectors.
 // ---------------------------------------------------------------------------
 // Kernel filter population - shared runtime allowlists
 // ---------------------------------------------------------------------------
