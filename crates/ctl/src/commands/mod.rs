@@ -9,6 +9,7 @@ pub(crate) mod circuit;
 pub(crate) mod cloud_detect;
 pub(crate) mod core;
 pub(crate) mod dashboard;
+pub(crate) mod exec_gate;
 pub(crate) mod firmware;
 pub(crate) mod history;
 pub(crate) mod integrations;

@@ -185,6 +185,20 @@ enum Command {
         command: RuleCommand,
     },
 
+    /// Execution Gate (spec 083): arm the in-kernel exec gate around your AI
+    /// agent's process — observe first, then enforce. Agent-scoped, so the host
+    /// itself is never gated.
+    ///
+    /// Examples:
+    ///   innerwarden exec-gate status
+    ///   innerwarden exec-gate arm --pid 1234 --observe --path /usr/bin/python3
+    ///   innerwarden exec-gate disarm
+    #[command(name = "exec-gate")]
+    ExecGate {
+        #[command(subcommand)]
+        command: ExecGateCommand,
+    },
+
     /// SOC playbook tools (spec 056).
     ///
     /// Examples:
@@ -1193,6 +1207,30 @@ enum IntegrateCommand {
         #[arg(long, default_value = "10")]
         interval: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum ExecGateCommand {
+    /// Show the live gate: mode, scope, and allowlist / scope-cgroup counts.
+    Status,
+    /// Arm the gate around a process's cgroup. `--observe` logs would-be denials
+    /// but allows them (the safe onboarding mode). Enforce is gated behind a
+    /// zero-would-deny rehearsal (a follow-up) and is refused until then.
+    Arm {
+        /// PID of the AI agent process to scope the gate to.
+        #[arg(long)]
+        pid: u32,
+        /// Observe mode: log what the gate WOULD block but allow it. Required
+        /// today (the only safe, non-bricking mode without a rehearsal).
+        #[arg(long)]
+        observe: bool,
+        /// A binary path to allowlist (repeatable). Observe tolerates an empty
+        /// allowlist — it simply learns what the agent runs.
+        #[arg(long = "path")]
+        paths: Vec<String>,
+    },
+    /// Disarm: return the gate to inert. Always safe, no preconditions.
+    Disarm,
 }
 
 #[derive(Subcommand)]
@@ -2804,6 +2842,15 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             yes,
         } => commands::capability::cmd_disable(&cli, &registry, capability, yes),
         Command::List => commands::core::cmd_list(&cli, &registry),
+        Command::ExecGate { ref command } => match command {
+            ExecGateCommand::Status => commands::exec_gate::cmd_status(),
+            ExecGateCommand::Arm {
+                pid,
+                observe,
+                ref paths,
+            } => commands::exec_gate::cmd_arm(*pid, *observe, paths),
+            ExecGateCommand::Disarm => commands::exec_gate::cmd_disarm(),
+        },
         Command::Rule { ref command } => match command {
             RuleCommand::List { ref r#type } => {
                 commands::rule::cmd_rule_list_all(&cli.sensor_config, r#type.as_deref())
