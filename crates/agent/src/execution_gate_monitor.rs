@@ -156,6 +156,21 @@ fn build_divergence_incident(
                 live_mode.label(),
             ),
         ),
+        Divergence::ScopeArmedButEmpty { mode } => (
+            // Not a brick (nothing is denied), but a false sense of security: the
+            // gate looks armed yet protects nothing. High, not Critical.
+            Severity::High,
+            format!("execution_gate:scope_armed_but_empty:{}", mode.label()),
+            "Execution Gate is agent-scoped but no cgroup is in scope".to_string(),
+            format!(
+                "The kernel Execution Gate is in {} mode and agent-scoped (LSM_POLICY key 4 = 1), \
+                 but the live EXEC_GATE_SCOPE map is EMPTY. Every exec is then out-of-scope and \
+                 allowed before any allowlist lookup, so the gate is protecting NOTHING while \
+                 appearing armed. Resolve the protected agent's cgroup id and write it into \
+                 EXEC_GATE_SCOPE, or disarm (set key 4 = 0 / key 3 = 0).",
+                mode.label()
+            ),
+        ),
     };
 
     Some(Incident {
@@ -170,9 +185,12 @@ fn build_divergence_incident(
             "intended_mode": gate.intended_mode.map(|m| m.label()),
             "live_count": gate.live_count,
             "live_mode": gate.live_mode.label(),
+            "live_scope_armed": gate.live_scope_armed,
+            "live_scope_count": gate.live_scope_count,
             "exec_allowlist_pin": execution_gate::EXEC_ALLOWLIST_PIN,
+            "exec_gate_scope_pin": execution_gate::EXEC_GATE_SCOPE_PIN,
             "lsm_policy_pin": execution_gate::LSM_POLICY_PIN,
-            "spec": "080-G4",
+            "spec": "080-G4+083",
         }),
         recommended_checks: vec![
             "Run `innerwarden doctor` — the Execution Gate section shows signed vs live.".into(),
@@ -219,12 +237,15 @@ fn gather_gate_state() -> GateState {
     let (signed_count, intended_mode) = read_signed_allowlist();
     // Live kernel-map reads are aya/kernel glue (codecov-excluded, like
     // lsm_policy/aya_impl.rs) — see `execution_gate_aya`.
-    let (live_count, live_mode) = crate::execution_gate_aya::read_live_gate();
+    let (live_count, live_mode, live_scope_armed, live_scope_count) =
+        crate::execution_gate_aya::read_live_gate();
     GateState {
         signed_count,
         intended_mode,
         live_count,
         live_mode,
+        live_scope_armed,
+        live_scope_count,
     }
 }
 
@@ -257,6 +278,8 @@ mod tests {
             intended_mode: Some(GateMode::Observe),
             live_count: Some(0),
             live_mode: GateMode::Inert,
+            live_scope_armed: None,
+            live_scope_count: None,
         }
     }
 
@@ -297,6 +320,8 @@ mod tests {
             intended_mode: Some(GateMode::Observe),
             live_count: Some(1685),
             live_mode: GateMode::Observe,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         assert!(!handle_gate_state(dir.path(), &healthy, 10_000, &slot));
     }
@@ -352,6 +377,8 @@ mod tests {
             intended_mode: None,
             live_count: Some(0),
             live_mode: GateMode::Inert,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let d = evaluate_divergence(&gate);
         assert!(build_divergence_incident("h", &gate, &d, chrono::Utc::now()).is_none());
@@ -364,6 +391,8 @@ mod tests {
             intended_mode: Some(GateMode::Observe),
             live_count: Some(0),
             live_mode: GateMode::Inert,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let d = evaluate_divergence(&gate);
         let inc = build_divergence_incident("oracle", &gate, &d, chrono::Utc::now())
@@ -383,6 +412,8 @@ mod tests {
             intended_mode: Some(GateMode::Enforce),
             live_count: Some(0),
             live_mode: GateMode::Enforce,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let d = evaluate_divergence(&gate);
         let inc = build_divergence_incident("box", &gate, &d, chrono::Utc::now()).unwrap();
@@ -398,11 +429,36 @@ mod tests {
             intended_mode: None,
             live_count: Some(0),
             live_mode: GateMode::Observe,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let d = evaluate_divergence(&gate);
         let inc = build_divergence_incident("box", &gate, &d, chrono::Utc::now()).unwrap();
         assert_eq!(inc.severity, Severity::High);
         assert!(inc.incident_id.contains("active_but_empty"));
+    }
+
+    #[test]
+    fn scope_armed_but_empty_builds_high_false_security_incident() {
+        // Gate enforce + agent-scoped, allowlist FULL, but scope map empty: it
+        // protects nothing (every exec out-of-scope). High false-security, not a
+        // brick.
+        let gate = GateState {
+            signed_count: None,
+            intended_mode: None,
+            live_count: Some(50),
+            live_mode: GateMode::Enforce,
+            live_scope_armed: Some(true),
+            live_scope_count: Some(0),
+        };
+        let d = evaluate_divergence(&gate);
+        let inc = build_divergence_incident("box", &gate, &d, chrono::Utc::now())
+            .expect("scope-armed-but-empty => incident");
+        assert_eq!(inc.severity, Severity::High);
+        assert!(inc.incident_id.contains("scope_armed_but_empty"));
+        assert!(inc.title.contains("agent-scoped but no cgroup"));
+        assert_eq!(inc.evidence["live_scope_count"], 0);
+        assert_eq!(inc.evidence["live_scope_armed"], true);
     }
 
     #[test]
@@ -413,6 +469,8 @@ mod tests {
             intended_mode: Some(GateMode::Observe),
             live_count: Some(0),
             live_mode: GateMode::Inert,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let d = evaluate_divergence(&gate);
         let inc = build_divergence_incident("h", &gate, &d, chrono::Utc::now()).unwrap();

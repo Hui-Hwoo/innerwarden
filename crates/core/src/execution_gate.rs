@@ -96,6 +96,13 @@ pub struct GateState {
     pub live_count: Option<usize>,
     /// Live gate mode from `LSM_POLICY` key 3.
     pub live_mode: GateMode,
+    /// Live scope mode from `LSM_POLICY` key 4 (spec 083): `Some(true)` =
+    /// agent-scoped (the gate only consults the allowlist for cgroups in
+    /// `EXEC_GATE_SCOPE`), `Some(false)` = host-wide, `None` = unreadable.
+    pub live_scope_armed: Option<bool>,
+    /// Entries in the live `EXEC_GATE_SCOPE` map — the cgroup ids the gate is
+    /// scoped to (`None` = unreadable, like `live_count`).
+    pub live_scope_count: Option<usize>,
 }
 
 /// Ignore a live-vs-signed gap smaller than this percent — the paid watcher
@@ -120,6 +127,13 @@ pub enum Divergence {
         intended_mode: Option<GateMode>,
         live_mode: GateMode,
     },
+    /// The gate is ACTIVE and agent-scoped (`LSM_POLICY` key 4 = 1) but the live
+    /// `EXEC_GATE_SCOPE` map is empty (spec 083). Every exec is then out-of-scope
+    /// and returns allow before any allowlist lookup, so the gate protects
+    /// NOTHING while appearing armed — a false sense of security (not a brick:
+    /// nothing is denied). Distinct from `ActiveButEmpty`, which is the allowlist
+    /// being empty while the gate WOULD gate.
+    ScopeArmedButEmpty { mode: GateMode },
 }
 
 impl Divergence {
@@ -135,7 +149,30 @@ impl Divergence {
 /// its own — an unreadable map must not masquerade as "empty" and cry wolf
 /// (privilege-blind reader safety).
 pub fn evaluate_divergence(s: &GateState) -> Divergence {
-    // 1) Live gate armed/observing but the allowlist is empty.
+    // 0) Agent-scoped (spec 083) but the scope map is empty: the gate is active
+    //    and key 4 = 1, yet no cgroup is in EXEC_GATE_SCOPE, so every exec is
+    //    out-of-scope -> allowed before any allowlist lookup. The gate protects
+    //    nothing while looking armed. This OUTRANKS ActiveButEmpty: when the
+    //    scope is empty the allowlist is never consulted, so an empty allowlist
+    //    is not a brick here — the missing scope is the real problem.
+    if s.live_mode.is_active() && s.live_scope_armed == Some(true) && s.live_scope_count == Some(0)
+    {
+        return Divergence::ScopeArmedButEmpty { mode: s.live_mode };
+    }
+
+    // 1) Live gate armed/observing but the allowlist is empty AND the gate would
+    //    actually consult it: host-wide, or scoped-with-a-non-empty-scope, or the
+    //    scope dimension is unknown.
+    //
+    //    Conservative call when scoped(=Some(true)) but the scope COUNT is
+    //    unreadable (None): we can't confirm whether the scope gates every exec
+    //    out, so we cannot promote to ScopeArmedButEmpty (step 0 needs
+    //    `live_scope_count == Some(0)`). The allowlist IS readable and empty and
+    //    the gate IS active, which is a real problem either way — an in-scope
+    //    brick or no protection — so we still flag it here as ActiveButEmpty
+    //    rather than hide it. (Symmetric with `live_count == None`, which never
+    //    reaches this branch and stays silent — an unreadable allowlist must not
+    //    masquerade as empty.)
     if s.live_mode.is_active() && s.live_count == Some(0) {
         return Divergence::ActiveButEmpty {
             mode: s.live_mode,
@@ -281,11 +318,34 @@ mod tests {
         live: Option<usize>,
         live_mode: GateMode,
     ) -> GateState {
+        // Scope unknown (None) by default — the spec-083 scope dimension only
+        // affects the verdict when it is actually readable, so these legacy
+        // host-wide-era cases behave exactly as before.
         GateState {
             signed_count: signed,
             intended_mode: intended,
             live_count: live,
             live_mode,
+            live_scope_armed: None,
+            live_scope_count: None,
+        }
+    }
+
+    fn state_scoped(
+        signed: Option<usize>,
+        intended: Option<GateMode>,
+        live: Option<usize>,
+        live_mode: GateMode,
+        scope_armed: Option<bool>,
+        scope_count: Option<usize>,
+    ) -> GateState {
+        GateState {
+            signed_count: signed,
+            intended_mode: intended,
+            live_count: live,
+            live_mode,
+            live_scope_armed: scope_armed,
+            live_scope_count: scope_count,
         }
     }
 
@@ -497,6 +557,146 @@ mod tests {
         );
         // no value section
         assert_eq!(parse_bpftool_value_u32("Not found"), None);
+    }
+
+    #[test]
+    fn scope_armed_but_empty_when_scoped_on_with_no_cgroup_in_scope() {
+        // active + key4=scoped + EXEC_GATE_SCOPE empty => gate protects nothing.
+        let d = evaluate_divergence(&state_scoped(
+            Some(10),
+            Some(GateMode::Enforce),
+            Some(10), // allowlist is FULL — irrelevant, nothing is in scope
+            GateMode::Enforce,
+            Some(true),
+            Some(0),
+        ));
+        assert_eq!(
+            d,
+            Divergence::ScopeArmedButEmpty {
+                mode: GateMode::Enforce
+            }
+        );
+        assert!(d.is_drift());
+    }
+
+    #[test]
+    fn scope_empty_outranks_active_but_empty() {
+        // scoped + scope-empty + allowlist ALSO empty: this is NOT a brick (every
+        // exec is out-of-scope -> allowed), so it must read as ScopeArmedButEmpty,
+        // not ActiveButEmpty.
+        let d = evaluate_divergence(&state_scoped(
+            None,
+            None,
+            Some(0),
+            GateMode::Enforce,
+            Some(true),
+            Some(0),
+        ));
+        assert_eq!(
+            d,
+            Divergence::ScopeArmedButEmpty {
+                mode: GateMode::Enforce
+            }
+        );
+    }
+
+    #[test]
+    fn scoped_with_a_populated_scope_and_empty_allowlist_is_active_but_empty() {
+        // scoped ON, scope has a cgroup, but the allowlist is empty: in-scope
+        // execs WILL be denied -> the real brick-within-the-pod. ActiveButEmpty.
+        let d = evaluate_divergence(&state_scoped(
+            Some(5),
+            Some(GateMode::Enforce),
+            Some(0),
+            GateMode::Enforce,
+            Some(true),
+            Some(1),
+        ));
+        assert_eq!(
+            d,
+            Divergence::ActiveButEmpty {
+                mode: GateMode::Enforce,
+                live: 0
+            }
+        );
+    }
+
+    #[test]
+    fn host_wide_empty_allowlist_is_still_active_but_empty() {
+        // key4=host-wide (Some(false)) + empty allowlist + enforce = host brick.
+        let d = evaluate_divergence(&state_scoped(
+            None,
+            None,
+            Some(0),
+            GateMode::Enforce,
+            Some(false),
+            None,
+        ));
+        assert_eq!(
+            d,
+            Divergence::ActiveButEmpty {
+                mode: GateMode::Enforce,
+                live: 0
+            }
+        );
+    }
+
+    #[test]
+    fn scope_unreadable_does_not_change_the_verdict() {
+        // scope dimension unknown (None) -> behaves exactly like the pre-spec-083
+        // logic: active + empty allowlist = ActiveButEmpty.
+        let d = evaluate_divergence(&state_scoped(
+            None,
+            None,
+            Some(0),
+            GateMode::Observe,
+            None,
+            None,
+        ));
+        assert_eq!(
+            d,
+            Divergence::ActiveButEmpty {
+                mode: GateMode::Observe,
+                live: 0
+            }
+        );
+    }
+
+    #[test]
+    fn scoped_but_scope_count_unreadable_falls_back_to_active_but_empty() {
+        // key4=scoped(true) but EXEC_GATE_SCOPE unreadable (None) + empty
+        // allowlist: we cannot confirm the scope is empty, so we do NOT promote
+        // to ScopeArmedButEmpty (step 0 needs scope_count==Some(0)); the empty
+        // allowlist on an active gate is still flagged conservatively.
+        let d = evaluate_divergence(&state_scoped(
+            None,
+            None,
+            Some(0),
+            GateMode::Enforce,
+            Some(true),
+            None,
+        ));
+        assert_eq!(
+            d,
+            Divergence::ActiveButEmpty {
+                mode: GateMode::Enforce,
+                live: 0
+            }
+        );
+    }
+
+    #[test]
+    fn scoped_and_converged_is_healthy() {
+        // scoped ON, scope populated, allowlist populated, mode observe -> no drift.
+        let d = evaluate_divergence(&state_scoped(
+            Some(10),
+            Some(GateMode::Observe),
+            Some(10),
+            GateMode::Observe,
+            Some(true),
+            Some(2),
+        ));
+        assert_eq!(d, Divergence::None);
     }
 
     #[test]

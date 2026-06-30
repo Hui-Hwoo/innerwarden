@@ -134,6 +134,13 @@ pub(crate) fn gate_doctor_check(gate: &innerwarden_core::execution_gate::GateSta
             ),
             "Signed config not applied to the kernel. Run a FULL `config-sign exec-gate apply`, then re-check that live == signed.",
         ),
+        Divergence::ScopeArmedButEmpty { mode } => Check::fail(
+            format!(
+                "Execution Gate is {} and agent-scoped (key 4 = 1) but EXEC_GATE_SCOPE is EMPTY — it protects NOTHING",
+                mode.label()
+            ),
+            "A scoped gate with an empty scope allows every exec. Write the protected agent's cgroup id into EXEC_GATE_SCOPE, or disarm (LSM_POLICY key 4 = 0).",
+        ),
         Divergence::None => {
             if gate.live_count.is_none()
                 && (gate.signed_count.is_some() || gate.intended_mode.is_some())
@@ -212,6 +219,46 @@ fn bpftool_gate_mode() -> innerwarden_core::execution_gate::GateMode {
         }
         _ => GateMode::Unknown,
     }
+}
+
+/// Live scope mode via `bpftool map lookup` of LSM_POLICY key 4 (spec 083).
+/// `Some(true)` = agent-scoped, `Some(false)` = the key reads back not-1, `None`
+/// when it can't be read (absent key / no privilege / no bpftool) — treated as
+/// unknown so it never flags a scope problem it can't see.
+fn bpftool_scope_armed() -> Option<bool> {
+    use innerwarden_core::execution_gate::{parse_bpftool_value_u32, LSM_POLICY_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args([
+            "map",
+            "lookup",
+            "pinned",
+            LSM_POLICY_PIN,
+            "key",
+            "4",
+            "0",
+            "0",
+            "0",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_bpftool_value_u32(&String::from_utf8_lossy(&out.stdout)) == Some(1))
+}
+
+/// Live `EXEC_GATE_SCOPE` entry count via `bpftool` (spec 083). `None` when the
+/// map can't be read.
+fn bpftool_scope_count() -> Option<usize> {
+    use innerwarden_core::execution_gate::{count_bpftool_dump, EXEC_GATE_SCOPE_PIN};
+    let out = std::process::Command::new("bpftool")
+        .args(["map", "dump", "pinned", EXEC_GATE_SCOPE_PIN])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(count_bpftool_dump(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Heuristic check for Telegram bot tokens: `<digits>:<20+ alphanumeric>`.
@@ -2280,6 +2327,8 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             intended_mode,
             live_count,
             live_mode,
+            live_scope_armed: bpftool_scope_armed(),
+            live_scope_count: bpftool_scope_count(),
         };
         run_section(vec![gate_doctor_check(&gate)], &mut total_issues);
     }
@@ -3372,6 +3421,8 @@ mod tests {
             intended_mode: Some(GateMode::Observe),
             live_count: Some(0),
             live_mode: GateMode::Inert,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let check = gate_doctor_check(&gate);
         assert_eq!(check.sev, Sev::Fail);
@@ -3387,6 +3438,8 @@ mod tests {
             intended_mode: Some(GateMode::Enforce),
             live_count: Some(0),
             live_mode: GateMode::Enforce,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let check = gate_doctor_check(&gate);
         assert_eq!(check.sev, Sev::Fail);
@@ -3401,10 +3454,30 @@ mod tests {
             intended_mode: Some(GateMode::Observe),
             live_count: Some(1685),
             live_mode: GateMode::Observe,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let check = gate_doctor_check(&gate);
         assert_eq!(check.sev, Sev::Ok);
         assert!(check.label.contains("consistent"));
+    }
+
+    #[test]
+    fn gate_doctor_check_fails_on_scope_armed_but_empty() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        // enforce + agent-scoped (key4=1) + empty scope map: the gate protects
+        // nothing while looking armed.
+        let gate = GateState {
+            signed_count: None,
+            intended_mode: None,
+            live_count: Some(50),
+            live_mode: GateMode::Enforce,
+            live_scope_armed: Some(true),
+            live_scope_count: Some(0),
+        };
+        let check = gate_doctor_check(&gate);
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("EXEC_GATE_SCOPE is EMPTY"));
     }
 
     #[test]
@@ -3415,6 +3488,8 @@ mod tests {
             intended_mode: Some(GateMode::Observe),
             live_count: None, // bpftool unavailable / unprivileged
             live_mode: GateMode::Unknown,
+            live_scope_armed: None,
+            live_scope_count: None,
         };
         let check = gate_doctor_check(&gate);
         assert_eq!(check.sev, Sev::Warn);
