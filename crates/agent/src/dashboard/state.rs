@@ -37,38 +37,10 @@ impl Drop for SseGuard {
 // Issue #71: Dashboard 2FA approval endpoints
 // ---------------------------------------------------------------------------
 
-/// A single pending 2FA approval request waiting for an operator decision
-/// via the dashboard. Populated by the main agent loop when an operation
-/// requires TOTP confirmation; consumed by the `/api/2fa/approve` and
-/// `/api/2fa/deny` endpoints.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct TwoFaPendingRequest {
-    /// Unique approval ID used in URL paths.
-    pub id: String,
-    /// The incident that triggered this approval request.
-    pub incident_id: String,
-    /// Human-readable description of the guarded action.
-    pub action_description: String,
-    /// Detector that raised the incident.
-    pub detector: String,
-    /// When this request was created.
-    pub created_at: DateTime<Utc>,
-    /// Deadline after which the request can no longer be acted on.
-    pub deadline: DateTime<Utc>,
-}
-
-impl TwoFaPendingRequest {
-    /// Returns `true` when the deadline has passed.
-    pub(crate) fn is_expired(&self) -> bool {
-        Utc::now() > self.deadline
-    }
-}
-
 /// The outcome of an approve or deny decision, sent back to the agent loop
 /// via the `approval_outcome_tx` channel.
 #[derive(Debug, Clone)]
 pub(crate) struct DashboardApprovalOutcome {
-    pub approval_id: String,
     pub incident_id: String,
     pub approved: bool,
     /// Username of the operator who acted.
@@ -277,16 +249,15 @@ pub(crate) struct DashboardState {
     /// `AgentConfig` into `DashboardState`.
     pub(super) playbook_sim: Arc<PlaybookSimContext>,
     // ── Issue #71: Dashboard 2FA approval endpoints ──────────────────────
-    /// Pending 2FA approval requests waiting for operator decision.
-    /// Populated by the main agent loop; consumed by `/api/2fa/approve`
-    /// and `/api/2fa/deny`. Entries are removed on approval/denial and
-    /// lazily pruned by the background cleanup task when expired.
-    pub(crate) pending_approvals: Arc<Mutex<HashMap<String, TwoFaPendingRequest>>>,
+    /// Pending confirmations visible to the dashboard 2FA endpoints.
+    /// Shared with the main agent loop via `AgentState.dashboard_pending`;
+    /// populated by `decision_confirmation.rs` when a Telegram confirmation
+    /// is created, consumed by `/api/2fa/approve` and `/api/2fa/deny`.
+    pub(crate) pending_approvals: Arc<Mutex<HashMap<String, crate::telegram::PendingConfirmation>>>,
     /// Optional channel for sending approve/deny outcomes back to the
     /// agent loop. `None` in tests and in standalone dashboard mode
     /// (outcomes are fire-and-forget in those cases).
-    pub(crate) approval_outcome_tx:
-        Option<tokio::sync::mpsc::Sender<DashboardApprovalOutcome>>,
+    pub(crate) approval_outcome_tx: Option<tokio::sync::mpsc::Sender<DashboardApprovalOutcome>>,
 }
 
 /// Inputs the playbook-test simulate endpoint feeds into the executor so

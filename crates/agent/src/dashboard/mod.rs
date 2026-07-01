@@ -469,6 +469,10 @@ pub async fn serve(
     insecure_no_tls: bool,
     two_factor: state::TwoFactorSettings,
     playbook_sim: state::PlaybookSimContext,
+    // Issue #71: shared pending map (bridge between agent loop and dashboard).
+    pending_approvals: Arc<Mutex<HashMap<String, crate::telegram::PendingConfirmation>>>,
+    // Issue #71: channel to notify the agent loop of approve/deny outcomes.
+    approval_outcome_tx: tokio::sync::mpsc::Sender<state::DashboardApprovalOutcome>,
 ) -> Result<()> {
     // SEC-005: Reject non-loopback bind without authentication.
     let is_loopback_bind = is_loopback_address(&bind);
@@ -579,8 +583,8 @@ pub async fn serve(
         fleet_state,
         two_factor: Arc::new(two_factor),
         playbook_sim: Arc::new(playbook_sim),
-        pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-        approval_outcome_tx: None,
+        pending_approvals,
+        approval_outcome_tx: Some(approval_outcome_tx),
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -928,10 +932,11 @@ pub async fn serve(
             // Issue #71: evict expired 2FA approval requests so the map
             // does not grow unbounded when the operator never acts on them.
             {
+                let now = Utc::now();
                 let mut approvals = cleanup_pending_approvals
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                approvals.retain(|_, r| !r.is_expired());
+                approvals.retain(|_, pc| pc.expires_at > now);
             }
         }
     });
@@ -7209,6 +7214,8 @@ mod tests {
             true,
             state::TwoFactorSettings::default(),
             state::PlaybookSimContext::default(),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            tokio::sync::mpsc::channel::<state::DashboardApprovalOutcome>(1).0,
         )
         .await;
 

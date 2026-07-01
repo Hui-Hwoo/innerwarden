@@ -30,6 +30,11 @@ pub(crate) async fn execute_request_confirmation(
                     detector: req_detector,
                     action_name: req_action.to_string(),
                 };
+                // Issue #71: mirror into the dashboard-visible map so the
+                // dashboard 2FA endpoints can list and act on this confirmation.
+                if let Ok(mut map) = state.dashboard_pending.lock() {
+                    map.insert(incident.incident_id.clone(), pending.clone());
+                }
                 state.pending_confirmations.insert(
                     incident.incident_id.clone(),
                     (pending, decision.clone(), incident.clone()),
