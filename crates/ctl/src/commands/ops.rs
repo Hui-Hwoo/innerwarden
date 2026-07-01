@@ -836,13 +836,42 @@ pub(crate) fn build_service_status_check_linux(
     }
 }
 
-/// Build the dashboard `--dashboard` flag-in-service check.
+/// Absolute path of the file that carries the agent's start command
+/// (`ExecStart` on systemd, `ProgramArguments` on launchd), per platform.
+/// The `--dashboard` flag lives here, so doctor must read the RIGHT one:
+/// reading the Linux systemd path on macOS always came back empty and produced
+/// a false "--dashboard is missing" warning even though the plist carried it
+/// (2026-07-01 macOS finding F5).
+pub(crate) fn agent_unit_file_path() -> &'static str {
+    agent_unit_file_path_for(cfg!(target_os = "macos"))
+}
+
+/// Pure inner (tested for both platforms on the Linux CI host).
+pub(crate) fn agent_unit_file_path_for(mac: bool) -> &'static str {
+    if mac {
+        "/Library/LaunchDaemons/com.innerwarden.agent.plist"
+    } else {
+        "/etc/systemd/system/innerwarden-agent.service"
+    }
+}
+
+/// Pure: the platform-correct "start the agent" hint shown when the dashboard is
+/// down and the agent is not running (launchd on macOS, systemd elsewhere).
+pub(crate) fn agent_start_hint(mac: bool) -> &'static str {
+    if mac {
+        "Start the agent:  sudo launchctl kickstart -k system/com.innerwarden.agent"
+    } else {
+        "Start the agent:  sudo systemctl start innerwarden-agent"
+    }
+}
+
+/// Build the dashboard `--dashboard` flag-in-unit check.
 pub(crate) fn build_dashboard_flag_check(flag_in_service: bool) -> Check {
     if flag_in_service {
-        Check::ok("--dashboard flag present in service ExecStart")
+        Check::ok("--dashboard flag present in the agent service definition")
     } else {
         Check::warn(
-            "--dashboard flag is missing from innerwarden-agent.service ExecStart",
+            "--dashboard flag is missing from the agent service definition",
             "Run: innerwarden configure dashboard  (it will add the flag automatically)",
         )
     }
@@ -879,14 +908,16 @@ pub(crate) fn build_dashboard_reachability_check(
     agent_alive: bool,
 ) -> Option<Check> {
     if reachable {
+        // The dashboard serves TLS by default (self-signed cert), so advertise
+        // https, not http (F5): a plain http:// URL just fails to connect.
         Some(Check::ok(
-            "Dashboard is reachable at http://YOUR_SERVER_IP:8787",
+            "Dashboard is reachable at https://YOUR_SERVER_IP:8787",
         ))
     } else if flag_in_service {
         let hint = if agent_alive {
-            "Agent is running; check the dashboard binding (port/TLS/listen address) — sudo journalctl -u innerwarden-agent -n 100 | grep -i dashboard"
+            "Agent is running; check the dashboard binding (port/TLS/listen address)"
         } else {
-            "Start the agent:  sudo systemctl start innerwarden-agent"
+            agent_start_hint(cfg!(target_os = "macos"))
         };
         Some(Check::warn("Dashboard port 8787 is not responding", hint))
     } else {
@@ -2538,10 +2569,10 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             .any(|l| l.starts_with("INNERWARDEN_DASHBOARD_PASSWORD_HASH="))
             || std::env::var("INNERWARDEN_DASHBOARD_PASSWORD_HASH").is_ok();
 
-        // Check if --dashboard flag is in the service ExecStart
-        let service_content =
-            std::fs::read_to_string("/etc/systemd/system/innerwarden-agent.service")
-                .unwrap_or_default();
+        // Check if --dashboard flag is in the agent's start command. On macOS
+        // this is the launchd plist's ProgramArguments, not a systemd unit
+        // (F5): reading the wrong path returned empty and false-warned.
+        let service_content = std::fs::read_to_string(agent_unit_file_path()).unwrap_or_default();
         let dashboard_flag_in_service = service_content.contains("--dashboard");
 
         db.push(build_dashboard_flag_check(dashboard_flag_in_service));
@@ -4632,6 +4663,47 @@ enabled = true
         assert!(c.hint.unwrap().contains("configure dashboard"));
     }
 
+    /// F5 anchor (2026-07-01): the flag-check message must not hardcode the
+    /// systemd unit name (`innerwarden-agent.service`) — it is shown on macOS
+    /// too, where the unit is a launchd plist.
+    #[test]
+    fn build_dashboard_flag_check_message_is_platform_neutral() {
+        assert!(!build_dashboard_flag_check(false)
+            .label
+            .contains("innerwarden-agent.service"));
+        assert!(!build_dashboard_flag_check(true).label.contains("ExecStart"));
+    }
+
+    /// F5 anchor: doctor reads the `--dashboard` flag from the launchd plist on
+    /// macOS and the systemd unit on Linux — never the wrong one.
+    #[test]
+    fn agent_unit_file_path_is_platform_correct() {
+        let p = agent_unit_file_path();
+        if cfg!(target_os = "macos") {
+            assert_eq!(p, "/Library/LaunchDaemons/com.innerwarden.agent.plist");
+        } else {
+            assert_eq!(p, "/etc/systemd/system/innerwarden-agent.service");
+        }
+    }
+
+    #[test]
+    fn agent_unit_file_path_for_both_platforms() {
+        assert_eq!(
+            agent_unit_file_path_for(true),
+            "/Library/LaunchDaemons/com.innerwarden.agent.plist"
+        );
+        assert_eq!(
+            agent_unit_file_path_for(false),
+            "/etc/systemd/system/innerwarden-agent.service"
+        );
+    }
+
+    #[test]
+    fn agent_start_hint_is_platform_specific() {
+        assert!(agent_start_hint(true).contains("launchctl kickstart"));
+        assert!(agent_start_hint(false).contains("systemctl start innerwarden-agent"));
+    }
+
     #[test]
     fn build_dashboard_credentials_checks_with_credentials_set() {
         let checks = build_dashboard_credentials_checks(true, true);
@@ -4684,13 +4756,19 @@ enabled = true
     }
 
     /// Pre-Bug-3 behavior: agent down, dashboard down → "Start the agent".
+    /// The start command is platform-aware (F5): launchd on macOS, systemd
+    /// elsewhere.
     #[test]
     fn build_dashboard_reachability_check_agent_down_suggests_start() {
         let c = build_dashboard_reachability_check(false, true, false).unwrap();
         assert_eq!(c.sev, Sev::Warn);
         let hint = c.hint.unwrap();
-        assert!(hint.contains("systemctl start"));
         assert!(hint.contains("Start the agent"));
+        if cfg!(target_os = "macos") {
+            assert!(hint.contains("launchctl kickstart"));
+        } else {
+            assert!(hint.contains("systemctl start"));
+        }
     }
 
     /// Bug 3 anchor (2026-05-06): when agent IS alive but dashboard

@@ -683,6 +683,47 @@ jobs:
           cp "$BUNDLE_PATH" "dist/${REF_NAME}-macos.intoto.jsonl"
           echo "Attached: ${REF_NAME}-macos.intoto.jsonl ($(wc -c <"$BUNDLE_PATH") bytes)"
 
+      # ── Aggregate SHA256SUMS-macos + GPG signature (F3) ───────────────────
+      # The Linux job's aggregate SHA256SUMS covers only the Linux binaries, so
+      # a macOS user following the documented `sha256sum -c SHA256SUMS` flow
+      # found NOTHING for their platform (the per-file `.sha256` sidecars still
+      # verify, but the signed aggregate manifest was Linux-only — 2026-07-01
+      # finding F3). Emit a parallel, GPG-signed SHA256SUMS-macos so macOS has
+      # the same manifest-verification path as Linux.
+      - name: Generate aggregate SHA256SUMS-macos
+        run: |
+          cd dist
+          # macOS runners have `shasum -a 256` (not GNU `sha256sum`); output
+          # format is identical, so it verifies with either tool on the client.
+          : > SHA256SUMS-macos
+          for f in $(ls -1 | grep -E '^innerwarden-.*-macos-(x86_64|aarch64)$' | sort); do
+            shasum -a 256 "$f" >> SHA256SUMS-macos
+          done
+          echo "=== SHA256SUMS-macos ==="
+          cat SHA256SUMS-macos
+
+      - name: Sign SHA256SUMS-macos with GPG (stable releases require this)
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+        run: |
+          if [[ -z "$RELEASE_GPG_KEY" ]]; then
+            echo "RELEASE_GPG_KEY secret missing; stable releases require a signed SHA256SUMS-macos.sig (F3)."
+            echo "Either set the secret or tag a prerelease (e.g. v0.13.1-rc.1)."
+            exit 1
+          fi
+          mkdir -p /tmp/gpg-home
+          chmod 700 /tmp/gpg-home
+          export GNUPGHOME=/tmp/gpg-home
+          umask 077
+          printf '%s\n' "$RELEASE_GPG_KEY" > /tmp/gpg-home/key.asc
+          gpg --batch --import /tmp/gpg-home/key.asc
+          shred -u /tmp/gpg-home/key.asc 2>/dev/null || rm -f /tmp/gpg-home/key.asc
+          gpg --batch --yes --pinentry-mode loopback --detach-sign --armor --output dist/SHA256SUMS-macos.sig dist/SHA256SUMS-macos
+          rm -rf /tmp/gpg-home
+          echo "=== SHA256SUMS-macos.sig ==="
+          ls -lh dist/SHA256SUMS-macos.sig
+
       # ── Upload macOS assets to existing release ────────────────────────────
       - name: Upload macOS assets to GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2

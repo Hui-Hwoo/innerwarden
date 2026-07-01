@@ -204,6 +204,7 @@ pub(crate) fn arm_plan_for_cli(
 
 /// `innerwarden exec-gate arm --pid <PID> --observe [--path P ...]`.
 pub(crate) fn cmd_arm(pid: u32, observe: bool, paths: &[String]) -> anyhow::Result<()> {
+    ensure_gate_available()?;
     let cgid = resolve_cgroup_id(pid).unwrap_or(0);
     let cmds = arm_plan_for_cli(cgid, observe, paths, &live_allowlist_keys())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -250,8 +251,100 @@ fn bpftool_dump_count(pin: &str) -> usize {
     }
 }
 
+/// Why the Execution Gate CLI cannot operate on this host.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GateUnavailable {
+    /// Not a Linux host — the gate is an eBPF-LSM feature (macOS/other) (F4).
+    NotLinux,
+    /// Linux, but no working `bpftool` for this kernel (F2).
+    NoBpftool,
+}
+
+impl GateUnavailable {
+    /// Actionable one-liner. `krel` is the running kernel release, used only for
+    /// the `linux-tools-<rel>` package hint in the `NoBpftool` case.
+    pub(crate) fn message(&self, krel: &str) -> String {
+        match self {
+            GateUnavailable::NotLinux => "The Execution Gate is a Linux eBPF-LSM feature \
+                 — it is not available on this platform."
+                .to_string(),
+            GateUnavailable::NoBpftool => format!(
+                "bpftool is unavailable for this kernel — install linux-tools-{krel} \
+                 (or your distro's kernel-tools package) so the Execution Gate CLI can \
+                 read and write the pinned BPF maps."
+            ),
+        }
+    }
+}
+
+/// PURE: decide whether the gate CLI can run from the two host probes. Both
+/// branches are unit-tested; the caller supplies `is_linux = cfg!(target_os =
+/// "linux")` and `bpftool_ok = bpftool_available()`.
+pub(crate) fn exec_gate_unavailable(is_linux: bool, bpftool_ok: bool) -> Option<GateUnavailable> {
+    if !is_linux {
+        Some(GateUnavailable::NotLinux)
+    } else if !bpftool_ok {
+        Some(GateUnavailable::NoBpftool)
+    } else {
+        None
+    }
+}
+
+/// I/O: is a working `bpftool` present for THIS kernel? On Ubuntu, `bpftool` is a
+/// wrapper that execs the versioned binary from `linux-tools-$(uname -r)`; when
+/// that package is absent it prints a "not found for kernel" warning and exits
+/// non-zero (F2 — every exec-gate map op then failed with a bare exit 1).
+/// `bpftool version` succeeding is a reliable readiness probe.
+fn bpftool_available() -> bool {
+    matches!(
+        std::process::Command::new("bpftool").arg("version").output(),
+        Ok(o) if o.status.success()
+    )
+}
+
+/// I/O: running kernel release (`uname -r`), for the linux-tools package hint.
+fn kernel_release() -> String {
+    std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "$(uname -r)".to_string())
+}
+
+/// I/O gate for the mutating subcommands (arm/disarm/enforce): hard-fail with an
+/// actionable message when the gate CLI cannot operate, instead of a bare
+/// bpftool exit 1 that silently leaves the gate unchanged (F2).
+fn ensure_gate_available() -> anyhow::Result<()> {
+    if let Some(u) = exec_gate_unavailable(cfg!(target_os = "linux"), bpftool_available()) {
+        anyhow::bail!("{}", u.message(&kernel_release()));
+    }
+    Ok(())
+}
+
 /// `innerwarden exec-gate status` — read-only summary of the live gate.
 pub(crate) fn cmd_status() -> anyhow::Result<()> {
+    // Never claim "inert" when we simply could not read the maps. On macOS the
+    // gate does not exist; on a Linux box without linux-tools we cannot read the
+    // pinned maps at all — reporting "inert" there (F2b) told operators the gate
+    // was OFF while it was actually enforcing. Distinguish unreadable from inert.
+    match exec_gate_unavailable(cfg!(target_os = "linux"), bpftool_available()) {
+        Some(GateUnavailable::NotLinux) => {
+            println!("Execution Gate: not available on this platform (Linux eBPF-LSM only).");
+            return Ok(());
+        }
+        Some(GateUnavailable::NoBpftool) => {
+            println!(
+                "Execution Gate: status UNKNOWN — cannot read the pinned BPF maps. This does \
+                 NOT mean the gate is off; it may be armed. {}",
+                GateUnavailable::NoBpftool.message(&kernel_release())
+            );
+            return Ok(());
+        }
+        None => {}
+    }
     let mode = GateMode::from_policy_key(bpftool_lookup_u32(eg::LSM_POLICY_PIN, eg::GATE_MODE_KEY));
     let scoped = bpftool_lookup_u32(eg::LSM_POLICY_PIN, eg::GATE_SCOPE_KEY) == Some(1);
     let allow = bpftool_dump_count(eg::EXEC_ALLOWLIST_PIN);
@@ -271,6 +364,7 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
 
 /// `innerwarden exec-gate disarm`.
 pub(crate) fn cmd_disarm() -> anyhow::Result<()> {
+    ensure_gate_available()?;
     for cmd in disarm_commands() {
         bpftool(&cmd)?;
     }
@@ -365,6 +459,7 @@ fn bpftool_scope_has(cgid: u64) -> bool {
 /// would-block events for the pid's cgroup so the operator knows whether enforce
 /// is safe and which binaries still need allowlisting.
 pub(crate) fn cmd_rehearse(pid: u32, window: Option<u64>, dir: &Path) -> anyhow::Result<()> {
+    ensure_gate_available()?;
     let window = window.unwrap_or(DEFAULT_REHEARSE_WINDOW_SECS);
     let cgid = resolve_cgroup_id(pid).unwrap_or(0);
     if cgid == 0 {
@@ -397,6 +492,7 @@ pub(crate) fn cmd_rehearse(pid: u32, window: Option<u64>, dir: &Path) -> anyhow:
 /// enforce, but ONLY after a clean rehearsal (observe-armed + scoped + zero
 /// would-block in the window). Otherwise refused — the gate is never flipped blind.
 pub(crate) fn cmd_enforce(pid: u32, window: Option<u64>, dir: &Path) -> anyhow::Result<()> {
+    ensure_gate_available()?;
     let window = window.unwrap_or(DEFAULT_REHEARSE_WINDOW_SECS);
     let cgid = resolve_cgroup_id(pid).unwrap_or(0);
     if cgid == 0 {
@@ -426,6 +522,65 @@ pub(crate) fn cmd_enforce(pid: u32, window: Option<u64>, dir: &Path) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── availability gate (F2/F2b/F4) ────────────────────────────────────────
+    #[test]
+    fn exec_gate_unavailable_flags_non_linux() {
+        assert_eq!(
+            exec_gate_unavailable(false, true),
+            Some(GateUnavailable::NotLinux),
+            "macOS/other: gate does not exist regardless of bpftool"
+        );
+        assert_eq!(
+            exec_gate_unavailable(false, false),
+            Some(GateUnavailable::NotLinux)
+        );
+    }
+
+    #[test]
+    fn exec_gate_unavailable_flags_missing_bpftool_on_linux() {
+        assert_eq!(
+            exec_gate_unavailable(true, false),
+            Some(GateUnavailable::NoBpftool),
+            "Linux without linux-tools: cannot drive the maps (F2)"
+        );
+    }
+
+    #[test]
+    fn exec_gate_available_when_linux_and_bpftool_present() {
+        assert_eq!(exec_gate_unavailable(true, true), None);
+    }
+
+    /// Exercise the real I/O probes (they run on the Linux CI host too):
+    /// `uname -r` yields a non-empty release; `bpftool_available` returns a
+    /// bool; `ensure_gate_available` returns Ok or a NoBpftool error depending
+    /// on whether the CI image ships bpftool — both are valid, non-panicking
+    /// paths through the code.
+    #[test]
+    fn gate_io_probes_execute() {
+        let krel = kernel_release();
+        assert!(!krel.is_empty());
+        let _present: bool = bpftool_available();
+        // Ok when the host can run the gate (Linux + bpftool); otherwise a
+        // non-empty actionable error (NoBpftool on Linux CI without linux-tools,
+        // or NotLinux when this test runs on a dev Mac). Both are valid paths.
+        match ensure_gate_available() {
+            Ok(()) => {}
+            Err(e) => assert!(!e.to_string().is_empty()),
+        }
+    }
+
+    #[test]
+    fn gate_unavailable_messages_are_actionable() {
+        // NoBpftool message names the exact package to install for this kernel.
+        let m = GateUnavailable::NoBpftool.message("6.17.0-1018-azure");
+        assert!(m.contains("linux-tools-6.17.0-1018-azure"));
+        assert!(m.to_lowercase().contains("bpftool"));
+        // NotLinux message is platform-honest and does not mention bpftool.
+        let m2 = GateUnavailable::NotLinux.message("irrelevant");
+        assert!(m2.contains("not available on this platform"));
+        assert!(!m2.contains("linux-tools"));
+    }
 
     #[test]
     fn le_hex_is_little_endian() {

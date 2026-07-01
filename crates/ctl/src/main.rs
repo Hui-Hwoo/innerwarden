@@ -1214,8 +1214,10 @@ enum ExecGateCommand {
     /// Show the live gate: mode, scope, and allowlist / scope-cgroup counts.
     Status,
     /// Arm the gate around a process's cgroup. `--observe` logs would-be denials
-    /// but allows them (the safe onboarding mode). Enforce is gated behind a
-    /// zero-would-deny rehearsal (a follow-up) and is refused until then.
+    /// but allows them (the safe onboarding mode). To then enforce, run
+    /// `exec-gate rehearse` and `exec-gate enforce` — enforce flips to DENY only
+    /// after a clean rehearsal (observe-armed, scoped, zero would-block), never
+    /// a blind flip.
     Arm {
         /// PID of the AI agent process to scope the gate to.
         #[arg(long)]

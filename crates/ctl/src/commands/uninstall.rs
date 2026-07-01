@@ -56,6 +56,41 @@ const DATA_DIRS: &[&str] = &[
 /// Stopped first (in this order) so nothing respawns the agent.
 const SUPERVISOR_UNITS: &[&str] = &["innerwarden-watchdog", "innerwarden-supervisor"];
 
+// ── macOS (launchd) constants ─────────────────────────────────────────────────
+// On macOS the installer lays down launchd plists (not systemd units) and uses
+// the `/usr/local` prefix for config/data/logs (not the Linux FHS `/etc`,
+// `/var/lib`, `/var/log`). The 2026-07-01 F9 finding was that uninstall ignored
+// all of this and ran systemctl/userdel against Linux paths, leaving the
+// launchd services running and the real data behind.
+
+/// Where the installer writes `com.innerwarden.*.plist`.
+const MAC_PLIST_DIR: &str = "/Library/LaunchDaemons";
+
+/// launchd labels, supervisors first (bootout order mirrors the systemd stop
+/// order so nothing respawns the agent mid-teardown).
+const MAC_LABELS_ORDERED: &[&str] = &[
+    "com.innerwarden.watchdog",
+    "com.innerwarden.supervisor",
+    "com.innerwarden.agent",
+    "com.innerwarden.sensor",
+];
+
+/// Removed even without `--purge` on macOS (software, not user data).
+const MAC_SOFTWARE_DIRS: &[&str] = &[
+    "/usr/local/lib/innerwarden",
+    "/usr/local/var/run/innerwarden",
+];
+
+/// Removed only with `--purge` on macOS. Includes the legacy `/var/lib/innerwarden`
+/// that older installers used for the Local Warden model (F6) so a purge does not
+/// strand ~90 MB there.
+const MAC_DATA_DIRS: &[&str] = &[
+    "/usr/local/etc/innerwarden",
+    "/usr/local/var/lib/innerwarden",
+    "/usr/local/var/log/innerwarden",
+    "/var/lib/innerwarden",
+];
+
 // ── plan ────────────────────────────────────────────────────────────────────
 
 /// One unit of teardown work. The plan is pure data so it can be asserted on.
@@ -69,6 +104,16 @@ pub enum Step {
     ResetFailed,
     DeleteUfwRule(u32),
     Userdel(String),
+    /// macOS: stop + unload a launchd daemon (`launchctl bootout system/<label>`).
+    /// This is the launchd analogue of systemd `stop`+`disable` in one call, and
+    /// crucially removes the KeepAlive job so it does not respawn a
+    /// now-deleted binary (the 2026-07-01 F9 failure was that uninstall never
+    /// did this on macOS, leaving orphaned launchd jobs).
+    Bootout(String),
+    /// macOS: delete a directory-services record (`dscl . -delete <path>`),
+    /// e.g. `/Users/innerwarden` or `/Groups/innerwarden`. macOS has no
+    /// `userdel`.
+    DsclDelete(String),
 }
 
 impl Step {
@@ -83,6 +128,8 @@ impl Step {
             Step::ResetFailed => "systemctl reset-failed".to_string(),
             Step::DeleteUfwRule(n) => format!("ufw --force delete {n}  (innerwarden rule)"),
             Step::Userdel(u) => format!("userdel {u}"),
+            Step::Bootout(l) => format!("launchctl bootout system/{l}"),
+            Step::DsclDelete(p) => format!("dscl . -delete {p}"),
         }
     }
 
@@ -101,6 +148,8 @@ impl Step {
                 vec!["--force".into(), "delete".into(), n.to_string()],
             )),
             Step::Userdel(u) => Some(("userdel", vec![u.clone()])),
+            Step::Bootout(l) => Some(("launchctl", vec!["bootout".into(), format!("system/{l}")])),
+            Step::DsclDelete(p) => Some(("dscl", vec![".".into(), "-delete".into(), p.clone()])),
             Step::RemoveFile(_) | Step::RemoveTree(_) => None,
         }
     }
@@ -171,6 +220,82 @@ pub fn build_plan(
     steps
 }
 
+/// Pure: the macOS (launchd) teardown plan. Analogue of [`build_plan`].
+///
+/// `plists` are the discovered `com.innerwarden.*.plist` file names in
+/// [`MAC_PLIST_DIR`]. We `bootout` every known label supervisors-first even if
+/// its plist is already gone (a live KeepAlive daemon must be unloaded before we
+/// delete its binary, or launchd respawns a missing executable — the F9 bug),
+/// then remove the plists, software dirs, binaries, sudoers, and on `--purge`
+/// the `/usr/local` data dirs plus the directory-services user and group.
+pub fn build_plan_macos(plists: &[String], sudoers: &[String], purge: bool) -> Vec<Step> {
+    let mut steps = Vec::new();
+
+    // 1) bootout supervisors first, then agent/sensor — unconditionally, so a
+    //    running daemon is stopped even if its plist was already deleted.
+    for label in MAC_LABELS_ORDERED {
+        steps.push(Step::Bootout((*label).to_string()));
+    }
+
+    // 2) remove the plist files.
+    for p in plists {
+        steps.push(Step::RemoveFile(format!("{MAC_PLIST_DIR}/{p}")));
+    }
+
+    // 3) software dirs + binaries.
+    for d in MAC_SOFTWARE_DIRS {
+        steps.push(Step::RemoveTree((*d).to_string()));
+    }
+    for b in BINARIES {
+        steps.push(Step::RemoveFile((*b).to_string()));
+    }
+
+    // 4) sudoers drop-ins (macOS also has /etc/sudoers.d).
+    for s in sudoers {
+        steps.push(Step::RemoveFile(format!("{SUDOERS_DIR}/{s}")));
+    }
+
+    // 5) purge config/data/logs + the DS user & group (macOS has no userdel).
+    if purge {
+        for d in MAC_DATA_DIRS {
+            steps.push(Step::RemoveTree((*d).to_string()));
+        }
+        steps.push(Step::DsclDelete(format!("/Users/{IW_USER}")));
+        steps.push(Step::DsclDelete(format!("/Groups/{IW_USER}")));
+    }
+
+    steps
+}
+
+/// Pure plan + display-paths selection by platform. Extracted so BOTH branches
+/// are exercised by unit tests on the Linux CI host (the `cfg!` dispatch in
+/// [`run_uninstall`] passes the real platform in).
+///
+/// `units` are systemd unit file names on Linux, `com.innerwarden.*.plist`
+/// file names on macOS.
+fn build_teardown_plan(
+    mac: bool,
+    units: &[String],
+    sudoers: &[String],
+    ufw: &[u32],
+    purge: bool,
+) -> Vec<Step> {
+    if mac {
+        build_plan_macos(units, sudoers, purge)
+    } else {
+        build_plan(units, sudoers, ufw, purge)
+    }
+}
+
+/// The config/data/log dirs shown in the uninstall preview + purged, per platform.
+fn purge_dirs(mac: bool) -> &'static [&'static str] {
+    if mac {
+        MAC_DATA_DIRS
+    } else {
+        DATA_DIRS
+    }
+}
+
 // ── injection seams ──────────────────────────────────────────────────────────
 
 /// Host-state discovery, injected so the orchestrator is testable.
@@ -191,6 +316,7 @@ pub trait Sys {
 fn run_uninstall(
     env: &dyn Env,
     sys: &mut dyn Sys,
+    mac: bool,
     purge: bool,
     yes: bool,
     dry: bool,
@@ -199,7 +325,8 @@ fn run_uninstall(
     let units = env.units();
     let sudoers = env.sudoers();
     let ufw = env.ufw_rules();
-    let plan = build_plan(&units, &sudoers, &ufw, purge);
+    let plan = build_teardown_plan(mac, &units, &sudoers, &ufw, purge);
+    let data_dirs = purge_dirs(mac);
 
     println!("InnerWarden uninstall — this will remove:");
     println!(
@@ -214,11 +341,11 @@ fn run_uninstall(
     println!("  · eBPF maps, embedded object, sudoers + firewall rules");
     if purge {
         println!("  · PURGE: config + data + logs + the `{IW_USER}` user:");
-        println!("           {}", DATA_DIRS.join(", "));
+        println!("           {}", data_dirs.join(", "));
     } else {
         println!(
             "  · keeping config + data ({}). Use --purge to remove them too.",
-            DATA_DIRS.join(", ")
+            data_dirs.join(", ")
         );
     }
     println!();
@@ -238,7 +365,10 @@ fn run_uninstall(
     } else if purge {
         println!("✅ InnerWarden fully uninstalled (config + data removed).");
     } else {
-        println!("✅ InnerWarden uninstalled. Config + data kept under /etc/innerwarden + /var/lib/innerwarden (re-run with --purge to remove).");
+        println!(
+            "✅ InnerWarden uninstalled. Config + data kept under {} (re-run with --purge to remove).",
+            data_dirs.join(" + ")
+        );
     }
     plan
 }
@@ -251,9 +381,15 @@ pub fn cmd_uninstall(cli: &Cli, purge: bool, yes: bool) -> Result<()> {
     }
     let env = RealEnv::new();
     let mut sys = RealSys;
-    run_uninstall(&env, &mut sys, purge, yes, dry, || {
-        confirm("Proceed with uninstall?")
-    });
+    run_uninstall(
+        &env,
+        &mut sys,
+        cfg!(target_os = "macos"),
+        purge,
+        yes,
+        dry,
+        || confirm("Proceed with uninstall?"),
+    );
     Ok(())
 }
 
@@ -264,11 +400,32 @@ struct RealEnv {
     sudoers_dir: PathBuf,
 }
 
+/// Pure: the directory holding the service definitions to discover — launchd
+/// plists under `/Library/LaunchDaemons` on macOS, systemd units under
+/// `/etc/systemd/system` on Linux.
+fn unit_dir_for(mac: bool) -> &'static str {
+    if mac {
+        MAC_PLIST_DIR
+    } else {
+        SYSTEMD_DIR
+    }
+}
+
 impl RealEnv {
     fn new() -> Self {
         Self {
-            systemd_dir: PathBuf::from(SYSTEMD_DIR),
+            systemd_dir: PathBuf::from(unit_dir_for(cfg!(target_os = "macos"))),
             sudoers_dir: PathBuf::from(SUDOERS_DIR),
+        }
+    }
+
+    /// Discover the installed service definitions in `dir`: launchd plists on
+    /// macOS, systemd units on Linux. Pure over `mac` so both are tested.
+    fn discovered_units(mac: bool, dir: &Path) -> Vec<String> {
+        if mac {
+            Self::read_plists(dir)
+        } else {
+            Self::read_units(dir)
         }
     }
 
@@ -287,6 +444,19 @@ impl RealEnv {
         found
     }
 
+    /// All `com.innerwarden.*.plist` launchd job files (macOS).
+    fn read_plists(plist_dir: &Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(plist_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("com.innerwarden.") && n.ends_with(".plist"))
+            .collect();
+        found.sort();
+        found
+    }
+
     fn read_sudoers(sudoers_dir: &Path) -> Vec<String> {
         std::fs::read_dir(sudoers_dir)
             .into_iter()
@@ -300,7 +470,7 @@ impl RealEnv {
 
 impl Env for RealEnv {
     fn units(&self) -> Vec<String> {
-        Self::read_units(&self.systemd_dir)
+        Self::discovered_units(cfg!(target_os = "macos"), &self.systemd_dir)
     }
     fn sudoers(&self) -> Vec<String> {
         Self::read_sudoers(&self.sudoers_dir)
@@ -564,6 +734,151 @@ Status: active
         );
     }
 
+    // ── build_plan_macos (F9) ────────────────────────────────────────────────
+    #[test]
+    fn macos_plan_boots_out_supervisors_first_then_agent_sensor() {
+        let plan = build_plan_macos(&[], &[], false);
+        let boots: Vec<&str> = plan
+            .iter()
+            .filter_map(|s| match s {
+                Step::Bootout(l) => Some(l.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            boots,
+            vec![
+                "com.innerwarden.watchdog",
+                "com.innerwarden.supervisor",
+                "com.innerwarden.agent",
+                "com.innerwarden.sensor",
+            ],
+            "bootout supervisors first, unconditionally (F9: stop before deleting binaries)"
+        );
+    }
+
+    #[test]
+    fn macos_plan_removes_plists_binaries_but_never_touches_systemd_or_userdel() {
+        let plists = vec![
+            "com.innerwarden.agent.plist".to_string(),
+            "com.innerwarden.sensor.plist".to_string(),
+        ];
+        let plan = build_plan_macos(&plists, &[], false);
+        for p in &plists {
+            assert!(plan.contains(&Step::RemoveFile(format!("{MAC_PLIST_DIR}/{p}"))));
+        }
+        for b in BINARIES {
+            assert!(plan.contains(&Step::RemoveFile((*b).to_string())));
+        }
+        // No Linux service-manager or userdel steps must ever appear on macOS.
+        assert!(!plan.iter().any(|s| matches!(
+            s,
+            Step::Stop(_)
+                | Step::Disable(_)
+                | Step::DaemonReload
+                | Step::ResetFailed
+                | Step::Userdel(_)
+        )));
+    }
+
+    #[test]
+    fn macos_plan_purge_removes_usr_local_data_and_dscl_deletes_user_and_group() {
+        let plan = build_plan_macos(&[], &[], true);
+        for d in MAC_DATA_DIRS {
+            assert!(
+                plan.contains(&Step::RemoveTree((*d).to_string())),
+                "purge must remove macOS data dir {d}"
+            );
+        }
+        // The two final steps delete the DS user then group.
+        assert_eq!(
+            plan[plan.len() - 2],
+            Step::DsclDelete(format!("/Users/{IW_USER}"))
+        );
+        assert_eq!(
+            plan[plan.len() - 1],
+            Step::DsclDelete(format!("/Groups/{IW_USER}"))
+        );
+    }
+
+    #[test]
+    fn macos_plan_keeps_data_without_purge() {
+        let plan = build_plan_macos(&[], &[], false);
+        for d in MAC_DATA_DIRS {
+            assert!(!plan.contains(&Step::RemoveTree((*d).to_string())));
+        }
+        assert!(!plan.iter().any(|s| matches!(s, Step::DsclDelete(_))));
+    }
+
+    #[test]
+    fn build_teardown_plan_selects_platform_shape() {
+        let units = vec!["com.innerwarden.agent.plist".to_string()];
+        // mac=true → launchd shape (Bootout present, no systemd Stop)
+        let mac = build_teardown_plan(true, &units, &[], &[], false);
+        assert!(mac.iter().any(|s| matches!(s, Step::Bootout(_))));
+        assert!(!mac.iter().any(|s| matches!(s, Step::Stop(_))));
+        // mac=false → systemd shape (Stop present, no Bootout)
+        let lin = build_teardown_plan(
+            false,
+            &["innerwarden-agent.service".to_string()],
+            &[],
+            &[],
+            false,
+        );
+        assert!(lin.iter().any(|s| matches!(s, Step::Stop(_))));
+        assert!(!lin.iter().any(|s| matches!(s, Step::Bootout(_))));
+    }
+
+    #[test]
+    fn purge_dirs_are_platform_specific() {
+        assert_eq!(purge_dirs(true), MAC_DATA_DIRS);
+        assert_eq!(purge_dirs(false), DATA_DIRS);
+        // macOS purge dirs live under /usr/local (plus the legacy /var/lib model dir).
+        assert!(purge_dirs(true)
+            .iter()
+            .any(|d| *d == "/usr/local/var/lib/innerwarden"));
+    }
+
+    #[test]
+    fn unit_dir_for_is_platform_specific() {
+        assert_eq!(unit_dir_for(true), MAC_PLIST_DIR);
+        assert_eq!(unit_dir_for(false), SYSTEMD_DIR);
+    }
+
+    #[test]
+    fn discovered_units_dispatches_by_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("innerwarden-agent.service"), "x").unwrap();
+        std::fs::write(dir.path().join("com.innerwarden.agent.plist"), "x").unwrap();
+        // Linux → systemd units only.
+        let lin = RealEnv::discovered_units(false, dir.path());
+        assert!(lin.contains(&"innerwarden-agent.service".to_string()));
+        assert!(!lin.iter().any(|u| u.ends_with(".plist")));
+        // macOS → launchd plists only.
+        let mac = RealEnv::discovered_units(true, dir.path());
+        assert!(mac.contains(&"com.innerwarden.agent.plist".to_string()));
+        assert!(!mac.iter().any(|u| u.ends_with(".service")));
+    }
+
+    #[test]
+    fn real_env_discovers_launchd_plists_filtered() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "com.innerwarden.agent.plist",
+            "com.innerwarden.sensor.plist",
+            "com.apple.something.plist", // not ours
+            "com.innerwarden.notes.txt", // wrong extension
+        ] {
+            std::fs::write(dir.path().join(f), "x").unwrap();
+        }
+        let plists = RealEnv::read_plists(dir.path());
+        assert!(plists.contains(&"com.innerwarden.agent.plist".to_string()));
+        assert!(plists.contains(&"com.innerwarden.sensor.plist".to_string()));
+        assert!(!plists.iter().any(|p| p.starts_with("com.apple")));
+        assert!(!plists.iter().any(|p| p.ends_with(".txt")));
+        assert_eq!(plists.len(), 2);
+    }
+
     // ── Step::describe ───────────────────────────────────────────────────────
     #[test]
     fn step_describe_covers_every_variant() {
@@ -580,6 +895,14 @@ Status: active
         assert_eq!(
             Step::Userdel("innerwarden".into()).describe(),
             "userdel innerwarden"
+        );
+        assert_eq!(
+            Step::Bootout("com.innerwarden.agent".into()).describe(),
+            "launchctl bootout system/com.innerwarden.agent"
+        );
+        assert_eq!(
+            Step::DsclDelete("/Users/innerwarden".into()).describe(),
+            "dscl . -delete /Users/innerwarden"
         );
     }
 
@@ -611,6 +934,27 @@ Status: active
         assert_eq!(
             Step::Userdel("innerwarden".into()).command(),
             Some(("userdel", vec!["innerwarden".to_string()]))
+        );
+        assert_eq!(
+            Step::Bootout("com.innerwarden.agent".into()).command(),
+            Some((
+                "launchctl",
+                vec![
+                    "bootout".to_string(),
+                    "system/com.innerwarden.agent".to_string()
+                ]
+            ))
+        );
+        assert_eq!(
+            Step::DsclDelete("/Users/innerwarden".into()).command(),
+            Some((
+                "dscl",
+                vec![
+                    ".".to_string(),
+                    "-delete".to_string(),
+                    "/Users/innerwarden".to_string()
+                ]
+            ))
         );
         // filesystem steps are in-process, not external commands
         assert_eq!(Step::RemoveFile("/a".into()).command(), None);
@@ -737,7 +1081,7 @@ Status: active
     fn run_executes_full_plan_when_confirmed() {
         let env = fake();
         let mut sys = RecordingSys::default();
-        let plan = run_uninstall(&env, &mut sys, true, false, false, || true);
+        let plan = run_uninstall(&env, &mut sys, false, true, false, false, || true);
         assert!(!plan.is_empty());
         let recorded: Vec<Step> = sys.applied.iter().map(|(s, _)| s.clone()).collect();
         assert_eq!(recorded, plan, "every plan step applied, in order");
@@ -746,10 +1090,28 @@ Status: active
     }
 
     #[test]
+    fn run_macos_executes_launchd_plan_and_dscl_deletes_user_last() {
+        // Same fake discovery, but mac=true selects the launchd teardown shape:
+        // no systemd/userdel steps, dscl-deletes the user + group last.
+        let env = fake();
+        let mut sys = RecordingSys::default();
+        let plan = run_uninstall(&env, &mut sys, true, true, false, false, || true);
+        assert!(!plan.is_empty());
+        assert!(plan.iter().any(|s| matches!(s, Step::Bootout(_))));
+        assert!(!plan
+            .iter()
+            .any(|s| matches!(s, Step::Stop(_) | Step::Disable(_) | Step::Userdel(_))));
+        assert_eq!(
+            plan.last(),
+            Some(&Step::DsclDelete(format!("/Groups/{IW_USER}")))
+        );
+    }
+
+    #[test]
     fn run_aborts_and_applies_nothing_when_declined() {
         let env = fake();
         let mut sys = RecordingSys::default();
-        let plan = run_uninstall(&env, &mut sys, false, false, false, || false);
+        let plan = run_uninstall(&env, &mut sys, false, false, false, false, || false);
         assert!(plan.is_empty(), "declined => empty plan returned");
         assert!(sys.applied.is_empty(), "nothing executed on decline");
     }
@@ -759,7 +1121,7 @@ Status: active
         let env = fake();
         let mut sys = RecordingSys::default();
         // confirm returns false, but dry=true must skip the prompt and still run.
-        let plan = run_uninstall(&env, &mut sys, false, false, true, || false);
+        let plan = run_uninstall(&env, &mut sys, false, false, false, true, || false);
         assert!(!plan.is_empty());
         let recorded: Vec<Step> = sys.applied.iter().map(|(s, _)| s.clone()).collect();
         assert_eq!(recorded, plan);
@@ -774,7 +1136,7 @@ Status: active
         let env = fake();
         let mut sys = RecordingSys::default();
         // yes=true, confirm would return false; must run anyway.
-        let plan = run_uninstall(&env, &mut sys, false, true, false, || false);
+        let plan = run_uninstall(&env, &mut sys, false, false, true, false, || false);
         assert!(!plan.is_empty());
         assert_eq!(sys.applied.len(), plan.len());
     }

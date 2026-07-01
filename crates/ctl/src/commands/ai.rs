@@ -779,8 +779,23 @@ fn cmd_install_classifier_with_target(
 
     println!();
     println!("Done. Restart the agent to load the classifier:");
-    println!("  sudo systemctl restart innerwarden-agent");
+    println!("  {}", agent_restart_hint());
     Ok(())
+}
+
+/// Platform-correct "restart the agent" command line. macOS uses launchd, not
+/// systemd, so `systemctl restart` there is a no-op that misleads the user (F6).
+fn agent_restart_hint() -> &'static str {
+    agent_restart_hint_for(cfg!(target_os = "macos"))
+}
+
+/// Pure inner (tested for both platforms on the Linux CI host).
+fn agent_restart_hint_for(mac: bool) -> &'static str {
+    if mac {
+        "sudo launchctl kickstart -k system/com.innerwarden.agent"
+    } else {
+        "sudo systemctl restart innerwarden-agent"
+    }
 }
 
 fn confirm_install<R: std::io::BufRead>(yes: bool, input: &mut R) -> Result<bool> {
@@ -870,6 +885,25 @@ mod tests {
     use std::process::Command as ProcessCommand;
     use std::sync::{Mutex, OnceLock};
     use std::thread;
+
+    /// F6 anchor (2026-07-01): the post-install restart hint uses the host's
+    /// real service manager — launchd on macOS, systemd elsewhere.
+    #[test]
+    fn agent_restart_hint_matches_platform() {
+        let h = agent_restart_hint();
+        if cfg!(target_os = "macos") {
+            assert!(h.contains("launchctl"));
+            assert!(!h.contains("systemctl"));
+        } else {
+            assert!(h.contains("systemctl restart innerwarden-agent"));
+        }
+    }
+
+    #[test]
+    fn agent_restart_hint_for_both_platforms() {
+        assert!(agent_restart_hint_for(true).contains("launchctl kickstart"));
+        assert!(agent_restart_hint_for(false).contains("systemctl restart innerwarden-agent"));
+    }
     use tempfile::TempDir;
 
     fn install_archive_lock() -> &'static Mutex<()> {
