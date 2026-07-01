@@ -110,10 +110,15 @@ pub enum Step {
     /// now-deleted binary (the 2026-07-01 F9 failure was that uninstall never
     /// did this on macOS, leaving orphaned launchd jobs).
     Bootout(String),
-    /// macOS: delete a directory-services record (`dscl . -delete <path>`),
-    /// e.g. `/Users/innerwarden` or `/Groups/innerwarden`. macOS has no
-    /// `userdel`.
-    DsclDelete(String),
+    /// macOS: delete a user account via `sysadminctl -deleteUser <name>`.
+    /// macOS has no `userdel`, and `dscl . -delete /Users/<name>` HANGS on
+    /// recent macOS (26.x) when driven non-interactively — the 2026-07-01
+    /// retest caught the user surviving `uninstall --purge`. `sysadminctl`
+    /// is the supported, non-blocking API and also tears down the login
+    /// records/share point.
+    MacDeleteUser(String),
+    /// macOS: delete a group via `dseditgroup -o delete <name>`.
+    MacDeleteGroup(String),
 }
 
 impl Step {
@@ -129,7 +134,8 @@ impl Step {
             Step::DeleteUfwRule(n) => format!("ufw --force delete {n}  (innerwarden rule)"),
             Step::Userdel(u) => format!("userdel {u}"),
             Step::Bootout(l) => format!("launchctl bootout system/{l}"),
-            Step::DsclDelete(p) => format!("dscl . -delete {p}"),
+            Step::MacDeleteUser(u) => format!("sysadminctl -deleteUser {u}"),
+            Step::MacDeleteGroup(g) => format!("dseditgroup -o delete {g}"),
         }
     }
 
@@ -149,7 +155,10 @@ impl Step {
             )),
             Step::Userdel(u) => Some(("userdel", vec![u.clone()])),
             Step::Bootout(l) => Some(("launchctl", vec!["bootout".into(), format!("system/{l}")])),
-            Step::DsclDelete(p) => Some(("dscl", vec![".".into(), "-delete".into(), p.clone()])),
+            Step::MacDeleteUser(u) => Some(("sysadminctl", vec!["-deleteUser".into(), u.clone()])),
+            Step::MacDeleteGroup(g) => {
+                Some(("dseditgroup", vec!["-o".into(), "delete".into(), g.clone()]))
+            }
             Step::RemoveFile(_) | Step::RemoveTree(_) => None,
         }
     }
@@ -260,8 +269,8 @@ pub fn build_plan_macos(plists: &[String], sudoers: &[String], purge: bool) -> V
         for d in MAC_DATA_DIRS {
             steps.push(Step::RemoveTree((*d).to_string()));
         }
-        steps.push(Step::DsclDelete(format!("/Users/{IW_USER}")));
-        steps.push(Step::DsclDelete(format!("/Groups/{IW_USER}")));
+        steps.push(Step::MacDeleteUser(IW_USER.to_string()));
+        steps.push(Step::MacDeleteGroup(IW_USER.to_string()));
     }
 
     steps
@@ -527,7 +536,14 @@ impl Sys for RealSys {
             Step::RemoveFile(p) | Step::RemoveTree(p) => remove_path(p),
             other => {
                 if let Some((prog, args)) = other.command() {
-                    let _ = Command::new(prog).args(&args).status();
+                    // Redirect stdin from /dev/null so no step can ever block on
+                    // interactive input. `dscl . -delete` in particular HANGS
+                    // when it inherits a TTY/pipe stdin (2026-07-01 retest); the
+                    // teardown must never wait for a prompt.
+                    let _ = Command::new(prog)
+                        .args(&args)
+                        .stdin(std::process::Stdio::null())
+                        .status();
                 }
             }
         }
@@ -782,7 +798,7 @@ Status: active
     }
 
     #[test]
-    fn macos_plan_purge_removes_usr_local_data_and_dscl_deletes_user_and_group() {
+    fn macos_plan_purge_removes_usr_local_data_and_deletes_user_and_group() {
         let plan = build_plan_macos(&[], &[], true);
         for d in MAC_DATA_DIRS {
             assert!(
@@ -790,14 +806,15 @@ Status: active
                 "purge must remove macOS data dir {d}"
             );
         }
-        // The two final steps delete the DS user then group.
+        // The two final steps delete the user (via sysadminctl, NOT the
+        // hang-prone `dscl . -delete`) then the group.
         assert_eq!(
             plan[plan.len() - 2],
-            Step::DsclDelete(format!("/Users/{IW_USER}"))
+            Step::MacDeleteUser(IW_USER.to_string())
         );
         assert_eq!(
             plan[plan.len() - 1],
-            Step::DsclDelete(format!("/Groups/{IW_USER}"))
+            Step::MacDeleteGroup(IW_USER.to_string())
         );
     }
 
@@ -807,7 +824,9 @@ Status: active
         for d in MAC_DATA_DIRS {
             assert!(!plan.contains(&Step::RemoveTree((*d).to_string())));
         }
-        assert!(!plan.iter().any(|s| matches!(s, Step::DsclDelete(_))));
+        assert!(!plan
+            .iter()
+            .any(|s| matches!(s, Step::MacDeleteUser(_) | Step::MacDeleteGroup(_))));
     }
 
     #[test]
@@ -901,8 +920,12 @@ Status: active
             "launchctl bootout system/com.innerwarden.agent"
         );
         assert_eq!(
-            Step::DsclDelete("/Users/innerwarden".into()).describe(),
-            "dscl . -delete /Users/innerwarden"
+            Step::MacDeleteUser("innerwarden".into()).describe(),
+            "sysadminctl -deleteUser innerwarden"
+        );
+        assert_eq!(
+            Step::MacDeleteGroup("innerwarden".into()).describe(),
+            "dseditgroup -o delete innerwarden"
         );
     }
 
@@ -946,13 +969,20 @@ Status: active
             ))
         );
         assert_eq!(
-            Step::DsclDelete("/Users/innerwarden".into()).command(),
+            Step::MacDeleteUser("innerwarden".into()).command(),
             Some((
-                "dscl",
+                "sysadminctl",
+                vec!["-deleteUser".to_string(), "innerwarden".to_string()]
+            ))
+        );
+        assert_eq!(
+            Step::MacDeleteGroup("innerwarden".into()).command(),
+            Some((
+                "dseditgroup",
                 vec![
-                    ".".to_string(),
-                    "-delete".to_string(),
-                    "/Users/innerwarden".to_string()
+                    "-o".to_string(),
+                    "delete".to_string(),
+                    "innerwarden".to_string()
                 ]
             ))
         );
@@ -1103,7 +1133,7 @@ Status: active
             .any(|s| matches!(s, Step::Stop(_) | Step::Disable(_) | Step::Userdel(_))));
         assert_eq!(
             plan.last(),
-            Some(&Step::DsclDelete(format!("/Groups/{IW_USER}")))
+            Some(&Step::MacDeleteGroup(IW_USER.to_string()))
         );
     }
 

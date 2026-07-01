@@ -2162,13 +2162,15 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             ("innerwarden-sensor", "com.innerwarden.sensor"),
             ("innerwarden-agent", "com.innerwarden.agent"),
         ] {
-            let running = std::process::Command::new("launchctl")
-                .args(["list", plist])
-                .output()
-                .map(|o| {
-                    o.status.success() && String::from_utf8_lossy(&o.stdout).contains("\"PID\"")
-                })
-                .unwrap_or(false);
+            // Detect via process presence (systemd::service_status is pgrep-based
+            // on macOS), NOT `launchctl list <label>`: that queries the caller's
+            // launchd domain, so a non-root `doctor` cannot see the SYSTEM-domain
+            // daemons and falsely reported them "not running" while they were
+            // live (2026-07-01 retest residual — same class as F7).
+            let running = matches!(
+                systemd::service_status(label),
+                systemd::ServiceStatus::Active
+            );
             svc.push(build_service_running_check(label, running, true));
             // Note: macOS plist filename is per-domain (com.innerwarden.*),
             // so we use it for the remediation hint by adjusting the helper.
