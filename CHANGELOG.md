@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.32] - 2026-07-01
+
 ### Fixed
 - **macOS retest residuals (a re-test of the fixes below, on the same Mac, caught two more launchd-specific bugs the Linux CI cannot see).** (1) `system doctor`'s Services section had its OWN macOS branch that used `launchctl list <label>` — which only queries the caller's launchd domain, so a non-root `doctor` could not see the SYSTEM-domain daemons and reported both as "not running" while they were live (same class as the status bug, different code path). It now detects via the same process-presence check as `get status`. (2) `uninstall --purge` used `dscl . -delete /Users/innerwarden` to remove the macOS user, which HANGS on recent macOS (26.x) when driven non-interactively, so the user survived the purge; it now uses `sysadminctl -deleteUser` (+ `dseditgroup -o delete` for the group), and every teardown step runs with stdin redirected from `/dev/null` so no step can ever block on a prompt. Verified live: fresh install → `doctor` shows both services running → `uninstall --purge` removes binaries, plists, `/usr/local` data, and the user/group.
 - **macOS support cluster: `ctl` status/doctor/uninstall + the `macos_log` collector were Linux/systemd-shaped and misbehaved on macOS (launchd) — found by a full install→test→uninstall pass on a real Mac (v0.15.31, arm64, macOS 26.5.1).** The install itself was healthy (signed binaries verify, both launchd daemons load, the dashboard serves HTTPS 200, the Local Warden model downloads + verifies), but eleven platform bugs surfaced. Fixed together:
