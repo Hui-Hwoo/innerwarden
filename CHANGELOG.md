@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Agent Guard denials now surface as dashboard Cases, not only a Telegram alert + jsonl log — the AI-agent guardrail becomes visible in the same UI as host detections.** When the guardrail flags/blocks a co-located AI agent's command (e.g. an AI agent trying `sudo systemctl start innerwarden-agent`, denied on `atr:privilege-escalation` / `ATR-2026-064`), the `AgentGuardAlert` historically flowed only to `agent-guard-events-YYYY-MM-DD.jsonl` and the chat "snitch" notification — so an operator watching the dashboard never saw the guard had acted. The alert is now also persisted as a first-class **incident** (detector `agent_guard:<signal-kind>`, e.g. `agent_guard:privilege-escalation`), which the SQLite-backed live-feed and Cases surfaces already read via `Store::incidents_since_ts`. Severity maps from the ATR verdict (medium→Medium, etc.; unknown→Info, never a silent escalation); a denied action is tagged `contained` (the guard already refused it, so the operator does not need to act) while a `review` verdict is `flagged`; the full alert (agent name, command, risk score, signals, ATR rule ids, explanation) is carried in the case evidence. The conversion is a pure, exhaustively-tested function (`dashboard::agent_guard_incident::alert_to_incident`); the boot dispatch writes the incident with `spawn_blocking` after the jsonl write, and idempotency is guaranteed by an `incident_id` that carries the alert timestamp against the store's `INSERT OR IGNORE`. Agent-only; no sensor/detector-count change.
+
 ## [0.15.33] - 2026-07-02
 
 ### Added

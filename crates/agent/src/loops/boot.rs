@@ -1151,6 +1151,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         let wh_timeout = cfg.webhook.timeout_secs;
         let wh_format = cfg.webhook.format.clone();
         let alert_data_dir = cli.data_dir.clone();
+        // Also persist each alert as a dashboard incident so blocked/flagged
+        // AI-agent actions surface as Cases (not only jsonl + Telegram).
+        let alert_sqlite_store = sqlite_store.clone();
+        let alert_host = std::env::var("HOSTNAME")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+            .unwrap_or_else(|_| "unknown".to_string());
         tokio::spawn(async move {
             let sc = if !sc_url.is_empty() {
                 slack::SlackClient::new(&sc_url).ok()
@@ -1207,6 +1213,27 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             }
                         }
                         Err(e) => warn!(error = %e, "failed to serialize agent-guard alert"),
+                    }
+                }
+
+                // Dashboard case: persist the alert as an incident so the
+                // guardrail's actions show up in the Cases / live-feed UI, not
+                // only in the jsonl audit + chat notification. Idempotent
+                // (incident_id carries the alert ts; store does INSERT OR
+                // IGNORE). Blocking SQLite write → spawn_blocking.
+                if let Some(sq) = alert_sqlite_store.clone() {
+                    let incident = crate::dashboard::agent_guard_incident::alert_to_incident(
+                        &alert,
+                        &alert_host,
+                    );
+                    match tokio::task::spawn_blocking(move || sq.insert_incident(&incident)).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "failed to persist agent-guard incident")
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "agent-guard incident persist task join failed")
+                        }
                     }
                 }
 

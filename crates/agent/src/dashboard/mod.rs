@@ -14,6 +14,7 @@ use types::*;
 
 mod actions;
 mod agent_api;
+pub(crate) mod agent_guard_incident;
 mod audit_export_csv;
 mod audit_export_signing;
 mod auth;
