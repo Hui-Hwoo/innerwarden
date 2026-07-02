@@ -11,7 +11,7 @@ use innerwarden_shield::origin_lockdown::OriginLockdown;
 use innerwarden_shield::rate_limiter::{IpRateLimiter, RateLimitDecision, RateLimiterConfig};
 use innerwarden_shield::store::Store;
 use innerwarden_shield::syn_tracker::{SynFloodConfig, SynFloodDetector};
-use innerwarden_shield::tcp_fingerprint::TcpFingerprinter;
+use innerwarden_shield::tcp_fingerprint::{ConnectionPattern, TcpFingerprinter};
 use innerwarden_shield::xdp_manager::XdpManager;
 
 use crate::config::{ShieldCloudflareFailoverConfig, ShieldOriginLockdownConfig};
@@ -24,6 +24,10 @@ pub(crate) struct ShieldState {
     pub escalation: EscalationEngine,
     pub classifier: AttackClassifier,
     pub fingerprinter: TcpFingerprinter,
+    /// IPs already reported as a TCP-fingerprint bot/botnet this session — so the
+    /// classifier emits ONE incident per IP, not one every tick. Pruned when the
+    /// IP goes stale (falls out of the fingerprinter), so a returning bot re-alerts.
+    fingerprint_alerted: std::collections::HashSet<String>,
     pub xdp: XdpManager,
     pub store: Store,
     pub tick_counter: u64,
@@ -107,6 +111,7 @@ impl ShieldState {
             escalation,
             classifier: AttackClassifier::new(),
             fingerprinter: TcpFingerprinter::new(),
+            fingerprint_alerted: std::collections::HashSet::new(),
             xdp,
             store,
             tick_counter: 0,
@@ -117,6 +122,17 @@ impl ShieldState {
             lockdown_dry_run: lockdown_cfg.dry_run,
         }
     }
+}
+
+/// A newly-classified TCP-fingerprint bot/botnet, snapshotted from the
+/// fingerprinter so the incident is built without holding a borrow on it.
+struct BotHit {
+    ip: String,
+    pattern: ConnectionPattern,
+    count: u64,
+    variance: f64,
+    win: Option<u16>,
+    ttl: Option<u8>,
 }
 
 /// Process a batch of sensor events through the shield pipeline.
@@ -207,18 +223,25 @@ pub(crate) async fn process_events(
             shield.syn_detector.record_ack(ip, now);
         }
 
-        // TCP fingerprinting
-        let window_size = event
-            .details
-            .get("window_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u16;
-        let ttl = event
-            .details
-            .get("ttl")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(64) as u8;
-        if window_size > 0 {
+        // TCP fingerprinting. `window_size`/`ttl` are L4 header fields that no
+        // current collector captures (they default to 0), so we DO NOT gate on
+        // them: the behavioural bot signal is the CONNECTION TIMING variance, which
+        // needs only the timestamps that every network event carries. Recording
+        // with window 0 keeps the per-IP timing-variance detection live now; the
+        // botnet (shared-L4-fingerprint) path stays dormant until a collector
+        // supplies a real window/ttl (classify_all skips the window-0 bucket, so
+        // absent fingerprints never false-cluster into a botnet).
+        {
+            let window_size = event
+                .details
+                .get("window_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u16;
+            let ttl = event
+                .details
+                .get("ttl")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u8;
             shield
                 .fingerprinter
                 .record_connection(ip, window_size, ttl, now);
@@ -328,6 +351,84 @@ pub(crate) async fn process_events(
             incidents.push(incident);
         }
 
+        // TCP-fingerprint bot/botnet classification (spec: the behavioural
+        // good-bot-vs-bad-bot signal that complements the rDNS identity check).
+        // The fingerprinter has been fed `record_connection` on every packet; run
+        // the classifier and emit ONE incident per newly-classified bot IP. This is
+        // a SIGNAL, not an auto-block: a low-timing-variance client can be a
+        // legitimate crawler/monitor, so the AI/operator decides — we never XDP-drop
+        // purely on a fingerprint. Botnet (one fingerprint shared across many IPs)
+        // is the coordinated case and rates High.
+        shield.fingerprinter.classify_all();
+        let new_bots: Vec<BotHit> = shield
+            .fingerprinter
+            .get_bots()
+            .into_iter()
+            .filter(|fp| !shield.fingerprint_alerted.contains(&fp.ip))
+            .map(|fp| BotHit {
+                ip: fp.ip.clone(),
+                pattern: fp.connection_pattern.clone(),
+                count: fp.connection_count,
+                variance: fp.timing_variance_ms(),
+                win: fp.dominant_window_size(),
+                ttl: fp.dominant_ttl(),
+            })
+            .collect();
+        if !new_bots.is_empty() {
+            let host = std::fs::read_to_string("/etc/hostname")
+                .unwrap_or_else(|_| "unknown".to_string())
+                .trim()
+                .to_string();
+            for BotHit {
+                ip,
+                pattern,
+                count,
+                variance,
+                win,
+                ttl,
+            } in new_bots
+            {
+                shield.fingerprint_alerted.insert(ip.clone());
+                let (severity, kind, title, why) = match pattern {
+                    ConnectionPattern::Botnet => (
+                        "high",
+                        "botnet",
+                        format!("Botnet TCP fingerprint from {ip}"),
+                        "many source IPs share one TCP stack fingerprint (window/TTL) — a coordinated botnet",
+                    ),
+                    _ => (
+                        "low",
+                        "bot",
+                        format!("Automated bot TCP fingerprint from {ip}"),
+                        "connections arrive at near-constant intervals (very low timing variance) — an automated client, not a human",
+                    ),
+                };
+                info!(
+                    ip,
+                    ?pattern,
+                    count,
+                    variance,
+                    "shield: TCP-fingerprint bot classified"
+                );
+                incidents.push(serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "host": host,
+                    "incident_id": format!("shield:tcp_fingerprint:{kind}:{ip}"),
+                    "severity": severity,
+                    "title": title,
+                    "summary": format!(
+                        "{why}. {count} connections, timing variance {variance:.0} ms\u{00b2}, \
+                         dominant window {}, TTL {}. Signal only — verify (a rDNS-verified crawler \
+                         is tagged bot:known and exempt); not auto-blocked.",
+                        win.map(|w| w.to_string()).unwrap_or_else(|| "?".into()),
+                        ttl.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                    ),
+                    "tags": ["shield", "bot", "tcp_fingerprint", kind],
+                    "entities": [{"kind": "ip", "value": ip}],
+                }));
+            }
+        }
+
         // Persist state every 30s (every 6 escalation ticks = 30 main ticks)
         if shield.tick_counter.is_multiple_of(30) {
             let state = innerwarden_shield::store::ShieldState {
@@ -349,6 +450,12 @@ pub(crate) async fn process_events(
             shield
                 .fingerprinter
                 .cleanup_stale(std::time::Duration::from_secs(300), now);
+            // Drop alerted IPs the fingerprinter no longer tracks (went stale), so
+            // the set stays bounded and a bot that returns later re-alerts.
+            let fpr = &shield.fingerprinter;
+            shield
+                .fingerprint_alerted
+                .retain(|ip| fpr.get_pattern(ip) != ConnectionPattern::Unknown);
         }
     }
 
@@ -515,6 +622,128 @@ mod tests {
             tags: vec![],
             entities: vec![],
         }
+    }
+
+    /// Drive the classifier: feed `events` (tick 1) then idle-tick to the next
+    /// multiple-of-5 tick where `classify_all` runs, returning every incident
+    /// produced along the way.
+    async fn run_to_classify_tick(
+        shield: &mut ShieldState,
+        events: &[innerwarden_core::event::Event],
+    ) -> Vec<serde_json::Value> {
+        let risk = HashMap::new();
+        let mut out = Vec::new();
+        let (_d, inc, _b) = process_events(shield, events, &risk).await;
+        out.extend(inc);
+        // tick_counter is now 1; classify runs at every 5th tick.
+        while !shield.tick_counter.is_multiple_of(5) {
+            let (_d, inc, _b) = process_events(shield, &[], &risk).await;
+            out.extend(inc);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn tcp_fingerprint_bot_classified_and_emitted_as_signal() {
+        // A client hammering with >= bot_conn_threshold (100) near-constant-interval
+        // connections (variance ~0) is classified Bot and emits a LOW signal
+        // incident — never an auto-block (a legit crawler/monitor can look like this).
+        let (_dir, mut shield) = make_shield_state(rl_config(1e9, 1e9, 60, u64::MAX));
+        let events: Vec<_> = (0..120)
+            .map(|_| network_event("203.0.113.7", "network.connect", 100))
+            .collect();
+        let incidents = run_to_classify_tick(&mut shield, &events).await;
+        let bot = incidents
+            .iter()
+            .find(|i| {
+                i["tags"]
+                    .as_array()
+                    .is_some_and(|t| t.iter().any(|x| x == "tcp_fingerprint"))
+            })
+            .expect("a tcp_fingerprint bot incident");
+        assert!(bot["incident_id"]
+            .as_str()
+            .unwrap()
+            .contains("tcp_fingerprint:bot:203.0.113.7"));
+        assert_eq!(bot["severity"], "low", "single-IP bot is a low signal");
+        assert!(bot["summary"]
+            .as_str()
+            .unwrap()
+            .contains("not auto-blocked"));
+
+        // Idempotent: a second classify tick must NOT re-emit for the same IP.
+        let again = run_to_classify_tick(&mut shield, &[]).await;
+        assert!(
+            !again.iter().any(|i| i["tags"]
+                .as_array()
+                .is_some_and(|t| t.iter().any(|x| x == "tcp_fingerprint"))),
+            "already-alerted bot must not re-fire every tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_fingerprint_bot_detected_without_l4_window_the_prod_case() {
+        // The real prod condition: NO collector emits window_size/ttl, so the
+        // fingerprint has no L4 data. The timing-variance bot detection must still
+        // fire from the connection TIMESTAMPS alone (window 0), and such an IP must
+        // NOT be mistaken for a botnet (window-0 bucket is skipped).
+        let (_dir, mut shield) = make_shield_state(rl_config(1e9, 1e9, 60, u64::MAX));
+        let no_l4 = |ip: &str| innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "unit-host".to_string(),
+            source: "unit-test".to_string(),
+            kind: "network.connect".to_string(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: "no-l4".to_string(),
+            details: serde_json::json!({ "src_ip": ip, "bytes": 100 }), // no window_size/ttl
+            tags: vec![],
+            entities: vec![],
+        };
+        let events: Vec<_> = (0..120).map(|_| no_l4("203.0.113.9")).collect();
+        let incidents = run_to_classify_tick(&mut shield, &events).await;
+        let bot = incidents.iter().find(|i| {
+            i["tags"]
+                .as_array()
+                .is_some_and(|t| t.iter().any(|x| x == "tcp_fingerprint"))
+        });
+        let bot = bot.expect("timing-variance bot must fire without any L4 fingerprint");
+        assert!(bot["tags"].as_array().unwrap().iter().any(|x| x == "bot"));
+        assert!(
+            !bot["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x == "botnet"),
+            "a window-0 (no-L4) IP must never be classed a botnet"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_fingerprint_botnet_rates_high() {
+        // >= botnet_ip_threshold (10) IPs sharing one TCP fingerprint (window/TTL)
+        // is a coordinated botnet -> High.
+        let (_dir, mut shield) = make_shield_state(rl_config(1e9, 1e9, 60, u64::MAX));
+        let mut events = Vec::new();
+        for i in 1..=12 {
+            let ip = format!("198.51.100.{i}");
+            for _ in 0..3 {
+                events.push(network_event(&ip, "network.connect", 100));
+            }
+        }
+        let incidents = run_to_classify_tick(&mut shield, &events).await;
+        let botnet: Vec<_> = incidents
+            .iter()
+            .filter(|i| {
+                i["tags"]
+                    .as_array()
+                    .is_some_and(|t| t.iter().any(|x| x == "botnet"))
+            })
+            .collect();
+        assert!(
+            !botnet.is_empty(),
+            "shared fingerprint across 12 IPs = botnet"
+        );
+        assert_eq!(botnet[0]["severity"], "high");
     }
 
     #[test]
