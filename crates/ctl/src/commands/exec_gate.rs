@@ -358,8 +358,48 @@ pub(crate) fn cmd_status() -> anyhow::Result<()> {
     );
     if mode == GateMode::Inert {
         println!("The gate is inert — it denies nothing. `arm --observe` to start.");
+    } else if let Some(w) = lsm_inactive_status_warning(mode, eg::read_bpf_lsm_active()) {
+        println!("{w}");
     }
     Ok(())
+}
+
+/// PURE: the `status` warning shown when the gate is in an ACTIVE mode but `bpf`
+/// is definitively not in the kernel's active LSM stack — the hook cannot run, so
+/// the gate denies NOTHING despite reporting armed (stock Ubuntu/Azure default,
+/// the Azure-6.17 finding). `None` (bpf active / mode inert / LSM list unreadable)
+/// = no warning, so an unreadable list never cries wolf.
+fn lsm_inactive_status_warning(mode: GateMode, bpf_lsm_active: Option<bool>) -> Option<String> {
+    if mode.is_active() && bpf_lsm_active == Some(false) {
+        Some(format!(
+            "  WARNING: `bpf` is NOT in the active kernel LSM stack (/sys/kernel/security/lsm), \
+             so this gate CANNOT enforce — it currently denies nothing despite mode={}. \
+             Add `lsm=...,bpf` to the kernel cmdline (GRUB_CMDLINE_LINUX) and reboot, then re-check.",
+            mode.label()
+        ))
+    } else {
+        None
+    }
+}
+
+/// PURE: the reason `enforce` refuses when `bpf` is definitively absent from the
+/// active LSM stack — enforce would be a silent no-op and the rehearsal is hollow
+/// (no would-block event can fire while the hook is inert). `None` = safe to
+/// proceed (bpf active, or the list is unreadable — never block on unreadable).
+fn enforce_lsm_block_reason(bpf_lsm_active: Option<bool>) -> Option<String> {
+    if bpf_lsm_active == Some(false) {
+        Some(
+            "refusing to enforce: `bpf` is NOT in the active kernel LSM stack \
+             (/sys/kernel/security/lsm), so the Execution Gate hook cannot run and enforce would \
+             deny NOTHING (a false sense of security). The rehearsal cannot be trusted either — no \
+             would-block event can fire while the hook is inert. Add `lsm=...,bpf` to the kernel \
+             cmdline (GRUB_CMDLINE_LINUX), reboot, confirm `bpf` appears in /sys/kernel/security/lsm, \
+             then re-arm --observe, re-rehearse, and enforce."
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 /// `innerwarden exec-gate disarm`.
@@ -497,6 +537,14 @@ pub(crate) fn cmd_enforce(pid: u32, window: Option<u64>, dir: &Path) -> anyhow::
     let cgid = resolve_cgroup_id(pid).unwrap_or(0);
     if cgid == 0 {
         anyhow::bail!("could not resolve a cgroup-v2 id for pid {pid}.");
+    }
+    // Preflight: the BPF-LSM must actually be in the kernel's active LSM stack, or
+    // the gate hook can never run — enforce would be a silent no-op AND the
+    // rehearsal that "passed" was hollow (no would-block event can fire when the
+    // hook is inert). Refuse rather than hand the operator a false sense of
+    // security (the Azure-6.17 finding: stock CONFIG_LSM omits `bpf`).
+    if let Some(reason) = enforce_lsm_block_reason(eg::read_bpf_lsm_active()) {
+        anyhow::bail!("{reason}");
     }
     let live_mode =
         GateMode::from_policy_key(bpftool_lookup_u32(eg::LSM_POLICY_PIN, eg::GATE_MODE_KEY));
@@ -692,6 +740,29 @@ mod tests {
     #[test]
     fn resolve_cgroup_id_none_for_bogus_pid() {
         assert!(resolve_cgroup_id(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn lsm_inactive_status_warning_only_when_active_and_bpf_off() {
+        // armed + bpf inactive -> warn (the Azure-6.17 finding).
+        let w = lsm_inactive_status_warning(GateMode::Enforce, Some(false));
+        assert!(w.as_deref().unwrap().contains("CANNOT enforce"));
+        assert!(w.as_deref().unwrap().contains("lsm=...,bpf"));
+        assert!(lsm_inactive_status_warning(GateMode::Observe, Some(false)).is_some());
+        // bpf active / unreadable / inert mode -> no warning (never cry wolf).
+        assert!(lsm_inactive_status_warning(GateMode::Enforce, Some(true)).is_none());
+        assert!(lsm_inactive_status_warning(GateMode::Enforce, None).is_none());
+        assert!(lsm_inactive_status_warning(GateMode::Inert, Some(false)).is_none());
+    }
+
+    #[test]
+    fn enforce_lsm_block_reason_only_when_bpf_off() {
+        let r = enforce_lsm_block_reason(Some(false));
+        assert!(r.as_deref().unwrap().contains("refusing to enforce"));
+        assert!(r.as_deref().unwrap().contains("lsm=...,bpf"));
+        // active / unreadable -> proceed (None). Unreadable must never block a real arm.
+        assert!(enforce_lsm_block_reason(Some(true)).is_none());
+        assert!(enforce_lsm_block_reason(None).is_none());
     }
 
     #[test]

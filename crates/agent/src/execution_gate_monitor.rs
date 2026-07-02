@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use innerwarden_core::execution_gate::{
-    self, evaluate_divergence, Divergence, GateMode, GateState,
+    self, evaluate_divergence_with_lsm, Divergence, GateMode, GateState,
 };
 use innerwarden_core::incident::Incident;
 use tracing::warn;
@@ -58,7 +58,11 @@ pub(crate) fn process_execution_gate_tick(data_dir: &Path) {
         return;
     }
     let gate = gather_gate_state();
-    handle_gate_state(data_dir, &gate, now, &INCIDENT_LAST_TS);
+    // Read the kernel's active-LSM list so an armed-but-LSM-inactive gate (the
+    // maps say enforce, but `bpf` is not in the active stack so the hook can
+    // never run) is caught, not silently trusted.
+    let bpf_lsm_active = execution_gate::read_bpf_lsm_active();
+    handle_gate_state(data_dir, &gate, bpf_lsm_active, now, &INCIDENT_LAST_TS);
 }
 
 /// Evaluate a gathered [`GateState`] and emit a cooldown-gated self-incident on
@@ -68,10 +72,11 @@ pub(crate) fn process_execution_gate_tick(data_dir: &Path) {
 fn handle_gate_state(
     data_dir: &Path,
     gate: &GateState,
+    bpf_lsm_active: Option<bool>,
     now: i64,
     incident_slot: &AtomicI64,
 ) -> bool {
-    let divergence = evaluate_divergence(gate);
+    let divergence = evaluate_divergence_with_lsm(gate, bpf_lsm_active);
     if !divergence.is_drift() {
         tracing::debug!(
             signed = ?gate.signed_count,
@@ -168,6 +173,23 @@ fn build_divergence_incident(
                  allowed before any allowlist lookup, so the gate is protecting NOTHING while \
                  appearing armed. Resolve the protected agent's cgroup id and write it into \
                  EXEC_GATE_SCOPE, or disarm (set key 4 = 0 / key 3 = 0).",
+                mode.label()
+            ),
+        ),
+        Divergence::ArmedButLsmInactive { mode } => (
+            // The maps say enforce, but the kernel BPF-LSM cannot run, so the gate
+            // denies NOTHING. Critical: the operator believes they are protected
+            // and are not (worse than a visible disarm).
+            Severity::Critical,
+            format!("execution_gate:armed_but_lsm_inactive:{}", mode.label()),
+            "Execution Gate is armed but the kernel BPF-LSM is not active".to_string(),
+            format!(
+                "The kernel Execution Gate is in {} mode, but `bpf` is NOT in the active LSM stack \
+                 (/sys/kernel/security/lsm), so the innerwarden_lsm_exec_gate hook cannot run and \
+                 the gate denies NOTHING while reporting armed — a false sense of security. This is \
+                 the stock Ubuntu/Azure default (CONFIG_LSM omits bpf). Add `lsm=...,bpf` to the \
+                 kernel cmdline (GRUB_CMDLINE_LINUX) and REBOOT, then re-verify the gate blocks an \
+                 unknown exec. Until then treat the agent as UNGATED.",
                 mode.label()
             ),
         ),
@@ -271,6 +293,7 @@ fn reset_throttle_for_test() {
 mod tests {
     use super::*;
     use innerwarden_core::event::Severity;
+    use innerwarden_core::execution_gate::evaluate_divergence;
 
     fn drift_state() -> GateState {
         GateState {
@@ -288,7 +311,7 @@ mod tests {
         // Private slot → parallel-safe (no shared throttle static).
         let slot = AtomicI64::new(0);
         let dir = tempfile::tempdir().unwrap();
-        let wrote = handle_gate_state(dir.path(), &drift_state(), 10_000, &slot);
+        let wrote = handle_gate_state(dir.path(), &drift_state(), None, 10_000, &slot);
         assert!(wrote, "drift must write a self-incident");
         let today = chrono::Local::now()
             .date_naive()
@@ -304,9 +327,15 @@ mod tests {
         let slot = AtomicI64::new(0);
         let dir = tempfile::tempdir().unwrap();
         // First drift emits; an immediate second drift is cooldown-suppressed.
-        assert!(handle_gate_state(dir.path(), &drift_state(), 10_000, &slot));
+        assert!(handle_gate_state(
+            dir.path(),
+            &drift_state(),
+            None,
+            10_000,
+            &slot
+        ));
         assert!(
-            !handle_gate_state(dir.path(), &drift_state(), 10_100, &slot),
+            !handle_gate_state(dir.path(), &drift_state(), None, 10_100, &slot),
             "second drift within the cooldown window must NOT re-emit"
         );
     }
@@ -323,7 +352,56 @@ mod tests {
             live_scope_armed: None,
             live_scope_count: None,
         };
-        assert!(!handle_gate_state(dir.path(), &healthy, 10_000, &slot));
+        assert!(!handle_gate_state(
+            dir.path(),
+            &healthy,
+            None,
+            10_000,
+            &slot
+        ));
+    }
+
+    #[test]
+    fn handle_gate_state_flags_armed_but_lsm_inactive() {
+        // The Azure-6.17 OpenClaw-box finding: maps say enforce + scoped + full
+        // allowlist (map-only verdict = healthy), but bpf is NOT in the active LSM
+        // stack -> the hook can't run -> Critical self-incident so the operator is
+        // told the gate is a no-op instead of silently trusting `mode:armed`.
+        let slot = AtomicI64::new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let armed = GateState {
+            signed_count: Some(3628),
+            intended_mode: Some(GateMode::Enforce),
+            live_count: Some(3628),
+            live_mode: GateMode::Enforce,
+            live_scope_armed: Some(true),
+            live_scope_count: Some(1),
+        };
+        // bpf active / unknown => no incident (map verdict healthy)
+        assert!(!handle_gate_state(
+            dir.path(),
+            &armed,
+            Some(true),
+            10_000,
+            &slot
+        ));
+        assert!(!handle_gate_state(dir.path(), &armed, None, 10_050, &slot));
+        // bpf inactive => Critical incident
+        assert!(handle_gate_state(
+            dir.path(),
+            &armed,
+            Some(false),
+            10_100,
+            &slot
+        ));
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let body =
+            std::fs::read_to_string(dir.path().join(format!("incidents-{today}.jsonl"))).unwrap();
+        assert!(body.contains("armed_but_lsm_inactive"));
+        assert!(body.contains("critical"));
     }
 
     #[test]

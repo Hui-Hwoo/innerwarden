@@ -135,12 +135,62 @@ pub enum Divergence {
     /// nothing is denied). Distinct from `ActiveButEmpty`, which is the allowlist
     /// being empty while the gate WOULD gate.
     ScopeArmedButEmpty { mode: GateMode },
+    /// The gate is ACTIVE (enforce/observe) in the maps, but the kernel's BPF
+    /// LSM is not in the active LSM stack (`bpf` absent from
+    /// `/sys/kernel/security/lsm`), so no `BPF_PROG_TYPE_LSM` hook — including
+    /// `innerwarden_lsm_exec_gate` — can run. The gate denies NOTHING while the
+    /// maps report `armed enforce`: the most dangerous false sense of security,
+    /// because every other signal (mode, allowlist, scope) looks correct. Seen on
+    /// stock Ubuntu/Azure kernels, whose `CONFIG_LSM` omits `bpf` and which were
+    /// not booted with an explicit `lsm=...,bpf` on the kernel cmdline. OUTRANKS
+    /// every other divergence: when the LSM cannot run, no map state matters.
+    ArmedButLsmInactive { mode: GateMode },
 }
 
 impl Divergence {
     pub fn is_drift(&self) -> bool {
         !matches!(self, Divergence::None)
     }
+}
+
+/// The securityfs file that lists the LSMs the running kernel actually has in
+/// its active stack (comma-separated). The BPF LSM can only enforce when `bpf`
+/// appears here — which requires the kernel's `CONFIG_LSM` to include it OR the
+/// box to have been booted with `lsm=...,bpf` on the cmdline. Stock Ubuntu/Azure
+/// kernels omit it from `CONFIG_LSM`, so an operator can `arm enforce`, see
+/// `mode:armed`, and be completely unprotected.
+pub const KERNEL_LSM_PIN: &str = "/sys/kernel/security/lsm";
+
+/// PURE: is `bpf` one of the comma-separated tokens in the kernel LSM list?
+/// Exact-token match (splits on `,`) so a substring like `bpfoobar` never
+/// counts. Trims whitespace/newlines.
+pub fn bpf_in_lsm_list(contents: &str) -> bool {
+    contents.trim().split(',').any(|t| t.trim() == "bpf")
+}
+
+/// Read [`KERNEL_LSM_PIN`] and report whether `bpf` is in the active LSM stack.
+/// `None` when the file cannot be read (non-Linux, no securityfs, or no
+/// privilege) — an unreadable list must NEVER be treated as "inactive" and cry
+/// wolf, exactly like an unreadable map count (privilege-blind reader safety).
+pub fn read_bpf_lsm_active() -> Option<bool> {
+    std::fs::read_to_string(KERNEL_LSM_PIN)
+        .ok()
+        .map(|s| bpf_in_lsm_list(&s))
+}
+
+/// [`evaluate_divergence`] plus the kernel-LSM-active preflight. When the gate
+/// is active in the maps but `bpf` is DEFINITIVELY not in the active LSM stack
+/// (`Some(false)`), the BPF-LSM hook cannot run at all, so the gate is inert in
+/// practice regardless of the maps — this OUTRANKS every map-derived divergence.
+/// `None` (unreadable LSM list) is treated as "cannot tell" and falls through to
+/// the normal map-based verdict (no wolf-crying). Callers that can read the LSM
+/// list (ctl, the agent monitor) should use this; the pure map-only
+/// [`evaluate_divergence`] stays for callers with no LSM visibility.
+pub fn evaluate_divergence_with_lsm(s: &GateState, bpf_lsm_active: Option<bool>) -> Divergence {
+    if s.live_mode.is_active() && bpf_lsm_active == Some(false) {
+        return Divergence::ArmedButLsmInactive { mode: s.live_mode };
+    }
+    evaluate_divergence(s)
 }
 
 /// PURE verdict over a [`GateState`]. Order matters: active-but-empty (active
@@ -684,6 +734,103 @@ mod tests {
         );
         // no value section
         assert_eq!(parse_bpftool_value_u32("Not found"), None);
+    }
+
+    #[test]
+    fn bpf_in_lsm_list_exact_token_only() {
+        // real Azure 6.17 (bpf ABSENT) vs a bpf-enabled stack, plus anti-substring.
+        assert!(!bpf_in_lsm_list(
+            "lockdown,capability,landlock,yama,apparmor,ima,evm"
+        ));
+        assert!(bpf_in_lsm_list(
+            "lockdown,capability,landlock,yama,apparmor,bpf,ima,evm\n"
+        ));
+        assert!(bpf_in_lsm_list("capability,bpf"));
+        assert!(bpf_in_lsm_list(" bpf , yama ")); // whitespace tolerated
+        assert!(!bpf_in_lsm_list("bpfoobar,capability")); // substring must NOT match
+        assert!(!bpf_in_lsm_list("")); // empty
+    }
+
+    #[test]
+    fn armed_but_lsm_inactive_outranks_everything() {
+        // Gate armed enforce, scope+allowlist perfectly healthy, BUT bpf not in the
+        // active LSM stack -> the hook cannot run -> the gate is inert in practice.
+        // This is the real Azure-6.17 OpenClaw-box finding: mode:armed, silently no
+        // enforcement. Must OUTRANK the map-derived verdict.
+        let gate = state_scoped(
+            Some(3628),
+            Some(GateMode::Enforce),
+            Some(3628),
+            GateMode::Enforce,
+            Some(true),
+            Some(1),
+        );
+        // map-only verdict: healthy
+        assert_eq!(evaluate_divergence(&gate), Divergence::None);
+        // with the LSM preflight: inactive -> ArmedButLsmInactive
+        let d = evaluate_divergence_with_lsm(&gate, Some(false));
+        assert_eq!(
+            d,
+            Divergence::ArmedButLsmInactive {
+                mode: GateMode::Enforce
+            }
+        );
+        assert!(d.is_drift());
+    }
+
+    #[test]
+    fn armed_but_lsm_inactive_outranks_scope_armed_but_empty() {
+        // Even a would-be ScopeArmedButEmpty is superseded: if the LSM can't run,
+        // the empty scope is moot.
+        let gate = state_scoped(
+            Some(10),
+            Some(GateMode::Enforce),
+            Some(10),
+            GateMode::Enforce,
+            Some(true),
+            Some(0), // scope empty -> would be ScopeArmedButEmpty on map-only
+        );
+        assert_eq!(
+            evaluate_divergence(&gate),
+            Divergence::ScopeArmedButEmpty {
+                mode: GateMode::Enforce
+            }
+        );
+        assert_eq!(
+            evaluate_divergence_with_lsm(&gate, Some(false)),
+            Divergence::ArmedButLsmInactive {
+                mode: GateMode::Enforce
+            }
+        );
+    }
+
+    #[test]
+    fn lsm_active_or_unreadable_falls_through_to_map_verdict() {
+        // bpf active (Some(true)) or unreadable (None) must NOT cry wolf: the
+        // wrapper delegates to the pure map verdict.
+        let healthy = state_scoped(
+            Some(3628),
+            Some(GateMode::Enforce),
+            Some(3628),
+            GateMode::Enforce,
+            Some(true),
+            Some(1),
+        );
+        assert_eq!(
+            evaluate_divergence_with_lsm(&healthy, Some(true)),
+            Divergence::None
+        );
+        assert_eq!(
+            evaluate_divergence_with_lsm(&healthy, None),
+            Divergence::None
+        );
+        // And an INERT gate on a bpf-less kernel is not flagged (nothing claims
+        // to be enforcing, so there is no false sense of security).
+        let inert = state(Some(0), None, Some(0), GateMode::Inert);
+        assert_eq!(
+            evaluate_divergence_with_lsm(&inert, Some(false)),
+            Divergence::None
+        );
     }
 
     #[test]

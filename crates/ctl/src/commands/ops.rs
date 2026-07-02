@@ -108,8 +108,26 @@ pub(crate) fn looks_like_anthropic_key(key: &str) -> bool {
 /// `innerwarden_core::execution_gate`. `fail` on real drift, `warn` when the
 /// signed config is present but the live map couldn't be read (run as root),
 /// `ok` when live matches intent.
-pub(crate) fn gate_doctor_check(gate: &innerwarden_core::execution_gate::GateState) -> Check {
-    use innerwarden_core::execution_gate::{evaluate_divergence, Divergence};
+/// PURE: the informational doctor note printed above the Execution Gate check
+/// when `bpf` is definitively not in the kernel's active LSM stack. `None` when
+/// bpf is active or the list is unreadable (never cry wolf on an unreadable list).
+pub(crate) fn gate_lsm_inactive_note(bpf_lsm_active: Option<bool>) -> Option<String> {
+    if bpf_lsm_active == Some(false) {
+        Some(
+            "  note: `bpf` is NOT in the active kernel LSM stack (/sys/kernel/security/lsm) — \
+             a BPF-LSM gate cannot enforce here until you add `lsm=...,bpf` to the kernel cmdline and reboot."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+pub(crate) fn gate_doctor_check(
+    gate: &innerwarden_core::execution_gate::GateState,
+    bpf_lsm_active: Option<bool>,
+) -> Check {
+    use innerwarden_core::execution_gate::{evaluate_divergence_with_lsm, Divergence};
     let signed = gate
         .signed_count
         .map(|n| n.to_string())
@@ -118,7 +136,14 @@ pub(crate) fn gate_doctor_check(gate: &innerwarden_core::execution_gate::GateSta
         .live_count
         .map(|n| n.to_string())
         .unwrap_or_else(|| "unreadable".into());
-    match evaluate_divergence(gate) {
+    match evaluate_divergence_with_lsm(gate, bpf_lsm_active) {
+        Divergence::ArmedButLsmInactive { mode } => Check::fail(
+            format!(
+                "Execution Gate is {} but the kernel BPF-LSM is NOT active (`bpf` missing from /sys/kernel/security/lsm) — it denies NOTHING",
+                mode.label()
+            ),
+            "The gate maps say armed but no BPF-LSM hook can run, so the agent is UNGATED. Add `lsm=...,bpf` to the kernel cmdline (GRUB_CMDLINE_LINUX) and reboot, then re-verify the gate blocks an unknown exec.",
+        ),
         Divergence::ActiveButEmpty { mode, .. } => Check::fail(
             format!(
                 "Execution Gate is {} but the live allowlist is EMPTY (signed {signed}, live {live})",
@@ -2363,7 +2388,14 @@ pub(crate) fn cmd_doctor_inner(cli: &Cli, registry: &CapabilityRegistry) -> Resu
             live_scope_armed: bpftool_scope_armed(),
             live_scope_count: bpftool_scope_count(),
         };
-        run_section(vec![gate_doctor_check(&gate)], &mut total_issues);
+        let bpf_lsm_active = innerwarden_core::execution_gate::read_bpf_lsm_active();
+        if let Some(note) = gate_lsm_inactive_note(bpf_lsm_active) {
+            println!("{note}");
+        }
+        run_section(
+            vec![gate_doctor_check(&gate, bpf_lsm_active)],
+            &mut total_issues,
+        );
     }
 
     // ── Telegram ──────────────────────────────────────────
@@ -3457,7 +3489,7 @@ mod tests {
             live_scope_armed: None,
             live_scope_count: None,
         };
-        let check = gate_doctor_check(&gate);
+        let check = gate_doctor_check(&gate, None);
         assert_eq!(check.sev, Sev::Fail);
         assert!(check.label.contains("apply drift"));
         assert!(check.label.contains("1685"));
@@ -3474,7 +3506,7 @@ mod tests {
             live_scope_armed: None,
             live_scope_count: None,
         };
-        let check = gate_doctor_check(&gate);
+        let check = gate_doctor_check(&gate, None);
         assert_eq!(check.sev, Sev::Fail);
         assert!(check.label.contains("EMPTY"));
     }
@@ -3490,7 +3522,7 @@ mod tests {
             live_scope_armed: None,
             live_scope_count: None,
         };
-        let check = gate_doctor_check(&gate);
+        let check = gate_doctor_check(&gate, None);
         assert_eq!(check.sev, Sev::Ok);
         assert!(check.label.contains("consistent"));
     }
@@ -3508,9 +3540,40 @@ mod tests {
             live_scope_armed: Some(true),
             live_scope_count: Some(0),
         };
-        let check = gate_doctor_check(&gate);
+        let check = gate_doctor_check(&gate, None);
         assert_eq!(check.sev, Sev::Fail);
         assert!(check.label.contains("EXEC_GATE_SCOPE is EMPTY"));
+    }
+
+    #[test]
+    fn gate_lsm_inactive_note_only_when_bpf_off() {
+        assert!(gate_lsm_inactive_note(Some(false))
+            .unwrap()
+            .contains("lsm=...,bpf"));
+        // bpf active / unreadable -> no note (never cry wolf on an unreadable list).
+        assert!(gate_lsm_inactive_note(Some(true)).is_none());
+        assert!(gate_lsm_inactive_note(None).is_none());
+    }
+
+    #[test]
+    fn gate_doctor_check_fails_when_armed_but_bpf_lsm_inactive() {
+        use innerwarden_core::execution_gate::{GateMode, GateState};
+        // The Azure-6.17 OpenClaw finding: maps perfectly healthy (enforce, scoped,
+        // full allowlist) but `bpf` not in the active LSM stack -> gate is a no-op.
+        let gate = GateState {
+            signed_count: Some(3628),
+            intended_mode: Some(GateMode::Enforce),
+            live_count: Some(3628),
+            live_mode: GateMode::Enforce,
+            live_scope_armed: Some(true),
+            live_scope_count: Some(1),
+        };
+        // bpf active -> converged/ok; bpf inactive -> fail with remediation.
+        assert_eq!(gate_doctor_check(&gate, Some(true)).sev, Sev::Ok);
+        let check = gate_doctor_check(&gate, Some(false));
+        assert_eq!(check.sev, Sev::Fail);
+        assert!(check.label.contains("BPF-LSM is NOT active"));
+        assert!(check.hint.as_deref().unwrap().contains("lsm=...,bpf"));
     }
 
     #[test]
@@ -3524,7 +3587,7 @@ mod tests {
             live_scope_armed: None,
             live_scope_count: None,
         };
-        let check = gate_doctor_check(&gate);
+        let check = gate_doctor_check(&gate, None);
         assert_eq!(check.sev, Sev::Warn);
         assert!(check.label.contains("not readable"));
     }
