@@ -585,6 +585,7 @@ fn file_open_to_event(
     filename: &str,
     flags: u32,
     host: &str,
+    exe_path: Option<&str>,
 ) -> Event {
     let is_write = flags & 0x3 != 0; // O_WRONLY or O_RDWR
 
@@ -600,6 +601,15 @@ fn file_open_to_event(
     });
     if let Some(cid) = container_id {
         details["container_id"] = serde_json::Value::String(cid.to_string());
+    }
+    // Non-forgeable process identity (the execve-captured exe path, NOT the
+    // forgeable `comm`). data_exfil_ebpf uses it so an attacker who `cp`s a
+    // payload to `/tmp/sshd` (comm=sshd) cannot inherit sshd's blanket
+    // credential-read exemption — a comm-spoofed reader from an untrusted path
+    // is not exempt. Absent when the pid was not seen execve (a daemon that
+    // predates the sensor), in which case the detector falls back to comm.
+    if let Some(exe) = exe_path {
+        details["exe_path"] = serde_json::Value::String(exe.to_string());
     }
 
     let mut tags = vec!["ebpf".to_string(), "file".to_string()];
@@ -2498,6 +2508,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let cident = resolve_container_identity(pid);
                     let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
 
                     let mut ev = file_open_to_event(
                         pid,
@@ -2509,6 +2520,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &filename,
                         flags,
                         &host,
+                        exe_path.as_deref(),
                     );
                     attach_pod_runtime(&mut ev.details, cident.as_ref());
                     Some(ev)
@@ -2532,6 +2544,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let cident = resolve_container_identity(pid);
                     let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
 
                     let mut ev = file_open_to_event(
                         pid,
@@ -2543,6 +2556,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &filename,
                         flags,
                         &host,
+                        exe_path.as_deref(),
                     );
                     attach_pod_runtime(&mut ev.details, cident.as_ref());
                     Some(ev)
@@ -4114,6 +4128,7 @@ mod tests {
             "/etc/hostname",
             0,
             "h",
+            None,
         );
         attach_pod_runtime(&mut ev.details, Some(&id));
         assert_eq!(ev.details["runtime"], "containerd");
@@ -4220,6 +4235,7 @@ mod tests {
             "/etc/shadow",
             0x1, // O_WRONLY
             "test-host",
+            None,
         );
         assert_eq!(event.kind, "file.write_access");
         assert_eq!(event.severity, Severity::High);
@@ -4238,9 +4254,33 @@ mod tests {
             "/etc/passwd",
             0x0, // O_RDONLY
             "test-host",
+            None,
         );
         assert_eq!(event.kind, "file.read_access");
         assert_eq!(event.severity, Severity::Info);
+        // No exe_path passed -> the field is absent (data_exfil then falls back to
+        // the comm exemption).
+        assert!(event.details.get("exe_path").is_none());
+    }
+
+    #[test]
+    fn file_open_event_carries_exe_path_when_present() {
+        // The non-forgeable exe path (from the execve cache) is stamped onto file
+        // read/write events so data_exfil_ebpf can reject a comm-spoofed daemon
+        // reading from an untrusted path (`cp evil /tmp/sshd`).
+        let event = file_open_to_event(
+            100,
+            1000,
+            1,
+            0,
+            None,
+            "sshd",
+            "/home/u/.aws/credentials",
+            0x0,
+            "test-host",
+            Some("/tmp/sshd"),
+        );
+        assert_eq!(event.details["exe_path"], "/tmp/sshd");
     }
 
     #[test]

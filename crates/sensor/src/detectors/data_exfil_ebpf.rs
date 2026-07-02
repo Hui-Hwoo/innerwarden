@@ -229,7 +229,25 @@ impl DataExfilEbpfDetector {
             "polkitd",
         ];
         if PASSWD_READERS.iter().any(|p| ev_comm.starts_with(p)) {
-            return None;
+            // `comm` is attacker-forgeable (prctl/argv0), so `cp evil /tmp/sshd`
+            // would otherwise inherit sshd's blanket credential-read exemption and
+            // exfiltrate `~/.aws/credentials` undetected (found by a live red-team,
+            // 2026-07-02). Only honour the daemon exemption when the NON-forgeable
+            // kernel-captured exe path is OS-trusted (a real daemon under
+            // /usr/sbin etc.). A comm-spoofed reader from an untrusted path (/tmp,
+            // /home, /dev/shm) is NOT exempt and its secret reads fire. exe_path
+            // absent (a daemon whose execve predates the sensor, so it was never
+            // cached) → fall back to the comm exemption to avoid a FP on legitimate
+            // long-running daemons.
+            let comm_spoofed_from_untrusted_path = event
+                .details
+                .get("exe_path")
+                .and_then(|v| v.as_str())
+                .map(|exe| !crate::path_trust::is_trusted_system_path(exe))
+                .unwrap_or(false);
+            if !comm_spoofed_from_untrusted_path {
+                return None;
+            }
         }
 
         // 2026-05-25: backup tools (rclone, restic, borg, …) read
@@ -665,6 +683,26 @@ mod tests {
         }
     }
 
+    // Same as the *_with_comm helpers but stamped with a (non-forgeable)
+    // exe_path — for the comm-rename evasion tests.
+    fn read_event_exe(pid: u32, filename: &str, comm: &str, exe: &str, ts: DateTime<Utc>) -> Event {
+        let mut ev = read_event_with_comm(pid, filename, comm, ts);
+        ev.details["exe_path"] = serde_json::Value::String(exe.to_string());
+        ev
+    }
+    fn connect_event_exe(
+        pid: u32,
+        dst_ip: &str,
+        dst_port: u16,
+        comm: &str,
+        exe: &str,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        let mut ev = connect_event_with_comm(pid, dst_ip, dst_port, comm, ts);
+        ev.details["exe_path"] = serde_json::Value::String(exe.to_string());
+        ev
+    }
+
     #[test]
     fn ssh_reading_passwd_then_connecting_outbound_does_not_alert() {
         // 2026-04-30: Operator hit a Critical FP on `git fetch`
@@ -822,6 +860,89 @@ mod tests {
         assert!(
             inc.is_none(),
             "python3 + /etc/passwd + outbound must stay suppressed (NSS-init pattern)"
+        );
+    }
+
+    #[test]
+    fn comm_spoofed_daemon_from_untrusted_path_still_fires() {
+        // 2026-07-02 comm-rename evasion anchor. `cp evil /tmp/sshd` gives comm=sshd
+        // (in the PASSWD_READERS daemon blanket), but the NON-forgeable exe_path is
+        // /tmp/sshd (untrusted). It must NOT inherit sshd's exemption: reading
+        // ~/.aws/credentials then connecting out fires Critical.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_exe(
+            8200,
+            "/home/u/.aws/credentials",
+            "sshd",
+            "/tmp/sshd",
+            now,
+        ));
+        let inc = det.process(&connect_event_exe(
+            8200,
+            "8.8.8.8",
+            443,
+            "sshd",
+            "/tmp/sshd",
+            now + Duration::milliseconds(3),
+        ));
+        let inc = inc.expect("comm=sshd from /tmp (untrusted exe) reading creds MUST fire");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("credentials"));
+    }
+
+    #[test]
+    fn real_daemon_from_trusted_path_stays_exempt() {
+        // Counterpart: a REAL sshd (exe under /usr/sbin) keeps the blanket
+        // exemption — reading a cred file then connecting out must NOT fire (it
+        // does NSS lookups + serves connections; this is its job, indistinguishable
+        // from exfil at this layer).
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_exe(
+            8201,
+            "/home/u/.aws/credentials",
+            "sshd",
+            "/usr/sbin/sshd",
+            now,
+        ));
+        let inc = det.process(&connect_event_exe(
+            8201,
+            "8.8.8.8",
+            443,
+            "sshd",
+            "/usr/sbin/sshd",
+            now + Duration::milliseconds(3),
+        ));
+        assert!(
+            inc.is_none(),
+            "trusted /usr/sbin/sshd must keep its exemption"
+        );
+    }
+
+    #[test]
+    fn daemon_comm_without_exe_path_falls_back_to_exemption() {
+        // A daemon whose execve predates the sensor has no cached exe_path. We must
+        // fall back to the comm exemption (no exe evidence to prove spoofing) rather
+        // than FP on every long-running daemon. No incident.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8202,
+            "/home/u/.aws/credentials",
+            "sshd",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8202,
+            "8.8.8.8",
+            443,
+            "sshd",
+            now + Duration::milliseconds(3),
+        ));
+        assert!(
+            inc.is_none(),
+            "comm=sshd with no exe_path must fall back to the exemption (no FP)"
         );
     }
 
