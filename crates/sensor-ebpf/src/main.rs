@@ -2025,13 +2025,25 @@ pub fn dispatch_kill(ctx: ProbeContext) -> u32 {
 // the entry pt_regs via the `syscall_arg!` macro (syscall-ABI position) and
 // mirrors the logic of its typed `innerwarden_*` counterpart.
 
-/// Bounded scan for a credential directory ANYWHERE in the path: `/.ssh/`,
-/// `/.aws/`, `/.kube/`, `/.gnupg/`. Catches home/root private keys and cloud/k8s
-/// creds (`/home/u/.ssh/id_rsa`, `/root/.aws/credentials`, `/home/u/.kube/config`)
-/// that an attacker reads via an openat-allowlisted tool (`cat`/`head`). These are
-/// high-value AND low-frequency-legit, so they must bypass the comm allowlist and
-/// the rate-limit like the /etc secrets do. Verifier-safe: one constant-bounded
-/// loop; the 3-byte discriminator only runs at a `/.` boundary.
+/// Bounded scan for a credential dir/file ANYWHERE in the path: `/.ssh/`,
+/// `/.aws/`, `/.kube/`, `/.gnupg/`, `/.env*`, `/.docker/`. Catches home/root
+/// private keys and cloud/k8s creds (`/home/u/.ssh/id_rsa`,
+/// `/root/.aws/credentials`, `/home/u/.kube/config`) plus the `.env`
+/// application-secret file and Docker registry auth — the credentials an AI
+/// coding agent touches most — read via an openat-allowlisted tool (`cat`/`head`)
+/// or an interpreter comm. These are high-value AND low-frequency-legit, so they
+/// must bypass the comm allowlist and the rate-limit like the /etc secrets do.
+///
+/// 2026-07-02 (agent cred-exfil blind spot, found by a live red-team): `.env`
+/// and `.docker/` were absent, so an interpreter comm (python/node/openclaw)
+/// reading `~/project/.env` then connecting out had its READ dropped by the
+/// openat comm-allowlist before the userspace data_exfil detector could see it —
+/// even though the detector's `SENSITIVE_PATHS` lists `.env`. The two layers
+/// disagreed; this aligns the kernel emit set with them.
+///
+/// Verifier-safe: one constant-bounded loop; the 3-byte discriminator only runs
+/// at a `/.` boundary. Matching 3 bytes means `/.env` (and `.env.local`,
+/// `.env.production`, direnv's `.envrc`) and `/.docker/` all count.
 #[inline(always)]
 fn contains_secret_dir(buf: &[u8]) -> bool {
     let mut i = 0usize;
@@ -2044,11 +2056,13 @@ fn contains_secret_dir(buf: &[u8]) -> bool {
             let a = buf[i + 2];
             let b = buf[i + 3];
             let c = buf[i + 4];
-            // /.ssh/  /.aws/  /.kube/  /.gnupg/
+            // /.ssh/  /.aws/  /.kube/  /.gnupg/  /.env*  /.docker/
             if (a == b's' && b == b's' && c == b'h')
                 || (a == b'a' && b == b'w' && c == b's')
                 || (a == b'k' && b == b'u' && c == b'b')
                 || (a == b'g' && b == b'n' && c == b'u')
+                || (a == b'e' && b == b'n' && c == b'v')
+                || (a == b'd' && b == b'o' && c == b'c')
             {
                 return true;
             }

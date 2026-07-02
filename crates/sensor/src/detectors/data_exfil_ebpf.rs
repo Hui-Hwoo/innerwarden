@@ -187,14 +187,23 @@ impl DataExfilEbpfDetector {
             return None;
         }
 
-        // Skip processes that legitimately read /etc/passwd for NSS uid→name
-        // resolution and then make outbound connections (CrowdSec, web servers).
+        // BLANKET-exempt processes: server DAEMONS that read /etc/passwd for
+        // NSS uid→name resolution on every request/session and are always
+        // making outbound calls as part of their job (CrowdSec bouncers, web
+        // servers, MTAs). Their read-then-connect shape cannot be distinguished
+        // from exfil at the kernel layer, so they are allowed for ALL files.
         //
-        // This list is for DAEMONS that read /etc/passwd as part of normal
-        // operation (uid lookup for every request, session setup, etc.) and
-        // are always making outbound calls as part of their job. These
-        // cannot meaningfully be distinguished from the exfil pattern, so
-        // they are always allowed.
+        // 2026-07-02 (agent-runtime blind spot, found by a live red-team):
+        // the interpreter/agent runtimes `python`, `python3`, `node`, `ruby`,
+        // `java`, `php`, `openclaw`, `libuv-worker` used to be in THIS blanket
+        // list. That silently exempted every AI coding agent (which runs as
+        // exactly those comms) from this detector: a compromised python/node/
+        // openclaw agent reading `~/.aws/credentials` / `~/.ssh/id_rsa` / `.env`
+        // and connecting out was dropped here before it was ever tracked — the
+        // exact threat the product exists to catch. They are now handled by the
+        // NARROW `/etc/passwd`-only NSS-init gate below (their only benign
+        // read-then-connect is the getpwuid_r startup read of /etc/passwd), so
+        // their reads of REAL secrets now fire again.
         const PASSWD_READERS: &[&str] = &[
             "http",
             "https",
@@ -218,14 +227,6 @@ impl DataExfilEbpfDetector {
             "systemd",
             "dbus-daemon",
             "polkitd",
-            "node",
-            "python",
-            "python3",
-            "ruby",
-            "java",
-            "php",
-            "openclaw",
-            "libuv-worker",
         ];
         if PASSWD_READERS.iter().any(|p| ev_comm.starts_with(p)) {
             return None;
@@ -396,6 +397,21 @@ impl DataExfilEbpfDetector {
                     "composer",
                     "mvn",
                     "gradle",
+                    // Interpreter / AI-agent runtimes. They also getpwuid_r at
+                    // startup (reads /etc/passwd) then connect to their LLM/API,
+                    // so their /etc/passwd read-then-connect is benign NSS init
+                    // and is suppressed HERE — but, unlike the old blanket gate,
+                    // their reads of REAL secrets (.aws/.ssh/.env) are NOT
+                    // covered by this `== "/etc/passwd"` match and now fire
+                    // (2026-07-02 agent-runtime blind-spot fix).
+                    "python",
+                    "python3",
+                    "node",
+                    "ruby",
+                    "java",
+                    "php",
+                    "openclaw",
+                    "libuv-worker",
                 ];
                 let is_nss_init = read.filename == "/etc/passwd"
                     && NSS_INIT_CLI_TOOLS.iter().any(|p| read.comm.starts_with(p));
@@ -726,6 +742,87 @@ mod tests {
         let inc = inc.expect("ssh reading id_ed25519 MUST still fire");
         assert_eq!(inc.severity, Severity::Critical);
         assert!(inc.title.contains("id_ed25519"));
+    }
+
+    #[test]
+    fn python_agent_reading_aws_credentials_then_connecting_fires_critical() {
+        // 2026-07-02 agent-runtime blind-spot regression anchor.
+        //
+        // `python3` (and `node`, `openclaw`, ...) used to be in the BLANKET
+        // PASSWD_READERS exemption, which `return None`-d for EVERY file
+        // before Phase-1 read tracking. That silently exempted every AI
+        // coding agent (which runs as exactly those comms) from this
+        // detector: a compromised python agent reading ~/.aws/credentials
+        // and connecting out was dropped before it was ever tracked — the
+        // exact threat the product exists to catch. Proven live on test001
+        // (0.15.32): comm=python3 read=~/.aws/credentials + outbound :443
+        // both captured, NO incident. The fix moves those runtimes to the
+        // NARROW /etc/passwd-only NSS-init gate. This test locks the catch.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8100,
+            "/home/test001/.aws/credentials",
+            "python3",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8100,
+            "8.8.8.8",
+            443,
+            "python3",
+            now + Duration::milliseconds(3),
+        ));
+        let inc = inc.expect("python3 reading .aws/credentials MUST fire (agent blind spot)");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains("credentials"));
+    }
+
+    #[test]
+    fn openclaw_agent_reading_dotenv_then_connecting_fires_critical() {
+        // Same class as the python test, for the openclaw runtime and a
+        // `.env` secret. Confirms the fix is not python-specific.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            8101,
+            "/home/test001/project/.env",
+            "openclaw",
+            now,
+        ));
+        let inc = det.process(&connect_event_with_comm(
+            8101,
+            "5.6.7.8",
+            443,
+            "openclaw",
+            now + Duration::milliseconds(3),
+        ));
+        let inc = inc.expect("openclaw reading .env MUST fire (agent blind spot)");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.title.contains(".env"));
+    }
+
+    #[test]
+    fn python_agent_reading_etc_passwd_then_connecting_stays_suppressed() {
+        // Counterpart: the runtimes were moved to the NARROW NSS-init gate,
+        // NOT removed entirely. Their one benign read-then-connect shape is
+        // the getpwuid_r startup read of the literal /etc/passwd before they
+        // dial their LLM/API. That must STILL be suppressed, otherwise every
+        // python/node process start becomes a Critical false positive.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(8102, "/etc/passwd", "python3", now));
+        let inc = det.process(&connect_event_with_comm(
+            8102,
+            "8.8.8.8",
+            443,
+            "python3",
+            now + Duration::milliseconds(3),
+        ));
+        assert!(
+            inc.is_none(),
+            "python3 + /etc/passwd + outbound must stay suppressed (NSS-init pattern)"
+        );
     }
 
     #[test]
