@@ -312,7 +312,27 @@ impl DataExfilEbpfDetector {
                 return None;
             }
 
-            if let Some(read) = self.pending_reads.remove(&pid) {
+            // Correlate the connect to a pending sensitive read: same PID first,
+            // then (split-pid evasion, 2026-07-02) the connecting process's PARENT.
+            // An attacker who reads the secret in a parent and forks a child to do
+            // the outbound connect would otherwise slip the same-PID correlation.
+            // The parent read must itself be a genuinely sensitive file (only those
+            // are in `pending_reads`), so a shell that read `~/.aws/credentials`
+            // then forked a `curl` to send it out is caught — a legitimately
+            // suspicious shape, not a broad heuristic.
+            let ppid = event
+                .details
+                .get("ppid")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .filter(|&pp| pp != 0 && pp != pid);
+            let matched = self
+                .pending_reads
+                .remove(&pid)
+                .map(|r| (pid, r))
+                .or_else(|| ppid.and_then(|pp| self.pending_reads.remove(&pp).map(|r| (pp, r))));
+            if let Some((read_pid, read)) = matched {
+                let split_pid = read_pid != pid;
                 // Same PID read a sensitive file then made outbound connection
                 let dst_ip = event
                     .details
@@ -457,17 +477,24 @@ impl DataExfilEbpfDetector {
                         read.filename
                     ),
                     summary: format!(
-                        "Process {comm} (pid={pid}) read sensitive file {} then made outbound \
+                        "Process {comm} (pid={pid}){} read sensitive file {} then made outbound \
                          connection to {dst_ip}:{dst_port} within {elapsed}s. This pattern \
                          indicates data exfiltration — the file content may have been sent \
                          to the remote host.",
+                        if split_pid {
+                            format!(" (child of the reader pid={read_pid})")
+                        } else {
+                            String::new()
+                        },
                         read.filename
                     ),
                     evidence: serde_json::json!([{
                         "kind": "data_exfil_ebpf",
-                        "detection": "read_then_connect",
+                        "detection": if split_pid { "parent_read_child_connect" } else { "read_then_connect" },
                         "comm": comm,
                         "pid": pid,
+                        "reader_pid": read_pid,
+                        "split_pid": split_pid,
                         "sensitive_file": read.filename,
                         "file_read_ts": read.ts.to_rfc3339(),
                         "connect_ts": now.to_rfc3339(),
@@ -700,6 +727,20 @@ mod tests {
     ) -> Event {
         let mut ev = connect_event_with_comm(pid, dst_ip, dst_port, comm, ts);
         ev.details["exe_path"] = serde_json::Value::String(exe.to_string());
+        ev
+    }
+
+    // A connect event stamped with a parent pid — for the split-pid tests.
+    fn connect_event_ppid(
+        pid: u32,
+        ppid: u32,
+        dst_ip: &str,
+        dst_port: u16,
+        comm: &str,
+        ts: DateTime<Utc>,
+    ) -> Event {
+        let mut ev = connect_event_with_comm(pid, dst_ip, dst_port, comm, ts);
+        ev.details["ppid"] = serde_json::Value::from(ppid);
         ev
     }
 
@@ -943,6 +984,63 @@ mod tests {
         assert!(
             inc.is_none(),
             "comm=sshd with no exe_path must fall back to the exemption (no FP)"
+        );
+    }
+
+    #[test]
+    fn split_pid_parent_read_child_connect_fires() {
+        // 2026-07-02 split-pid evasion anchor. The PARENT (pid 9000) reads
+        // ~/.aws/credentials; a forked CHILD (pid 9001, ppid 9000) does the
+        // outbound connect. The same-PID correlation would miss it; the parent-pid
+        // fallback catches it and marks it split_pid.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            9000,
+            "/home/u/.aws/credentials",
+            "bash",
+            now,
+        ));
+        let inc = det.process(&connect_event_ppid(
+            9001,
+            9000,
+            "8.8.8.8",
+            443,
+            "curl",
+            now + Duration::milliseconds(5),
+        ));
+        let inc = inc.expect("parent-read + child-connect MUST fire (split-pid)");
+        assert_eq!(inc.severity, Severity::Critical);
+        assert!(inc.summary.contains("child of the reader pid=9000"));
+        assert_eq!(inc.evidence[0]["detection"], "parent_read_child_connect");
+        assert_eq!(inc.evidence[0]["split_pid"], true);
+    }
+
+    #[test]
+    fn unrelated_child_connect_does_not_borrow_a_stranger_read() {
+        // The ppid fallback must only match the connecting process's OWN parent. A
+        // child whose parent never read a secret does not fire just because some
+        // unrelated pid has a pending read.
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        det.process(&read_event_with_comm(
+            9100,
+            "/home/u/.aws/credentials",
+            "bash",
+            now,
+        ));
+        // Child 9201's parent is 9200 (NOT the reader 9100) — no correlation.
+        let inc = det.process(&connect_event_ppid(
+            9201,
+            9200,
+            "8.8.8.8",
+            443,
+            "curl",
+            now + Duration::milliseconds(5),
+        ));
+        assert!(
+            inc.is_none(),
+            "a child whose parent did not read must not borrow an unrelated pending read"
         );
     }
 
