@@ -1,14 +1,14 @@
-# Inner Warden
+# InnerWarden
 
 **Local safety layer for AI agents that can use the terminal.**
 
 AI agents are starting to do real work: read files, run commands, install packages, call APIs, and touch servers. That is useful. It is also the moment a chatbot becomes something with operational power.
 
-Inner Warden sits outside the agent, on the host it is using. It screens risky commands and MCP/tool traffic routed through its guard, watches the real Linux activity underneath with eBPF, blocks or flags dangerous behavior, and keeps the decision trail local. No cloud control plane. Open source. Dry-run by default.
+InnerWarden sits outside the agent, on the host it is using. Not a sandbox, not a prompt filter: it screens risky commands and MCP/tool traffic routed through its guard, watches the real Linux activity underneath with eBPF, blocks or flags dangerous behavior, and keeps the decision trail local. Its kernel Execution Gate (an eBPF LSM hook, inert by default) can make unauthorized binaries impossible to run, enforced below anything a hijacked agent can reach. No cloud control plane. Open source. Dry-run by default.
 
 > Your agent reads a pull request, a web page, or a file with hidden instructions.
 > It tries to read secrets, run an unsafe shell command, or connect somewhere it should not.
-> Inner Warden catches the action before the damage leaves the box, then shows you what happened and why.
+> InnerWarden catches the action before the damage leaves the box, then shows you what happened and why.
 
 ```bash
 curl -fsSL https://innerwarden.com/install | sudo bash
@@ -46,7 +46,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 ### How is this different?
 
-Prompt guardrails try to control what an agent says. Inner Warden controls what it actually does.
+Prompt guardrails try to control what an agent says. InnerWarden controls what it actually does.
 
 It lives where the action is: on the machine the agent can affect. Agent-facing checks can review commands and MCP tool calls before they run; host-level sensors still watch what actually executes. If the agent is tricked, the safety layer is not inside the thing being tricked. One binary, one SQLite database, no SIEM bundle, no external IDS, no cloud control plane. Two Rust daemons and a CLI.
 
@@ -66,7 +66,7 @@ Under the hood: 27 eBPF programs loaded (kernel-dependent), 82 detectors, 69 cro
 
 ### Why this exists
 
-I built Inner Warden because agents are going to do real work, and real work needs supervision. The same system that can catch a reverse shell at the kernel level, block an attacker, deploy a honeypot, and alert you on Telegram can also sit underneath an AI agent and ask a simpler question: "is this action safe to let through?"
+I built InnerWarden because agents are going to do real work, and real work needs supervision. The same system that can catch a reverse shell at the kernel level, block an attacker, deploy a honeypot, and alert you on Telegram can also sit underneath an AI agent and ask a simpler question: "is this action safe to let through?"
 
 Apache-2.0. If this project helps make agent automation safer to try, [give it a star](https://github.com/InnerWarden/innerwarden/stargazers) so others can find it.
 
@@ -246,7 +246,7 @@ Everything is local, audited, and reversible.
        The agent keeps working. The dangerous action does not.
 ```
 
-The same host-defense layer still protects the server itself. If someone brute-forces SSH at 2 AM, Inner Warden can detect the attack, block the IP, capture the session, deploy a honeypot, and send you a report before you wake up.
+The same host-defense layer still protects the server itself. If someone brute-forces SSH at 2 AM, InnerWarden can detect the attack, block the IP, capture the session, deploy a honeypot, and send you a report before you wake up.
 
 No human needed when auto-execution is enabled. Otherwise, you approve via Telegram or the dashboard. Full audit trail. Every action reversible.
 
@@ -254,7 +254,7 @@ No human needed when auto-execution is enabled. Otherwise, you approve via Teleg
 
 ## Response skills
 
-When a threat is confirmed, Inner Warden picks the right tool.
+When a threat is confirmed, InnerWarden picks the right tool.
 
 | Skill | What it does |
 |-------|-------------|
@@ -275,7 +275,7 @@ Blocking is **layered**: a single block decision triggers XDP (instant kernel dr
 
 ### Posture-aware alerting (v0.13.1)
 
-Inner Warden snapshots your host's defensive posture every 10 minutes (sshd config, sudoers, services, firewall) and downgrades incident severity for attack vectors the host already neutralised. An `ssh_bruteforce` against a host with `PasswordAuthentication=no` becomes Low instead of High; the operator stops getting paged for things the kernel was always going to refuse anyway. Hard invariant: never demote when the attacker actually established a session, executed a process, or wrote a file. Read the live posture via `innerwarden get posture` or the dashboard panel; ask Telegram with `/posture`.
+InnerWarden snapshots your host's defensive posture every 10 minutes (sshd config, sudoers, services, firewall) and downgrades incident severity for attack vectors the host already neutralised. An `ssh_bruteforce` against a host with `PasswordAuthentication=no` becomes Low instead of High; the operator stops getting paged for things the kernel was always going to refuse anyway. Hard invariant: never demote when the attacker actually established a session, executed a process, or wrote a file. Read the live posture via `innerwarden get posture` or the dashboard panel; ask Telegram with `/posture`.
 
 ### Honeypot that actually traps (v0.13.1)
 
@@ -382,7 +382,7 @@ Two Rust daemons. No external dependencies. Measured production RSS (full stack)
 
 ## AI is optional and controlled
 
-Inner Warden detects and logs threats without any AI provider. Add AI when you want:
+InnerWarden detects and logs threats without any AI provider. Add AI when you want:
 
 - **Confidence-scored recommendations**: not binary yes/no, but 0.0-1.0 scored decisions
 - **Policy-gated execution**: AI recommends, your policy decides if it runs
@@ -406,7 +406,7 @@ Not everything should be automatic.
 
 ## Safe defaults
 
-Inner Warden ships with the safest possible posture. On first run, **nothing is blocked, killed, or modified**. The system only observes and logs.
+InnerWarden ships with the safest possible posture. On first run, **nothing is blocked, killed, or modified**. The system only observes and logs.
 
 | Default | Meaning |
 |---------|---------|
@@ -421,7 +421,7 @@ You must explicitly change **two settings** before any response action can fire:
 
 ## Start in observe mode. Always.
 
-Before enabling automatic responses, run Inner Warden in observe-only mode for a period that makes sense for your environment (days to weeks). During this time:
+Before enabling automatic responses, run InnerWarden in observe-only mode for a period that makes sense for your environment (days to weeks). During this time:
 
 1. **Review the logs**: check the dashboard or query `innerwarden.db` in your data directory to understand what the detectors are flagging.
 2. **Check for false positives**: make sure legitimate traffic (CI/CD systems, monitoring probes, your own scripts) is not being misidentified.
@@ -481,11 +481,11 @@ innerwarden module search <term>     # search the registry
 
 ## Protecting AI agents
 
-If you run an AI agent with access to a shell, files, API keys, MCP tools, or production-like infrastructure, Inner Warden gives it a supervisor outside the prompt.
+If you run an AI agent with access to a shell, files, API keys, MCP tools, or production-like infrastructure, InnerWarden gives it a supervisor outside the prompt.
 
 There are three protection surfaces:
 
-- **Advisor API** for agents or tools you can modify: ask Inner Warden before running a command or connecting to an IP.
+- **Advisor API** for agents or tools you can modify: ask InnerWarden before running a command or connecting to an IP.
 - **MCP inspecting proxy** for tool servers: screen `tools/call` arguments, tool descriptions, and tool results inline.
 - **Host-level verification** for connected agents: eBPF/audit signals show what actually executed even if the agent ignored advice.
 
@@ -499,7 +499,7 @@ This enables command monitoring and agent safety checks for supported local agen
 
 ### Let your agent ask before acting
 
-Inner Warden exposes an API that AI agents can query:
+InnerWarden exposes an API that AI agents can query:
 
 ```bash
 # "Is my server safe right now?"
@@ -579,7 +579,7 @@ Checks SSH config, firewall, kernel params (ASLR, SYN cookies, IP forwarding), f
 
 ## Live threat feed
 
-See Inner Warden responding to live network anomalies on our lab infrastructure in real time: [innerwarden.com/live](https://innerwarden.com/live)
+See InnerWarden responding to live network anomalies on our lab infrastructure in real time: [innerwarden.com/live](https://innerwarden.com/live)
 
 The agent exposes public read-only endpoints for live monitoring:
 
@@ -826,10 +826,10 @@ No. Starts in observe-only mode. You enable response skills and disable dry-run 
 No. Detection, logging, dashboard, and reports all work without AI. AI adds confidence-scored triage for autonomous response and is entirely optional.
 
 **How is this different from Fail2ban?**
-Fail2ban blocks IPs based on regex patterns. Inner Warden has 82 detectors, 27 eBPF kernel programs (kernel-dependent) with kill chain detection, a collaborative defence mesh network, 10 response skills (including sudo suspension, process kill, container pause, honeypots, and traffic capture), twelve AI providers, 4-layer DDoS defence, Telegram bot, AbuseIPDB intelligence sharing, and a full investigation dashboard with MITRE ATT&CK mapping.
+Fail2ban blocks IPs based on regex patterns. InnerWarden has 82 detectors, 27 eBPF kernel programs (kernel-dependent) with kill chain detection, a collaborative defence mesh network, 10 response skills (including sudo suspension, process kill, container pause, honeypots, and traffic capture), twelve AI providers, 4-layer DDoS defence, Telegram bot, AbuseIPDB intelligence sharing, and a full investigation dashboard with MITRE ATT&CK mapping.
 
 **How is this different from other HIDS tools?**
-Most host intrusion detection systems only observe. They write alerts for a human to act on. Inner Warden observes AND blocks. LSM hooks stop reverse shells at the kernel's execve before the process runs. XDP drops attack traffic at wire speed. Kill chain detection blocks 7 generic exploit patterns without CVE signatures, catching zero-day exploits by behaviour rather than known hashes.
+Most host intrusion detection systems only observe. They write alerts for a human to act on. InnerWarden observes AND blocks. LSM hooks stop reverse shells at the kernel's execve before the process runs. XDP drops attack traffic at wire speed. Kill chain detection blocks 7 generic exploit patterns without CVE signatures, catching zero-day exploits by behaviour rather than known hashes.
 
 **Can I add custom detectors or skills?**
 Yes. See [module authoring guide](https://github.com/InnerWarden/innerwarden/wiki/Module-Authoring).
@@ -839,9 +839,9 @@ Yes. See [module authoring guide](https://github.com/InnerWarden/innerwarden/wik
 ## Disclaimer
 
 > **Warning**
-> Inner Warden is an **experimental** security agent that can **block IP addresses, kill processes, suspend user privileges, pause containers, and modify firewall rules** on your system. These are powerful, potentially disruptive actions. Read this document carefully before deploying. Always start in observe-only mode and review behavior before enabling automatic responses.
+> InnerWarden is an **experimental** security agent that can **block IP addresses, kill processes, suspend user privileges, pause containers, and modify firewall rules** on your system. These are powerful, potentially disruptive actions. Read this document carefully before deploying. Always start in observe-only mode and review behavior before enabling automatic responses.
 
-Inner Warden is provided as-is, without warranty. It is experimental software that interacts with your system's firewall, process table, and user permissions. Automated security responses carry inherent risk. A false positive can block a legitimate user or disrupt a production service.
+InnerWarden is provided as-is, without warranty. It is experimental software that interacts with your system's firewall, process table, and user permissions. Automated security responses carry inherent risk. A false positive can block a legitimate user or disrupt a production service.
 
 **You are responsible for:**
 - Testing thoroughly in observe/dry-run mode before enabling responses
@@ -871,7 +871,7 @@ Tell us: what did you install it on (distro / kernel)? Did it catch anything rea
 
 We need more hands. Detector writers, integration authors, docs hackers, testers — every contribution moves the project forward.
 
-- [**Contributing guide**](CONTRIBUTING.md) — local dev setup, PR checklist, code style
+- [**Contributing guide**](CONTRIBUTING.md) — local dev setup, PR checklist, code style. Commits need a [DCO](DCO) sign-off (`git commit -s`); no CLA.
 - [**Good first issues**](https://github.com/InnerWarden/innerwarden/labels/good%20first%20issue) — documentation, config flags, small features
 - [**Help wanted**](https://github.com/InnerWarden/innerwarden/labels/help%20wanted) — new detectors, sinks, integrations, CLI commands
 - [**Module authoring**](https://github.com/InnerWarden/innerwarden/wiki/Module-Authoring) — write a vertical security module (manifest + config + docs + tests)
