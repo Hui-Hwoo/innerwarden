@@ -216,6 +216,29 @@ enum Command {
         command: AuditCommand,
     },
 
+    /// Internal: privileged helper for the `suspend-user-sudo` response. Invoked
+    /// only via a narrow sudoers grant; generates + installs a deny-all sudoers
+    /// drop-in for a user (no arbitrary-content primitive). Not for direct use.
+    #[clap(name = "__sudo-suspend", hide = true)]
+    SudoSuspend {
+        /// Username to suspend sudo for (validated; `root` refused).
+        #[arg(long)]
+        user: String,
+        /// Informational expiry recorded in the drop-in (RFC 3339). sudo does
+        /// not enforce it; the agent's cleanup loop removes the file.
+        #[arg(long)]
+        expires: String,
+    },
+
+    /// Internal: privileged helper that removes a `suspend-user-sudo` deny
+    /// drop-in for a user. Invoked only via the narrow sudoers grant.
+    #[clap(name = "__sudo-restore", hide = true)]
+    SudoRestore {
+        /// Username to restore sudo for (validated; `root` refused).
+        #[arg(long)]
+        user: String,
+    },
+
     /// SOC playbook tools (spec 056).
     ///
     /// Examples:
@@ -2948,6 +2971,11 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 *json,
             ),
         },
+        Command::SudoSuspend {
+            ref user,
+            ref expires,
+        } => commands::sudo_guard::cmd_sudo_suspend(user, expires),
+        Command::SudoRestore { ref user } => commands::sudo_guard::cmd_sudo_restore(user),
         Command::Rule { ref command } => match command {
             RuleCommand::List { ref r#type } => {
                 commands::rule::cmd_rule_list_all(&cli.sensor_config, r#type.as_deref())

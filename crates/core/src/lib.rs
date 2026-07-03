@@ -5,3 +5,4 @@ pub mod execution_gate;
 pub mod incident;
 pub mod policy;
 pub mod signal;
+pub mod sudo_guard;
