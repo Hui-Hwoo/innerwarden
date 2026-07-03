@@ -199,6 +199,23 @@ enum Command {
         command: ExecGateCommand,
     },
 
+    /// Decision-log external-anchor integrity audit.
+    ///
+    /// The hash chain proves the log is internally consistent, but cannot detect
+    /// the whole log being deleted or rolled back and re-grown from a fresh root.
+    /// `anchor` prints a compact commitment to the log's tip that you store
+    /// OUTSIDE this host; `verify` later proves the log still contains that exact
+    /// committed history (Intact / Truncated / Rewritten). The paid tier signs
+    /// the anchor (Ed25519) via `innerwarden-config-sign audit`.
+    ///
+    /// Examples:
+    ///   innerwarden audit anchor --json > anchor.json
+    ///   innerwarden audit verify --file anchor.json
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+
     /// SOC playbook tools (spec 056).
     ///
     /// Examples:
@@ -1255,6 +1272,36 @@ enum ExecGateCommand {
     },
     /// Disarm: return the gate to inert. Always safe, no preconditions.
     Disarm,
+}
+
+#[derive(Subcommand)]
+enum AuditCommand {
+    /// Compute and print a publishable anchor over the decision log's tip.
+    ///
+    /// Record the output OUTSIDE this host (a second box, a ticket, a
+    /// transparency log). Human-readable by default; `--json` emits a single
+    /// line that round-trips into `audit verify --anchor`. Prints nothing to
+    /// anchor when the log is empty.
+    Anchor {
+        /// Emit the anchor as a single-line JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify the live decision log against a previously-published anchor.
+    ///
+    /// Exit code is non-zero on tamper (Truncated / Rewritten), so this can gate
+    /// CI or a monitoring probe. Provide the anchor via `--file` or `--anchor`.
+    Verify {
+        /// Path to a JSON anchor file (as written by `audit anchor --json`).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// The anchor as an inline JSON string (alternative to `--file`).
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Emit the verdict as JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2884,6 +2931,22 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 &resolve_data_dir(&cli, &cli.data_dir),
             ),
             ExecGateCommand::Disarm => commands::exec_gate::cmd_disarm(),
+        },
+        Command::Audit { ref command } => match command {
+            AuditCommand::Anchor { json } => {
+                commands::audit::cmd_audit_anchor(&cli.agent_config, &cli.data_dir, *json)
+            }
+            AuditCommand::Verify {
+                ref file,
+                ref anchor,
+                json,
+            } => commands::audit::cmd_audit_verify(
+                &cli.agent_config,
+                &cli.data_dir,
+                file.as_deref(),
+                anchor.as_deref(),
+                *json,
+            ),
         },
         Command::Rule { ref command } => match command {
             RuleCommand::List { ref r#type } => {
