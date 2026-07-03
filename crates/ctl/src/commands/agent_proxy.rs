@@ -161,7 +161,7 @@ mod tests {
             ParsedLine::Message(e) => e,
             _ => panic!("message"),
         };
-        let d = route_message(&env, Direction::ClientToServer, None, None);
+        let d = route_message(&env, Direction::ClientToServer, None, None, None);
         let line = format_alert("mylabel", &d);
         assert!(line.contains("label=mylabel"));
         assert!(line.contains("client->server"));

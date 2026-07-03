@@ -24,7 +24,7 @@ pub struct VerdictAlert {
 }
 
 impl VerdictAlert {
-    fn builtin(rule: &str, detail: String, block: bool) -> Self {
+    pub(crate) fn builtin(rule: &str, detail: String, block: bool) -> Self {
         Self {
             rule: rule.into(),
             detail,
