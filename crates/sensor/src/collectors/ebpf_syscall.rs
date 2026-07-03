@@ -820,6 +820,14 @@ const EXEC_ALLOWLIST_PIN: &str = "/sys/fs/bpf/innerwarden/exec_allowlist";
 /// never fires (fail-open), so a wipe is safe, not a brick.
 const EXEC_GATE_SCOPE_PIN: &str = "/sys/fs/bpf/innerwarden/exec_gate_scope";
 
+/// Pin path for the Execution Gate trusted DIRECTORY-PREFIX map
+/// (FNV(dir-prefix-with-trailing-slash) -> 1). Populated by the paid
+/// `config-sign exec-gate` tooling with OS-maintenance dir prefixes so host-wide
+/// enforce does not deny per-kernel dpkg/initramfs maintainer scripts (the
+/// "managed installer" trust). Consulted by the gate after the exact-hash
+/// allowlist miss; empty + armed = no prefix trusted = unchanged behaviour.
+const EXEC_TRUSTED_PREFIX_PIN: &str = "/sys/fs/bpf/innerwarden/exec_trusted_prefix";
+
 /// Attach LSM execution policy and pin the policy map.
 /// Requires `lsm=...,bpf` in kernel boot cmdline.
 /// Non-critical - if LSM is not available, the sensor continues without it.
@@ -1169,6 +1177,11 @@ fn pin_lsm_policy(bpf: &mut aya::Ebpf) {
     // Preserve across restart like the allowlist so the agent stays scoped; a
     // wipe is fail-open (empty scope = gate never fires) so it is not a brick.
     repin_preserving::<u64, u8>(bpf, "EXEC_GATE_SCOPE", EXEC_GATE_SCOPE_PIN);
+
+    // Execution Gate trusted DIRECTORY-PREFIX map (managed-installer trust for
+    // host-wide enforce). Preserve across restart like the allowlist; empty +
+    // armed = no prefix trusted = fail-open, so a wipe is safe.
+    repin_preserving::<u64, u8>(bpf, "EXEC_TRUSTED_PREFIX", EXEC_TRUSTED_PREFIX_PIN);
 
     // Capability + blocked-pid maps. These have the same restart-wipe behaviour
     // (TODO spec 080 P0 follow-up: BLOCKED_PIDS is an LRU map + the capability

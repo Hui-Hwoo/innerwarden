@@ -576,6 +576,25 @@ static LSM_POLICY: HashMap<u32, u32> = HashMap::with_max_entries(16, 0);
 #[map]
 static EXEC_ALLOWLIST: HashMap<u64, u8> = HashMap::with_max_entries(20_000, 0);
 
+/// Execution Gate trusted DIRECTORY-PREFIX allowlist (Active Defence / paid).
+/// Key = FNV-1a hash of a directory path prefix INCLUDING its trailing `/`
+/// (e.g. `FNV("/var/lib/dpkg/info/")`, `FNV("/etc/cron.daily/")`). An exec whose
+/// path lies under ANY trusted prefix is allowed even when its exact path-hash
+/// is absent from `EXEC_ALLOWLIST`.
+///
+/// This is the "managed installer" trust for host-wide enforce: OS-maintenance
+/// scripts (dpkg maintainer scripts, initramfs, cron.daily, grub.d, kernel
+/// hooks) live in root-only-writable dirs whose per-file path changes every
+/// kernel/package version (`linux-image-<ver>.postinst`) but whose parent dir is
+/// stable. Exact-hash seeding therefore self-DoSes the next `apt`/kernel update;
+/// a stable directory prefix does not. A non-root / hijacked-agent attacker (the
+/// gate's threat model — root can disarm the gate) cannot drop a file in these
+/// dirs, so prefix trust adds no bypass. Populated + pinned by the userspace
+/// loader; empty by default (no prefix trusted) so behaviour is unchanged until
+/// the paid loader seeds it.
+#[map]
+static EXEC_TRUSTED_PREFIX: HashMap<u64, u8> = HashMap::with_max_entries(64, 0);
+
 /// Per-CPU scratch for reading the exec path OFF the stack. `innerwarden_lsm_exec`
 /// is already near the 512-byte BPF stack limit; a 256-byte path buffer on its
 /// stack overflows the verifier/LLVM limit (caught on the test001 x86_64 build).
@@ -746,6 +765,53 @@ fn fnv1a_path(buf: &[u8]) -> u64 {
     h
 }
 
+/// Number of leading directory levels the prefix-trust check considers. Trusted
+/// maintenance dirs are shallow (`/var/lib/dpkg/info/` = 4, `/usr/share/
+/// initramfs-tools/` = 3), so 8 covers every real prefix. This bounds the map
+/// lookups to a small CONSTANT — a lookup inside the byte-scan loop instead blew
+/// the eBPF verifier's 1M-instruction budget (256 iters × a branching lookup).
+/// Gate decision for the exec at `buf`: exact path-hash on `EXEC_ALLOWLIST`, OR
+/// its PARENT DIRECTORY on `EXEC_TRUSTED_PREFIX` (managed-installer trust).
+///
+/// Verifier budget is the hard constraint here: the exact-allowlist FNV already
+/// loops the full 256-byte path and nearly fills the 1M-instruction limit, so a
+/// SEPARATE prefix scan, a per-iteration array write, OR a map lookup inside any
+/// loop all blow it (measured: each → `processed 1000001 insns`). So this does
+/// the cheapest possible thing: the SAME single FNV loop also remembers the
+/// running hash at the last `/` — which is `FNV(parent-dir-including-slash)`,
+/// exactly the key the loader stores (`FNV("/var/lib/dpkg/info/")`) — as one
+/// extra scalar, no lookup/array in the loop. Then just TWO lookups OUTSIDE the
+/// loop. Immediate-parent only (not every ancestor), so the loader seeds each
+/// concrete maintenance dir incl. nested ones (`/usr/share/initramfs-tools/
+/// scripts/local-top/`). Empty prefix map (default) → exact-allowlist-only →
+/// unchanged behaviour. Same FNV constants + trailing-slash convention as the
+/// loader, so keys agree.
+#[inline(always)]
+fn exec_gate_allowed(buf: &[u8]) -> bool {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    let mut parent: u64 = 0; // running hash at the last '/' = FNV(parent dir)
+    let mut i = 0usize;
+    while i < 256 && i < buf.len() {
+        let b = buf[i];
+        if b == 0 {
+            break;
+        }
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        if b == b'/' {
+            parent = h;
+        }
+        i += 1;
+    }
+    if unsafe { EXEC_ALLOWLIST.get(&h) }.is_some() {
+        return true; // exact path-hash on the allowlist
+    }
+    if parent != 0 && unsafe { EXEC_TRUSTED_PREFIX.get(&parent) }.is_some() {
+        return true; // parent dir is a trusted maintenance dir
+    }
+    false
+}
+
 // LSM hook entry point. Marked `sleepable` so the program lands in
 // the `lsm.s/` ELF section instead of `lsm/`. On kernel ≥ 6.4 the
 // verifier tightens the BTF FUNC arg0 check for `lsm/` programs: it
@@ -834,9 +900,11 @@ fn try_exec_gate(ctx: &LsmContext) -> Result<i32, i64> {
         Ok(p) => p,
         Err(_) => return Ok(0),
     };
-    let phash = fnv1a_path(path);
-    if unsafe { EXEC_ALLOWLIST.get(&phash) }.is_some() {
-        return Ok(0); // path-hash on the allowlist → allow
+    // Exact path-hash on the allowlist, OR the parent dir is a trusted
+    // maintenance dir (managed-installer trust for OS dirs whose per-file paths
+    // change every kernel/package version). One FNV pass computes both keys.
+    if exec_gate_allowed(path) {
+        return Ok(0);
     }
 
     // Unknown binary under an armed gate — emit a block event carrying the REAL
