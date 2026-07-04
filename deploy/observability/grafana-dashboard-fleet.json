@@ -7,8 +7,17 @@
       "type": "datasource",
       "pluginId": "prometheus",
       "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_LOKI",
+      "label": "Loki",
+      "description": "Loki datasource holding the InnerWarden incident / agent-guard / decision logs (shipped by Alloy). Optional — the incident-investigation panels use it; the metric panels do not.",
+      "type": "datasource",
+      "pluginId": "loki",
+      "pluginName": "Loki"
     }
   ],
+  "uid": "iw-fleet",
   "title": "InnerWarden — AI Agent Fleet",
   "description": "Fleet-wide visibility across every host running an InnerWarden agent: per-tenant AI-agent activity and host-level detection in one place. Each scrape target is one node; the `instance` label is the host and `tenant` is the attributed agent/employee/pod.",
   "tags": ["innerwarden", "ai-agents", "fleet", "security"],
@@ -242,6 +251,29 @@
       "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
       "targets": [{ "expr": "sort_desc(sum by (tenant) (label_replace(litellm_spend_metric, \"tenant\", \"$1\", \"team\", \"(.*)\")))", "format": "table", "instant": true, "refId": "A" }],
       "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "tenant": "Tenant / agent", "Value": "Spend (USD)" } } }]
+    },
+    {
+      "type": "row",
+      "title": "Incident investigation (what actually happened — needs Loki, see README)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 }
+    },
+    {
+      "type": "logs",
+      "title": "Command review journal — every command each agent tried",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 50 },
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "description": "The verbatim commands each AI agent ran through the guard, with the verdict and the ATR rules that fired. This is the 'what did they try, and what got blocked' investigation view. Filter to one tenant with the $tenant variable. Secrets are redacted in transit.",
+      "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true, "enableLogDetails": true, "dedupStrategy": "none" },
+      "targets": [{ "expr": "{kind=\"guard\", job=\"innerwarden\"} | json | line_format \"[{{.recommendation}}] risk={{.risk_score}}  {{.command}}  «{{.atr_rule_ids}}»\"", "refId": "A" }]
+    },
+    {
+      "type": "logs",
+      "title": "Live incident feed",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 60 },
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "description": "Every incident InnerWarden raised across the fleet, newest first: severity, title, and the tags (including the tenant tag for agent-attributed incidents). Click a line to expand the full record for hand-off / evidence.",
+      "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true, "enableLogDetails": true, "dedupStrategy": "none" },
+      "targets": [{ "expr": "{kind=\"incident\", job=\"innerwarden\"} | json | line_format \"[{{.severity}}] {{.title}}  «{{.tags}}»\"", "refId": "A" }]
     }
   ]
 }

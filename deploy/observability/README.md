@@ -54,6 +54,41 @@ kubectl apply -f servicemonitor.yaml   # requires Prometheus Operator / kube-pro
 dashboard's tenant panels then break down activity per Claude Code pod /
 employee automatically as the fleet scales.
 
+## Incident investigation (Loki — "what actually happened")
+
+Metrics tell you *how much* and *trending*; a security team also needs *what
+happened, who, which command, why* — per incident, drill-down. That is the wrong
+shape for Prometheus (it aggregates). The incident layer adds **Loki** (event
+store) + **Alloy** (log shipper): one Alloy per node tails the InnerWarden
+agent's JSONL — `incidents-*.jsonl`, `agent-guard-events-*.jsonl`,
+`decisions-*.jsonl` — and ships them to Loki. Grafana then queries Loki with
+LogQL for the investigation panels:
+
+- **Command review journal** — the verbatim command each agent ran through the
+  guard, the verdict (allow/review/deny), and the ATR rules that fired. The
+  "what did they try, and what got blocked" view.
+- **Live incident feed** — every incident across the fleet, newest first,
+  severity + title + tags; click a line to expand the full record for evidence.
+
+Labels are kept low-cardinality (`kind`, `host`, `job`); the high-cardinality
+fields (tenant, command text, ATR ids) stay in the log line and are parsed on
+read by LogQL — the correct Loki pattern. Alloy runs a secret-redaction pass
+before shipping (tokens, private keys, `password=`), and Loki retention
+defaults to 14 days (configurable in `loki-config.yaml` — the customer owns it).
+
+```bash
+# Loki (single binary) + Alloy (shipper). Both are standard, customer-run,
+# deployed alongside Prometheus/Grafana (not inside the agent).
+./loki -config.file=loki-config.yaml &
+sudo ./alloy run config.alloy --storage.path=./alloy-data &   # root: reads /var/lib/innerwarden (0750)
+# In Grafana: add a Loki datasource → http://localhost:3100, then the
+# "Incident investigation" panels light up (the dashboard already includes them).
+```
+
+`config.alloy` tails the default `/var/lib/innerwarden/*.jsonl` paths; adjust if
+your data dir differs. On Kubernetes, run Alloy as a DaemonSet with a hostPath
+mount of the agent data dir (same low-cardinality labels).
+
 ## Cost & tokens per agent (optional)
 
 InnerWarden is a **security** layer — it screens what an agent runs, it does
