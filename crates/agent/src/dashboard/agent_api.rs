@@ -521,6 +521,10 @@ pub(super) fn run_analysis(
                 .map(|m| m.rule_id.clone())
                 .collect(),
             explanation: analysis.explanation.clone(),
+            tenant: tenant
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
         };
         // Spec 037 I-13 follow-up #5: surface drop counts via
         // `innerwarden_agent_alert_drops_total{reason="full"|"closed"}`
@@ -2972,6 +2976,7 @@ enabled = false
             signals: Vec::new(),
             atr_rule_ids: Vec::new(),
             explanation: "test".to_string(),
+            tenant: None,
         }
     }
 

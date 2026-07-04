@@ -476,6 +476,7 @@ mod tests {
             signals: vec!["shell".to_string(), "credential".to_string()],
             atr_rule_ids: vec!["ATR-7".to_string()],
             explanation: "dangerous".to_string(),
+            tenant: None,
         }
     }
 

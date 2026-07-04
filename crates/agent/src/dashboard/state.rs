@@ -294,6 +294,12 @@ pub struct AgentGuardAlert {
     pub signals: Vec<String>,
     pub atr_rule_ids: Vec<String>,
     pub explanation: String,
+    /// The tenant the calling agent's container belongs to (spec 084), so a
+    /// multi-tenant fleet can attribute + investigate each guard check per
+    /// tenant in the incident layer (agent-guard-events JSONL → Loki). Omitted
+    /// from the JSON when absent so existing single-tenant logs are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 // ── Session ─────────────────────────────────────────────────────────────

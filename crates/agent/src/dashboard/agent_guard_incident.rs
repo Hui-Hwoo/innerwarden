@@ -154,7 +154,20 @@ mod tests {
             signals: vec!["atr:privilege-escalation".to_string()],
             atr_rule_ids: vec!["ATR-2026-064".to_string()],
             explanation: "[ATR-2026-064] ATR-2026-064 match".to_string(),
+            tenant: None,
         }
+    }
+
+    #[test]
+    fn alert_serializes_tenant_only_when_present() {
+        // absent tenant → field omitted (single-tenant logs unchanged).
+        let json = serde_json::to_string(&deny_alert()).unwrap();
+        assert!(!json.contains("tenant"), "tenant must be omitted when None");
+        // present tenant → in the JSONL for per-tenant incident investigation.
+        let mut a = deny_alert();
+        a.tenant = Some("globex-inc".to_string());
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("\"tenant\":\"globex-inc\""));
     }
 
     #[test]

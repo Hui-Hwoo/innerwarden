@@ -2815,6 +2815,7 @@ mod tests {
             signals: vec!["dangerous_command".to_string()],
             atr_rule_ids: vec!["ATR-001".to_string()],
             explanation: "dangerous operation".to_string(),
+            tenant: None,
         };
         client.send_agent_guard_alert(&guard_alert).await?;
 
@@ -3205,6 +3206,7 @@ mod tests {
             signals: vec![],
             atr_rule_ids: vec![],
             explanation: "needs operator review".to_string(),
+            tenant: None,
         };
         client.send_agent_guard_alert(&medium_review_alert).await?;
         let low_monitor_alert = crate::dashboard::AgentGuardAlert {
@@ -3217,6 +3219,7 @@ mod tests {
             signals: vec!["odd_file_access".to_string()],
             atr_rule_ids: vec![],
             explanation: "watching low-risk behavior".to_string(),
+            tenant: None,
         };
         client.send_agent_guard_alert(&low_monitor_alert).await?;
 
