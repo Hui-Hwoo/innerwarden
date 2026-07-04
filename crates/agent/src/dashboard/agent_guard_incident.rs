@@ -99,8 +99,20 @@ pub(crate) fn alert_to_incident(alert: &AgentGuardAlert, host: &str) -> Incident
     // Tags: always mark the source; carry signals + ATR ids so the case is
     // filterable; a denied action is already contained (the guard refused it),
     // so tag it as such — the operator does not need to act.
-    let mut tags = Vec::with_capacity(2 + alert.signals.len() + alert.atr_rule_ids.len());
+    let mut tags = Vec::with_capacity(3 + alert.signals.len() + alert.atr_rule_ids.len());
     tags.push("agent_guard".to_string());
+    // Spec 084: carry the tenant as a `tenant:<id>` tag (the same shape the
+    // fleet dashboard / SQLite->Loki bridge read) so a blocked/flagged AI-agent
+    // action is attributed to the right agent/employee/pod in the per-tenant
+    // command review, not just in the /metrics counter. Omitted when absent.
+    if let Some(t) = alert
+        .tenant
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        tags.push(format!("tenant:{t}"));
+    }
     for s in &alert.signals {
         tags.push(s.clone());
     }
@@ -114,6 +126,7 @@ pub(crate) fn alert_to_incident(alert: &AgentGuardAlert, host: &str) -> Incident
     let evidence = serde_json::json!({
         "source": "agent_guard",
         "agent_name": agent_name,
+        "tenant": alert.tenant,
         "command": alert.command,
         "risk_score": alert.risk_score,
         "recommendation": alert.recommendation,
@@ -168,6 +181,23 @@ mod tests {
         a.tenant = Some("globex-inc".to_string());
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains("\"tenant\":\"globex-inc\""));
+    }
+
+    #[test]
+    fn tenant_becomes_a_tag_and_evidence_field() {
+        // no tenant → no tenant tag, evidence tenant is null.
+        let inc = alert_to_incident(&deny_alert(), "h");
+        assert!(!inc.tags.iter().any(|t| t.starts_with("tenant:")));
+        assert!(inc.evidence["tenant"].is_null());
+        // tenant present → `tenant:<id>` tag (spec-084 shape) + evidence field.
+        let mut a = deny_alert();
+        a.tenant = Some("globex-inc".to_string());
+        let inc = alert_to_incident(&a, "h");
+        assert!(inc.tags.contains(&"tenant:globex-inc".to_string()));
+        assert_eq!(inc.evidence["tenant"], "globex-inc");
+        // still tagged agent_guard + contained (deny).
+        assert!(inc.tags.contains(&"agent_guard".to_string()));
+        assert!(inc.tags.contains(&"contained".to_string()));
     }
 
     #[test]

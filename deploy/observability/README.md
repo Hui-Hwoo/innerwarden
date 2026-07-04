@@ -89,6 +89,28 @@ sudo ./alloy run config.alloy --storage.path=./alloy-data &   # root: reads /var
 your data dir differs. On Kubernetes, run Alloy as a DaemonSet with a hostPath
 mount of the agent data dir (same low-cardinality labels).
 
+### If incidents live in SQLite (current default): use the bridge
+
+Current InnerWarden binaries persist incidents to the **unified SQLite store**
+(`<data_dir>/innerwarden.db`, table `incidents`), not the legacy
+`incidents-*.jsonl` sink — so an Alloy setup that tails the JSONL sees nothing.
+Use `sqlite-loki-bridge.py` instead: it reads new `incidents` rows by rowid
+cursor and pushes them to Loki with the same labels the panels expect
+(`{kind="incident"|"guard", host, job}`), attributing agent-guard incidents to
+their tenant. Run it on a short timer:
+
+```bash
+sudo install -Dm755 sqlite-loki-bridge.py /opt/innerwarden/observability/sqlite-loki-bridge.py
+sudo cp iw-loki-bridge.{service,timer} /etc/systemd/system/
+sudo systemctl enable --now iw-loki-bridge.timer   # runs every 20s
+# env overrides (drop-in): IW_DB, LOKI_URL, CURSOR, BATCH
+```
+
+`kind` is `guard` for agent-guard incidents (detector `agent_guard:*`) and
+`incident` otherwise, so the Command review journal and Live incident feed both
+fill from the live store. Use the JSONL/Alloy path above only if your build
+still writes the JSONL sink.
+
 ## Cost & tokens per agent (optional)
 
 InnerWarden is a **security** layer — it screens what an agent runs, it does
