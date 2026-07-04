@@ -106,6 +106,38 @@ the two panel queries to that gateway's token/spend metric names. Until a
 gateway is scraped, the row shows "No data" (it is deliberately included so the
 unified view is ready the moment a gateway is added).
 
+## Demo / smoke data (`demo/populate-demo.sh`)
+
+To fill every panel with lifelike data — for a walkthrough, a screenshot, or an
+end-to-end smoke test — run the scenario generator on the agent host:
+
+```bash
+deploy/observability/demo/populate-demo.sh [BASE_URL] [WAVES]   # defaults: https://127.0.0.1:8787  3
+```
+
+It drives the agent's `check-command` API as a realistic multi-tenant fleet:
+four tenants (each Claude Code = one employee/pod) where `acme-corp`,
+`initech`, `umbrella` do benign engineering work and `globex-inc` is a
+compromised/rogue agent running a full kill chain (recon → credential access →
+exfil → C2 → destruction). `check-command` only *analyses* a command (it never
+executes it), so this is safe against a live box; every denied command also
+becomes an agent_guard incident, so the incident feed, rogue-agent signal, and
+command review journal all populate from one run. The rogue tenant lights the
+rogue-agent panel deep red (~96% deny share) while the benign tenants stay
+green — the "one agent went rogue, spot it instantly" story, reproducibly.
+
+For the **Cost & tokens** row without a real gateway, `demo/gateway-sim.py`
+stands in for a LiteLLM gateway: it exposes `litellm_total_tokens` /
+`litellm_spend_metric` per team (monotonic counters, so `increase()` renders
+real curves). Run it and add a scrape target so the cost panels light up:
+
+```bash
+python3 deploy/observability/demo/gateway-sim.py 9101 &   # DEMO ONLY, not a product component
+# then add a Prometheus job:  - job_name: 'llm-gateway'  static_configs: [{ targets: ['127.0.0.1:9101'] }]
+```
+
+It is clearly a stand-in — do not ship it in place of a real gateway.
+
 ## Metrics the dashboard uses
 
 `innerwarden_incidents_by_tenant{tenant}` · `innerwarden_incidents_total{detector}`
