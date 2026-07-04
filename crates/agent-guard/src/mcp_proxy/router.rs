@@ -25,7 +25,7 @@ pub enum Direction {
 }
 
 impl Direction {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Direction::ClientToServer => "client->server",
             Direction::ServerToClient => "server->client",
@@ -116,7 +116,13 @@ fn route_server_to_client(
             request_id: env.id.clone(),
         },
         (Some("tools/call"), Some(result)) => {
-            let content = concat_text_content(result);
+            // ASI07 (Memory Leakage): scrub secrets/PII from the untrusted tool
+            // output before it enters the guard pipeline / the agent's context,
+            // so injected credentials never become part of what the model (or a
+            // downstream log) remembers. Injection instructions survive the
+            // scrub (only secrets are masked), so `inspect_response` still catches
+            // them below.
+            let content = crate::redact::redact_secrets(&concat_text_content(result)).text;
             // Remember the untrusted output so a later call reusing it is caught.
             if let Some(t) = taint {
                 t.record_result(&content);

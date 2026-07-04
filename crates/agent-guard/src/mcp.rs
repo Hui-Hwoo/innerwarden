@@ -220,6 +220,11 @@ pub struct CommandAnalysis {
     pub explanation: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub atr_matches: Vec<AtrMatch>,
+    /// OWASP Agentic Top 10 threat ids this command triggers (e.g. `["ASI02",
+    /// "ASI10"]`), derived from the fired signals + ATR categories. The "reason
+    /// chain" that lets a deny say WHICH agentic threat class it caught.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub asi_ids: Vec<String>,
 }
 
 /// Push a signal only if its label is not already present, so several
@@ -245,6 +250,7 @@ pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> Comma
             recommendation: "allow".into(),
             explanation: "empty command".into(),
             atr_matches: Vec::new(),
+            asi_ids: Vec::new(),
         };
     }
 
@@ -460,6 +466,23 @@ pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> Comma
             .join("; ")
     };
 
+    // Reason chain: map each fired signal + ATR category to its OWASP Agentic
+    // threat class, deduped and sorted, so a deny can say WHICH agentic threat
+    // it caught (and so the product's OWASP coverage is derived from what
+    // actually fires, not asserted in marketing copy).
+    let mut asi_ids: Vec<String> = signals
+        .iter()
+        .filter_map(|s| crate::asi::signal_to_asi(&s.signal))
+        .chain(
+            atr_matches
+                .iter()
+                .filter_map(|m| crate::asi::category_to_asi(&m.category)),
+        )
+        .map(String::from)
+        .collect();
+    asi_ids.sort_unstable();
+    asi_ids.dedup();
+
     CommandAnalysis {
         command: cmd.to_string(),
         risk_score: score,
@@ -468,6 +491,7 @@ pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> Comma
         recommendation: recommendation.into(),
         explanation,
         atr_matches,
+        asi_ids,
     }
 }
 

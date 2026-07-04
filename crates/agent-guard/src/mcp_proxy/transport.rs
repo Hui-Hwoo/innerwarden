@@ -164,6 +164,7 @@ fn classify_client_line(
     engine: Option<&RuleEngine>,
     map: &mut IdMethodMap,
     taint: &mut TaintTracker,
+    breaker: &mut crate::breaker::Breaker,
 ) -> ClientAction {
     match parse_line(line) {
         ParsedLine::Empty => ClientAction::Drop,
@@ -171,6 +172,43 @@ fn classify_client_line(
         ParsedLine::Message(env) => {
             if let (Some(id), Some(method)) = (env.id.as_ref(), env.method.as_ref()) {
                 map.insert(id_key(id), method.clone());
+            }
+            // ASI09 (Cost / Quota Abuse): a hijacked or looping agent hammering
+            // the SAME tool call every iteration is a runaway retry storm. Record
+            // each `tools/call` against the per-session circuit breaker; if the
+            // same call repeats past the loop ceiling, halt the run instead of
+            // forwarding another billable iteration. (The cost-ceiling half of
+            // the breaker lives at the model-billing boundary / LLM gateway; the
+            // proxy sees the loop symptom.)
+            if env.method.as_deref() == Some("tools/call") {
+                let sig = tool_call_signature(&env);
+                if let crate::breaker::BreakerVerdict::Tripped { reason } =
+                    breaker.record(&sig, 0.0)
+                {
+                    let decision = ProxyDecision {
+                        verdict: crate::mcp::Verdict {
+                            allowed: false,
+                            alerts: vec![crate::mcp::VerdictAlert::builtin(
+                                "AG-ASI09-BREAKER",
+                                format!("cost/quota breaker tripped: {reason}"),
+                                true,
+                            )],
+                        },
+                        direction: Direction::ClientToServer.label(),
+                        method: Some("tools/call".into()),
+                        tool_name: None,
+                        request_id: env.id.clone(),
+                    };
+                    let denial =
+                        super::enforce::synthesize_denial(&decision, cfg.as_protocol_error)
+                            .trim_end()
+                            .to_string();
+                    return ClientAction::Deny {
+                        denial,
+                        decision,
+                        kill: false,
+                    };
+                }
             }
             let decision =
                 route_message(&env, Direction::ClientToServer, None, engine, Some(taint));
@@ -196,6 +234,22 @@ fn classify_client_line(
             }
         }
     }
+}
+
+/// Signature for the ASI09 loop guard: the tool name plus its arguments, so an
+/// agent re-issuing the IDENTICAL call collides (a retry storm) while distinct
+/// calls stay separate. Arguments are stringified stably enough for equality.
+fn tool_call_signature(env: &super::jsonrpc::JsonRpcEnvelope) -> String {
+    let params = env.params.as_ref();
+    let name = params
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let args = params
+        .and_then(|p| p.get("arguments"))
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    format!("{name}:{args}")
 }
 
 /// Pure: classify a server→client line. Resolves the responded-to method via the
@@ -303,6 +357,8 @@ where
     // Per-connection session state for confused-deputy detection: tool results
     // record their long tokens; a later call reusing one is escalated.
     let mut taint = TaintTracker::new();
+    // ASI09 loop/quota guard for this session (see classify_client_line).
+    let mut breaker = crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
     let mut err_open = true;
 
     loop {
@@ -316,7 +372,7 @@ where
                         child_stdin = None;
                     }
                     Some(line) => {
-                        match classify_client_line(&line, &cfg, engine, &mut map, &mut taint) {
+                        match classify_client_line(&line, &cfg, engine, &mut map, &mut taint, &mut breaker) {
                             ClientAction::Drop => {}
                             ClientAction::Forward { raw, alert } => {
                                 if let Some(d) = &alert {
@@ -440,7 +496,8 @@ mod tests {
                 &cfg(ProxyMode::Advisory),
                 None,
                 &mut m,
-                &mut TaintTracker::new()
+                &mut TaintTracker::new(),
+                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default())
             ),
             ClientAction::Drop
         ));
@@ -455,7 +512,8 @@ mod tests {
                 &cfg(ProxyMode::Guard),
                 None,
                 &mut m,
-                &mut TaintTracker::new()
+                &mut TaintTracker::new(),
+                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default())
             ),
             ClientAction::Forward { alert: None, .. }
         ));
@@ -465,7 +523,8 @@ mod tests {
                 &cfg(ProxyMode::Guard),
                 None,
                 &mut m,
-                &mut TaintTracker::new()
+                &mut TaintTracker::new(),
+                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default())
             ),
             ClientAction::Forward { alert: None, .. }
         ));
@@ -482,6 +541,7 @@ mod tests {
             None,
             &mut m,
             &mut TaintTracker::new(),
+            &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
         ) {
             ClientAction::Forward { alert: Some(d), .. } => {
                 assert!(d.verdict.alerts.iter().any(|a| a.rule == "AG-CRED"));
@@ -499,6 +559,7 @@ mod tests {
             None,
             &mut m,
             &mut TaintTracker::new(),
+            &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
         ) {
             ClientAction::Deny { denial, kill, .. } => {
                 assert!(!kill);
@@ -517,7 +578,14 @@ mod tests {
             mode: ProxyMode::Kill,
             as_protocol_error: false,
         };
-        match classify_client_line(CREDS, &kill_cfg, None, &mut m, &mut TaintTracker::new()) {
+        match classify_client_line(
+            CREDS,
+            &kill_cfg,
+            None,
+            &mut m,
+            &mut TaintTracker::new(),
+            &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
+        ) {
             ClientAction::Deny { kill, .. } => assert!(kill),
             other => panic!("expected Deny+kill, got {other:?}"),
         }

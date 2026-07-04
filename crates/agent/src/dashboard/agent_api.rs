@@ -545,6 +545,10 @@ pub(super) fn run_analysis(
         "signals": analysis.signals,
         "recommendation": analysis.recommendation,
         "explanation": analysis.explanation,
+        // OWASP Agentic Top 10 reason chain: which agentic threat class(es) this
+        // command triggered (e.g. ["ASI02","ASI10"]). Lets a caller/log say WHY
+        // it was denied in the framework a security team evaluates against.
+        "asi_ids": analysis.asi_ids,
     });
     // Echo the tenant back so the caller (and any log of the response) carries
     // the attribution (spec 084 P0 1D). Omitted when not supplied.
