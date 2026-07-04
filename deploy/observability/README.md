@@ -54,6 +54,23 @@ kubectl apply -f servicemonitor.yaml   # requires Prometheus Operator / kube-pro
 dashboard's tenant panels then break down activity per Claude Code pod /
 employee automatically as the fleet scales.
 
+## Cost & tokens per agent (optional)
+
+InnerWarden is a **security** layer — it screens what an agent runs, it does
+not sit in the agent's LLM request path, so it does not measure token spend.
+That data lives in the **LLM gateway** a fleet fronts its agents with (for rate
+limits and cost caps). Point the same Prometheus at that gateway and the
+dashboard's "Cost & tokens per agent" row lights up next to the security
+panels — one pane for **what each agent did, what got blocked, and what it
+cost**, per employee.
+
+The panels use LiteLLM's metric names (`litellm_total_tokens`,
+`litellm_spend_metric`) and alias the gateway's `team`/`key` label to `tenant`
+so cost lines up with the security panels. If the gateway is not LiteLLM, adjust
+the two panel queries to that gateway's token/spend metric names. Until a
+gateway is scraped, the row shows "No data" (it is deliberately included so the
+unified view is ready the moment a gateway is added).
+
 ## Metrics the dashboard uses
 
 `innerwarden_incidents_by_tenant{tenant}` · `innerwarden_incidents_total{detector}`

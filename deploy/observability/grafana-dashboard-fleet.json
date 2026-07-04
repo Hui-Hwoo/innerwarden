@@ -217,6 +217,31 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "targets": [{ "expr": "sum(innerwarden_responses_active{instance=~\"$node\"})", "refId": "A" }]
+    },
+    {
+      "type": "row",
+      "title": "Cost & tokens per agent (requires an LLM gateway, e.g. LiteLLM — see README)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tokens per tenant",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "LLM tokens consumed by each agent/employee. InnerWarden is a security layer and does not sit in the LLM path, so this comes from the LLM gateway (LiteLLM `litellm_total_tokens`). The `team`/`key` gateway label is aliased to `tenant` so it lines up with the security panels. No data until a gateway is scraped.",
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 50, "stacking": { "mode": "normal" } } } },
+      "targets": [{ "expr": "sum by (tenant) (label_replace(increase(litellm_total_tokens[5m]), \"tenant\", \"$1\", \"team\", \"(.*)\"))", "legendFormat": "{{tenant}}", "refId": "A" }]
+    },
+    {
+      "type": "table",
+      "title": "Spend by tenant (top)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "LLM spend per agent/employee from the gateway (LiteLLM `litellm_spend_metric`). Pair it with the security panels: who cost the most, and did any of it get blocked. No data until a gateway is scraped.",
+      "options": { "showHeader": true, "sortBy": [{ "displayName": "Spend (USD)", "desc": true }] },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+      "targets": [{ "expr": "sort_desc(sum by (tenant) (label_replace(litellm_spend_metric, \"tenant\", \"$1\", \"team\", \"(.*)\")))", "format": "table", "instant": true, "refId": "A" }],
+      "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "tenant": "Tenant / agent", "Value": "Spend (USD)" } } }]
     }
   ]
 }
