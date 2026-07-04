@@ -156,6 +156,37 @@ impl ReverseShellDetector {
             return None;
         }
 
+        // Cloud guest-agent downgrade: on a cloud VM the platform's own agent
+        // (Azure WALinuxAgent / ExtHandler) opens control-plane sockets (e.g. the
+        // WireServer 168.63.129.16) and redirects fds in a shape that trips
+        // `ebpf_reverse_shell` — observed ~992+ Critical FP/hour from `ExtHandler`
+        // on an Azure k8s node, saturating the sensor event channel (shed-load).
+        //
+        // The short-lived guest-agent CHILD (`ExtHandler`) usually EXITS before
+        // this userspace detector runs, so its own `/proc` is gone and identity
+        // can't be resolved from the child pid. Fall back to its LONG-LIVED
+        // PARENT — `WALinuxAgent ... -run-exthandlers` — which the collector
+        // enriches as `ppid` on the fd_redirect (the event that EMITS the
+        // incident) and whose `/proc` lineage still resolves. Identity stays
+        // NON-FORGEABLE (real /proc lineage of the alive parent). `uid` is not
+        // present on every eBPF event (the fd_redirect omits it), so default it
+        // to 0 rather than SKIP the whole gate; `is_guest_agent` still requires a
+        // DMI-detected cloud VM + a real root-owned guest-agent lineage, so the
+        // default cannot let a `/tmp` or non-root process through. Downgrade-only.
+        let uid = event
+            .details
+            .get("uid")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let ppid = event.details.get("ppid").and_then(|v| v.as_u64());
+        let is_guest = crate::cloud_platform::is_guest_agent(pid, uid as u32)
+            || ppid.is_some_and(|pp| {
+                pp != 0 && crate::cloud_platform::is_guest_agent(pp as u32, uid as u32)
+            });
+        if is_guest {
+            return None;
+        }
+
         // Record this event for the PID
         let dst_ip = event
             .details
@@ -1168,6 +1199,30 @@ mod tests {
         assert!(
             inc.is_none(),
             "InnerWarden's own verified egress must NOT fire ebpf_reverse_shell"
+        );
+    }
+
+    /// The cloud guest-agent gate is DOWNGRADE-ONLY: a real reverse shell (any
+    /// non-guest-agent process) still fires. Uses DEAD_PID so `/proc` has no
+    /// lineage and `is_guest_agent` is reliably inert on cloud CI runners
+    /// (GitHub runners are Azure), so this exercises the real-attacker path. The
+    /// guest-agent suppression itself is unit-tested in `crate::cloud_platform`.
+    #[test]
+    fn guest_agent_gate_does_not_suppress_a_real_reverse_shell() {
+        let mut det = ReverseShellDetector::new("test", 300);
+        let now = Utc::now();
+        assert!(det
+            .process(&connect_event(DEAD_PID, "185.220.101.44", 4444, now))
+            .is_none());
+        let inc = det.process(&fd_redirect_event(
+            DEAD_PID,
+            5,
+            0,
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_some(),
+            "a real (non-guest-agent) reverse shell must still fire"
         );
     }
 

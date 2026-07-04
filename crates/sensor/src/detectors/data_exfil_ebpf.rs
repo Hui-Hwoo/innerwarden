@@ -187,6 +187,26 @@ impl DataExfilEbpfDetector {
             return None;
         }
 
+        // Cloud guest-agent downgrade: the platform's own management agent
+        // (Azure WALinuxAgent / ExtHandler) reads /etc/passwd (getpwuid) then
+        // connects to the control plane — a read-then-connect shape that cannot
+        // be told from exfil at the kernel layer. Observed as a persistent FP
+        // from `ExtHandler` on an Azure VM. The short-lived `ExtHandler` child
+        // often EXITS before this detector runs (its `/proc` is gone), so fall
+        // back to its LONG-LIVED PARENT (`WALinuxAgent ... -run-exthandlers`,
+        // carried as `ppid`) whose `/proc` lineage still resolves. NON-FORGEABLE
+        // (real /proc lineage), gated on a DMI-detected cloud VM + uid 0.
+        // Downgrade-only: a real process from /tmp, or any non-root, still fires.
+        let guest_uid = if ev_uid == u64::MAX { 0 } else { ev_uid };
+        let ev_ppid = event.details.get("ppid").and_then(|v| v.as_u64());
+        let is_guest = crate::cloud_platform::is_guest_agent(pid, guest_uid as u32)
+            || ev_ppid.is_some_and(|pp| {
+                pp != 0 && crate::cloud_platform::is_guest_agent(pp as u32, guest_uid as u32)
+            });
+        if is_guest {
+            return None;
+        }
+
         // BLANKET-exempt processes: server DAEMONS that read /etc/passwd for
         // NSS uid→name resolution on every request/session and are always
         // making outbound calls as part of their job (CrowdSec bouncers, web
@@ -668,6 +688,32 @@ mod tests {
             entities: vec![],
         };
         assert!(det.process(&iw_connect).is_none());
+    }
+
+    /// The cloud guest-agent gate is DOWNGRADE-ONLY: a real credential exfil (a
+    /// non-guest-agent process reading a secret then connecting out) still fires.
+    /// Uses a pid above the kernel pid_max ceiling so `/proc` has no lineage and
+    /// `is_guest_agent` is reliably inert on cloud CI runners (GitHub runners are
+    /// Azure); the guest-agent suppression itself is unit-tested in
+    /// `crate::cloud_platform`.
+    #[test]
+    fn guest_agent_gate_does_not_suppress_real_exfil() {
+        const DEAD_PID: u32 = 4_000_000_001;
+        let mut det = DataExfilEbpfDetector::new("test", 60, 300);
+        let now = Utc::now();
+        assert!(det
+            .process(&read_event(DEAD_PID, "/etc/shadow", now))
+            .is_none());
+        let inc = det.process(&connect_event(
+            DEAD_PID,
+            "185.220.101.44",
+            4444,
+            now + Duration::seconds(1),
+        ));
+        assert!(
+            inc.is_some(),
+            "a real (non-guest-agent) shadow-read-then-connect must still fire"
+        );
     }
 
     fn read_event_with_comm(pid: u32, filename: &str, comm: &str, ts: DateTime<Utc>) -> Event {
