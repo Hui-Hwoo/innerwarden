@@ -46,6 +46,76 @@ pub(crate) fn agent_alert_drops_closed() -> u64 {
     AGENT_ALERT_DROPS_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// ── Agent-guard command-check counter, by tenant + verdict ──────────────────
+// Exposed as `innerwarden_agent_guard_checks_total{tenant,verdict}`. This is the
+// per-agent fleet-visibility metric: in a multi-tenant deployment (e.g. one
+// Claude Code per pod) it answers "how many commands did each agent try, and how
+// many were allowed / held for review / denied". `tenant` is operator-controlled
+// (spec 084), so the map is capped to bound cardinality — once the cap is hit a
+// new tenant's checks bucket into tenant="other" rather than growing unbounded.
+// `verdict` is a fixed small set; absent tenant → "unattributed".
+
+/// Max distinct (tenant, verdict) series before overflow buckets into "other".
+const GUARD_CHECK_MAX_SERIES: usize = 1024;
+
+fn guard_check_counts(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<(String, String), u64>> {
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(String, String), u64>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Bump the command-check counter for `(tenant, verdict)`. `tenant=None`/blank →
+/// "unattributed"; `verdict` is normalized to the small known set.
+pub(crate) fn record_guard_check(tenant: Option<&str>, verdict: &str) {
+    let tenant = tenant
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("unattributed");
+    let verdict = match verdict {
+        "deny" | "review" | "allow" => verdict,
+        _ => "other",
+    };
+    let mut map = guard_check_counts()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = (tenant.to_string(), verdict.to_string());
+    if !map.contains_key(&key) && map.len() >= GUARD_CHECK_MAX_SERIES {
+        // Cap reached: attribute to the overflow bucket instead of a new series.
+        *map.entry(("other".to_string(), verdict.to_string()))
+            .or_insert(0) += 1;
+        return;
+    }
+    *map.entry(key).or_insert(0) += 1;
+}
+
+/// Snapshot for the metrics renderer: `((tenant, verdict), count)` rows.
+pub(crate) fn guard_check_snapshot() -> Vec<((String, String), u64)> {
+    guard_check_counts()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
+/// Escape a Prometheus label VALUE per the text exposition format: backslash,
+/// double-quote, and newline. `tenant` is operator-controlled, so an unescaped
+/// value could otherwise break the exposition or inject a label.
+pub(crate) fn prom_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Record a `try_send` failure on the agent-alert channel. Bumps the
 /// counter for the matched `TrySendError` variant; on `Closed`, also
 /// emits a one-shot `warn!` per process (subsequent Closed drops
@@ -408,6 +478,12 @@ pub(super) fn run_analysis(
     tenant: Option<&str>,
 ) -> serde_json::Value {
     let analysis = innerwarden_agent_guard::mcp::analyze_command(command, Some(&state.rule_engine));
+
+    // Fleet visibility: count every guard check by (tenant, verdict) so a
+    // multi-tenant dashboard can show, per agent/pod, how many commands were
+    // allowed / held for review / denied. Exposed as
+    // `innerwarden_agent_guard_checks_total{tenant,verdict}` on /metrics.
+    record_guard_check(tenant, &analysis.recommendation);
 
     // Spec 084 P0 1D: record which tenant the guarded command belongs to, so a
     // multi-tenant fleet can attribute guard activity per tenant. Logged only
@@ -918,6 +994,23 @@ pub(super) fn build_prometheus_metrics_text(
         "innerwarden_agent_guard_atr_rules_loaded {}\n",
         state.rule_engine.rule_count()
     ));
+
+    // Per-tenant command-check verdicts: how many commands each agent/pod tried
+    // and how each was judged (allow / review / deny). The fleet-visibility
+    // metric behind the "what did every Claude Code run, and what got blocked"
+    // dashboard panel. `tenant` is capped (see `record_guard_check`) to bound
+    // cardinality; label values are escaped for the exposition format.
+    out.push_str(
+        "# HELP innerwarden_agent_guard_checks_total Agent-guard command checks by tenant and verdict\n",
+    );
+    out.push_str("# TYPE innerwarden_agent_guard_checks_total counter\n");
+    for ((tenant, verdict), count) in guard_check_snapshot() {
+        out.push_str(&format!(
+            "innerwarden_agent_guard_checks_total{{tenant=\"{}\",verdict=\"{}\"}} {count}\n",
+            prom_escape(&tenant),
+            prom_escape(&verdict)
+        ));
+    }
 
     // Spec 024 drift metrics — appended after legacy metrics so any existing
     // Prometheus scrape keeps reading the same fields.
@@ -2819,6 +2912,33 @@ enabled = false
             read_telemetry_error_count(td.path(), date, "nonexistent"),
             0
         );
+    }
+
+    #[test]
+    fn guard_check_counter_buckets_by_tenant_and_verdict() {
+        // absent/blank tenant → "unattributed"; unknown verdict → "other".
+        record_guard_check(Some("globex-inc"), "deny");
+        record_guard_check(Some("globex-inc"), "deny");
+        record_guard_check(Some("globex-inc"), "allow");
+        record_guard_check(Some("  "), "review");
+        record_guard_check(None, "weird-verdict");
+        let snap: std::collections::BTreeMap<(String, String), u64> =
+            guard_check_snapshot().into_iter().collect();
+        assert_eq!(snap.get(&("globex-inc".into(), "deny".into())), Some(&2));
+        assert_eq!(snap.get(&("globex-inc".into(), "allow".into())), Some(&1));
+        assert_eq!(
+            snap.get(&("unattributed".into(), "review".into())),
+            Some(&1)
+        );
+        assert_eq!(snap.get(&("unattributed".into(), "other".into())), Some(&1));
+    }
+
+    #[test]
+    fn prom_escape_handles_quotes_backslash_newline() {
+        assert_eq!(prom_escape("plain"), "plain");
+        assert_eq!(prom_escape("a\"b"), "a\\\"b");
+        assert_eq!(prom_escape("a\\b"), "a\\\\b");
+        assert_eq!(prom_escape("a\nb"), "a\\nb");
     }
 
     // ── Spec 037 I-13 follow-up #5 — alert drop counter anchors ────
