@@ -20,10 +20,10 @@ START = time.monotonic()
 # team -> (tokens/sec, model). Benign agents do more real work (more tokens);
 # the rogue does less legitimate work. Blended price ~ $0.012 / 1k tokens.
 TEAMS = {
-    "acme-corp":  (42.0, "claude-sonnet-4-6"),
-    "initech":    (28.0, "claude-sonnet-4-6"),
-    "umbrella":   (35.0, "claude-opus-4-8"),
-    "globex-inc": (14.0, "claude-sonnet-4-6"),
+    "platform-eng":  (42.0, "claude-sonnet-4-6"),
+    "payments-team":    (28.0, "claude-sonnet-4-6"),
+    "data-science":   (35.0, "claude-opus-4-8"),
+    "growth-team": (14.0, "claude-sonnet-4-6"),
 }
 PRICE_PER_1K = 0.012
 
