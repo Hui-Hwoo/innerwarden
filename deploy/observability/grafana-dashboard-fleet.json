@@ -156,6 +156,16 @@
       "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "tenant": "Tenant / agent", "Value": "Denied" } } }]
     },
     {
+      "type": "bargauge",
+      "title": "Rogue-agent signal — deny share by tenant",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "The fraction of each agent's commands that were denied — normalized for volume, so a rogue agent stands out even with few commands. Red = a high share of what this agent tried was dangerous. The 'which employee/pod went rogue' signal.",
+      "options": { "displayMode": "gradient", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.3 }, { "color": "red", "value": 0.6 } ] } } },
+      "targets": [{ "expr": "sum by (tenant) (innerwarden_agent_guard_checks_total{verdict=\"deny\",tenant=~\"$tenant\"}) / clamp_min(sum by (tenant) (innerwarden_agent_guard_checks_total{tenant=~\"$tenant\"}), 1)", "legendFormat": "{{tenant}}", "instant": true, "refId": "A" }]
+    },
+    {
       "type": "row",
       "title": "Decisions & response",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
@@ -264,7 +274,7 @@
       "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
       "description": "The verbatim commands each AI agent ran through the guard, with the verdict and the ATR rules that fired. This is the 'what did they try, and what got blocked' investigation view. Filter to one tenant with the $tenant variable. Secrets are redacted in transit.",
       "options": { "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true, "enableLogDetails": true, "dedupStrategy": "none" },
-      "targets": [{ "expr": "{kind=\"guard\", job=\"innerwarden\"} | json | line_format \"[{{.recommendation}}] risk={{.risk_score}}  {{.command}}  «{{.atr_rule_ids}}»\"", "refId": "A" }]
+      "targets": [{ "expr": "{kind=\"guard\", job=\"innerwarden\"} | json | tenant=~\"$tenant\" | line_format \"{{.tenant}}  [{{.recommendation}}] risk={{.risk_score}}  {{.command}}  «{{.atr_rule_ids}}»\"", "refId": "A" }]
     },
     {
       "type": "logs",
