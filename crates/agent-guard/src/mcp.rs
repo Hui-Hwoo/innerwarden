@@ -94,8 +94,10 @@ pub fn inspect_tool_call(
         ));
     }
 
+    // Lowercase the (possibly large) args once, not once per IOC.
+    let args_lower = args_str.to_lowercase();
     for ioc in threats::SUPPLY_CHAIN_IOCS {
-        if args_str.to_lowercase().contains(&ioc.to_lowercase()) {
+        if args_lower.contains(&ioc.to_lowercase()) {
             alerts.push(VerdictAlert::builtin(
                 "AG-IOC",
                 format!("supply chain IOC: {ioc}"),
@@ -558,6 +560,23 @@ mod tests {
         let args = serde_json::json!({"query": "SELECT * FROM users"});
         let v = inspect_tool_call("db_query", &args, None);
         assert!(v.allowed);
+    }
+
+    #[test]
+    fn flags_supply_chain_ioc_in_args() {
+        // Covers the IOC scan branch (args lowercased once above the loop):
+        // an IOC substring must still raise the AG-IOC alert, case-insensitively.
+        let args = serde_json::json!({"url": "https://WEBHOOK.SITE/abc123"});
+        let v = inspect_tool_call("http_post", &args, None);
+        assert!(v.alerts.iter().any(|a| a.rule == "AG-IOC"));
+        assert!(!v.allowed);
+        // A clean URL raises no IOC alert.
+        let clean = inspect_tool_call(
+            "http_post",
+            &serde_json::json!({"url": "https://example.com/ok"}),
+            None,
+        );
+        assert!(!clean.alerts.iter().any(|a| a.rule == "AG-IOC"));
     }
 
     #[test]
