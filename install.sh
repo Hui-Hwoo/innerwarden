@@ -1276,7 +1276,7 @@ Documentation=https://github.com/InnerWarden/innerwarden
 Type=simple
 User=innerwarden
 Group=innerwarden
-EnvironmentFile=/etc/innerwarden/agent.env
+EnvironmentFile=-/etc/innerwarden/agent.env
 ExecStart=/usr/local/bin/innerwarden-agent --data-dir /var/lib/innerwarden --config /etc/innerwarden/agent.toml --dashboard
 Restart=on-failure
 RestartSec=5
@@ -1314,7 +1314,7 @@ Documentation=https://github.com/InnerWarden/innerwarden/wiki/Operations
 Type=simple
 User=innerwarden
 Group=innerwarden
-EnvironmentFile=/etc/innerwarden/agent.env
+EnvironmentFile=-/etc/innerwarden/agent.env
 ExecStart=/usr/local/bin/innerwarden-supervisor \\
   --agent-binary /usr/local/bin/innerwarden-agent \\
   --agent-arg --data-dir --agent-arg /var/lib/innerwarden \\
