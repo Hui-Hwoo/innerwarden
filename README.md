@@ -27,7 +27,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![eBPF Programs](https://img.shields.io/badge/eBPF%20programs-27%20loaded-blueviolet)
 ![Detectors](https://img.shields.io/badge/detectors-82-blue)
 ![Correlation Rules](https://img.shields.io/badge/correlation%20rules-69-purple)
-![Tests](https://img.shields.io/badge/tests-7900%2B-brightgreen)
+![Tests](https://img.shields.io/badge/tests-9800%2B-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-90%2B%20mappings-red)
 ![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-209-blueviolet)
 ![Memory](https://img.shields.io/badge/memory-sensor%20~200MB%20%7C%20full%20stack%20~0.8GB-green)
@@ -56,7 +56,7 @@ It lives where the action is: on the machine the agent can affect. Agent-facing 
 - **Watch.** It sees what actually executes on the host with eBPF, so if something slips past the polite guardrail it is still caught.
 - **Prove.** It records every decision locally in a tamper-evident audit trail. No cloud, your data never leaves the box.
 
-Under the hood: 27 eBPF programs loaded (kernel-dependent), 82 detectors, 69 cross-layer correlation rules, 56 MITRE ATT&CK technique IDs (90+ detector mappings), and 7900+ tests gate every change. The full tour is further down: [what it does](#what-it-does), [what it detects](#what-it-detects), [how it works](#how-it-works).
+Under the hood: 27 eBPF programs loaded (kernel-dependent), 82 detectors, 69 cross-layer correlation rules, 56 MITRE ATT&CK technique IDs (90+ detector mappings), and 9800+ tests gate every change. The full tour is further down: [what it does](#what-it-does), [what it detects](#what-it-detects), [how it works](#how-it-works).
 
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to live network anomalies on our lab infrastructure</a>
@@ -349,7 +349,7 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 
 ## How it works
 
-**Sensor**: deterministic signal collection. No AI, no HTTP. 31 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 27 kernel programs loaded (kernel-dependent), JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, kernel audit state monitoring (alerts when the audit subsystem is disabled, T1562.001), tunnel-interface monitoring (new tun/WireGuard interface = mesh-VPN persistence, rename-proof), USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **7900+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
+**Sensor**: deterministic signal collection. No AI, no HTTP. 31 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 27 kernel programs loaded (kernel-dependent), JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, kernel audit state monitoring (alerts when the audit subsystem is disabled, T1562.001), tunnel-interface monitoring (new tun/WireGuard interface = mesh-VPN persistence, rename-proof), USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **9800+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
 
 **eBPF**: 47 kernel programs compiled, 27 loaded in prod (kernel-dependent). Linux 5.8+, CO-RE/BTF portable:
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
