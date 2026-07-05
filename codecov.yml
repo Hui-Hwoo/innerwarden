@@ -134,6 +134,13 @@ coverage:
           - "!crates/sensor/src/event_dispatch.rs"
           - "!crates/sensor/src/detector_set.rs"
           - "!crates/sensor/src/boot/build_detectors.rs"
+          # Collector-spawn wiring: a sequence of `if cfg.collectors.X.enabled {
+          # tokio::spawn(collector.run(...)) }` blocks. Each collector's run() is
+          # unit-tested in its own module; the spawn glue here only orchestrates.
+          # Same class as build_detectors.rs. Also holds the windows_etw spawn,
+          # whose `cfg!(target_os = "windows")` block cannot execute on the Linux
+          # CI runner (spec 085).
+          - "!crates/sensor/src/boot/spawn_collectors.rs"
           # FFI boundary to the kernel BPF map at
           # /sys/fs/bpf/innerwarden/blocked_pids. Every line in
           # aya_impl.rs calls into aya which calls into the kernel —
@@ -156,6 +163,17 @@ coverage:
           # unit-tested; the writes are validated on a real kernel by the
           # `#[ignore]`d on-box roundtrip test in the file.
           - "!crates/agent/src/execution_gate_arm.rs"
+          # Windows Event Log collector (spec 085 Phantom-on-Windows Phase 1):
+          # run() spawns `wevtutil` and drains its stdout in a poll loop -
+          # Windows-only, so it compiles on the Linux CI runner but can never
+          # execute there (probe fails, fail-open returns Ok), leaving those
+          # runtime lines uncoverable - same class as the eBPF/kernel-FFI files
+          # above and main.rs/boot.rs. The PURE parser + watermark math it
+          # delegates to (parse_win_event, is_local_dest, drain_should_continue,
+          # ...) IS unit-tested by the 33 in-file #[cfg(test)] tests that run
+          # under `cargo test` and gate via `make test`. Future Windows-runtime
+          # collectors/skills under spec 085 get the same exclusion.
+          - "!crates/sensor/src/collectors/windows_etw.rs"
       # Orchestration / boot wiring gets its own *informational* gauge so
       # it is measured (not hidden) but never blocks merges. Real ceiling
       # is set by integration tests, not unit tests.

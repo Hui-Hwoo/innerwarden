@@ -42,6 +42,7 @@ use crate::collectors::{
     exec_audit::ExecAuditCollector, integrity::IntegrityCollector, journald::JournaldCollector,
     macos_log::MacosLogCollector, nginx_access::NginxAccessCollector,
     nginx_error::NginxErrorCollector, syslog_firewall::SyslogFirewallCollector,
+    windows_etw::WindowsEtwCollector,
 };
 use crate::config::Config;
 use crate::detectors;
@@ -275,6 +276,27 @@ pub(crate) fn spawn_collectors(
         tokio::spawn(async move {
             if let Err(e) = collector.run(tx_macos).await {
                 tracing::error!("macos_log collector error: {e:#}");
+            }
+        });
+    }
+
+    // Spawn windows_etw collector (spec 085). Belt-and-suspenders: gated on
+    // BOTH `cfg!(target_os = "windows")` (the collector only does useful work
+    // there; its `wevtutil` probe fails open elsewhere) AND the opt-in config
+    // flag. The `cfg!` macro is a runtime bool (same idiom as line ~64), so
+    // the block still COMPILES on every platform - keeping `WindowsEtwCollector`
+    // referenced (no dead-code) - while only ever SPAWNING on Windows.
+    if cfg!(target_os = "windows") && cfg.collectors.windows_etw.enabled {
+        let wc = &cfg.collectors.windows_etw;
+        let collector = WindowsEtwCollector::new(&cfg.agent.host_id)
+            .with_channels(wc.channels.clone())
+            .with_poll_seconds(wc.poll_seconds)
+            .with_batch_cap(wc.batch_cap);
+        info!(channels = ?wc.channels, "starting windows_etw collector");
+        let tx_etw = tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = collector.run(tx_etw).await {
+                tracing::error!("windows_etw collector error: {e:#}");
             }
         });
     }
