@@ -12,7 +12,7 @@
 use innerwarden_core::entities::EntityRef;
 use innerwarden_core::event::{Event, Severity};
 use std::net::Ipv4Addr;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Embedded eBPF bytecode (compiled into the sensor binary).
 /// Built with: cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release
@@ -30,6 +30,26 @@ const EBPF_BYTECODE_EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const EBPF_OBJ_PATH: &str = "/usr/local/lib/innerwarden/innerwarden-ebpf";
 const EBPF_OBJ_PATH_DEV: &str =
     "crates/sensor-ebpf/target/bpfel-unknown-none/release/innerwarden-ebpf";
+
+/// Runtime count of eBPF programs this sensor actually attached, set by
+/// [`run`] after the attach phase. `usize::MAX` is the sentinel for "not
+/// attached yet / eBPF never started" (distinct from a real 0). This closes
+/// the gap the `build_ebpf_status` comment flagged: eBPF can be *available*
+/// (loads fine) yet attach 0 programs at runtime — e.g. under a restrictive
+/// systemd sandbox — leaving the sensor host-blind while it still reports
+/// "active". The health layer reads this to surface that state.
+static EBPF_ATTACHED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// How many eBPF programs the sensor attached at runtime. `None` until the
+/// attach phase has run (or if eBPF never started); `Some(0)` means eBPF
+/// loaded but nothing attached — the sensor is host-blind.
+pub fn ebpf_progs_attached() -> Option<usize> {
+    match EBPF_ATTACHED.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => None,
+        n => Some(n),
+    }
+}
 
 /// Check if eBPF is available on this system.
 pub fn is_ebpf_available() -> bool {
@@ -1876,23 +1896,25 @@ fn syscall_wrapper_symbol(syscall: &str) -> String {
 /// than one for syscalls with several entry points, e.g. dup2/dup3); each that
 /// resolves is attached to the same program.
 #[cfg(feature = "ebpf")]
-fn attach_syscall_kprobe(bpf: &mut aya::Ebpf, prog_name: &str, syscalls: &[&str]) {
+/// Returns the number of syscall wrappers this program successfully attached to
+/// (0 = not monitored). The caller sums these to detect a host-blind sensor.
+fn attach_syscall_kprobe(bpf: &mut aya::Ebpf, prog_name: &str, syscalls: &[&str]) -> usize {
     use aya::programs::KProbe;
 
     let Some(prog) = bpf.program_mut(prog_name) else {
         warn!("{prog_name}: kprobe program not found in bytecode");
-        return;
+        return 0;
     };
     let kp: &mut KProbe = match prog.try_into() {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "{prog_name}: not a KProbe program");
-            return;
+            return 0;
         }
     };
     if let Err(e) = kp.load() {
         warn!(error = %e, "{prog_name}: kprobe load (verifier) failed");
-        return;
+        return 0;
     }
     let mut attached = 0usize;
     for sc in syscalls {
@@ -1908,6 +1930,7 @@ fn attach_syscall_kprobe(bpf: &mut aya::Ebpf, prog_name: &str, syscalls: &[&str]
     if attached == 0 {
         warn!("{prog_name}: no syscall wrapper symbol resolved - syscall not monitored");
     }
+    attached
 }
 
 #[cfg(feature = "ebpf")]
@@ -2011,35 +2034,40 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
     // `sys_enter` raw_tracepoint dispatch, which fired on EVERY syscall and
     // flooded the EVENTS ring buffer, starving `reserve()` so events never
     // surfaced. Each attach is fail-open (missing symbol → warn + skip).
+    // Count successful attaches: 0 syscall kprobes = the sensor is host-blind
+    // (loaded but nothing attached, e.g. under a restrictive systemd sandbox),
+    // which the health layer must surface instead of reporting "active".
+    let mut attached_progs = 0usize;
     {
-        attach_syscall_kprobe(&mut bpf, "dispatch_execve", &["execve"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_connect", &["connect"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_openat", &["openat"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_ptrace", &["ptrace"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_setuid", &["setuid"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_bind", &["bind"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_mount", &["mount"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_memfd_create", &["memfd_create"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_init_module", &["init_module"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_execve", &["execve"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_connect", &["connect"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_openat", &["openat"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_ptrace", &["ptrace"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_setuid", &["setuid"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_bind", &["bind"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_mount", &["mount"]);
+        attached_progs +=
+            attach_syscall_kprobe(&mut bpf, "dispatch_memfd_create", &["memfd_create"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_init_module", &["init_module"]);
         // dup2 is x86_64-only; dup3 exists on both arches. Attach both candidates;
         // the absent one fails-open on aarch64.
-        attach_syscall_kprobe(&mut bpf, "dispatch_dup", &["dup3", "dup2"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_listen", &["listen"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_mprotect", &["mprotect"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_clone", &["clone"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_dup", &["dup3", "dup2"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_listen", &["listen"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_mprotect", &["mprotect"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_clone", &["clone"]);
         // Spec 070: setns(2) — privilege-provenance pivot (emit-only).
-        attach_syscall_kprobe(&mut bpf, "dispatch_setns", &["setns"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_unlink", &["unlinkat"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_rename", &["renameat2"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_kill", &["kill"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_prctl", &["prctl"]);
-        attach_syscall_kprobe(&mut bpf, "dispatch_accept", &["accept4"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_setns", &["setns"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_unlink", &["unlinkat"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_rename", &["renameat2"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_kill", &["kill"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_prctl", &["prctl"]);
+        attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_accept", &["accept4"]);
         // ioperm/iopl are x86_64-only (absent from the aarch64 bytecode →
         // fail-open skip there).
         #[cfg(target_arch = "x86_64")]
         {
-            attach_syscall_kprobe(&mut bpf, "dispatch_ioperm", &["ioperm"]);
-            attach_syscall_kprobe(&mut bpf, "dispatch_iopl", &["iopl"]);
+            attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_ioperm", &["ioperm"]);
+            attached_progs += attach_syscall_kprobe(&mut bpf, "dispatch_iopl", &["iopl"]);
         }
     }
 
@@ -2054,6 +2082,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     warn!(error = %e, "innerwarden_privesc: failed to attach to commit_creds");
                 } else {
                     info!("eBPF: innerwarden_privesc → commit_creds (privilege escalation) ✅");
+                    attached_progs += 1;
                 }
             }
         }
@@ -2072,6 +2101,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         warn!(error = %e, "innerwarden_process_exit: failed to attach");
                     } else {
                         info!("eBPF: innerwarden_process_exit → sched_process_exit (raw_tp) ✅");
+                        attached_progs += 1;
                     }
                 }
             }
@@ -2125,6 +2155,24 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
 
     // Attach XDP firewall (non-critical - continues without it)
     attach_xdp(&mut bpf);
+
+    // Record the runtime attach count so the health layer surfaces a
+    // host-blind sensor (bytecode loaded but 0 programs attached) instead of
+    // reporting "active". This is the runtime companion to the static
+    // `ebpf_unavailability_reason` check — see `build_ebpf_status`.
+    EBPF_ATTACHED.store(attached_progs, std::sync::atomic::Ordering::Relaxed);
+    if attached_progs == 0 {
+        error!(
+            "eBPF: 0 programs attached - the sensor is HOST-BLIND. The bytecode \
+             loaded but every attach failed, so kernel syscall detection is OFF \
+             and host telemetry will not flow. Check systemd sandboxing \
+             (RestrictNamespaces / a private mount namespace masking \
+             /sys/kernel/tracing), capabilities (CAP_BPF, CAP_PERFMON, \
+             CAP_SYS_ADMIN), and perf_event_paranoid."
+        );
+    } else {
+        info!("eBPF: attached {attached_progs} syscall/core programs");
+    }
 
     // Phase 2: Firmware security hooks (non-critical on ARM — some x86 only)
     // MSR write monitoring (x86 only — kprobe on native_write_msr)
