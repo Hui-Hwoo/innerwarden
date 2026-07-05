@@ -77,7 +77,6 @@ fn run_smoke_test_with<F>(expected_version: &str, mut spawn: F) -> SmokeOutcome
 where
     F: FnMut() -> std::io::Result<std::process::Output>,
 {
-    use std::os::unix::process::ExitStatusExt;
     let mut attempt = 0u32;
     let result = loop {
         match spawn() {
@@ -96,7 +95,20 @@ where
     match result {
         Err(_) => smoke_test_verdict(false, false, None, "", expected_version),
         Ok(out) => {
-            let signaled = out.status.signal().is_some();
+            // A process cannot be signal-killed on Windows (spec 085 Phase 0),
+            // so `signaled=false` there; the arch smoke-test relies on the
+            // exit-code + version match, which is cross-platform.
+            let signaled = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    out.status.signal().is_some()
+                }
+                #[cfg(not(unix))]
+                {
+                    false
+                }
+            };
             let stdout = String::from_utf8_lossy(&out.stdout);
             smoke_test_verdict(true, signaled, out.status.code(), &stdout, expected_version)
         }
@@ -700,19 +712,28 @@ fn cmd_upgrade_with_release(
 /// chmod 640 + chgrp innerwarden so the service user (User=innerwarden) can read them.
 /// Fail-silent - best-effort in environments where the group doesn't exist.
 fn fix_config_dir_permissions(config_dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(entries) = std::fs::read_dir(config_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640));
-            let _ = std::process::Command::new("chgrp")
-                .arg("innerwarden")
-                .arg(&path)
-                .output();
+    // Unix chmod/chgrp of config files. On Windows (spec 085 Phase 0) this is a
+    // no-op concept; the ACL equivalent belongs to a later phase.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(entries) = std::fs::read_dir(config_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640));
+                let _ = std::process::Command::new("chgrp")
+                    .arg("innerwarden")
+                    .arg(&path)
+                    .output();
+            }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_dir;
     }
 }
 

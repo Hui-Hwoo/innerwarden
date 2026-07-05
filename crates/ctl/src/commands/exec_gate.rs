@@ -140,12 +140,22 @@ pub(crate) fn parse_bpftool_u64_keys(dump: &str) -> BTreeSet<u64> {
 // ── I/O (real kernel + bpftool; exercised on a box, error-path only in CI) ────
 
 fn resolve_cgroup_id(pid: u32) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    let raw = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    let rel = eg::parse_cgroup_v2_path(&raw)?;
-    std::fs::metadata(format!("/sys/fs/cgroup{rel}"))
-        .ok()
-        .map(|m| m.ino())
+    // cgroup ids come from /proc + /sys (Linux). The exec-gate is already
+    // runtime-gated to Linux, so on Windows (spec 085 Phase 0) return None.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        let rel = eg::parse_cgroup_v2_path(&raw)?;
+        std::fs::metadata(format!("/sys/fs/cgroup{rel}"))
+            .ok()
+            .map(|m| m.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 fn bpftool(args: &[String]) -> anyhow::Result<()> {
