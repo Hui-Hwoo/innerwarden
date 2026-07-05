@@ -5,14 +5,11 @@
 //! Multiple instances of the same agent type are supported.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 
 use crate::session::SessionTracker;
 use crate::signatures::{Kind, SignatureIndex};
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Capture identity facts for a pid from `/proc/<pid>` at connect time (spec
 /// 081 registry hardening). Returns `(exe_path, owner_uid, cmdline_fingerprint)`,
@@ -117,6 +114,11 @@ pub struct AgentStats {
 pub struct Registry {
     agents: HashMap<String, ConnectedAgent>,
     index: SignatureIndex,
+    /// Monotonic id counter, OWNED by this registry instance (not a global
+    /// static): each `Registry` mints ids from its own space, so distinct
+    /// instances — including parallel tests — never race on a shared counter.
+    /// Seeded above the highest restored id in [`Registry::restore_from`].
+    next_id: u64,
 }
 
 impl Registry {
@@ -124,6 +126,7 @@ impl Registry {
         Self {
             agents: HashMap::new(),
             index: SignatureIndex::new(),
+            next_id: 1,
         }
     }
 
@@ -168,7 +171,8 @@ impl Registry {
             return Err(format!("pid {pid} already connected"));
         }
 
-        let id = format!("ag-{:04x}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        let id = format!("ag-{:04x}", self.next_id);
+        self.next_id += 1;
 
         let (kind, integration) = if let Some(sig) = self.index.identify(name) {
             (sig.kind, format!("{:?}", sig.integration).to_lowercase())
@@ -321,7 +325,7 @@ impl Registry {
             .collect();
         RegistrySnapshot {
             schema_version: 1,
-            next_id: NEXT_ID.load(Ordering::Relaxed),
+            next_id: self.next_id,
             agents,
         }
     }
@@ -342,8 +346,8 @@ impl Registry {
         Ok(())
     }
 
-    /// Construct a registry from a previously-saved snapshot. The
-    /// global `NEXT_ID` counter is reseeded above the highest seen
+    /// Construct a registry from a previously-saved snapshot. This
+    /// instance's `next_id` counter is seeded above the highest seen
     /// ag-id so future `connect` calls do not collide with restored
     /// ones. A missing file is NOT an error — a clean install / first
     /// boot simply starts empty. Corrupt JSON IS an error so the
@@ -356,7 +360,7 @@ impl Registry {
         let snapshot: RegistrySnapshot = serde_json::from_str(&body)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // Reseed NEXT_ID. Take the max of the persisted counter and
+        // Seed next_id. Take the max of the persisted counter and
         // (max parsed ag-id + 1): the counter handles the case where
         // an agent was connected then disconnected (we lost the
         // disconnect but the counter remembers we burned the id), the
@@ -372,7 +376,6 @@ impl Registry {
             .max()
             .unwrap_or(0);
         let seed = snapshot.next_id.max(max_parsed + 1);
-        NEXT_ID.store(seed, Ordering::Relaxed);
 
         let mut agents = HashMap::with_capacity(snapshot.agents.len());
         for p in snapshot.agents {
@@ -399,6 +402,7 @@ impl Registry {
         Ok(Self {
             agents,
             index: SignatureIndex::new(),
+            next_id: seed,
         })
     }
 }
@@ -567,9 +571,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn unique_pid() -> u32 {
-        // The NEXT_ID counter is a global static, so we randomise pids
-        // across persistence tests to avoid collisions with sibling
-        // tests in the same module (registry insists pids be unique).
+        // Randomise pids across persistence tests to avoid collisions with
+        // sibling tests in the same module (registry insists pids be unique).
         // Using `std::process::id() ^ time_nanos` keeps the pid unique
         // per test invocation without pulling in a random crate.
         let t = std::time::SystemTime::now()
@@ -637,8 +640,9 @@ mod tests {
     #[test]
     fn restore_seeds_next_id_above_restored_ids_so_future_connects_dont_collide() {
         // The exact failure this guards against: snapshot has ag-0001,
-        // we restart, NEXT_ID resets to 1, next connect tries to mint
-        // ag-0001 again and overwrites the restored agent.
+        // we restart, next_id resets to 1, next connect tries to mint
+        // ag-0001 again and overwrites the restored agent. The counter is
+        // per-instance, so this is deterministic under parallel tests.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
         let pid_a = unique_pid();

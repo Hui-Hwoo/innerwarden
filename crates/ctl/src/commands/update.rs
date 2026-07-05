@@ -61,8 +61,39 @@ fn smoke_test_verdict(
 /// Run `<path> --version` and classify the outcome. Unix-only (the only targets
 /// InnerWarden ships). The staged binary must already be sha256+sig verified.
 fn run_smoke_test(path: &Path, expected_version: &str) -> SmokeOutcome {
+    run_smoke_test_with(expected_version, || {
+        std::process::Command::new(path).arg("--version").output()
+    })
+}
+
+/// Core of [`run_smoke_test`] with the spawn injected so the retry logic is
+/// unit-testable without a real process. A freshly-staged binary can transiently
+/// fail to exec — ETXTBSY (26) if a concurrent fork still holds a write fd to
+/// it, or EAGAIN (11) if the host is briefly out of process slots — neither of
+/// which means the binary is unusable. Retry those a few times before declaring
+/// `CannotRun`, which would abort the upgrade and keep the old binary behind a
+/// misleading wrong-arch message. Permanent errors (e.g. ENOENT) fail fast.
+fn run_smoke_test_with<F>(expected_version: &str, mut spawn: F) -> SmokeOutcome
+where
+    F: FnMut() -> std::io::Result<std::process::Output>,
+{
     use std::os::unix::process::ExitStatusExt;
-    match std::process::Command::new(path).arg("--version").output() {
+    let mut attempt = 0u32;
+    let result = loop {
+        match spawn() {
+            Ok(out) => break Ok(out),
+            Err(e) => {
+                let transient = matches!(e.raw_os_error(), Some(26) | Some(11));
+                if transient && attempt < 5 {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+                    continue;
+                }
+                break Err(e);
+            }
+        }
+    };
+    match result {
         Err(_) => smoke_test_verdict(false, false, None, "", expected_version),
         Ok(out) => {
             let signaled = out.status.signal().is_some();
@@ -776,6 +807,54 @@ mod tests {
             run_smoke_test(&bin, "9.9.9"),
             SmokeOutcome::RanUnverified(_)
         ));
+    }
+
+    fn fake_output(exit_code: i32, stdout: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(exit_code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn run_smoke_test_retries_transient_etxtbsy_then_succeeds() {
+        // A transient exec failure (ETXTBSY: a concurrent fork still holds a
+        // write fd to the freshly-staged binary) must be retried, not reported
+        // as "cannot run on this arch". This is also what makes the real-binary
+        // smoke test deterministic under parallel `cargo test` load.
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let v = run_smoke_test_with("9.9.9", || {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n < 2 {
+                Err(std::io::Error::from_raw_os_error(26)) // ETXTBSY
+            } else {
+                Ok(fake_output(0, "fakebin 9.9.9"))
+            }
+        });
+        assert_eq!(v, SmokeOutcome::Ok);
+        assert_eq!(
+            calls.get(),
+            3,
+            "should retry the two transient failures then succeed"
+        );
+    }
+
+    #[test]
+    fn run_smoke_test_does_not_retry_permanent_error() {
+        // A permanent spawn error (ENOENT) is a real "cannot run" and must fail
+        // fast — no retry loop.
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let v = run_smoke_test_with("9.9.9", || {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(2)) // ENOENT
+        });
+        assert!(matches!(v, SmokeOutcome::CannotRun(_)));
+        assert_eq!(calls.get(), 1, "a permanent error must not be retried");
     }
 
     fn dests(n: usize) -> Vec<PathBuf> {
