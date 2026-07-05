@@ -234,11 +234,14 @@ pub(crate) struct ContainerIdentity {
 /// surfaced tens of seconds late. Memoising collapses repeated lookups for the
 /// same PID to a map hit. Pid reuse can briefly serve a stale id; acceptable for
 /// container attribution and bounded by an 8192-entry cap.
-fn resolve_container_identity(pid: u32) -> Option<ContainerIdentity> {
+fn resolve_container_identity(pid: u32) -> Option<std::sync::Arc<ContainerIdentity>> {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     const CACHE_CAP: usize = 8192;
-    static CACHE: OnceLock<Mutex<HashMap<u32, Option<ContainerIdentity>>>> = OnceLock::new();
+    // Cache the identity behind an `Arc` so a cache hit (every event on a
+    // container host) is a refcount bump, not a fresh clone of the whole
+    // `ContainerIdentity` (container_id + pod_uid + runtime Strings) per event.
+    static CACHE: OnceLock<Mutex<HashMap<u32, Option<Arc<ContainerIdentity>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     // Recover from a poisoned lock rather than branching on the error so the
     // happy path stays single-expression.
@@ -248,7 +251,7 @@ fn resolve_container_identity(pid: u32) -> Option<ContainerIdentity> {
             return v.clone();
         }
     }
-    let result = resolve_container_identity_uncached(pid);
+    let result = resolve_container_identity_uncached(pid).map(Arc::new);
     let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
     if map.len() >= CACHE_CAP {
         map.clear();
@@ -2452,7 +2455,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &filename,
                         &host,
                     );
-                    attach_pod_runtime(&mut ev.details, cident.as_ref());
+                    attach_pod_runtime(&mut ev.details, cident.as_deref());
                     Some(ev)
                 }
                 // ConnectEvent layout (#[repr(C)]):
@@ -2500,7 +2503,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &host,
                         exe_path.as_deref(),
                     );
-                    attach_pod_runtime(&mut ev.details, cident.as_ref());
+                    attach_pod_runtime(&mut ev.details, cident.as_deref());
                     Some(ev)
                 }
                 // FileOpenEvent layout (#[repr(C)]):
@@ -2537,7 +2540,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &host,
                         exe_path.as_deref(),
                     );
-                    attach_pod_runtime(&mut ev.details, cident.as_ref());
+                    attach_pod_runtime(&mut ev.details, cident.as_deref());
                     Some(ev)
                 }
                 // FileWrite from LSM file_open hook (same layout as FileOpenEvent)
@@ -2573,7 +2576,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &host,
                         exe_path.as_deref(),
                     );
-                    attach_pod_runtime(&mut ev.details, cident.as_ref());
+                    attach_pod_runtime(&mut ev.details, cident.as_deref());
                     Some(ev)
                 }
                 // PrivEscEvent layout (#[repr(C)]):
@@ -2603,7 +2606,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         &host,
                     )
                     .map(|mut ev| {
-                        attach_pod_runtime(&mut ev.details, cident.as_ref());
+                        attach_pod_runtime(&mut ev.details, cident.as_deref());
                         ev
                     })
                 }
@@ -2640,7 +2643,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
-                    attach_pod_runtime(&mut details, cident.as_ref());
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     let mut tags = vec!["ebpf".to_string(), "lsm".to_string()];
                     tags.push(if observe { "would_block" } else { "blocked" }.to_string());
@@ -2716,7 +2719,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "container_id": container_id.as_deref().unwrap_or(""),
                         "overlay_upper": true,
                     });
-                    attach_pod_runtime(&mut details, cident.as_ref());
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2805,7 +2808,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
-                    attach_pod_runtime(&mut details, cident.as_ref());
+                    attach_pod_runtime(&mut details, cident.as_deref());
                     if let Some(ctx) = exec_ctx {
                         details["filename"] = serde_json::Value::String(ctx.filename.clone());
                         details["comm"] = serde_json::Value::String(ctx.comm.clone());
@@ -2910,7 +2913,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
-                    attach_pod_runtime(&mut details, cident.as_ref());
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     let mut tags = vec![
                         "ebpf".to_string(),
@@ -2953,7 +2956,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
-                    attach_pod_runtime(&mut details, cident.as_ref());
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -2999,7 +3002,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
-                    attach_pod_runtime(&mut details, cident.as_ref());
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -3048,7 +3051,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
-                    attach_pod_runtime(&mut details, cident.as_ref());
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     let mut tags = vec!["ebpf".to_string(), "mount".to_string()];
                     if in_container {
@@ -3089,7 +3092,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
-                    attach_pod_runtime(&mut details, cident.as_ref());
+                    attach_pod_runtime(&mut details, cident.as_deref());
 
                     Some(Event {
                         ts: chrono::Utc::now(),
@@ -4053,7 +4056,7 @@ mod tests {
     // themselves only run against a live kernel ring buffer (covered by the
     // on-box live validation), so these cover the same logic via the helper +
     // builders — the exact `let mut ev = builder(..); attach_pod_runtime(&mut
-    // ev.details, cident.as_ref())` shape used in every arm.
+    // ev.details, cident.as_deref())` shape used in every arm.
     #[test]
     fn attach_pod_runtime_adds_pod_and_runtime() {
         let id = ContainerIdentity {
@@ -4082,6 +4085,25 @@ mod tests {
         attach_pod_runtime(&mut d2, Some(&docker));
         assert_eq!(d2["runtime"], "docker");
         assert!(d2.get("pod_uid").is_none());
+    }
+
+    // Zero-regression guard for the Arc-cached identity: a repeated lookup of
+    // the same pid must serve the SAME allocation (a refcount bump), not
+    // re-resolve or clone. In a non-container env (typical CI) both resolve to
+    // None; the assertion then only checks the cache stays consistent.
+    #[test]
+    fn resolve_container_identity_cache_shares_the_arc() {
+        let pid = std::process::id();
+        let a = resolve_container_identity(pid);
+        let b = resolve_container_identity(pid);
+        match (a, b) {
+            (Some(x), Some(y)) => assert!(
+                std::sync::Arc::ptr_eq(&x, &y),
+                "cache hit must share the Arc, not re-clone the identity"
+            ),
+            (None, None) => {}
+            _ => panic!("cache returned inconsistent Some/None for the same pid"),
+        }
     }
 
     #[test]
