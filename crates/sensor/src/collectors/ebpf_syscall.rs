@@ -2640,7 +2640,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         details["would_block_by"] =
                             serde_json::Value::String("exec_gate".to_string());
                     }
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
                     attach_pod_runtime(&mut details, cident.as_deref());
@@ -2654,7 +2654,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         tags.push("observe".to_string());
                     }
                     let mut entities = vec![];
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         tags.push("container".to_string());
                         entities.push(EntityRef::container(cid));
                     }
@@ -2805,7 +2805,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "action": "blocked",
                         "source_program": source_program,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
                     attach_pod_runtime(&mut details, cident.as_deref());
@@ -2830,7 +2830,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         format!("hook:{hook_name}"),
                     ];
                     let mut entities = vec![];
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         tags.push("container".to_string());
                         entities.push(EntityRef::container(cid));
                     }
@@ -2910,7 +2910,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "request": request, "request_name": request_name,
                         "comm": comm, "cgroup_id": cgroup_id,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
                     attach_pod_runtime(&mut details, cident.as_deref());
@@ -2953,7 +2953,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "pid": pid, "uid": uid, "target_uid": target_uid,
                         "comm": comm, "cgroup_id": cgroup_id,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
                     attach_pod_runtime(&mut details, cident.as_deref());
@@ -2999,7 +2999,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "addr": format!("{ip}"), "family": family,
                         "comm": comm, "cgroup_id": cgroup_id,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
                     attach_pod_runtime(&mut details, cident.as_deref());
@@ -3048,7 +3048,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "comm": comm, "cgroup_id": cgroup_id,
                         "in_container": in_container,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
                     attach_pod_runtime(&mut details, cident.as_deref());
@@ -3089,7 +3089,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         "pid": pid, "uid": uid, "flags": flags,
                         "name": name, "comm": comm, "cgroup_id": cgroup_id,
                     });
-                    if let Some(ref cid) = container_id {
+                    if let Some(cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
                     }
                     attach_pod_runtime(&mut details, cident.as_deref());
