@@ -385,7 +385,7 @@ fn read_proc_cmdline(pid: u32, filename: &str) -> Vec<String> {
         Ok(data) if !data.is_empty() => data
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).to_string())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect(),
         _ => vec![filename.to_string()],
     }
@@ -447,9 +447,11 @@ fn execve_to_event(
     let full_argv = read_proc_cmdline(pid, filename);
     let argc = full_argv.len();
     let command = full_argv.join(" ");
+    // Move each token into the JSON array instead of cloning it: `command` and
+    // `argc` are already computed above, so `full_argv` is no longer needed.
     let argv_json: Vec<serde_json::Value> = full_argv
-        .iter()
-        .map(|s| serde_json::Value::String(s.clone()))
+        .into_iter()
+        .map(serde_json::Value::String)
         .collect();
 
     let parent_comm = crate::detectors::exec_context::proc_comm(ppid).unwrap_or_default();
@@ -727,7 +729,7 @@ fn privesc_to_event(
 /// Extract a null-terminated string from a byte slice.
 fn bytes_to_string(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).to_string()
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 /// `ExecveEvent.argv[0]` lives at bytes 352..480 of the `#[repr(C)]` layout
@@ -2438,7 +2440,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let mut ev = execve_to_event(
                         pid,
@@ -2483,7 +2485,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
                     let mut ev = connect_to_event(
@@ -2520,7 +2522,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
                     let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
 
                     let mut ev = file_open_to_event(
@@ -2556,7 +2558,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
 
                     let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
                     let exe_path = execve_cache.get(&pid).map(|c| c.filename.clone());
 
                     let mut ev = file_open_to_event(
@@ -2589,7 +2591,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     }
 
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     privesc_to_event(
                         pid,
@@ -2619,7 +2621,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let observe = is_exec_gate_observe(data);
 
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let mut details = serde_json::json!({
                         "pid": pid,
@@ -2703,7 +2705,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let filename = bytes_to_string(&data[96..352]);
 
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let mut details = serde_json::json!({
                         "pid": pid,
@@ -2758,7 +2760,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     // operators don't have to translate boot-relative ns.
 
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     // PR-A: the `reason` field at offset 12 was repurposed
                     // as `hook_id` (sensor-ebpf-types LSM_HOOK_*) so kind=35
@@ -2898,7 +2900,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         _ => "UNKNOWN",
                     };
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "target_pid": target_pid,
@@ -2943,7 +2945,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let comm = bytes_to_string(&data[32..96]);
 
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "target_uid": target_uid,
                         "comm": comm, "cgroup_id": cgroup_id,
@@ -2980,7 +2982,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
 
                     let ip = std::net::Ipv4Addr::from(addr_raw);
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     // Low ports or INADDR_ANY are more suspicious
                     let severity = if port < 1024 || addr_raw == 0 {
@@ -3028,7 +3030,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let fs_type = bytes_to_string(&data[600..632]);
 
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
                     let in_container = cgroup_id > 1;
 
                     let severity = if in_container {
@@ -3078,7 +3080,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                     let name = bytes_to_string(&data[88..344]);
 
                     let cident = resolve_container_identity(pid);
-                    let container_id = cident.as_ref().map(|c| c.container_id.clone());
+                    let container_id = cident.as_ref().map(|c| c.container_id.as_str());
 
                     let mut details = serde_json::json!({
                         "pid": pid, "uid": uid, "flags": flags,
