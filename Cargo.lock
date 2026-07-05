@@ -2749,6 +2749,7 @@ version = "0.15.34"
 dependencies = [
  "innerwarden-agent-guard",
  "serde_json",
+ "tempfile",
  "tiny_http",
  "tokio",
 ]

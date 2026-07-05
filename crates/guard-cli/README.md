@@ -39,12 +39,24 @@ The verdict is JSON: `recommendation` (`allow` / `review` / `deny`),
 `risk_score`, `severity`, `signals`, `explanation`, `atr_matches`, and
 `asi_ids` (e.g. `["ASI02","ASI10"]`).
 
-## Wire it into an agent (gate on the exit code)
-
-Because `check` exits `1` on a `deny`, any pre-execution hook can block:
+## Wire it into Claude Code (one command)
 
 ```sh
-# Claude Code PreToolUse hook / a shell wrapper
+iw-guard install claude-code            # or: --block-review to also block `review`
+```
+
+This adds a fail-closed `PreToolUse:Bash` hook to `~/.claude/settings.json` (or
+`%USERPROFILE%\.claude\settings.json`) that runs `iw-guard hook` before every
+shell command Claude Code proposes. `hook` reads the tool call on stdin, screens
+the command in-process (no agent, no HTTP, offline), and blocks it (exit 2) on a
+`deny`. It is idempotent and preserves any hooks you already have. Restart Claude
+Code to load it.
+
+### Any other agent (gate on the exit code)
+
+`check` exits `1` on a `deny`, so any pre-execution wrapper can block:
+
+```sh
 iw-guard check "$COMMAND" || { echo "blocked by InnerWarden"; exit 1; }
 ```
 

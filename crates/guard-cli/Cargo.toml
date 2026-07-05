@@ -24,3 +24,6 @@ tiny_http = "0.12"
 # Async runtime for the `proxy` mode (the enforcing MCP stdio guard, which pumps
 # the wrapped server's stdio via tokio::process). Windows-clean: no unix APIs.
 tokio = { version = "1", features = ["rt-multi-thread", "io-std", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
