@@ -16,7 +16,7 @@
   EDR (eBPF, Execution Gate) is Linux-only and not part of the Windows build.
 
 .PARAMETER Version
-  Release tag (e.g. v0.15.35). Defaults to the latest release.
+  Release tag (e.g. v0.16.0). Defaults to the latest release.
 
 .PARAMETER Full
   Install the full sensor+agent+ctl trio + boot-start service (needs Administrator).

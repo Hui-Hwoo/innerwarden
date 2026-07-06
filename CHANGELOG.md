@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-06
+
+### Highlight: Windows support (Phantom tier)
+
+InnerWarden now runs on **Windows**, not just Linux/macOS. Two tiers ship: the
+per-user **AI-agent guardrail** (`iw-guard`: check / serve / enforcing MCP proxy /
+one-command Claude Code hook), and the elevated **full host tier** (`install.ps1
+-Full`: the signed sensor+agent+ctl trio, boot-start Scheduled Tasks, Windows Event
+Log (ETW) telemetry -> the 82 detectors -> cloud-AI triage -> dashboard -> Windows
+Firewall containment, monitor-only by default). This is the macOS-parity light tier
+(spec 085); the kernel EDR (eBPF, Execution Gate) stays Linux-only. Minor version
+bump: a new operating-system tier is a feature, not a patch.
+
 ### Added
 - **`install.ps1 -Full` installs the Mac-parity Windows host tier (spec 085 Phantom Phase 5).** The default `install.ps1` still installs only the `iw-guard` guardrail per-user; the new elevated `-Full` mode downloads the signed trio (`innerwarden-{sensor,agent,ctl}-windows-x86_64.exe`, published by the new `build-release-windows-full` release job), installs to `%ProgramFiles%\InnerWarden` with state under `%ProgramData%\InnerWarden`, writes a Windows monitor-only config (ETW + integrity collectors on, Linux collectors off, `[responder] enabled=false dry_run=true`), locks the state dir to Administrators/SYSTEM, and registers two boot-start SYSTEM Scheduled Tasks (`InnerWarden\innerwarden-{sensor,agent}`, the names `ctl`'s systemd.rs restart/status route to) with KeepAlive semantics (`ExecutionTimeLimit=0` to defeat the 72h auto-kill, 1-min repetition, RestartCount). So a Windows box can now download, install, and boot-start the full light tier: ETW host telemetry -> the 82 detectors -> cloud-AI triage -> dashboard, plus firewall containment via the `block_ip_windows` skill. A `powershell-parse` CI job AST-parses `install.ps1` on every change. Light Scheduled Task, not true SCM (the plain console exes have no ServiceMain); eBPF/Execution Gate stay Linux-only.
 - **Windows now ships the AI-agent guardrail: `iw-guard`, a signed, SLSA-attested `.exe` per release.** The guardrail half of InnerWarden (screen an agent's shell command / MCP tool call for danger) is OS-agnostic Rust, so it now runs the same on Linux, macOS, and **Windows** without the Linux host-EDR (eBPF/sensor/Execution Gate stays Linux-only). A new thin crate `crates/guard-cli` (bin `iw-guard`) drives the already-Windows-clean `agent-guard` engine with three subcommands: `iw-guard check "<cmd>"` (verdict JSON, exits 1 on `deny` so a PreToolUse hook can gate), `iw-guard serve` (plain-HTTP `POST /api/agent/check-command` on loopback for an MCP wrapper), and `iw-guard proxy --mode guard -- <server>` (the enforcing stdio MITM that blocks a disallowed `tools/call` inline). `iw-guard install claude-code` wires a fail-closed `PreToolUse:Bash` hook into Claude Code in one command (offline, in-process): the hook runs `iw-guard hook`, which reads the tool call on stdin, screens the command locally, and blocks it (exit 2) on a `deny` (`--block-review` also blocks `review`). It depends only on `agent-guard` (plus its `mcp_proxy`): no sensor, jemalloc, systemd, `/proc`, or TLS on the check-command path. The new `build-release-windows` job publishes `iw-guard-windows-x86_64.exe` (+ build-only aarch64) with a lowercase SHA-256 sidecar, an Ed25519 `.sig` (same scheme as Linux/macOS), and a Sigstore provenance bundle. A `windows-guard` CI job builds + smoke-tests the real `.exe` (check + serve) on a `windows-latest` runner on every guardrail-touching PR. `install.ps1` fetches, verifies, and installs it. No sensor/agent/detector-count change on Linux.
