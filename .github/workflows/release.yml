@@ -880,3 +880,145 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Windows FULL trio (spec 085 Phantom Phase 5): the Mac-parity light tier -
+  # sensor + agent + ctl for x86_64-pc-windows-msvc, PLAIN cargo build (no eBPF,
+  # no local-classifier, no jemalloc), exactly like build-release-macos. Kept a
+  # SEPARATE job from the guardrail (iw-guard) above: different toolchain (the
+  # trio needs NASM for ring's asm; iw-guard does not), different scope, and a
+  # trio build break must not block the proven guardrail publish. x86_64 only -
+  # ci.yml windows-compile-unlock proves only x86_64 trio compilation.
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-release-windows-full:
+    name: Build and publish (Windows trio)
+    runs-on: windows-latest
+    needs: build-release
+
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # ring's x86_64 assembly needs NASM. Perl + cl.exe are pre-installed on
+      # windows-latest; CMake is NOT needed (spec 085 dropped aws-lc-sys).
+      - name: Install NASM (ring x86_64 asm)
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: windows-msvc-trio-release
+
+      # Plain build - the same feature-less flag set as build-release-macos and
+      # the ci.yml windows-compile-unlock gate. No smoke beyond `--version`: the
+      # trio has no simple deny/allow probe, and windows-compile-unlock already
+      # proves it compiles + links on every PR.
+      - name: Build sensor + agent + ctl (x86_64-pc-windows-msvc)
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc -p innerwarden-sensor -p innerwarden-agent -p innerwarden-ctl
+
+      - name: Smoke test - the CLI runs and prints its version
+        shell: pwsh
+        run: |
+          $ctl = "target/x86_64-pc-windows-msvc/release/innerwarden-ctl.exe"
+          $v = & $ctl --version
+          if ($LASTEXITCODE -ne 0) { throw "innerwarden-ctl --version failed with $LASTEXITCODE" }
+          Write-Host "windows trio smoke OK: $v"
+
+      # Canonical asset names: innerwarden-<bin>-windows-x86_64.exe (matches the
+      # -macos-<arch> convention). Lowercase-hex .sha256 sidecar (no filename).
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          foreach ($bin in @("innerwarden-sensor", "innerwarden-agent", "innerwarden-ctl")) {
+            $src = "target/x86_64-pc-windows-msvc/release/$bin.exe"
+            $dest = "dist/$bin-windows-x86_64.exe"
+            Copy-Item $src $dest
+            (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower() |
+              Out-File -NoNewline -Encoding ascii "$dest.sha256"
+          }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      # Ed25519 over the SHA-256 digest, same scheme as Linux/macOS + the guardrail
+      # job. Genuine OpenSSL 3.x (choco); `-rawin` needs a seekable `-in` file.
+      - name: Sign Windows trio binaries
+        if: env.RELEASE_SIGNING_KEY != ''
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        shell: pwsh
+        run: |
+          choco install openssl --no-progress -y | Out-Null
+          $ossl = "C:\Program Files\OpenSSL-Win64\bin\openssl.exe"
+          & $ossl version
+          $key = Join-Path $env:TEMP "sign-key.pem"
+          [IO.File]::WriteAllText($key, $env:RELEASE_SIGNING_KEY)
+          try {
+            foreach ($exe in Get-ChildItem dist/innerwarden-*-windows-*.exe) {
+              Write-Host "signing $($exe.Name)..."
+              $dig = Join-Path $env:TEMP "d.bin"
+              $sig = Join-Path $env:TEMP "sig.bin"
+              $b64 = Join-Path $env:TEMP "sig.b64"
+              & $ossl dgst -sha256 -binary -out $dig $exe.FullName
+              & $ossl pkeyutl -sign -inkey $key -rawin -in $dig -out $sig
+              & $ossl base64 -A -in $sig -out $b64
+              (Get-Content -Raw $b64).Trim() |
+                Out-File -NoNewline -Encoding ascii "$($exe.FullName).sig"
+              Remove-Item $dig, $sig, $b64 -ErrorAction SilentlyContinue
+            }
+          } finally {
+            Remove-Item $key -ErrorAction SilentlyContinue
+          }
+
+      - name: Attest build provenance for Windows trio binaries
+        id: attest_windows_full
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            dist/innerwarden-sensor-windows-x86_64.exe
+            dist/innerwarden-agent-windows-x86_64.exe
+            dist/innerwarden-ctl-windows-x86_64.exe
+
+      - name: Attach Windows trio Sigstore bundle to release
+        shell: pwsh
+        env:
+          BUNDLE_PATH: ${{ steps.attest_windows_full.outputs.bundle-path }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if (-not $env:BUNDLE_PATH -or -not (Test-Path $env:BUNDLE_PATH)) {
+            Write-Error "No bundle-path output from attest_windows_full"; exit 1
+          }
+          Copy-Item $env:BUNDLE_PATH "dist/$($env:REF_NAME)-windows-full.intoto.jsonl"
+
+      - name: Verify Windows trio assets present
+        shell: pwsh
+        run: |
+          foreach ($bin in @("innerwarden-sensor", "innerwarden-agent", "innerwarden-ctl")) {
+            foreach ($f in @("dist/$bin-windows-x86_64.exe", "dist/$bin-windows-x86_64.exe.sha256")) {
+              if (-not (Test-Path $f)) { throw "missing required asset: $f" }
+            }
+            if (-not ("${{ github.ref_name }}".Contains("-"))) {
+              if (-not (Test-Path "dist/$bin-windows-x86_64.exe.sig")) {
+                throw "stable release requires a signed $bin-windows-x86_64.exe.sig"
+              }
+            }
+          }
+
+      - name: Upload Windows trio assets to GitHub Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
