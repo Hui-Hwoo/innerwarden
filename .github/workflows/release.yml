@@ -817,7 +817,22 @@ jobs:
         shell: pwsh
         run: |
           choco install openssl --no-progress -y | Out-Null
-          $ossl = "C:\Program Files\OpenSSL-Win64\bin\openssl.exe"
+          # choco updates the machine PATH but not this session, and the install
+          # dir varies by package version, so locate openssl instead of assuming
+          # a hardcoded path (that path was empty on the runner - v0.16.0-rc.1).
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+            [System.Environment]::GetEnvironmentVariable("Path", "User")
+          $ossl = (Get-Command openssl.exe -ErrorAction SilentlyContinue).Source
+          if (-not $ossl) {
+            $ossl = @(
+              "C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+              "C:\Program Files\OpenSSL\bin\openssl.exe",
+              "C:\tools\OpenSSL-Win64\bin\openssl.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $ossl -or -not (Test-Path $ossl)) {
+            throw "openssl not found after 'choco install openssl'"
+          }
           & $ossl version
           $key = Join-Path $env:TEMP "sign-key.pem"
           [IO.File]::WriteAllText($key, $env:RELEASE_SIGNING_KEY)
@@ -962,7 +977,22 @@ jobs:
         shell: pwsh
         run: |
           choco install openssl --no-progress -y | Out-Null
-          $ossl = "C:\Program Files\OpenSSL-Win64\bin\openssl.exe"
+          # choco updates the machine PATH but not this session, and the install
+          # dir varies by package version, so locate openssl instead of assuming
+          # a hardcoded path (that path was empty on the runner - v0.16.0-rc.1).
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+            [System.Environment]::GetEnvironmentVariable("Path", "User")
+          $ossl = (Get-Command openssl.exe -ErrorAction SilentlyContinue).Source
+          if (-not $ossl) {
+            $ossl = @(
+              "C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+              "C:\Program Files\OpenSSL\bin\openssl.exe",
+              "C:\tools\OpenSSL-Win64\bin\openssl.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $ossl -or -not (Test-Path $ossl)) {
+            throw "openssl not found after 'choco install openssl'"
+          }
           & $ossl version
           $key = Join-Path $env:TEMP "sign-key.pem"
           [IO.File]::WriteAllText($key, $env:RELEASE_SIGNING_KEY)
