@@ -125,6 +125,15 @@ coverage:
           # those still count toward the `ctl` project gate. Only the
           # interactive apply loop (which prompts on stdin) is unreachable.
           - "!crates/ctl/src/commands/setup.rs"
+          # Service-manager I/O wrappers: systemd.rs shells out to systemctl /
+          # launchctl / schtasks / tasklist. The Windows branch (schtasks/tasklist)
+          # only runs on Windows (spec 085 Phase 4), so those spawns are
+          # uncoverable on the Linux runner. All the ROUTING + parsing logic it
+          # composes (restart_route, scheduled_task_name, classify_tasklist,
+          # classify_pgrep, classify_systemctl_is_active, restart_*_with via
+          # injected closures) IS unit-tested (26 tests) - only the thin
+          # spawn-the-real-tool wrappers are excluded.
+          - "!crates/ctl/src/systemd.rs"
           - "!crates/sensor/src/main.rs"
           # Sensor dispatch/wiring: process_event dispatches to 79
           # detectors + writes incidents via SQLite. Unit-testing
