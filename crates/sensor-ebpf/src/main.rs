@@ -43,7 +43,7 @@ use innerwarden_ebpf_types::{
     ModuleLoadEvent, MountEvent, MprotectEvent, MsrWriteEvent, PrctlEvent, PrivEscEvent,
     ProcessExitEvent, PtraceEvent, RenameEvent, SetUidEvent, SetnsEvent, SocketBindEvent,
     SyscallKind, TimingProbeEvent, TimingTarget, TruncateEvent, UnlinkEvent, UtimensatEvent,
-    MAX_COMM_LEN, MAX_FILENAME_LEN,
+    MAX_ARGS, MAX_ARG_LEN, MAX_COMM_LEN, MAX_FILENAME_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -321,6 +321,29 @@ macro_rules! syscall_arg_at {
     ($regs:expr, $n:tt) => {
         bpf_probe_read_kernel(($regs).add(__sc_off!($n)) as *const u64)
     };
+}
+
+/// Read the `$i`-th entry of an execve `argv[]` array (userspace `char **` at
+/// `$base`) into `event.argv[$i]`, updating `$n` to the count captured. `$i`
+/// MUST be a literal so the index into the reserved ring entry is constant (the
+/// eBPF verifier rejects a runtime index into `event.argv`). Evaluates to `true`
+/// when an arg was read, `false` at the argv NULL terminator; callers chain with
+/// `&&` so capture stops at the first NULL (manual unroll, no loop). Fail-soft:
+/// a bad userspace read stops capture rather than aborting the event.
+macro_rules! read_argv_slot {
+    ($base:expr, $i:literal, $event:expr, $n:expr) => {{
+        let slot = ($base as usize + $i * core::mem::size_of::<u64>()) as *const u64;
+        let str_addr = unsafe { bpf_probe_read_user(slot) }.unwrap_or(0);
+        if str_addr != 0 {
+            unsafe {
+                let _ = bpf_probe_read_user_str_bytes(str_addr as *const u8, &mut $event.argv[$i]);
+            }
+            $n = $i as u32 + 1;
+            true
+        } else {
+            false
+        }
+    }};
 }
 
 // Per-arg pt_regs byte offset as a LITERAL (expands at the call site). Two
@@ -1878,7 +1901,29 @@ fn try_dispatch_execve(regs: *const u8) -> Result<(), i64> {
     unsafe {
         let _ = bpf_probe_read_user_str_bytes(filename_ptr, &mut event.filename);
     }
-    event.argv = [[0u8; 128]; 8];
+    // Capture argv IN-KERNEL from the caller's still-mapped userspace memory.
+    // Userspace otherwise reconstructs argv from /proc/PID/cmdline, but a
+    // short-lived process (rm, find) exits before the ring reader runs, so /proc
+    // is already gone and only argv[0] survives -- leaving argv-based detectors
+    // (data_destruction_pattern) blind to `-rf` and the target path. Reading here
+    // at execve entry is reliable: the CALLING process's argv array is still live
+    // in its address space. Manually unrolled (see read_argv_slot!) so every index
+    // into the reserved ring entry is constant; `&&` stops at the NULL terminator.
+    event.argv = [[0u8; MAX_ARG_LEN]; MAX_ARGS];
+    let argv_base = unsafe { syscall_arg_at!(regs, 1) }.unwrap_or(0);
+    let mut argc: u32 = 0;
+    if argv_base != 0
+        && read_argv_slot!(argv_base, 0, event, argc)
+        && read_argv_slot!(argv_base, 1, event, argc)
+        && read_argv_slot!(argv_base, 2, event, argc)
+        && read_argv_slot!(argv_base, 3, event, argc)
+        && read_argv_slot!(argv_base, 4, event, argc)
+        && read_argv_slot!(argv_base, 5, event, argc)
+        && read_argv_slot!(argv_base, 6, event, argc)
+    {
+        let _ = read_argv_slot!(argv_base, 7, event, argc);
+    }
+    event.argc = argc;
     entry.submit(0);
     Ok(())
 }
