@@ -464,10 +464,20 @@ fn execve_to_event(
     container_id: Option<&str>,
     comm: &str,
     filename: &str,
+    kernel_argv: Vec<String>,
     host: &str,
 ) -> Event {
-    // Read full argv from /proc/PID/cmdline (eBPF only gives us filename/argv[0])
-    let full_argv = read_proc_cmdline(pid, filename);
+    // Prefer the argv captured IN-KERNEL at execve entry (see the eBPF
+    // read_argv_slot! unroll): it is complete and reliable even for a
+    // short-lived process. /proc/PID/cmdline is only a fallback for when the
+    // kernel gave us nothing useful (an older sensor eBPF that zeroes argv, or a
+    // failed read) - and for a dead process it degrades to just [filename]
+    // anyway, which is exactly the blindness this replaces.
+    let full_argv = if kernel_argv.len() > 1 {
+        kernel_argv
+    } else {
+        read_proc_cmdline(pid, filename)
+    };
     let argc = full_argv.len();
     let command = full_argv.join(" ");
     // Move each token into the JSON array instead of cloning it: `command` and
@@ -2474,6 +2484,27 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         continue;
                     }
 
+                    // argv[] captured in-kernel (struct offsets: argv 352..1376 =
+                    // 8 slots x 128 bytes, argc at 1376). Preferred over
+                    // /proc/PID/cmdline in execve_to_event because /proc is already
+                    // gone for a short-lived rm/find by the time this reader runs.
+                    // Older sensor eBPF zeroes argv -> argc 0 -> /proc fallback.
+                    let kernel_argv: Vec<String> = if data.len() >= 1380 {
+                        let argc = (read_u32!(data, 1376..1380) as usize).min(8);
+                        let mut v = Vec::with_capacity(argc);
+                        for i in 0..argc {
+                            let start = 352 + i * 128;
+                            let s = bytes_to_string(&data[start..start + 128]);
+                            if s.is_empty() {
+                                break;
+                            }
+                            v.push(s);
+                        }
+                        v
+                    } else {
+                        Vec::new()
+                    };
+
                     // Spec 052 Phase 1d: cache for join with LsmDecisionEvent
                     // (kind=35). Insert before any early-return below so a
                     // future LSM block on this pid has context to merge.
@@ -2510,6 +2541,7 @@ pub async fn run(tx: crate::event_channels::EbpfTx, host: String) {
                         container_id.as_deref(),
                         &comm,
                         &filename,
+                        kernel_argv,
                         &host,
                     );
                     attach_pod_runtime(&mut ev.details, cident.as_deref());
@@ -4179,6 +4211,7 @@ mod tests {
             Some("4858a7b75b55"),
             "bash",
             "/usr/bin/id",
+            vec![],
             "h",
         );
         attach_pod_runtime(&mut ev.details, Some(&id));
@@ -4241,12 +4274,39 @@ mod tests {
     #[test]
     fn execve_event_maps_to_shell_command_exec() {
         // Use PID 0 to avoid reading /proc/<pid>/cmdline of a real process.
-        let event = execve_to_event(0, 0, 1, 0, None, "bash", "/usr/bin/curl", "test-host");
+        let event = execve_to_event(
+            0,
+            0,
+            1,
+            0,
+            None,
+            "bash",
+            "/usr/bin/curl",
+            vec![],
+            "test-host",
+        );
         assert_eq!(event.source, "ebpf");
         assert_eq!(event.kind, "shell.command_exec");
         assert!(event.summary.contains("curl"));
         assert_eq!(event.details["pid"], 0);
         assert_eq!(event.details["ppid"], 1);
+    }
+
+    #[test]
+    fn execve_prefers_kernel_argv_over_proc() {
+        // A short-lived rm exits before /proc can be read; the in-kernel argv is
+        // the only reliable source of `-rf` + the target. When the kernel gives us
+        // the full argv, it must be used verbatim (not the /proc[pid=0] fallback).
+        let kargv = vec![
+            "/usr/bin/rm".to_string(),
+            "-rf".to_string(),
+            "/home/user/data".to_string(),
+        ];
+        let event = execve_to_event(0, 0, 1, 0, None, "rm", "/usr/bin/rm", kargv, "h");
+        assert_eq!(event.details["argc"], 3);
+        assert_eq!(event.details["command"], "/usr/bin/rm -rf /home/user/data");
+        assert_eq!(event.details["argv"][1], "-rf");
+        assert_eq!(event.details["argv"][2], "/home/user/data");
     }
 
     #[test]
@@ -4259,6 +4319,7 @@ mod tests {
             Some("abc123def456"),
             "bash",
             "/usr/bin/curl",
+            vec![],
             "test-host",
         );
         assert_eq!(event.details["container_id"], "abc123def456");
