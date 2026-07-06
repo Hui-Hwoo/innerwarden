@@ -12,6 +12,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.16.0] - 2026-07-06
 
 ### Added
+- **GuardFall runtime coverage: `find -delete` bulk deletion in the data-destruction
+  detector.** The static check-command (above) blocks GuardFall when the agent
+  proposes the destructive command directly, but a payload hidden in a repo
+  (a `Makefile`/script the agent innocently runs) executes as a subprocess the
+  static hook never sees. The sensor closes that gap because it inspects the REAL,
+  already-shell-resolved argv the kernel exec'd - so `r''m -rf /home/user` is
+  caught on its post-rewrite `["rm","-rf","/home/user"]` form regardless of the
+  obfuscation. The `data_destruction_pattern` detector now also fires on an
+  unfiltered `find <user-data-path> ... -delete` (GuardFall class E, the bulk-delete
+  tool a `rm`-watching blocklist misses), while leaving the ubiquitous filtered
+  cleanup (`find . -name '*.tmp' -delete`), `/tmp`, and build-cache dirs silent - the
+  same target discrimination the `rm -rf` path uses, so a malicious `make test`
+  wiping `/home/user` fires while a legit `make clean` of `target/` does not.
+
+### Added
 - **GuardFall shell-rewrite defence in the agent-guard check-command engine.**
   A text/regex blocklist that inspects the command an AI agent proposes is fooled
   because the shell REWRITES the command before running it (a class of attack the
