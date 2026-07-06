@@ -11,6 +11,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.16.0] - 2026-07-06
 
+### Added
+- **GuardFall shell-rewrite defence in the agent-guard check-command engine.**
+  A text/regex blocklist that inspects the command an AI agent proposes is fooled
+  because the shell REWRITES the command before running it (a class of attack the
+  GuardFall research showed defeated 10 of 11 open-source coding agents). The
+  check-command engine (`threats::check_command`, behind `/api/agent/check-command`
+  and `iw-guard check`) now runs a pure, non-executing `normalize_command` pass that
+  de-obfuscates the shell rewrites back to their real form before matching: empty-quote
+  insertion (`r''m` -> `rm`), `$IFS` word-splitting (`rm$IFS-rf`), command substitution
+  (`$(echo rm)`, backticks), variable indirection (`${x:-rm}`), and backslash escapes
+  (`\r\m`). It also adds destructive tools a `rm`-watching blocklist misses (`dd of=`,
+  `shred`, `install`/`cp` from `/dev/null`, `truncate -s 0`, `tar -C /`) and a
+  filter-aware `find -delete` check that blocks an unfiltered bulk delete
+  (`find /path -type f -delete`) while leaving the ubiquitous filtered cleanup
+  (`find . -name '*.tmp' -delete`) allowed. GuardFall classes A-E now resolve to
+  `deny`; the false-positive benchmark ceiling holds (1/18). The normalizer never
+  spawns a shell or evaluates input and is length- and pass-bounded against DoS.
+
 ### Highlight: Windows support (Phantom tier)
 
 InnerWarden now runs on **Windows**, not just Linux/macOS. Two tiers ship: the
