@@ -226,6 +226,9 @@ pub const COLLECTOR_MANIFEST: &[(&str, CollectorCategory)] = &[
     ("cloudtrail", CollectorCategory::Telemetry),
     ("dns_capture", CollectorCategory::Telemetry),
     ("ebpf", CollectorCategory::Telemetry),
+    // Windows ETW / Event Log collector (spec 085). Emits `source: "etw"`;
+    // always-on log stream, so a low count means the feed is broken.
+    ("etw", CollectorCategory::Telemetry),
     ("file_extract", CollectorCategory::Telemetry),
     ("http_capture", CollectorCategory::Telemetry),
     ("journald", CollectorCategory::Telemetry),

@@ -106,6 +106,40 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         description: "pickle deserialization",
         block: false,
     },
+    // GuardFall class E: destructive tools other than `rm` that a text
+    // blocklist watching for "rm" misses entirely. Combined with
+    // normalize_command (below), which de-obfuscates class A-D rewrites back
+    // to their real form before matching.
+    CommandPattern {
+        pattern: r"\bdd\b[^|;&]*\bof=",
+        description: "dd overwrite",
+        block: true,
+    },
+    CommandPattern {
+        pattern: r"\bshred\b\s",
+        description: "shred (unrecoverable delete)",
+        block: true,
+    },
+    CommandPattern {
+        pattern: r"\binstall\b[^|;&]*\s/dev/null\b",
+        description: "install from /dev/null (file overwrite)",
+        block: false,
+    },
+    CommandPattern {
+        pattern: r"\bcp\b\s+/dev/null\b",
+        description: "cp /dev/null (file overwrite)",
+        block: false,
+    },
+    CommandPattern {
+        pattern: r"\btruncate\b[^|;&]*-s\s*0\b",
+        description: "truncate to zero",
+        block: false,
+    },
+    CommandPattern {
+        pattern: r"\btar\b[^|;&]*\s-C\s*/(?:\s|$)",
+        description: "tar extract into /",
+        block: false,
+    },
 ];
 
 /// API key patterns for credential exposure detection.
@@ -299,7 +333,7 @@ fn api_key_regexes() -> &'static [(regex::Regex, &'static str)] {
 
 /// Compiled-once `(regex, description, block)` for each dangerous command
 /// pattern. Same rationale as [`api_key_regexes`]: `check_command` runs on
-/// every command/tool call, so the 14 patterns are compiled once, not per call.
+/// every command/tool call, so the 20 patterns are compiled once, not per call.
 fn dangerous_command_regexes() -> &'static [(regex::Regex, &'static str, bool)] {
     static R: std::sync::OnceLock<Vec<(regex::Regex, &'static str, bool)>> =
         std::sync::OnceLock::new();
@@ -325,12 +359,89 @@ pub fn check_credentials(content: &str) -> Option<&'static str> {
     None
 }
 
+/// De-obfuscate a shell command the way the shell itself would, WITHOUT
+/// executing it, so [`check_command`] sees the real command behind GuardFall
+/// shell-rewrite obfuscation: empty-quote insertion (`r''m`), `$IFS`
+/// word-splitting (`rm$IFS-rf`), command substitution (`$(echo rm)`), variable
+/// indirection (`${x:-rm}`), and backslash escapes (`\r\m`). Pure string
+/// transformation - it NEVER spawns a shell or evaluates the input. Bounded to a
+/// few passes and a max length so nested obfuscation resolves without unbounded
+/// work or a DoS on a pathological input.
+pub fn normalize_command(cmd: &str) -> String {
+    static SUBST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BACKTICK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static VARDEF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BACKSLASH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // `$( ... )` with no nested parens; repeated passes resolve nesting inside-out.
+    let subst = SUBST.get_or_init(|| regex::Regex::new(r"\$\(([^()]*)\)").unwrap());
+    let backtick = BACKTICK.get_or_init(|| regex::Regex::new(r"`([^`]*)`").unwrap());
+    // `${var:-default}` / `${var:=default}` -> default (indirection like `${x:-rm}`).
+    let vardef = VARDEF
+        .get_or_init(|| regex::Regex::new(r"\$\{[A-Za-z_][A-Za-z0-9_]*:[-=]?([^}]*)\}").unwrap());
+    // A backslash before a word char is a no-op in the shell (`\r` -> `r`).
+    let backslash = BACKSLASH.get_or_init(|| regex::Regex::new(r"\\([A-Za-z0-9])").unwrap());
+
+    let mut s = cmd.to_string();
+    // Cap length so a pathological input cannot blow up the passes.
+    if s.len() > 8192 {
+        s.truncate(8192);
+    }
+    for _ in 0..5 {
+        let before = s.clone();
+        // Unwrap command substitution + backticks, keeping the INNER command
+        // visible to the matcher (so `$(r''m -rf /)` exposes `r''m -rf /`).
+        // This is a structural unwrap, NOT execution.
+        s = subst.replace_all(&s, " $1 ").into_owned();
+        s = backtick.replace_all(&s, " $1 ").into_owned();
+        // `$IFS` / `${IFS}` used to split `rm -rf` into `rm$IFS-rf`.
+        s = s.replace("${IFS}", " ").replace("$IFS", " ");
+        // `${var:-default}` indirection.
+        s = vardef.replace_all(&s, "$1").into_owned();
+        // Empty quotes inserted between chars: `r''m` / `r""m` -> `rm`.
+        s = s.replace("''", "").replace("\"\"", "");
+        // Backslash-escaped word chars: `\r\m` -> `rm`.
+        s = backslash.replace_all(&s, "$1").into_owned();
+        if s == before {
+            break;
+        }
+    }
+    s
+}
+
 /// Check for dangerous commands. Returns description and whether to block.
+/// Matches BOTH the raw command and its shell-normalized form (see
+/// [`normalize_command`]) so GuardFall shell-rewrite obfuscation is caught, not
+/// just the literal text the agent proposed.
 pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
     for (re, description, block) in dangerous_command_regexes() {
         if re.is_match(content) {
             return Some((description, *block));
         }
+    }
+    let normalized = normalize_command(content);
+    let normalized_differs = normalized != content;
+    if normalized_differs {
+        for (re, description, block) in dangerous_command_regexes() {
+            if re.is_match(&normalized) {
+                return Some((description, *block));
+            }
+        }
+    }
+    // `find ... -delete` is dual-use: a FILTERED form (`find . -name '*.tmp'
+    // -delete`) is a common, safe cleanup, but an UNFILTERED bulk delete
+    // (`find /path -type f -delete`, GuardFall class E) is destructive. Flag only
+    // the unfiltered form so the ubiquitous filtered cleanup is not a false block.
+    let unfiltered_find_delete = |hay: &str| {
+        hay.contains("find")
+            && hay.contains("-delete")
+            && !["-name", "-iname", "-path", "-regex", "-wholename"]
+                .iter()
+                .any(|flag| hay.contains(flag))
+    };
+    if unfiltered_find_delete(content)
+        || (normalized_differs && unfiltered_find_delete(&normalized))
+    {
+        return Some(("find -delete (unfiltered bulk deletion)", true));
     }
     None
 }
@@ -503,6 +614,81 @@ pub fn check_download_execute_staged(content: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── GuardFall shell-rewrite defence (normalize_command + check_command) ──
+
+    #[test]
+    fn normalize_command_deobfuscates_guardfall_rewrites() {
+        let n = |c: &str| normalize_command(c);
+        assert!(n("r''m -rf /x").contains("rm -rf"), "empty-quote");
+        assert!(n("rm$IFS-rf$IFS/x").contains("rm -rf"), "$IFS");
+        assert!(n("echo $(r''m -rf /x)").contains("rm -rf"), "cmd-subst");
+        assert!(n("`r''m -rf /x`").contains("rm -rf"), "backtick");
+        assert!(n("${x:-rm} -rf /x").contains("rm -rf"), "var-default");
+        assert!(n("\\r\\m -rf /x").contains("rm -rf"), "backslash");
+    }
+
+    #[test]
+    fn normalize_command_is_bounded_on_pathological_input() {
+        // Never hangs / overflows on a deeply-nested or huge input.
+        let big = "$(".repeat(5000) + "rm -rf /" + &")".repeat(5000);
+        let out = normalize_command(&big);
+        assert!(out.len() <= 8192);
+    }
+
+    #[test]
+    fn check_command_catches_guardfall_class_a_to_e() {
+        // A-D: obfuscated rewrites of `rm -rf /` must BLOCK.
+        for cmd in [
+            "r''m -rf /tmp/x",
+            "rm$IFS-rf$IFS/tmp/x",
+            "echo \"$(r''m -rf /tmp/x)\"",
+            "\\r\\m -rf /tmp/x",
+            "${x:-rm} -rf /tmp/x",
+        ] {
+            let r = check_command(cmd);
+            assert!(r.is_some(), "GuardFall payload not caught: {cmd}");
+            assert!(r.unwrap().1, "GuardFall payload should block: {cmd}");
+        }
+        // E: destructive tools a text blocklist watching only for `rm` misses.
+        for cmd in [
+            "find /tmp/x -type f -delete",
+            "dd if=/dev/null of=/tmp/x/m",
+            "shred -u /tmp/x",
+        ] {
+            let r = check_command(cmd);
+            assert!(
+                r.is_some() && r.unwrap().1,
+                "destructive tool not blocked: {cmd}"
+            );
+        }
+        // E overwrite tools: flagged (review), block not required.
+        for cmd in [
+            "install -m 0600 /dev/null /tmp/x/m",
+            "cp /dev/null /tmp/x/m",
+            "tar -C / -xf a.tar",
+        ] {
+            assert!(check_command(cmd).is_some(), "not flagged: {cmd}");
+        }
+    }
+
+    #[test]
+    fn check_command_no_false_positive_block_on_benign() {
+        // A benign command that merely mentions rm, a non-destructive find, or an
+        // unrelated `rm` (docker rm) must never produce a BLOCK.
+        for cmd in [
+            "git commit -m \"remove the old rm helper\"",
+            "echo \"use rm to clean up\"",
+            "find /tmp -name '*.log' -type f",
+            "ls -la /home",
+            "docker rm mycontainer",
+            "npm run build",
+        ] {
+            if let Some((desc, block)) = check_command(cmd) {
+                assert!(!block, "false-positive BLOCK ({desc}) on benign: {cmd}");
+            }
+        }
+    }
 
     #[test]
     fn detects_injection() {
@@ -859,7 +1045,7 @@ mod tests {
             24,
             "prompt-injection pattern count"
         );
-        assert_eq!(DANGEROUS_COMMANDS.len(), 14, "dangerous-command count");
+        assert_eq!(DANGEROUS_COMMANDS.len(), 20, "dangerous-command count");
         assert_eq!(API_KEY_PATTERNS.len(), 7, "API-key pattern count");
     }
 }

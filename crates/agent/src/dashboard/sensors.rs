@@ -169,6 +169,7 @@ pub(super) const KNOWN_COLLECTORS: &[&str] = &[
     "cloudtrail",
     "dns_capture",
     "ebpf",
+    "etw",
     "file_extract",
     "http_capture",
     "journald",

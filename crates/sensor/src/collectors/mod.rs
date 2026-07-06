@@ -44,3 +44,9 @@ pub mod tcp_stream;
 pub mod tls_fingerprint;
 pub mod tunnel_iface;
 pub mod usb_monitor;
+/// Windows ETW / Event Log collector (spec 085). The pure XML parser +
+/// its watermark helpers compile and unit-test on every platform; the
+/// `run` collector only does useful work on Windows (its `wevtutil` probe
+/// fails open elsewhere) and is only spawned under
+/// `cfg!(target_os = "windows")` in `boot::spawn_collectors`.
+pub mod windows_etw;

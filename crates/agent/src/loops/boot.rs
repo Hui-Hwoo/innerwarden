@@ -1951,17 +1951,17 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             cfg.hypervisor.poll_secs.max(60),
         ));
 
-        // SIGTERM / SIGINT. Unix-only — the agent is not currently
-        // shipped on Windows (codename Phantom is "planned" not
-        // active per CLAUDE.md). The pre-cleanup duplicate
-        // `#[cfg(not(unix))]` slow-loop block was 142 lines of
-        // forward-compat scaffolding nobody exercised; deleted on
-        // PR #486 follow-up to stop tarpaulin counting it as
-        // "uncovered" and to drop the dead-code maintenance burden.
+        // Graceful-shutdown signal. On unix this is SIGTERM; on Windows
+        // (spec 085 Phantom-on-Windows Phase 0) it is CtrlShutdown
+        // (service-stop / logoff). Both expose `async fn recv(&mut self)`
+        // so the `sigterm.recv()` select arm below is platform-agnostic.
+        #[cfg(unix)]
         let mut sigterm = {
             use tokio::signal::unix::{signal, SignalKind};
             signal(SignalKind::terminate())?
         };
+        #[cfg(not(unix))]
+        let mut sigterm = tokio::signal::windows::ctrl_shutdown()?;
 
         // Spec 084 P0 1C (hardening): refresh the Kubernetes pod -> tenant cache
         // in a DEDICATED task. It previously lived in the narrative `select!`
