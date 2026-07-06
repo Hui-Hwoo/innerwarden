@@ -283,6 +283,39 @@ jobs:
             -p innerwarden-agent `
             -p innerwarden-ctl
 
+  # Parse-check the Windows installer (spec 085 Phase 5). pwsh is pre-installed
+  # on the ubuntu runner, so a syntax/AST parse gates install.ps1 changes without
+  # a Windows box. Runtime install is only exercisable on real Windows.
+  powershell-parse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Detect changes
+        id: changes
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        with:
+          filters: |
+            ps1:
+              - '**/*.ps1'
+              - '.github/workflows/ci.yml'
+
+      - name: Parse install.ps1
+        if: steps.changes.outputs.ps1 == 'true'
+        shell: pwsh
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./install.ps1), [ref]$null, [ref]$errs)
+          if ($errs) {
+            $errs | ForEach-Object {
+              Write-Host ("::error::install.ps1 line " + $_.Extent.StartLineNumber + ": " + $_.Message)
+            }
+            throw "install.ps1 has $($errs.Count) parse error(s)"
+          }
+          Write-Host "install.ps1 parses clean."
+
   replay-qa:
     runs-on: ubuntu-latest
     needs: [validate]

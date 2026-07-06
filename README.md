@@ -655,13 +655,25 @@ Build from source:
 INNERWARDEN_BUILD_FROM_SOURCE=1 curl -fsSL https://innerwarden.com/install | sudo bash
 ```
 
-### Windows (the AI-agent guardrail)
+### Windows
 
-The Linux/macOS installer above sets up the full host defence. On **Windows**, InnerWarden ships the **guardrail** half only: `iw-guard`, a single signed binary that screens an AI agent's shell command / MCP tool call for danger (the kernel host-EDR is Linux-only). One line installs it (downloads for your arch, verifies the SHA-256, adds it to PATH):
+On **Windows**, InnerWarden ships two tiers (the kernel EDR - eBPF, Execution Gate - stays Linux-only):
+
+**Guardrail** (default, per-user, no admin): `iw-guard`, a single signed binary that screens an AI agent's shell command / MCP tool call for danger. One line downloads it (per-arch), verifies the SHA-256, and adds it to PATH:
 
 ```powershell
 irm https://raw.githubusercontent.com/InnerWarden/innerwarden/main/install.ps1 | iex
 ```
+
+**Full host tier** (the Mac-parity light tier: sensor + agent + dashboard, boot-start Scheduled Tasks, monitor-only by default). Run elevated with `-Full`:
+
+```powershell
+# in an elevated PowerShell:
+irm https://raw.githubusercontent.com/InnerWarden/innerwarden/main/install.ps1 -OutFile install.ps1
+.\install.ps1 -Full
+```
+
+It installs the signed trio, writes a Windows config (ETW + integrity collectors on, responder off / dry-run), and registers two SYSTEM tasks so the sensor + agent start on boot. Windows Event Log telemetry then feeds the same detectors + cloud-AI triage + dashboard as Linux/macOS.
 
 Or grab the signed `.exe` straight from the release and verify it yourself:
 
