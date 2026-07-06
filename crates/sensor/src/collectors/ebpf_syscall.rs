@@ -1784,12 +1784,21 @@ fn cgroup_dir_path(cgroup_file: &str) -> Option<std::path::PathBuf> {
 /// for tasks in that cgroup. `None` if the process is gone or on cgroup v1.
 /// Thin I/O wrapper over the pure `cgroup_dir_path`; `allow(dead_code)` keeps the
 /// non-`ebpf` build (which still compiles the pure helpers + their tests) clean.
+#[cfg(unix)]
 #[allow(dead_code)]
 fn cgroup_id_of_pid(pid: &str) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let abs = cgroup_dir_path(&content)?;
     std::fs::metadata(abs).ok().map(|m| m.ino())
+}
+
+// cgroup ids are a Linux/proc concept. On Windows (spec 085 Phase 0) return
+// None; the eBPF run() that consumes this is Linux-only and feature-gated.
+#[cfg(not(unix))]
+#[allow(dead_code)]
+fn cgroup_id_of_pid(_pid: &str) -> Option<u64> {
+    None
 }
 
 /// Pure core of the self-cgroup scan: given `(exe, cgroup_id)` for each running

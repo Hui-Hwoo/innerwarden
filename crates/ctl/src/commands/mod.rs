@@ -26,7 +26,23 @@ pub(crate) mod response;
 pub(crate) mod rule;
 pub(crate) mod setup;
 pub(crate) mod status;
+
+// sudo_guard is a unix sudoers.d helper (OpenOptionsExt/PermissionsExt +
+// extern geteuid); it has no Windows portable form. On Windows (spec 085
+// Phase 0) a stub bails so the two callers in main.rs still link; UAC/token
+// elevation replaces sudo there in a later phase.
+#[cfg(unix)]
 pub(crate) mod sudo_guard;
+#[cfg(windows)]
+pub(crate) mod sudo_guard {
+    use anyhow::{bail, Result};
+    pub(crate) fn cmd_sudo_suspend(_user: &str, _expires: &str) -> Result<()> {
+        bail!("sudo suspension is not supported on Windows")
+    }
+    pub(crate) fn cmd_sudo_restore(_user: &str) -> Result<()> {
+        bail!("sudo suspension is not supported on Windows")
+    }
+}
 pub(crate) mod uninstall;
 pub(crate) mod update;
 pub(crate) mod watchdog;

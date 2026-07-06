@@ -23,6 +23,42 @@ pub fn launchd_label(unit: &str) -> Option<String> {
     Some(format!("com.innerwarden.{short}"))
 }
 
+/// Map a logical InnerWarden unit to its Windows Scheduled-Task name (spec 085
+/// Phantom Phase 4). The daemons install as two AtStartup SYSTEM tasks under an
+/// `InnerWarden\` folder named after the full unit, so `innerwarden-sensor`
+/// (optionally `.service`/`.timer`) maps to `InnerWarden\innerwarden-sensor`.
+/// This is the canonical name contract shared with `install.ps1 -Full`
+/// (Register-ScheduledTask). Returns `None` for a foreign or empty unit.
+pub(crate) fn scheduled_task_name(unit: &str) -> Option<String> {
+    let base = unit.trim_end_matches(".service").trim_end_matches(".timer");
+    let short = base.strip_prefix("innerwarden-")?;
+    if short.is_empty() {
+        return None;
+    }
+    Some(format!("InnerWarden\\{base}"))
+}
+
+/// The host service manager. `cfg!(target_os = ...)` at the call site picks the
+/// arm; passing it explicitly keeps the routing decision a pure, Linux-testable
+/// function (mac + windows behaviour is covered on the Linux CI host).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceHost {
+    Linux,
+    Macos,
+    Windows,
+}
+
+/// The host this binary is running on.
+pub(crate) fn current_host() -> ServiceHost {
+    if cfg!(target_os = "macos") {
+        ServiceHost::Macos
+    } else if cfg!(target_os = "windows") {
+        ServiceHost::Windows
+    } else {
+        ServiceHost::Linux
+    }
+}
+
 /// Which service manager a restart of `unit` should go through.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RestartVia {
@@ -30,18 +66,26 @@ pub(crate) enum RestartVia {
     Systemd,
     /// macOS: `launchctl kickstart -k system/<label>`.
     Launchd(String),
+    /// Windows: `schtasks /End` then `/Run` on `InnerWarden\<unit>` (there is no
+    /// Restart-Service for a plain console exe under a Scheduled Task).
+    ScheduledTask(String),
 }
 
-/// PURE routing decision so both platforms are covered on the Linux CI host:
-/// on macOS an InnerWarden unit maps to its launchd label; anything else (or a
-/// non-macOS host) uses systemd. `mac = cfg!(target_os = "macos")` at the call.
-pub(crate) fn restart_route(mac: bool, unit: &str) -> RestartVia {
-    if mac {
-        if let Some(label) = launchd_label(unit) {
-            return RestartVia::Launchd(label);
-        }
+/// PURE routing decision so every platform is covered on the Linux CI host:
+/// macOS maps our units to a launchd label, Windows to a Scheduled-Task name,
+/// Linux (and any foreign unit) uses systemd.
+pub(crate) fn restart_route(host: ServiceHost, unit: &str) -> RestartVia {
+    match host {
+        ServiceHost::Macos => match launchd_label(unit) {
+            Some(label) => RestartVia::Launchd(label),
+            None => RestartVia::Systemd,
+        },
+        ServiceHost::Windows => match scheduled_task_name(unit) {
+            Some(task) => RestartVia::ScheduledTask(task),
+            None => RestartVia::Systemd,
+        },
+        ServiceHost::Linux => RestartVia::Systemd,
     }
-    RestartVia::Systemd
 }
 
 fn restart_service_with<F>(unit: &str, dry_run: bool, mut run: F) -> Result<()>
@@ -66,12 +110,44 @@ where
 /// Linux, launchd on macOS (so config-change restarts don't silently no-op on
 /// macOS). In dry_run mode, no command is executed.
 pub fn restart_service(unit: &str, dry_run: bool) -> Result<()> {
-    match restart_route(cfg!(target_os = "macos"), unit) {
+    match restart_route(current_host(), unit) {
         RestartVia::Launchd(label) => restart_launchd(&label, dry_run),
+        RestartVia::ScheduledTask(task) => restart_scheduled_task(&task, dry_run),
         RestartVia::Systemd => restart_service_with(unit, dry_run, |program, args| {
             Command::new(program).args(args).output()
         }),
     }
+}
+
+fn restart_scheduled_task_with<F>(task: &str, dry_run: bool, mut run: F) -> Result<()>
+where
+    F: FnMut(&str, &[String]) -> std::io::Result<std::process::Output>,
+{
+    if dry_run {
+        return Ok(());
+    }
+    // Best-effort stop first (the task may not be running); a failure here is
+    // fine - it is the "kill the old process" half of the config-change restart.
+    let _ = run(
+        "schtasks",
+        &["/End".to_string(), "/TN".to_string(), task.to_string()],
+    );
+    let args = vec!["/Run".to_string(), "/TN".to_string(), task.to_string()];
+    let out = run("schtasks", &args)
+        .with_context(|| format!("failed to run schtasks /Run /TN {task}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("schtasks /Run /TN {task} failed: {stderr}");
+    }
+    Ok(())
+}
+
+/// Restart a Windows Scheduled Task (spec 085 Phase 4): `/End` then `/Run`, the
+/// launchd `kickstart -k` analog. In dry_run mode nothing is executed.
+pub fn restart_scheduled_task(task: &str, dry_run: bool) -> Result<()> {
+    restart_scheduled_task_with(task, dry_run, |program, args| {
+        Command::new(program).args(args).output()
+    })
 }
 
 fn restart_launchd_with<F>(label: &str, dry_run: bool, mut run: F) -> Result<()>
@@ -141,6 +217,9 @@ pub fn service_status(unit: &str) -> ServiceStatus {
     if cfg!(target_os = "macos") {
         return macos_service_status(unit);
     }
+    if cfg!(target_os = "windows") {
+        return windows_service_status(unit);
+    }
     let out = Command::new("systemctl").args(["is-active", unit]).output();
     let out = match out {
         Ok(o) => o,
@@ -176,6 +255,36 @@ pub(crate) fn classify_pgrep(code: Option<i32>) -> ServiceStatus {
         Some(0) => ServiceStatus::Active,
         Some(1) => ServiceStatus::Inactive,
         _ => ServiceStatus::Unknown,
+    }
+}
+
+/// Windows status probe (spec 085 Phase 4). Like the macOS branch, we probe
+/// PROCESS presence rather than the Scheduled-Task state: a KeepAlive task reads
+/// "Ready" between its 1-minute repetitions even while the daemon is alive, so
+/// `tasklist` on the exe name is the reliable signal (the pgrep analog).
+fn windows_service_status(unit: &str) -> ServiceStatus {
+    let exe = format!("{unit}.exe");
+    match Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {exe}"), "/NH"])
+        .output()
+    {
+        Ok(o) => classify_tasklist(&o.stdout, &exe),
+        Err(_) => ServiceStatus::Unknown,
+    }
+}
+
+/// Pure helper: map `tasklist /FI "IMAGENAME eq <exe>" /NH` stdout to a status.
+/// When a process matches, tasklist prints a row containing the image name; when
+/// none match it prints `INFO: No tasks are running ...`. Anything else (an error
+/// shape) is Unknown, the same defer-to-secondary contract as `classify_pgrep`.
+pub(crate) fn classify_tasklist(stdout: &[u8], exe: &str) -> ServiceStatus {
+    let s = String::from_utf8_lossy(stdout).to_lowercase();
+    if s.contains(&exe.to_lowercase()) {
+        ServiceStatus::Active
+    } else if s.contains("no tasks") {
+        ServiceStatus::Inactive
+    } else {
+        ServiceStatus::Unknown
     }
 }
 
@@ -249,15 +358,97 @@ mod tests {
     fn restart_route_picks_launchd_only_on_mac_for_iw_units() {
         // macOS + an InnerWarden unit → launchd label.
         assert_eq!(
-            restart_route(true, "innerwarden-agent"),
+            restart_route(ServiceHost::Macos, "innerwarden-agent"),
             RestartVia::Launchd("com.innerwarden.agent".to_string())
         );
         // macOS but a foreign unit we don't own → systemd (surfaces the error).
-        assert_eq!(restart_route(true, "sshd"), RestartVia::Systemd);
-        // Non-macOS → always systemd, even for our own units.
         assert_eq!(
-            restart_route(false, "innerwarden-agent"),
+            restart_route(ServiceHost::Macos, "sshd"),
             RestartVia::Systemd
+        );
+        // Linux → always systemd, even for our own units.
+        assert_eq!(
+            restart_route(ServiceHost::Linux, "innerwarden-agent"),
+            RestartVia::Systemd
+        );
+    }
+
+    #[test]
+    fn restart_route_picks_scheduled_task_on_windows_for_iw_units() {
+        // Windows + an InnerWarden unit → Scheduled-Task name (spec 085 Phase 4).
+        assert_eq!(
+            restart_route(ServiceHost::Windows, "innerwarden-sensor"),
+            RestartVia::ScheduledTask("InnerWarden\\innerwarden-sensor".to_string())
+        );
+        // Windows + a foreign unit → systemd fallback (we never restart those).
+        assert_eq!(
+            restart_route(ServiceHost::Windows, "sshd"),
+            RestartVia::Systemd
+        );
+    }
+
+    #[test]
+    fn scheduled_task_name_maps_and_rejects() {
+        assert_eq!(
+            scheduled_task_name("innerwarden-sensor").as_deref(),
+            Some("InnerWarden\\innerwarden-sensor")
+        );
+        assert_eq!(
+            scheduled_task_name("innerwarden-agent.service").as_deref(),
+            Some("InnerWarden\\innerwarden-agent")
+        );
+        // Foreign / empty units are rejected (never routed to a task).
+        assert_eq!(scheduled_task_name("sshd"), None);
+        assert_eq!(scheduled_task_name("innerwarden-"), None);
+    }
+
+    #[test]
+    fn restart_scheduled_task_with_covers_dry_run_success_and_failure() {
+        // dry_run short-circuits before any schtasks call.
+        assert!(
+            restart_scheduled_task_with("InnerWarden\\innerwarden-sensor", true, |_p, _a| {
+                shell_output("exit 1")
+            })
+            .is_ok()
+        );
+        // Non-dry-run: the /End is best-effort, the /Run result decides. Success:
+        assert!(
+            restart_scheduled_task_with("InnerWarden\\innerwarden-sensor", false, |_p, _a| {
+                shell_output("exit 0")
+            })
+            .is_ok()
+        );
+        // Failure surfaces stderr.
+        let err =
+            restart_scheduled_task_with("InnerWarden\\innerwarden-sensor", false, |_p, _a| {
+                shell_output("printf task-down >&2; exit 1")
+            })
+            .expect_err("failed schtasks /Run should be reported");
+        assert!(err.to_string().contains("task-down"));
+    }
+
+    #[test]
+    fn classify_tasklist_maps_presence() {
+        // A row containing the exe name = the process is up = Active.
+        assert_eq!(
+            classify_tasklist(
+                b"innerwarden-sensor.exe          1234 Services    0    12,345 K\n",
+                "innerwarden-sensor.exe"
+            ),
+            ServiceStatus::Active
+        );
+        // The "No tasks" line = a clean not-running answer.
+        assert_eq!(
+            classify_tasklist(
+                b"INFO: No tasks are running which match the specified criteria.\n",
+                "innerwarden-sensor.exe"
+            ),
+            ServiceStatus::Inactive
+        );
+        // An unrecognised shape defers to Unknown (never a false "down").
+        assert_eq!(
+            classify_tasklist(b"", "innerwarden-sensor.exe"),
+            ServiceStatus::Unknown
         );
     }
 

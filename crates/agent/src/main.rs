@@ -22,7 +22,7 @@
 // (an explicit `compile_error!` macro cannot observe the state of
 // another cfg-gated item without producing the same duplicate-lang
 // error first).
-#[cfg(all(not(target_os = "macos"), not(feature = "dhat-heap")))]
+#[cfg(all(target_os = "linux", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -50,9 +50,9 @@ static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
 //   between "dirty" and "returned to the OS"). Matching the dirty
 //   interval gives a single predictable decay window.
 //
-// Linux-only; the macOS build uses the system allocator so this
-// symbol is not needed there.
-#[cfg(all(not(target_os = "macos"), not(test)))]
+// Linux-only; the macOS and Windows builds use the system allocator so
+// this symbol is not needed there.
+#[cfg(all(target_os = "linux", not(test)))]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]
 pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";

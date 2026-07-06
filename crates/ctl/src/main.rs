@@ -2583,22 +2583,33 @@ fn dispatch_module(cli: &Cli, command: &ModuleCommand) -> Result<()> {
 
 /// Check if we have write access to the config directory.
 fn am_root() -> bool {
-    let config_dir = Path::new("/etc/innerwarden");
-    if config_dir.exists() {
-        // Try to check write permission
-        std::fs::metadata(config_dir)
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                m.uid() == 0 && unsafe { libc_geteuid() } == 0
-            })
-            .unwrap_or(false)
-    } else {
-        // Config dir doesn't exist yet — need root to create it
-        unsafe { libc_geteuid() == 0 }
+    // On Windows (spec 085 Phase 0) return false: treat self as non-elevated,
+    // so ctl warns / offers a re-exec instead of writing config as if
+    // privileged (fail-closed). Real IsUserAnAdmin/token-elevation is a later phase.
+    #[cfg(unix)]
+    {
+        let config_dir = Path::new("/etc/innerwarden");
+        if config_dir.exists() {
+            // Try to check write permission
+            std::fs::metadata(config_dir)
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.uid() == 0 && unsafe { libc_geteuid() } == 0
+                })
+                .unwrap_or(false)
+        } else {
+            // Config dir doesn't exist yet - need root to create it
+            unsafe { libc_geteuid() == 0 }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
 /// Safe wrapper for geteuid without libc dep.
+#[cfg(unix)]
 unsafe fn libc_geteuid() -> u32 {
     // geteuid is always available on Linux/macOS
     extern "C" {
